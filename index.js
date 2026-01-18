@@ -12,15 +12,20 @@ const app = express();
 
 // -------------------------
 // Config
-// -------------------------
 const PORT = Number(process.env.PORT || 3001);
-const FREE_LIMIT = Number(process.env.FREE_LIMIT || 7);
+const FREE_LIMIT = Number(process.env.FREE_LIMIT || 17);
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+if (!OPENAI_API_KEY.startsWith("sk-")) {
+  console.warn("⚠️ OPENAI_API_KEY missing or invalid — vision disabled");
+}
+
 const SERPAPI_KEY = (process.env.SERPAPI_KEY || "").trim();
+const ETSY_API_KEY = (process.env.ETSY_API_KEY || "").trim();
 
 const HAS_OPENAI = !!OPENAI_API_KEY;
 const HAS_SERPAPI = !!SERPAPI_KEY;
+const HAS_ETSY = !!ETSY_API_KEY;
 
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
