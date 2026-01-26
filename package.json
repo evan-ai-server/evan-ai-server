@@ -4,13 +4,14 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "expo": "^54.0.31",
-    "express": "^5.2.1",
+    "express": "^4.19.2",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
     "openai": "^6.16.0",
