@@ -12206,7 +12206,7 @@ if (!openai) {
         }
       );
 
-      console.warn("❌ VISION ERROR:", reason, err?.message || err);
+      console.warn("❌ VISION ERROR:", reason, err?.message || err, err?.stack?.split("\n").slice(1,4).join(" | "));
 
       return res.status(200).json({
         ok: true,
