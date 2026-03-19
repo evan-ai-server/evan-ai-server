@@ -1890,21 +1890,24 @@ async function objectStorePutBuffer(
   metadata = {}
 ) {
   if (canUseS3ObjectStore()) {
-    await s3Client.send(
-      new PutObjectCommand({
-        Bucket: OBJECT_STORE_BUCKET,
-        Key: key,
-        Body: buffer,
-        ContentType: contentType,
-        Metadata: normalizeObjectMetadata(metadata),
-      })
-    );
-
-    return {
-      key,
-      url: objectStorePublicUrl(key),
-      provider: "s3",
-    };
+    try {
+      await s3Client.send(
+        new PutObjectCommand({
+          Bucket: OBJECT_STORE_BUCKET,
+          Key: key,
+          Body: buffer,
+          ContentType: contentType,
+          Metadata: normalizeObjectMetadata(metadata),
+        })
+      );
+      return {
+        key,
+        url: objectStorePublicUrl(key),
+        provider: "s3",
+      };
+    } catch (s3Err) {
+      console.warn("⚠️ S3 put failed, falling back to local:", s3Err?.message || s3Err);
+    }
   }
 
   await writeBufferIfMissing(key, buffer);
