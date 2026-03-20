@@ -10757,6 +10757,8 @@ function buildVisionConsensusSchema() {
 function buildVisionPassPrompt(passLabel, mode, propContext) {
   const header = modeHeader(mode, propContext);
 
+  // box_tag is OCR-only; pass-specific instructions conflict with it
+  if (mode === "box_tag") return header;
 
     if (passLabel === "counterfactual_alt1") {
       return `${header}
@@ -10784,34 +10786,18 @@ function buildVisionPassPrompt(passLabel, mode, propContext) {
     if (passLabel === "brand_model") {
       return `${header}
 
-  PASS: BRAND + MODEL EXTRACTION
-
-Focus on:
-- logos
-- readable text
-- maker marks
-- model names
-- exact visible identifiers
-
-Return the strongest resale search identity possible.
-If brand/model are unclear, stay honest and broad.`;
+PASS: BRAND + MODEL EXTRACTION
+Scan for: logos → legible text → maker marks → model names → SKU codes.
+Legible text beats shape-based guesses every time.
+query = exact brand + exact model name. If brand unclear, say so honestly.`;
   }
 
   if (passLabel === "visual_shape") {
     return `${header}
 
 PASS: VISUAL SHAPE + MATERIAL + COLOR
-
-Focus on:
-- silhouette
-- category
-- colors
-- materials
-- shape words
-- fashion/style cues
-- lens/frame traits if eyewear
-
-Return the strongest visually grounded resale search identity possible.`;
+Ignore brand uncertainty. Focus on: silhouette → category → colors → materials → style cues → lens/frame if eyewear.
+query = descriptive visual terms that would find this item on a marketplace without knowing the brand.`;
   }
 
   if (passLabel === "ultra") {
@@ -10921,6 +10907,10 @@ const parsed = {
   identity:
     parsedRaw?.identity && typeof parsedRaw.identity === "object"
       ? parsedRaw.identity
+      : null,
+  attributeCertainty:
+    parsedRaw?.attributeCertainty && typeof parsedRaw.attributeCertainty === "object"
+      ? parsedRaw.attributeCertainty
       : null,
 };
 
@@ -11169,6 +11159,11 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   const parsedList = passes.map((p) => p?.parsed || {});
   const passLabels = ["master", "brand_model", "visual_shape"];
 
+  // Track which passes returned actual responses (vs total failure)
+  const anyPassGotResponse = passes.some(
+    (p) => p?.rawText && String(p.rawText).trim().length > 2
+  );
+
   const passMeta = parsedList.map((parsed, idx) => {
     const query =
       typeof parsed?.query === "string" ? parsed.query.trim() : "";
@@ -11178,6 +11173,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       parsed?.identity || null,
       query
     );
+    const attrCert = parsed?.attributeCertainty || {};
 
     const tokenCount = titleTokens(query).length;
 
@@ -11191,13 +11187,17 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         ? 10
         : passLabels[idx] === "master"
         ? 4
-        : 0);
+        : 0) +
+      // bonus for attribute certainty signals
+      ((attrCert.brand || 0) > 0.7 ? 8 : 0) +
+      ((attrCert.model || 0) > 0.7 ? 8 : 0);
 
     return {
       label: passLabels[idx],
       query,
       confidence,
       identity,
+      attrCert,
       detailScore,
     };
   });
@@ -11229,6 +11229,20 @@ const mergedIdentity = mergeVisionIdentityObjects(
   passMeta.map((p) => p.identity || null),
   query || ""
 );
+
+// Override brand/model with the pass that has the highest attributeCertainty for each field
+const bestBrandPass = passMeta
+  .filter(p => p.identity?.brand && (p.attrCert?.brand || 0) > 0.5)
+  .sort((a, b) => (b.attrCert?.brand || 0) - (a.attrCert?.brand || 0))[0];
+if (bestBrandPass?.identity?.brand && (bestBrandPass.attrCert?.brand || 0) > 0.55) {
+  mergedIdentity.brand = bestBrandPass.identity.brand;
+}
+const bestModelPass = passMeta
+  .filter(p => p.identity?.model && (p.attrCert?.model || 0) > 0.5)
+  .sort((a, b) => (b.attrCert?.model || 0) - (a.attrCert?.model || 0))[0];
+if (bestModelPass?.identity?.model && (bestModelPass.attrCert?.model || 0) > 0.55) {
+  mergedIdentity.model = bestModelPass.identity.model;
+}
 
 const identityPreferredQuery = chooseBestIdentityQuery(
   mergedIdentity,
@@ -11275,12 +11289,32 @@ if (
     .map((p) => Number(p?.confidence))
     .filter((n) => Number.isFinite(n));
 
-  let confidence =
-    confidenceValues.length > 0
-      ? clamp01(
-          confidenceValues.reduce((a, b) => a + b, 0) / confidenceValues.length
-        )
-      : 0;
+  // Weighted average by detailScore — high-detail passes dominate over low-detail ones
+  const totalDetailScore = passMeta.reduce((s, p) => s + p.detailScore, 0);
+  let confidence;
+  if (totalDetailScore > 0 && confidenceValues.length > 0) {
+    confidence = clamp01(
+      passMeta.reduce((s, p) => s + p.confidence * (p.detailScore / totalDetailScore), 0)
+    );
+  } else if (confidenceValues.length > 0) {
+    confidence = clamp01(confidenceValues.reduce((a, b) => a + b, 0) / confidenceValues.length);
+  } else {
+    confidence = 0;
+  }
+
+  // Brand agreement boost: 2+ passes identifying same brand = higher reliability
+  const allBrands = passMeta.map(p => (p.identity?.brand || "").toLowerCase().trim()).filter(Boolean);
+  const brandFreq = {};
+  for (const b of allBrands) brandFreq[b] = (brandFreq[b] || 0) + 1;
+  const brandAgreement = Object.values(brandFreq).some(v => v >= 2);
+  if (brandAgreement) confidence = clamp01(confidence + 0.10);
+
+  // Model agreement boost: 2+ passes naming same model
+  const allModels = passMeta.map(p => (p.identity?.model || "").toLowerCase().trim()).filter(Boolean);
+  const modelFreq = {};
+  for (const m of allModels) modelFreq[m] = (modelFreq[m] || 0) + 1;
+  const modelAgreement = Object.values(modelFreq).some(v => v >= 2);
+  if (modelAgreement) confidence = clamp01(confidence + 0.08);
 
   let variants = uniqueQueries([
     ...(Array.isArray(parsedList[0]?.variants) ? parsedList[0].variants : []),
@@ -11296,7 +11330,7 @@ const consensusLooksEmpty =
   confidence <= 0.05 &&
   rawQueries.length === 0;
 
-if (consensusLooksEmpty && mode === "item" && getResolvedPlan(req) !== "free") {
+if (consensusLooksEmpty && mode === "item" && getResolvedPlan(req) !== "free" && anyPassGotResponse) {
   console.warn("⚠️ EMPTY VISION CONSENSUS -> running recovery pass", {
     rid: req.rid,
   });
