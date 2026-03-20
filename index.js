@@ -12236,6 +12236,23 @@ if (!openai) {
           });
         }
 
+        // ── Price intelligence (zero-cost, from user inputs) ────────────────────
+        if (originalPrice || cheapestAlt) {
+          const intel = { priceBracket: priceBracket || null };
+          if (originalPrice) intel.listedPrice = originalPrice;
+          if (cheapestAlt)   intel.cheapestAlt  = cheapestAlt;
+          if (originalPrice && cheapestAlt && cheapestAlt > 0) {
+            const savingsPct = ((cheapestAlt - originalPrice) / cheapestAlt * 100);
+            const roundedPct = Math.abs(Math.round(savingsPct * 10) / 10);
+            intel.savingsVsAlt       = Math.round(savingsPct * 10) / 10;
+            intel.isCheaperThanAlt   = originalPrice < cheapestAlt;
+            intel.signal = intel.isCheaperThanAlt
+              ? `Listed ${roundedPct}% below cheapest alternative ($${cheapestAlt})`
+              : `Listed ${roundedPct}% above cheapest alternative ($${cheapestAlt})`;
+          }
+          shaped.priceIntelligence = intel;
+        }
+
         visionCache.set(cacheKey, shaped);
         await cacheSet(cacheKey, shaped, 86400);
 
