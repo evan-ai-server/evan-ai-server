@@ -101,6 +101,7 @@ import {
   getIntelligenceStats,
   recordPriceHistory,
   getPriceHistorySummary,
+  getPriceHistoryChartPoints,
   recordSoldCompHistory,
   getSoldCompSummary,
   rerankWithIntelligence,
@@ -3347,6 +3348,18 @@ function referralUserKey(userId) {
   return `referral_user:${safeStr(userId, 64)}`;
 }
 
+// Tracks per-device redemptions so the same device can't redeem twice
+// even if the user creates a new account.
+function referralInstallKey(installId) {
+  return `referral_install:${safeStr(installId, 128)}`;
+}
+
+// Pending: a referral link was clicked on this device but not yet redeemed.
+// Stored until the user authenticates and calls /referral/redeem.
+function referralPendingKey(installId) {
+  return `referral_pending:${safeStr(installId, 128)}`;
+}
+
 async function createReferral(ownerId) {
   if (!redis) return null;
 
@@ -3403,17 +3416,20 @@ async function getReferralByOwner(ownerId) {
   }
 }
 
-async function redeemReferral({ code, userId, source = "manual" }) {
+async function redeemReferral({ code, userId, installId, source = "manual" }) {
   if (!redis) return { ok: false, reason: "redis_unavailable" };
 
-  const cleanCode = safeStr(code, 32).toUpperCase();
-  const cleanUserId = safeStr(userId || "", 64);
-  const cleanSource = safeStr(source || "manual", 24) || "manual";
+  const cleanCode    = safeStr(code, 32).toUpperCase();
+  const cleanUserId  = safeStr(userId || "", 64);
+  const cleanInstall = safeStr(installId || "", 128);
+  const cleanSource  = safeStr(source || "manual", 24) || "manual";
 
+  // Both userId and installId required — confirms the user actually has the app installed.
   if (!cleanCode || !cleanUserId) {
     return { ok: false, reason: "sign_in_required" };
   }
 
+  // Look up the code
   const raw = await redis.get(referralCodeKey(cleanCode));
   if (!raw) return { ok: false, reason: "invalid_code" };
 
@@ -3428,13 +3444,24 @@ async function redeemReferral({ code, userId, source = "manual" }) {
     return { ok: false, reason: "invalid_code" };
   }
 
+  // Cannot use your own code
   if (String(referral.ownerId) === String(cleanUserId)) {
     return { ok: false, reason: "self_referral_not_allowed" };
   }
 
+  // Cannot redeem if this account already has (userId-level lock)
   const existingUserRedeem = await redis.get(referralUserKey(cleanUserId));
   if (existingUserRedeem) {
     return { ok: false, reason: "already_redeemed" };
+  }
+
+  // Cannot redeem if this physical device already has (installId-level lock)
+  // This prevents uninstall + reinstall + new account farming.
+  if (cleanInstall) {
+    const existingInstallRedeem = await redis.get(referralInstallKey(cleanInstall));
+    if (existingInstallRedeem) {
+      return { ok: false, reason: "already_redeemed_device" };
+    }
   }
 
   referral.uses = Number(referral.uses || 0) + 1;
@@ -3444,13 +3471,22 @@ async function redeemReferral({ code, userId, source = "manual" }) {
     ownerId: referral.ownerId,
     redeemedAt: Date.now(),
     source: cleanSource,
+    installId: cleanInstall || null,
   };
 
-  await redis
+  const multi = redis
     .multi()
     .set(referralCodeKey(cleanCode), JSON.stringify(referral))
-    .set(referralUserKey(cleanUserId), JSON.stringify(redeemPayload))
-    .exec();
+    .set(referralUserKey(cleanUserId), JSON.stringify(redeemPayload));
+
+  // Bind the device too
+  if (cleanInstall) {
+    multi.set(referralInstallKey(cleanInstall), JSON.stringify(redeemPayload));
+    // Clean up pending record now that it's been redeemed
+    multi.del(referralPendingKey(cleanInstall));
+  }
+
+  await multi.exec();
 
   return {
     ok: true,
@@ -3459,6 +3495,33 @@ async function redeemReferral({ code, userId, source = "manual" }) {
     uses: referral.uses,
     source: cleanSource,
   };
+}
+
+// Register that a referral link was clicked on this device (pre-auth).
+// Does NOT grant rewards. Just persists the intent so it survives until
+// the user authenticates and calls /referral/redeem.
+async function registerPendingReferral(installId, code) {
+  if (!redis || !installId || !code) return false;
+  const cleanInstall = safeStr(installId, 128);
+  const cleanCode    = safeStr(code, 32).toUpperCase();
+  if (!cleanInstall || !cleanCode) return false;
+
+  // Verify the code actually exists before persisting
+  const raw = await redis.get(referralCodeKey(cleanCode));
+  if (!raw) return false;
+
+  // Don't overwrite an already-redeemed install
+  const already = await redis.get(referralInstallKey(cleanInstall));
+  if (already) return false;
+
+  // Store with 30-day TTL (enough time for the user to finish signup)
+  await redis.set(
+    referralPendingKey(cleanInstall),
+    JSON.stringify({ code: cleanCode, registeredAt: Date.now() }),
+    "EX",
+    60 * 60 * 24 * 30,
+  );
+  return true;
 }
 
 // -------------------- TTL cache (prevents memory leak) --------------------
@@ -7738,6 +7801,24 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
       costUnits: 6,
     }));
 
+  const canUseAmazonSerp =
+    !!SERPAPI_KEY &&
+    !isSourceCoolingDown("serpapi") &&
+    runtimePlan !== "free" &&
+    (await sourceBudget.canUse("serpapi", {
+      plan: runtimePlan,
+      costUnits: 4,
+    }));
+
+  const canUseResaleSerp =
+    !!SERPAPI_KEY &&
+    !isSourceCoolingDown("serpapi") &&
+    runtimePlan !== "free" &&
+    (await sourceBudget.canUse("serpapi", {
+      plan: runtimePlan,
+      costUnits: 4,
+    }));
+
   if (!canUseEbay && !canUseWalmart && !canUseBestBuy && !canUseEtsy && !canUseSerpForce) {
     console.warn("⚠️ No marketplace APIs configured — using backup web lanes only");
   }
@@ -7757,13 +7838,33 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
   let backupAll = [];
   let etsyAll = [];
   let etsyVariants = [];
+  let amazonAll = [];
+  let resaleAll = [];
+
+  // Feature 3: low-confidence accuracy boost — add visible text fallback queries
+  const visionConf = Number(identity?.confidence ?? identity?.visionConfidence ?? 1);
+  const lowConfidence = visionConf < 0.5;
+  const visibleTextQueries = lowConfidence && Array.isArray(identity?.visibleText) && identity.visibleText.length
+    ? uniqueQueries(
+        identity.visibleText
+          .filter((t) => typeof t === "string" && t.trim().length > 2)
+          .slice(0, 4)
+          .flatMap((t) => {
+            const cleaned = normalizeQuery(t.trim());
+            return cleaned ? [cleaned, `${cleaned} buy`, `buy ${cleaned}`] : [];
+          })
+      ).slice(0, 4)
+    : [];
+
+  const maxQueries = isEyewearQuery ? 10 : (lowConfidence ? 14 : 12);
 
   const marketplaceQueries = uniqueQueries([
     normalizedQuery,
     ...incomingVariants,
     ...buildServerQueryVariants(normalizedQuery, incomingVariants, "item", identity),
     ...buildEmergencyShoppingFallbacks(normalizedQuery, incomingVariants),
-  ]).slice(0, isEyewearQuery ? 10 : 12);
+    ...visibleTextQueries,
+  ]).slice(0, maxQueries);
 
   if (marketplaceQueries.length) {
     const sourceResults = await Promise.all(
@@ -7861,6 +7962,51 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
     etsyAll = etsyResults.flatMap((x) => x.items || []);
   }
 
+  // ── Amazon lane ────────────────────────────────────────────────────────────
+  if (canUseAmazonSerp) {
+    try {
+      amazonAll = await runBudgetedSourceLane(
+        "serpapi",
+        () => serpAmazon(normalizedQuery, { softFail: true }),
+        { plan: runtimePlan, costUnits: 4 }
+      );
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Category-routed resale lane (StockX / Poshmark / Depop / Mercari) ────
+  if (canUseResaleSerp) {
+    const cat = inferVisionCategory(normalizedQuery);
+    const resaleSites = [];
+
+    if (cat === "footwear") {
+      resaleSites.push({ site: "stockx.com",  label: "StockX"   });
+      resaleSites.push({ site: "goat.com",     label: "GOAT"     });
+    } else if (cat === "apparel" || cat === "bags") {
+      resaleSites.push({ site: "poshmark.com", label: "Poshmark" });
+      resaleSites.push({ site: "depop.com",    label: "Depop"    });
+      resaleSites.push({ site: "mercari.com",  label: "Mercari"  });
+    } else if (cat === "watch") {
+      resaleSites.push({ site: "stockx.com",   label: "StockX"   });
+      resaleSites.push({ site: "chrono24.com", label: "Chrono24" });
+    } else {
+      resaleSites.push({ site: "mercari.com",  label: "Mercari"  });
+      resaleSites.push({ site: "poshmark.com", label: "Poshmark" });
+    }
+
+    const resaleResults = await Promise.all(
+      resaleSites.map(({ site, label }) =>
+        marketSearchConcurrency(() =>
+          runBudgetedSourceLane(
+            "serpapi",
+            () => serpScopedSearch(normalizedQuery, site, { softFail: true, label }),
+            { plan: runtimePlan, costUnits: 2 }
+          )
+        )
+      )
+    );
+    resaleAll = resaleResults.flat().filter(Boolean);
+  }
+
   const [retrievalSnapshot, retrievalIndexed] = await Promise.all([
     getRetrievalSnapshotCached(normalizedQuery).catch(() => null),
     searchRetrievalIndexCached(normalizedQuery, 24).catch(() => []),
@@ -7877,6 +8023,8 @@ let rawMerged = [
   ...bestBuyAll,
   ...backupAll,
   ...etsyAll,
+  ...amazonAll,
+  ...resaleAll,
   ...retrievalSeed,
 ];
 
@@ -9867,10 +10015,12 @@ Extract with maximum precision:
 Put ALL text you can read into visibleText[]. Even partial text fragments.
 If box/tag is not present or unreadable => query=null.`;
   }
-  // Parse price bracket from propContext if present (format: "...price:luxury|listed:450|alt:280...")
+  // Parse price bracket and item hint from propContext
   const priceBracketMatch = (propContext || "").match(/price:(luxury|premium|mid|entry)/);
   const listedMatch = (propContext || "").match(/listed:([\d.]+)/);
   const altMatch = (propContext || "").match(/alt:([\d.]+)/);
+  const hintMatch  = (propContext || "").match(/hint:([^|]+)/);
+  const sizeMatch  = (propContext || "").match(/size:([^|]+)/);
   const priceBracketLabel = priceBracketMatch?.[1] || null;
   const listedPrice = listedMatch?.[1] ? `$${listedMatch[1]}` : null;
   const altPrice = altMatch?.[1] ? `$${altMatch[1]}` : null;
@@ -9886,7 +10036,13 @@ If box/tag is not present or unreadable => query=null.`;
     priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "low"}, cheapest alternative ${altPrice || "comparable"}. ENTRY BRACKET — common brands, mass market, or significantly worn. Be honest about condition.`;
   }
 
-  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.${priceSignal}`;
+  const itemHintSignal = hintMatch?.[1]
+    ? `\nUSER HINT: The user says this is "${hintMatch[1].trim()}". Use this as a strong search-query anchor — confirm visually if consistent, then build the query around it.`
+    : "";
+  const sizeHintSignal = sizeMatch?.[1]
+    ? `\nSIZE HINT: The user specified size/variant "${sizeMatch[1].trim()}". Include this in the search query when relevant (e.g. "Nike Air Force 1 Size 10", "Medium Blue").`
+    : "";
+  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.${priceSignal}${itemHintSignal}${sizeHintSignal}`;
 }
 
 function cleanMode(m) {
@@ -11830,6 +11986,7 @@ if (!openai) {
       const rawPropContext = safeStr(req.body?.propContext, 220);
       const originalPrice = Number(req.body?.originalPrice || req.body?.price || 0) || null;
       const cheapestAlt = Number(req.body?.cheapestAlternative || req.body?.cheapestAlt || 0) || null;
+      const itemHint = typeof req.body?.itemHint === "string" ? req.body.itemHint.trim().slice(0, 80) : null;
       const priceRef = originalPrice || cheapestAlt;
       const priceBracket = priceRef
         ? priceRef >= 500 ? "luxury"
@@ -11840,7 +11997,8 @@ if (!openai) {
       const priceContext = priceBracket
         ? `price:${priceBracket}|listed:${originalPrice || "?"}|alt:${cheapestAlt || "?"}`
         : "";
-      const propContext = [rawPropContext, priceContext].filter(Boolean).join("|");
+      const hintContext = itemHint ? `hint:${itemHint}` : "";
+      const propContext = [rawPropContext, priceContext, hintContext].filter(Boolean).join("|");
       const imgHash = sha256(file.buffer);
       const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
 
@@ -12657,6 +12815,166 @@ async function serpShopping(query, opts = {}) {
       softFail
     );
 
+    return [];
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// -------------------- SERP: Amazon --------------------
+async function serpAmazon(query, opts = {}) {
+  const { bypassCooldown = false, softFail = false } = opts || {};
+
+  if (!SERPAPI_KEY) return [];
+  if (process.env.DISABLE_SERP === "true") return [];
+  if (!bypassCooldown && isSourceCoolingDown("serpapi")) return [];
+
+  const startedAt = Date.now();
+
+  const params = new URLSearchParams({
+    engine: "amazon",
+    k: query,
+    amazon_domain: "amazon.com",
+    api_key: SERPAPI_KEY,
+  });
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+
+    if (!r.ok) {
+      if (r.status === 429) {
+        if (!softFail) {
+          markSourceFailure("serpapi", "http_429");
+          const h = getSourceHealth("serpapi");
+          h.cooldownUntil = Math.max(Number(h.cooldownUntil || 0), Date.now() + 45 * 1000);
+        }
+        return [];
+      }
+      if (!softFail) markSourceFailure("serpapi", `http_${r.status}`);
+      return [];
+    }
+
+    const data = await r.json();
+    const raw = Array.isArray(data.organic_results) ? data.organic_results : [];
+
+    let items = raw
+      .map((it, idx) => {
+        const rawPrice = it.price?.value ?? it.price ?? null;
+        const price = rawPrice != null
+          ? parseFloat(String(rawPrice).replace(/[^0-9.]/g, "")) || null
+          : null;
+        const link = it.link || (it.asin ? `https://www.amazon.com/dp/${it.asin}` : null);
+        const normalized = normalizeItem({
+          title: it.title,
+          price,
+          totalPrice: price,
+          link,
+          url: link,
+          image: it.thumbnail,
+          source: "Amazon",
+        });
+        return {
+          ...normalized,
+          link,
+          url: link,
+          buyLink: link,
+          source: "Amazon",
+          __fromMarketSearch: true,
+          __serverRank: idx + 1,
+        };
+      })
+      .filter((x) => x.title)
+      .filter((x) => Number.isFinite(x.totalPrice) || Number.isFinite(x.price));
+
+    items = dedupeSmart(items);
+    markSourceSuccess("serpapi", Date.now() - startedAt);
+    console.log("🛒 SERP AMAZON COUNT", { query, kept: items.length });
+    return items.slice(0, 40);
+  } catch (err) {
+    if (!softFail) markSourceFailure("serpapi", err?.name === "AbortError" ? "timeout" : "exception");
+    console.warn("⚠️ serpAmazon error:", err?.message || err, "query=", query);
+    return [];
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// -------------------- SERP: Scoped resale search (StockX / Poshmark / Depop / Mercari) --------------------
+async function serpScopedSearch(query, site, opts = {}) {
+  const { bypassCooldown = false, softFail = false, label = site } = opts || {};
+
+  if (!SERPAPI_KEY) return [];
+  if (process.env.DISABLE_SERP === "true") return [];
+  if (!bypassCooldown && isSourceCoolingDown("serpapi")) return [];
+
+  const startedAt = Date.now();
+
+  const params = new URLSearchParams({
+    engine: "google_shopping",
+    q: `${query} site:${site}`,
+    hl: "en",
+    gl: "us",
+    api_key: SERPAPI_KEY,
+  });
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+
+    if (!r.ok) {
+      if (r.status === 429) {
+        if (!softFail) {
+          markSourceFailure("serpapi", "http_429");
+          const h = getSourceHealth("serpapi");
+          h.cooldownUntil = Math.max(Number(h.cooldownUntil || 0), Date.now() + 45 * 1000);
+        }
+        return [];
+      }
+      if (!softFail) markSourceFailure("serpapi", `http_${r.status}`);
+      return [];
+    }
+
+    const data = await r.json();
+    const raw = [
+      ...(Array.isArray(data.shopping_results) ? data.shopping_results : []),
+      ...(Array.isArray(data.inline_shopping_results) ? data.inline_shopping_results : []),
+    ];
+
+    let items = raw
+      .map((it, idx) => {
+        const normalized = normalizeItem({
+          ...it,
+          link: it.link || it.product_link || it.product_page_url || it.url || null,
+        });
+        const fallbackLink =
+          normalized.link || it.link || it.product_link || it.product_page_url || null;
+        return {
+          ...normalized,
+          link: fallbackLink,
+          url: fallbackLink,
+          buyLink: fallbackLink,
+          source: label,
+          __fromMarketSearch: true,
+          __serverRank: idx + 1,
+        };
+      })
+      .filter((x) => x.title)
+      .filter((x) => Number.isFinite(x.totalPrice) || Number.isFinite(x.price));
+
+    items = dedupeSmart(items);
+    markSourceSuccess("serpapi", Date.now() - startedAt);
+    console.log(`🔍 SERP SCOPED [${label}]`, { query, kept: items.length });
+    return items.slice(0, 30);
+  } catch (err) {
+    if (!softFail) markSourceFailure("serpapi", err?.name === "AbortError" ? "timeout" : "exception");
+    console.warn(`⚠️ serpScopedSearch [${label}] error:`, err?.message || err);
     return [];
   } finally {
     clearTimeout(t);
@@ -13795,6 +14113,38 @@ async function buildMarketSearchResponsePayload({
     },
   };
 }
+// ── Price history API ──────────────────────────────────────────────────────
+app.get("/api/price-history", async (req, res) => {
+  try {
+    const query = normalizeQuery(safeStr(req.query?.q, 220));
+    if (!query) return res.status(400).json({ ok: false, error: "missing_query" });
+
+    const [summary, chartPoints] = await Promise.all([
+      getPriceHistorySummary(query),
+      getPriceHistoryChartPoints(query, 90),
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      query,
+      chartPoints: chartPoints || [],
+      summary: summary
+        ? {
+            rollingLow:    summary.rollingLow,
+            rollingMedian: summary.rollingMedian,
+            rollingHigh:   summary.rollingHigh,
+            points:        summary.points,
+            firstSeenAt:   summary.firstSeenAt,
+            lastSeenAt:    summary.lastSeenAt,
+          }
+        : null,
+    });
+  } catch (e) {
+    console.warn("⚠️ /api/price-history error", e?.message || e);
+    return res.status(500).json({ ok: false, error: "internal" });
+  }
+});
+
 app.get("/debug/internal-retrieval", async (req, res) => {
   try {
     const query = normalizeQuery(safeStr(req.query?.q, 220));
@@ -13888,8 +14238,13 @@ if (
 
 const visualMatchQueries = extractVisualMatchQueries(req.body?.visualMatches);
 
+// Feature 11: size/variant hint
+const sizeHint = safeStr(req.body?.sizeHint, 40) || null;
+const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
+
 const variants = normalizeVariantList(
   [
+    ...(sizeAugmented ? [sizeAugmented] : []),
     ...(Array.isArray(req.body?.variants) ? req.body.variants : []),
     ...visualMatchQueries,
     ...(Array.isArray(visionIdentity?.searchQueries) ? visionIdentity.searchQueries : []),
@@ -14180,8 +14535,13 @@ if (
 
 const visualMatchQueries = extractVisualMatchQueries(req.body?.visualMatches);
 
+// Feature 11: size/variant hint
+const sizeHint = safeStr(req.body?.sizeHint, 40) || null;
+const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
+
 const variants = normalizeVariantList(
   [
+    ...(sizeAugmented ? [sizeAugmented] : []),
     ...(Array.isArray(req.body?.variants) ? req.body.variants : []),
     ...visualMatchQueries,
     ...(Array.isArray(visionIdentity?.searchQueries) ? visionIdentity.searchQueries : []),
@@ -14575,6 +14935,7 @@ app.use(
   [
     "/referral/create",
     "/referral/redeem",
+    "/referral/register-link",
     "/referral/bonus",
     "/referral/stats",
     "/history/load",
@@ -14636,15 +14997,34 @@ app.post("/referral/create", async (req, res) => {
   }
 });
 
+// Register a pending referral (called when deep-link is opened, before user authenticates).
+// Safe to call multiple times — idempotent. Does NOT grant rewards.
+app.post("/referral/register-link", async (req, res) => {
+  try {
+    const installId = safeStr(req.body?.installId, 128);
+    const code      = safeStr(req.body?.code, 32).toUpperCase();
+
+    if (!installId || !code) {
+      return res.status(200).json({ ok: false, reason: "missing_fields" });
+    }
+
+    const registered = await registerPendingReferral(installId, code);
+    return res.status(200).json({ ok: registered, code: registered ? code : null });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
 // Redeem referral
 app.post(
   "/referral/redeem",
   createIdempotencyMiddleware("referral_redeem"),
   async (req, res) => {
   try {
-    const code = safeStr(req.body?.code, 32).toUpperCase();
-    const userId = safeStr(req.body?.userId, 64);
-    const source = safeStr(req.body?.source, 24) || "manual";
+    const code      = safeStr(req.body?.code, 32).toUpperCase();
+    const userId    = safeStr(req.body?.userId, 64);
+    const installId = safeStr(req.body?.installId, 128);
+    const source    = safeStr(req.body?.source, 24) || "manual";
 
     if (!code || !userId) {
       return res.status(200).json({
@@ -14657,6 +15037,7 @@ app.post(
     const result = await redeemReferral({
       code,
       userId,
+      installId: installId || null,
       source,
     });
 
@@ -15771,21 +16152,13 @@ app.post(
         drops.push(payload);
       }
       if (userId && payload.priceDropped && result.delta?.significant) {
-        queueNotificationFanout({
+        notifyPriceDrop({
           userId,
-          kind: "price_drop",
-          title: "Price drop detected",
-          body: `${payload.query} dropped to $${payload.bestPrice ?? "?"}`,
-          dedupeKey: `price_drop:${payload.query}:${payload.bestPrice}`,
-          data: {
-            query: payload.query,
-            bestPrice: payload.bestPrice,
-            dropAmount: payload.dropAmount,
-            dropPct: payload.dropPct,
-            source: payload?.best?.source || null,
-            title: payload?.best?.title || null,
-          },
-          cooldownMs: 12 * 60 * 60 * 1000,
+          query: payload.query,
+          bestPrice: payload.bestPrice,
+          dropAmount: payload.dropAmount,
+          dropPct: payload.dropPct,
+          best: payload.best,
         });
       }
     }
@@ -15847,21 +16220,13 @@ app.post(
     const result = await runWatchCheck(userId, query);
 
     if (userId && result?.delta?.priceDropped && result?.delta?.significant) {
-      queueNotificationFanout({
+      notifyPriceDrop({
         userId,
-        kind: "price_drop",
-        title: "Price drop detected",
-        body: `${result?.query || query} dropped to $${result?.bestPrice ?? "?"}`,
-        dedupeKey: `price_drop:${result?.query || query}:${result?.bestPrice ?? "?"}`,
-        data: {
-          query: result?.query || query,
-          bestPrice: result?.bestPrice ?? null,
-          dropAmount: result?.delta?.dropAmount ?? null,
-          dropPct: result?.delta?.dropPct ?? null,
-          source: result?.best?.source || null,
-          title: result?.best?.title || null,
-        },
-        cooldownMs: 12 * 60 * 60 * 1000,
+        query: result?.query || query,
+        bestPrice: result?.bestPrice ?? null,
+        dropAmount: result?.delta?.dropAmount ?? null,
+        dropPct: result?.delta?.dropPct ?? null,
+        best: result?.best ?? null,
       });
     }
 
@@ -15891,6 +16256,99 @@ app.post(
       consensus: buildMarketConsensus([]),
       reason: "watch_recheck_failed",
     });
+  }
+});
+
+// ── Feature 7: Push Notifications ─────────────────────────────────────────────
+
+/** Redis key for user push tokens */
+function pushTokenKey(userId) { return `push_token:${safeStr(userId, 120)}`; }
+
+/** Store Expo push token for a user */
+async function storePushToken(userId, token) {
+  if (!userId || !token) return;
+  try {
+    await redis.set(pushTokenKey(userId), String(token).trim(), "EX", 90 * 24 * 3600);
+  } catch { /* non-fatal */ }
+}
+
+/** Retrieve stored push token for a user */
+async function getPushToken(userId) {
+  if (!userId) return null;
+  try { return (await redis.get(pushTokenKey(userId))) || null; }
+  catch { return null; }
+}
+
+/**
+ * Send Expo Push Notification to a single token.
+ * Uses the Expo Push Notifications service (no SDK needed — plain HTTP).
+ */
+async function sendExpoPushNotification({ token, title, body, data = {} }) {
+  if (!token || !String(token).startsWith("ExponentPushToken")) return false;
+  try {
+    const payload = JSON.stringify({
+      to: token,
+      sound: "default",
+      title: String(title || "Evan AI"),
+      body: String(body || ""),
+      data: data && typeof data === "object" ? data : {},
+      priority: "high",
+    });
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: payload,
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    const json = await r.json().catch(() => null);
+    const status = json?.data?.status;
+    if (status === "error") {
+      console.warn("⚠️ Expo push error:", json?.data?.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn("⚠️ sendExpoPushNotification failed:", err?.message || err);
+    return false;
+  }
+}
+
+/** Queue push + in-app notification for a price drop */
+async function notifyPriceDrop({ userId, query, bestPrice, dropAmount, dropPct, best }) {
+  if (!userId) return;
+  const title = "Price Drop Alert 🔔";
+  const body = `${query} dropped to $${bestPrice ?? "?"} (${dropPct != null ? `-${Math.round(dropPct)}%` : `-$${Math.round(dropAmount ?? 0)}`})`;
+  const dedupeKey = `price_drop:${query}:${bestPrice}`;
+  const data = { query, bestPrice, dropAmount, dropPct, source: best?.source || null, title: best?.title || null };
+
+  // In-app notification
+  queueNotificationFanout({ userId, kind: "price_drop", title, body, dedupeKey, data, cooldownMs: 12 * 60 * 60 * 1000 });
+
+  // Device push notification
+  try {
+    const token = await getPushToken(userId);
+    if (token) await sendExpoPushNotification({ token, title, body, data });
+  } catch { /* non-fatal */ }
+}
+
+// POST /push/register — store Expo push token for user
+app.post("/push/register", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64) || null;
+    const token  = safeStr(req.body?.pushToken, 200) || null;
+    if (!userId || !token) {
+      return res.status(200).json({ ok: false, error: "missing_fields" });
+    }
+    if (!token.startsWith("ExponentPushToken")) {
+      return res.status(200).json({ ok: false, error: "invalid_token_format" });
+    }
+    await storePushToken(userId, token);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "register_failed" });
   }
 });
 
