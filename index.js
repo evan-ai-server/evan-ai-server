@@ -12884,12 +12884,66 @@ async function serpEbaySold(query) {
         ? (prices[mid - 1] + prices[mid]) / 2
         : prices[mid];
 
+      // ── Velocity computation ────────────────────────────────────────────
+      // Parse soldDate strings into timestamps. SerpAPI gives either:
+      //   • Absolute: "Jan 15, 2026" / "February 2, 2026"
+      //   • Relative: "2 days ago" / "1 week ago"
+      const parseSoldDate = (str) => {
+        if (!str || typeof str !== "string") return null;
+        const s = str.trim();
+        const now = Date.now();
+        // Relative
+        const rel = s.match(/^(\d+)\s*(hour|day|week|month)/i);
+        if (rel) {
+          const n   = parseInt(rel[1], 10);
+          const u   = rel[2].toLowerCase();
+          const ms  = u.startsWith("hour")  ? n * 3_600_000
+                    : u.startsWith("day")   ? n * 86_400_000
+                    : u.startsWith("week")  ? n * 7 * 86_400_000
+                    : u.startsWith("month") ? n * 30 * 86_400_000 : 0;
+          return ms ? new Date(now - ms) : null;
+        }
+        // Absolute
+        const d = new Date(s);
+        return isNaN(d.getTime()) ? null : d;
+      };
+
+      const now = Date.now();
+      const MS_30D = 30 * 86_400_000;
+      const parsedDates = comps.map((c) => parseSoldDate(c.soldDate)).filter(Boolean);
+
+      // How many sold in last 30 days
+      const soldCount30d = parsedDates.length
+        ? parsedDates.filter((d) => now - d.getTime() <= MS_30D).length
+        : 0;
+
+      // Avg days to sell: spread oldest → newest divided by count
+      let avgDaysToSell = null;
+      if (parsedDates.length >= 2) {
+        const oldest = Math.min(...parsedDates.map((d) => d.getTime()));
+        const span   = (now - oldest) / 86_400_000; // days
+        avgDaysToSell = Math.max(1, Math.round(span / parsedDates.length));
+      }
+
+      // Velocity tier (use soldCount30d if we have dates, else fall back to total count)
+      const velocityCount = parsedDates.length ? soldCount30d : comps.length;
+      const velocityTier  = velocityCount >= 18 ? "hot"
+                          : velocityCount >= 10 ? "active"
+                          : velocityCount >= 5  ? "steady"
+                          : velocityCount >= 2  ? "slow"
+                          : "rare";
+
+      const velocityLabel = { hot: "Hot", active: "Active", steady: "Steady", slow: "Slow", rare: "Rare" }[velocityTier];
+
       console.log("🏷️ EBAY SOLD COMPS", {
         query,
         count: comps.length,
         low: prices[0],
         median: Math.round(median),
         high: prices[prices.length - 1],
+        soldCount30d,
+        avgDaysToSell,
+        velocityTier,
       });
 
       return {
@@ -12900,6 +12954,12 @@ async function serpEbaySold(query) {
         high: prices[prices.length - 1],
         avg: Math.round((prices.reduce((s, p) => s + p, 0) / prices.length) * 100) / 100,
         recentSolds: comps.slice(0, 5),
+        // Velocity fields
+        soldCount30d:   soldCount30d || comps.length,  // fall back to total count
+        avgDaysToSell,
+        velocityTier,
+        velocityLabel,
+        hasDates: parsedDates.length > 0,
       };
     }
 
@@ -19588,7 +19648,12 @@ app.post(
         ctx.avgMarket != null ? `Average market price: ${fmtPrice(ctx.avgMarket)}`                       : null,
         ctx.totalMatches    ? `Listings scanned: ${ctx.totalMatches}`                                    : null,
         ctx.ebaySoldComps?.count
-          ? `eBay recent sales: ${ctx.ebaySoldComps.count} sold · median ${fmtPrice(ctx.ebaySoldComps.median)} · range ${fmtPrice(ctx.ebaySoldComps.low)}–${fmtPrice(ctx.ebaySoldComps.high)}` : null,
+          ? [
+              `eBay recent sales: ${ctx.ebaySoldComps.soldCount30d ?? ctx.ebaySoldComps.count} sold (30d) · median ${fmtPrice(ctx.ebaySoldComps.median)} · range ${fmtPrice(ctx.ebaySoldComps.low)}–${fmtPrice(ctx.ebaySoldComps.high)}`,
+              ctx.ebaySoldComps.avgDaysToSell ? `Avg days to sell: ${ctx.ebaySoldComps.avgDaysToSell} days` : null,
+              ctx.ebaySoldComps.velocityLabel ? `Sell velocity: ${ctx.ebaySoldComps.velocityLabel}` : null,
+            ].filter(Boolean).join(" · ")
+          : null,
         ctx.localComps?.count
           ? `Local comps near ${ctx.localComps.location}: ${ctx.localComps.count} listings · median ${fmtPrice(ctx.localComps.median)}` : null,
         ctx.trendIntel?.buyAdvice    ? `Market trend: ${ctx.trendIntel.buyAdvice}`                       : null,
