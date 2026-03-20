@@ -14993,6 +14993,310 @@ app.get("/api/profile/savings/:userId", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Feature A: HAGGLE SCORE — POST /api/haggle/score
+//
+// Body: { query, currentPrice, category?, zipCode? }
+// Response: { ok, score, scoreLabel, offerPrice, marketMedian, listingCount,
+//             priceVsMedianPct, script, reasoning }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/haggle/score", async (req, res) => {
+  try {
+    const { query, currentPrice, category = "", zipCode = "" } = req.body || {};
+
+    if (!query || typeof query !== "string" || !query.trim()) {
+      return res.status(400).json({ ok: false, error: "query required" });
+    }
+    if (!currentPrice || isNaN(Number(currentPrice)) || Number(currentPrice) <= 0) {
+      return res.status(400).json({ ok: false, error: "currentPrice must be > 0" });
+    }
+
+    const price = Number(currentPrice);
+    const cleanQuery = safeStr(query, 200).trim();
+    const cleanCategory = safeStr(category, 80).trim().toLowerCase();
+    const cacheKey = `haggle:${cleanQuery.slice(0, 80)}:${Math.round(price)}`;
+
+    const cached = await cacheGet(cacheKey);
+    if (cached) return res.json(cached);
+
+    // Fetch market listings
+    const listings = await serpShopping(cleanQuery, { softFail: true });
+    const prices = (Array.isArray(listings) ? listings : [])
+      .map((it) => Number(it?.price || it?.totalPrice || 0))
+      .filter((p) => p > 0)
+      .sort((a, b) => a - b);
+
+    let median = price;
+    let avg = price;
+    let count = 0;
+
+    if (prices.length > 0) {
+      count = prices.length;
+      const mid = Math.floor(prices.length / 2);
+      median = prices.length % 2 === 0
+        ? (prices[mid - 1] + prices[mid]) / 2
+        : prices[mid];
+      avg = Math.round((prices.reduce((s, p) => s + p, 0) / prices.length) * 100) / 100;
+    }
+
+    // Haggle score computation
+    const priceVsMedian = median > 0 ? (price - median) / median * 100 : 0;
+    const supplyPts = Math.min(3, Math.floor(count / 4));
+    const premiumPts = Math.min(5, Math.max(0, Math.floor(priceVsMedian / 8)));
+    const haggleCategories = ["electronics", "furniture", "sneakers", "clothing", "luxury", "bag", "watch"];
+    const categoryBonus = haggleCategories.includes(cleanCategory) ? 1 : 0;
+    const rawScore = supplyPts + premiumPts + categoryBonus + 1;
+    const score = Math.min(10, rawScore);
+
+    const scoreLabelMap = [
+      [1, 3, "Fixed Price"],
+      [4, 5, "Low Leverage"],
+      [6, 7, "Some Room"],
+      [8, 9, "Strong Position"],
+      [10, 10, "High Leverage"],
+    ];
+    const scoreLabel = scoreLabelMap.find(([lo, hi]) => score >= lo && score <= hi)?.[2] || "Some Room";
+
+    const offerPrice = Math.round(Math.min(price * 0.82, median * 0.90) * 100) / 100;
+
+    // Negotiation script via OpenAI
+    let script = null;
+    if (openai) {
+      try {
+        const scriptRes = await openai.responses.create({
+          model: "gpt-4.1-mini",
+          temperature: 0.4,
+          max_output_tokens: 400,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "haggle_script",
+              strict: true,
+              schema: {
+                type: "object",
+                properties: {
+                  openingLine: { type: "string", description: "Opening negotiation line for the buyer" },
+                  reasoningPoints: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Up to 3 reasoning points to support the lower offer",
+                  },
+                  closingLine: { type: "string", description: "Closing line to seal the deal" },
+                  redFlags: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Up to 2 red flags that could weaken the buyer's position",
+                  },
+                },
+                required: ["openingLine", "reasoningPoints", "closingLine", "redFlags"],
+                additionalProperties: false,
+              },
+            },
+          },
+          input: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: `You are a negotiation coach. Given this item: ${cleanQuery}, listed at $${price}, market median is $${Math.round(median)} across ${count} listings. Generate a short, confident negotiation script for a buyer. Be direct and give exact dollar numbers. Keep reasoningPoints to max 3 items and redFlags to max 2 items.`,
+                },
+              ],
+            },
+          ],
+        });
+        const rawText = scriptRes?.output_text || scriptRes?.output?.[0]?.content?.[0]?.text || "";
+        if (rawText) {
+          const parsed = JSON.parse(rawText);
+          script = {
+            openingLine: parsed.openingLine || "",
+            reasoningPoints: (parsed.reasoningPoints || []).slice(0, 3),
+            closingLine: parsed.closingLine || "",
+            redFlags: (parsed.redFlags || []).slice(0, 2),
+          };
+        }
+      } catch (scriptErr) {
+        console.warn("⚠️ haggle script generation failed:", scriptErr?.message);
+        // non-fatal — return score without script
+      }
+    }
+
+    const reasoning = `Item is priced ${priceVsMedian >= 0 ? Math.round(priceVsMedian) + "% above" : Math.round(Math.abs(priceVsMedian)) + "% below"} the market median of $${Math.round(median)} across ${count} listing${count !== 1 ? "s" : ""}.`;
+
+    const result = {
+      ok: true,
+      score,
+      scoreLabel,
+      offerPrice,
+      marketMedian: Math.round(median * 100) / 100,
+      listingCount: count,
+      priceVsMedianPct: Math.round(priceVsMedian),
+      script,
+      reasoning,
+    };
+
+    await cacheSet(cacheKey, result, 1800);
+    return res.json(result);
+  } catch (e) {
+    console.error("❌ /api/haggle/score error:", e?.message);
+    return res.status(200).json({ ok: false, error: e?.message || "haggle_score_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature B: RADAR LOCAL — POST /api/radar/local
+//
+// Body: { queries: string[], zipCode: string, targetPrices?: Record<string,number> }
+// Response: { ok, zipCode, results: [{ query, low, median, count, items }] }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/radar/local", async (req, res) => {
+  try {
+    const { queries, zipCode, targetPrices = {} } = req.body || {};
+
+    if (!Array.isArray(queries) || queries.length === 0 || queries.length > 20) {
+      return res.status(400).json({ ok: false, error: "queries must be an array of 1-20 items" });
+    }
+    if (!zipCode || typeof zipCode !== "string" || !zipCode.trim()) {
+      return res.status(400).json({ ok: false, error: "zipCode required" });
+    }
+
+    const cleanZip = safeStr(zipCode, 20).trim();
+    const limitedQueries = queries.slice(0, 8).map((q) => safeStr(String(q || ""), 150).trim()).filter(Boolean);
+    const cacheKey = `radar:${cleanZip}:${limitedQueries.slice(0, 3).join("|")}`;
+
+    const cached = await cacheGet(cacheKey);
+    if (cached) return res.json(cached);
+
+    // Run local shopping in parallel (max 3 concurrent via manual batching)
+    const CONCURRENCY = 3;
+    const allResults = [];
+    for (let i = 0; i < limitedQueries.length; i += CONCURRENCY) {
+      const batch = limitedQueries.slice(i, i + CONCURRENCY);
+      const settled = await Promise.allSettled(
+        batch.map((q) => serpLocalShopping(q, cleanZip))
+      );
+      for (let j = 0; j < batch.length; j++) {
+        const q = batch[j];
+        const outcome = settled[j];
+        if (outcome.status === "fulfilled" && outcome.value) {
+          const data = outcome.value;
+          let items = Array.isArray(data.items) ? data.items : [];
+          const targetPrice = targetPrices && targetPrices[q];
+          if (targetPrice && Number(targetPrice) > 0) {
+            items = items.filter((it) => (it?.price || it?.totalPrice || 0) <= Number(targetPrice));
+          }
+          allResults.push({
+            query: q,
+            low: data.low ?? null,
+            median: data.median ?? null,
+            count: data.count ?? 0,
+            items: items.slice(0, 5).map((it) => ({
+              title: it?.title || "",
+              price: it?.price || it?.totalPrice || 0,
+              source: it?.source || "",
+              thumbnail: it?.thumbnail || null,
+            })),
+          });
+        }
+      }
+    }
+
+    const result = { ok: true, zipCode: cleanZip, results: allResults };
+    await cacheSet(cacheKey, result, 900);
+    return res.json(result);
+  } catch (e) {
+    console.error("❌ /api/radar/local error:", e?.message);
+    return res.status(200).json({ ok: false, error: e?.message || "radar_local_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature C: P&L RECORD — POST /api/pl/record + GET /api/pl/flips/:userId
+//
+// Lightweight server-side flip P&L backup via Redis list (in-memory fallback).
+// ─────────────────────────────────────────────────────────────────────────────
+const PL_MEM = new Map();
+
+app.post("/api/pl/record", async (req, res) => {
+  try {
+    const { userId, flip } = req.body || {};
+    if (!userId || typeof userId !== "string" || !userId.trim()) {
+      return res.status(400).json({ ok: false, error: "userId required" });
+    }
+    if (!flip || typeof flip !== "object") {
+      return res.status(400).json({ ok: false, error: "flip object required" });
+    }
+
+    const cleanUserId = safeStr(userId, 128).trim();
+    const redisKey = `pl:flips:${cleanUserId}`;
+    const entry = JSON.stringify({
+      id: flip.id || `flip_${Date.now()}`,
+      itemName: safeStr(String(flip.itemName || ""), 200),
+      boughtPrice: Number(flip.boughtPrice) || 0,
+      soldPrice: Number(flip.soldPrice) || 0,
+      platform: safeStr(String(flip.platform || ""), 80),
+      date: safeStr(String(flip.date || new Date().toISOString()), 40),
+      category: safeStr(String(flip.category || ""), 80),
+      recordedAt: new Date().toISOString(),
+    });
+
+    if (redis) {
+      try {
+        await redis.lpush(redisKey, entry);
+        await redis.ltrim(redisKey, 0, 499);
+        await redis.expire(redisKey, 365 * 24 * 60 * 60);
+      } catch (redisErr) {
+        console.warn("⚠️ pl/record redis error, falling back to memory:", redisErr?.message);
+        const existing = PL_MEM.get(cleanUserId) || [];
+        existing.unshift(entry);
+        PL_MEM.set(cleanUserId, existing.slice(0, 500));
+      }
+    } else {
+      const existing = PL_MEM.get(cleanUserId) || [];
+      existing.unshift(entry);
+      PL_MEM.set(cleanUserId, existing.slice(0, 500));
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ /api/pl/record error:", e?.message);
+    return res.status(200).json({ ok: false, error: e?.message || "pl_record_failed" });
+  }
+});
+
+app.get("/api/pl/flips/:userId", async (req, res) => {
+  try {
+    const cleanUserId = safeStr(String(req.params.userId || ""), 128).trim();
+    if (!cleanUserId) {
+      return res.status(400).json({ ok: false, error: "userId required" });
+    }
+
+    const redisKey = `pl:flips:${cleanUserId}`;
+    let rawEntries = [];
+
+    if (redis) {
+      try {
+        rawEntries = await redis.lrange(redisKey, 0, 499);
+      } catch (redisErr) {
+        console.warn("⚠️ pl/flips redis error, falling back to memory:", redisErr?.message);
+        rawEntries = PL_MEM.get(cleanUserId) || [];
+      }
+    } else {
+      rawEntries = PL_MEM.get(cleanUserId) || [];
+    }
+
+    const flips = rawEntries.map((raw) => {
+      try { return typeof raw === "string" ? JSON.parse(raw) : raw; }
+      catch { return null; }
+    }).filter(Boolean);
+
+    return res.json({ ok: true, userId: cleanUserId, flips });
+  } catch (e) {
+    console.error("❌ /api/pl/flips error:", e?.message);
+    return res.status(200).json({ ok: false, error: e?.message || "pl_flips_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Feature 3: RECEIPT SCAN — POST /api/receipt/analyze
 //
 // Body: { imageBase64: string }
