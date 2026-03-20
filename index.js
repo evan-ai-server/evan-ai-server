@@ -9680,6 +9680,17 @@ CARDS / COLLECTIBLES
 Pokémon: Pikachu yellow vs counterfeit (off-color), holographic foil pattern on holos (rainbow or galaxy), card stock texture (authentic = smooth with slight blue core visible on edge)
 PSA/BGS slabs: label font and hologram authenticity
 
+JEWELRY
+Gold/silver: look for karat stamps (10K, 14K, 18K, 24K, 750, 585, 375, 925, 999 for silver), hallmarks, maker's marks inside band or clasp
+Diamonds: 4C descriptions only if grading certificate visible. DO NOT guess carat weight from proportions.
+Vintage: examine patina, hand-engraving style, old European cut stones, c-catch clasps (pre-1900), box clasps (Art Deco)
+Designer jewelry: Tiffany & Co. (T heart/interlocking Ts/Return to Tiffany tag), Cartier (Love bracelet screws, Trinity band grooves, Panthère clasp), David Yurman (cable pattern + signature clasp), Van Cleef (Alhambra quatrefoil motif)
+
+VINTAGE APPAREL
+Era identification from tag style: Champion (80s = blue/white script, 90s = C-logo script, reverse weave ribbing), Nike (orange tag 1972-1985, grey tag 1985-1994), Levi's (red tab capital E = pre-1971, lower-case e = post-1971), Ralph Lauren (knit Polo bear, hockey Polo logo)
+Deadstock signals: original tags attached, no wear, original packaging present
+searchQueries: [brand+decade+item, "vintage" + brand + item, brand + item + "90s"/"80s"]
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 2 — PER-CATEGORY EXTRACTION RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -9743,7 +9754,17 @@ CLOTHING / APPAREL — extract in this order:
 5. Size if visible on tag
 6. Material if readable on care label
 7. Condition: pilling, fading, stains, collar stretch
-searchQueries: [brand+item+design name, brand+item+color, brand+collection+item, item+brand]
+8. Era/vintage signals: tag style, care label format, copyright year, union label
+searchQueries: [brand+item+design name, brand+item+color, brand+collection+item, "vintage" + brand + item if era signals present]
+
+JEWELRY — extract in this order:
+1. Metal type + karat stamp (e.g. "14K gold", "925 silver", "platinum 950")
+2. Gemstone type if visible (diamond, ruby, emerald, sapphire, pearl, cubic zirconia)
+3. Designer brand from hallmark, engraving, or distinctive design motif
+4. Item type (ring, bracelet, necklace, earrings, pendant, brooch)
+5. Style (solitaire, halo, tennis, chain, cuff, chandelier)
+6. Condition: prong integrity, clasp function visible, stone inclusions, metal scratches
+searchQueries: [brand+item type+metal, metal+karat+item type, item type+gemstone+metal, brand alone if recognized]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 3 — CONDITION ASSESSMENT (5-tier)
@@ -12271,7 +12292,7 @@ app.post("/vision/enrich", async (req, res) => {
 
     if (!query) return res.status(200).json({ ok: false, reason: "missing_query" });
 
-    const cacheKey = `enrich|${mode}|${context}|${query}`;
+    const cacheKey = `enrich2|${mode}|${context}|${query}`;
     const cached = visionCache.get(cacheKey);
     if (cached) return res.status(200).json({ ...cached, cached: true });
 
@@ -12304,6 +12325,13 @@ LOCAL block — keywords: 4-6 search terms optimized for local marketplace apps 
 
 PARTS block — keywords: 4-6 keywords for parts/accessories/replacement searches (e.g. "Air Jordan 1 replacement laces", "Rolex jubilee bracelet", "Louis Vuitton Neverfull insert")
 
+PRICE_RANGE block — typical resale price range on secondary market (eBay sold listings, StockX, etc.):
+- low: conservative floor price in USD (recent sold comps, worn/fair condition)
+- high: ceiling price in USD (recent sold comps, new/excellent condition)
+- typical: most common sold price for average condition
+- currency: "USD"
+- note: brief justification or caveat (e.g. "varies by colorway", "size-dependent", "authentication required")
+
 Be specific. Be accurate. This data is used to find real resale prices — wrong data = financial harm.
 `.trim();
 
@@ -12318,7 +12346,7 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
             temperature: 0.2,
             max_output_tokens: 800,
 
-            prompt_cache_key: "evan-ai-enrich-v5",
+            prompt_cache_key: "evan-ai-enrich-v6",
             prompt_cache_retention: "24h",
 
             text: {
@@ -12329,7 +12357,7 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
                 schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["ok", "collector", "materials", "alternatives", "local", "parts"],
+                  required: ["ok", "collector", "materials", "alternatives", "local", "parts", "priceRange"],
                   properties: {
                     ok: { type: "boolean" },
                     collector: {
@@ -12374,6 +12402,18 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
                       required: ["keywords"],
                       properties: {
                         keywords: { type: "array", items: { type: "string" } },
+                      },
+                    },
+                    priceRange: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["low", "high", "typical", "currency", "note"],
+                      properties: {
+                        low:      { anyOf: [{ type: "number" }, { type: "null" }] },
+                        high:     { anyOf: [{ type: "number" }, { type: "null" }] },
+                        typical:  { anyOf: [{ type: "number" }, { type: "null" }] },
+                        currency: { type: "string" },
+                        note:     { anyOf: [{ type: "string" }, { type: "null" }] },
                       },
                     },
                   },
