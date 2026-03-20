@@ -19534,6 +19534,102 @@ app.post(
     }
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // ASK AI — POST /api/ask
+  //
+  // Conversational AI with full scan context injected as system prompt.
+  // Maintains multi-turn history on client (stateless on server).
+  //
+  // Body: {
+  //   messages: [{ role: "user"|"assistant", content: string }],  // full history
+  //   scanContext: {                          // injected as system context
+  //     itemName, store, price, scannedPrice, savedAmount, cheaperPct,
+  //     buyVerdict, buyScore, visionConfidence, visionQuery, category,
+  //     historicalLow, historicalHigh, avgMarket, totalMatches,
+  //     ebaySoldComps, localComps, trendIntel, seasonalFlip, authenticityIntel
+  //   }
+  // }
+  // Response: { ok: true, reply: string }
+  // ─────────────────────────────────────────────────────────────────────────
+  app.post("/api/ask", async (req, res) => {
+    try {
+      const { messages, scanContext } = req.body || {};
+      if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(200).json({ ok: false, error: "missing_messages" });
+      }
+
+      // Validate + sanitize messages (max 20 turns, 1000 chars each)
+      const cleanMessages = messages
+        .slice(-20)
+        .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .map((m) => ({ role: m.role, content: String(m.content).slice(0, 1000) }));
+
+      if (cleanMessages.length === 0) {
+        return res.status(200).json({ ok: false, error: "invalid_messages" });
+      }
+
+      // Build scan context block for system prompt
+      const ctx = scanContext || {};
+      const fmtPrice = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : null);
+      const fmtPct   = (v) => (Number.isFinite(Number(v)) ? `${Math.round(Number(v))}%` : null);
+
+      const contextLines = [
+        ctx.itemName        ? `Item: ${ctx.itemName}`                                                    : null,
+        ctx.category        ? `Category: ${ctx.category}`                                                : null,
+        ctx.store           ? `Best source: ${ctx.store}`                                                : null,
+        ctx.price != null   ? `Best price found: ${fmtPrice(ctx.price)}`                                 : null,
+        ctx.scannedPrice != null ? `Price user is paying: ${fmtPrice(ctx.scannedPrice)}`                  : null,
+        ctx.savedAmount > 0 ? `Savings vs scanned price: ${fmtPrice(ctx.savedAmount)} (${fmtPct(ctx.cheaperPct)} less)` : null,
+        ctx.buyVerdict      ? `AI deal verdict: ${ctx.buyVerdict} (score ${ctx.buyScore ?? "??"}/10)`    : null,
+        ctx.visionConfidence != null ? `Vision match confidence: ${fmtPct(ctx.visionConfidence * 100)}`  : null,
+        ctx.visionQuery     ? `Identified as: "${ctx.visionQuery}"`                                      : null,
+        ctx.historicalLow != null && ctx.historicalHigh != null
+          ? `Historical price range: ${fmtPrice(ctx.historicalLow)} – ${fmtPrice(ctx.historicalHigh)}`  : null,
+        ctx.avgMarket != null ? `Average market price: ${fmtPrice(ctx.avgMarket)}`                       : null,
+        ctx.totalMatches    ? `Listings scanned: ${ctx.totalMatches}`                                    : null,
+        ctx.ebaySoldComps?.count
+          ? `eBay recent sales: ${ctx.ebaySoldComps.count} sold · median ${fmtPrice(ctx.ebaySoldComps.median)} · range ${fmtPrice(ctx.ebaySoldComps.low)}–${fmtPrice(ctx.ebaySoldComps.high)}` : null,
+        ctx.localComps?.count
+          ? `Local comps near ${ctx.localComps.location}: ${ctx.localComps.count} listings · median ${fmtPrice(ctx.localComps.median)}` : null,
+        ctx.trendIntel?.buyAdvice    ? `Market trend: ${ctx.trendIntel.buyAdvice}`                       : null,
+        ctx.seasonalFlip?.topSignal  ? `Seasonal signal: ${ctx.seasonalFlip.topSignal}`                  : null,
+        ctx.authenticityIntel?.topSignal ? `Authenticity: ${ctx.authenticityIntel.topSignal}`            : null,
+      ].filter(Boolean);
+
+      const systemPrompt = [
+        "You are Evan AI — a concise, expert resale intelligence assistant. You help users decide whether to buy, flip, or skip an item based on real market data.",
+        "",
+        "SCAN CONTEXT (real data from this session):",
+        ...contextLines,
+        "",
+        "RULES:",
+        "- Be direct and concise. Max 3 short paragraphs per reply.",
+        "- Use the scan data above to ground every answer. Don't speculate beyond it.",
+        "- Give clear buy/skip/negotiate recommendations when asked.",
+        "- For negotiation questions, suggest a specific opening offer and reasoning.",
+        "- For flip questions, give an estimated net profit and sell timeline if data allows.",
+        "- Never say you're an AI or mention your training cutoff. Just answer.",
+        "- No markdown headers. Short bullets or plain prose only.",
+      ].join("\n");
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...cleanMessages,
+        ],
+        max_tokens: 320,
+        temperature: 0.4,
+      });
+
+      const reply = completion.choices?.[0]?.message?.content?.trim() || "Sorry, I couldn't generate a response right now.";
+      return res.json({ ok: true, reply });
+    } catch (e) {
+      console.error("❌ /api/ask error:", e?.message);
+      return res.status(200).json({ ok: false, error: e?.message || "ask_failed" });
+    }
+  });
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
