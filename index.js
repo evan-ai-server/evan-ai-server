@@ -484,7 +484,7 @@ const TEXT_TIMEOUT_MS = process.env.TEXT_TIMEOUT_MS
 
 const VISION_TIMEOUT_MS = process.env.VISION_TIMEOUT_MS
   ? Number(process.env.VISION_TIMEOUT_MS)
-  : 12500;
+  : 18000;
 
 // CORS: allow all by default; lock down in prod with ALLOWED_ORIGINS
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
@@ -1754,7 +1754,7 @@ const s3Client =
       })
     : null;
 
-const PREPROCESS_MAX_EDGE = Number(process.env.PREPROCESS_MAX_EDGE || 1600);
+const PREPROCESS_MAX_EDGE = Number(process.env.PREPROCESS_MAX_EDGE || 768);
 const PREPROCESS_JPEG_QUALITY = Number(
   process.env.PREPROCESS_JPEG_QUALITY || 82
 );
@@ -2069,6 +2069,7 @@ async function preprocessScanUpload(file) {
         fit: "inside",
         withoutEnlargement: true,
       })
+      .sharpen({ sigma: 0.6, m1: 1.5, m2: 2.0 })
       .jpeg({
         quality: PREPROCESS_JPEG_QUALITY,
         mozjpeg: true,
@@ -2143,39 +2144,30 @@ async function persistScanArtifacts(file, imageHash) {
   const thumbKey = scanThumbKey(imageHash);
   const manifestKey = scanManifestKey(imageHash);
 
-  await objectStorePutBuffer(
-    originalKey,
-    file.buffer,
-    file?.mimetype || "application/octet-stream",
-    {
-      imageHash,
-      assetKind: "original",
-    }
-  );
-
   const processed = await preprocessScanUpload(file);
 
-  await objectStorePutBuffer(
-    processedKey,
-    processed.buffer,
-    processed.mimetype,
-    {
-      imageHash,
-      assetKind: "processed",
-    }
-  );
-
-  if (Buffer.isBuffer(processed.thumbnailBuffer) && processed.thumbnailBuffer.length) {
-    await objectStorePutBuffer(
-      thumbKey,
-      processed.thumbnailBuffer,
-      processed.thumbnailMime || "image/jpeg",
-      {
-        imageHash,
-        assetKind: "thumb",
-      }
-    );
-  }
+  await Promise.all([
+    objectStorePutBuffer(
+      originalKey,
+      file.buffer,
+      file?.mimetype || "application/octet-stream",
+      { imageHash, assetKind: "original" }
+    ),
+    objectStorePutBuffer(
+      processedKey,
+      processed.buffer,
+      processed.mimetype,
+      { imageHash, assetKind: "processed" }
+    ),
+    Buffer.isBuffer(processed.thumbnailBuffer) && processed.thumbnailBuffer.length
+      ? objectStorePutBuffer(
+          thumbKey,
+          processed.thumbnailBuffer,
+          processed.thumbnailMime || "image/jpeg",
+          { imageHash, assetKind: "thumb" }
+        )
+      : Promise.resolve(),
+  ]);
 
   const manifest = {
     hash: imageHash,
@@ -9854,7 +9846,26 @@ Extract with maximum precision:
 Put ALL text you can read into visibleText[]. Even partial text fragments.
 If box/tag is not present or unreadable => query=null.`;
   }
-  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.`;
+  // Parse price bracket from propContext if present (format: "...price:luxury|listed:450|alt:280...")
+  const priceBracketMatch = (propContext || "").match(/price:(luxury|premium|mid|entry)/);
+  const listedMatch = (propContext || "").match(/listed:([\d.]+)/);
+  const altMatch = (propContext || "").match(/alt:([\d.]+)/);
+  const priceBracketLabel = priceBracketMatch?.[1] || null;
+  const listedPrice = listedMatch?.[1] ? `$${listedMatch[1]}` : null;
+  const altPrice = altMatch?.[1] ? `$${altMatch[1]}` : null;
+
+  let priceSignal = "";
+  if (priceBracketLabel === "luxury") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "high value"}, cheapest alternative ${altPrice || "comparable"}. HIGH-VALUE ITEM — prioritize luxury brand extraction (LV, Gucci, Chanel, Hermès, Rolex, AP, Patek, Prada, Balenciaga, etc). These brands have authentication tells — look harder.`;
+  } else if (priceBracketLabel === "premium") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "mid-high"}, cheapest alternative ${altPrice || "comparable"}. PREMIUM BRACKET — check for Nike/Jordan/Adidas/New Balance limited releases, designer streetwear, mid-tier watches, electronics with storage variants.`;
+  } else if (priceBracketLabel === "mid") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "mid-range"}, cheapest alternative ${altPrice || "comparable"}. MID BRACKET — branded sportswear, contemporary fashion, used electronics. Condition matters for this price.`;
+  } else if (priceBracketLabel === "entry") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "low"}, cheapest alternative ${altPrice || "comparable"}. ENTRY BRACKET — common brands, mass market, or significantly worn. Be honest about condition.`;
+  }
+
+  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.${priceSignal}`;
 }
 
 function cleanMode(m) {
@@ -10803,6 +10814,14 @@ Focus on:
 Return the strongest visually grounded resale search identity possible.`;
   }
 
+  if (passLabel === "ultra") {
+    return `${header}
+
+ID: logos/text/marks first → silhouette/colors/materials second → synthesize.
+Legible text beats logo guesses. Logo beats visual shape. Be specific, not generic.
+Output the single best resale search query + 8 ranked variants (specific→broad).`;
+  }
+
   return `${header}
 
 PASS: MASTER RESALE SEARCH
@@ -10825,7 +10844,7 @@ const response = await withModelServing(
         {
           model: VISION_MODEL,
           temperature: 0.1,
-          max_output_tokens: 900,
+          max_output_tokens: 600,
           prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
           prompt_cache_retention: "24h",
           text: {
@@ -10855,11 +10874,7 @@ const response = await withModelServing(
               ],
             },
           ],
-          metadata: {
-            rid: rid || "",
-            mode,
-            pass: passLabel,
-          },
+          metadata: { rid: rid || "", mode, pass: passLabel },
         },
         { signal: timeout.signal }
       ),
@@ -10965,10 +10980,7 @@ async function runVisionRecoveryPass({ req, file, mode, propContext }) {
                     required: ["query", "variants", "confidence"],
                     properties: {
                       query: { anyOf: [{ type: "string" }, { type: "null" }] },
-                      variants: {
-                        type: "array",
-                        items: { type: "string" },
-                      },
+                      variants: { type: "array", items: { type: "string" } },
                       confidence: { type: "number" },
                     },
                   },
@@ -10977,33 +10989,17 @@ async function runVisionRecoveryPass({ req, file, mode, propContext }) {
               input: [
                 {
                   role: "system",
-                  content: [
-                    {
-                      type: "input_text",
-text:
-  "You are Evan AI — a resale expert with encyclopedic knowledge of sneakers, luxury bags, watches, apparel, electronics, and eyewear. You have ONE job: return the most specific, accurate marketplace search query possible for the item in the photo. Rules: (1) Be specific — include brand + model + color whenever visible. (2) Never return generic words like 'item', 'object', 'product', 'shoes', 'bag', 'jacket' alone — always add identifying details. (3) For sneakers: brand + model name + colorway. (4) For luxury bags: brand + model + size + material. (5) For watches: brand + model + reference if visible. (6) For eyewear: brand + model/shape + frame color + lens color. Do NOT call tinted glasses 'sunglasses' unless sun-blocking purpose is clear. Do NOT call glasses 'safety glasses' unless industrial PPE cues are present. (7) Use the variants array for 2-4 alternate spellings or search phrasings. (8) confidence = probability that searching this query returns accurate resale comps.",
-                    },
-                  ],
+                  content: [{ type: "input_text", text: "You are Evan AI — a resale expert. Return the most specific marketplace search query for the item in the photo. Include brand + model + color. Never return generic words alone." }],
                 },
                 {
                   role: "user",
                   content: [
-                    {
-                      type: "input_text",
-                      text: `Recovery mode. Original mode: ${mode}. Context: ${propContext || "none"}. Return the strongest resale search query you can.`,
-                    },
-                    {
-                      type: "input_image",
-                      image_url: dataUrl,
-                    },
+                    { type: "input_text", text: `Recovery mode. Mode: ${mode}. Context: ${propContext || "none"}. Return the strongest resale search query.` },
+                    { type: "input_image", image_url: dataUrl },
                   ],
                 },
               ],
-              metadata: {
-                rid: req.rid || "",
-                mode,
-                pass: "recovery",
-              },
+              metadata: { rid: req.rid || "", mode, pass: "recovery" },
             },
             { signal: timeout.signal }
           ),
@@ -11022,12 +11018,7 @@ text:
     const rawText =
       typeof response?.output_text === "string" && response.output_text.trim()
         ? response.output_text
-        : Array.isArray(response?.output)
-        ? response.output
-            .flatMap((block) => (Array.isArray(block?.content) ? block.content : []))
-            .map((part) => (typeof part?.text === "string" ? part.text : ""))
-            .find((x) => x && x.trim()) || ""
-        : "";
+        : response?.choices?.[0]?.message?.content || "";
 
     const parsedRaw =
       safeJsonParse(rawText, null) || extractFirstJsonObject(rawText) || {};
@@ -11170,27 +11161,9 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
 
   const passes = await Promise.all([
-    runVisionPass({
-      dataUrl,
-      mode,
-      propContext,
-      passLabel: "master",
-      rid: req.rid,
-    }),
-    runVisionPass({
-      dataUrl,
-      mode,
-      propContext,
-      passLabel: "brand_model",
-      rid: req.rid,
-    }),
-    runVisionPass({
-      dataUrl,
-      mode,
-      propContext,
-      passLabel: "visual_shape",
-      rid: req.rid,
-    }),
+    runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid }),
+    runVisionPass({ dataUrl, mode, propContext, passLabel: "brand_model", rid: req.rid }),
+    runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
   ]);
 
   const parsedList = passes.map((p) => p?.parsed || {});
@@ -11233,6 +11206,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     .map((p) => p.query)
     .filter(Boolean);
 
+  // Single-pass: use the branded candidate if it has brand+model, else best query
   const brandedCandidate = passMeta
     .filter(
       (p) =>
@@ -11796,7 +11770,20 @@ if (!openai) {
       }
 
       const mode = cleanMode(req.body?.mode);
-      const propContext = safeStr(req.body?.propContext, 220);
+      const rawPropContext = safeStr(req.body?.propContext, 220);
+      const originalPrice = Number(req.body?.originalPrice || req.body?.price || 0) || null;
+      const cheapestAlt = Number(req.body?.cheapestAlternative || req.body?.cheapestAlt || 0) || null;
+      const priceRef = originalPrice || cheapestAlt;
+      const priceBracket = priceRef
+        ? priceRef >= 500 ? "luxury"
+        : priceRef >= 150 ? "premium"
+        : priceRef >= 50  ? "mid"
+        : "entry"
+        : null;
+      const priceContext = priceBracket
+        ? `price:${priceBracket}|listed:${originalPrice || "?"}|alt:${cheapestAlt || "?"}`
+        : "";
+      const propContext = [rawPropContext, priceContext].filter(Boolean).join("|");
       const imgHash = sha256(file.buffer);
       const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
 
@@ -11808,17 +11795,62 @@ if (!openai) {
       }
 
       const originalHash = imgHash;
-      const storedScan = await persistScanArtifacts(file, originalHash);
+
+      // Preprocess synchronously (needed for vision API call)
+      // Storage writes fire in background — don't block the vision call
+      const processed = await preprocessScanUpload(file).catch(() => ({
+        buffer: file.buffer,
+        mimetype: file.mimetype || "image/jpeg",
+        thumbnailBuffer: null,
+        thumbnailMime: null,
+        quality: null,
+        metadata: { transformed: false, size: file.buffer.length, originalSize: file.buffer.length },
+      }));
 
       const preparedFile = {
         ...file,
-        buffer: storedScan.processedBuffer,
-        mimetype: storedScan.processedMime,
-        size: storedScan.processedBuffer.length,
+        buffer: processed.buffer,
+        mimetype: processed.mimetype,
+        size: processed.buffer.length,
+      };
+
+      // Fire storage persistence in background — vision doesn't need to wait
+      enqueueBackgroundJob(
+        "persist_scan_artifacts",
+        { imageHash: originalHash },
+        async () => {
+          try {
+            await persistScanArtifacts(file, originalHash);
+          } catch (e) {
+            console.warn("persist_scan_artifacts_bg_error", e?.message || e);
+          }
+          return { ok: true };
+        }
+      );
+
+      // Build a lightweight storedScan-compatible object for downstream code
+      const storedScan = {
+        imageHash: originalHash,
+        asset: {
+          hash: originalHash,
+          originalKey: null,
+          processedKey: null,
+          thumbKey: null,
+          manifestKey: null,
+          originalUrl: null,
+          processedUrl: null,
+          thumbUrl: null,
+        },
+        preprocess: {
+          ...processed.metadata,
+          quality: processed.quality || null,
+        },
+        processedBuffer: processed.buffer,
+        processedMime: processed.mimetype,
       };
 
       const requestPlan = getResolvedPlan(req);
-      const imageQuality = storedScan?.preprocess?.quality || null;
+      const imageQuality = processed?.quality || null;
 
       if (imageQuality?.usable === false && requestPlan !== "internal") {
         return res.status(200).json({
@@ -11863,63 +11895,8 @@ if (!openai) {
       const allowFreshEmbedding =
         requestPlan === "pro" || requestPlan === "internal";
 
-      const embeddingPromise = !allowFreshEmbedding
-        ? Promise.resolve({
-            scanEmbedding: null,
-            visualMatches: [],
-          })
-        : (async () => {
-            const vector = await getOrCreateStoredEmbedding(
-              originalHash,
-              storedScan.processedBuffer
-            );
-
-            let neighbors = [];
-            let localNeighbors = [];
-
-            if (vector && typeof nearestVectors === "function") {
-              try {
-                neighbors = await Promise.resolve(nearestVectors(vector, 8));
-              } catch (e) {
-                console.warn("vector search failed", e?.message || e);
-              }
-            }
-
-            if (vector) {
-              try {
-                localNeighbors = await searchNearestStoredVectors(vector, 8);
-              } catch (e) {
-                console.warn("local vector search failed", e?.message || e);
-              }
-            }
-
-            const mergedNeighbors = [];
-            const seen = new Set();
-
-            for (const row of [
-              ...(Array.isArray(neighbors) ? neighbors : []),
-              ...(Array.isArray(localNeighbors) ? localNeighbors : []),
-            ]) {
-              const key =
-                safeStr(
-                  row?.imageHash ||
-                    row?.id ||
-                    row?.query ||
-                    row?.metadata?.query ||
-                    "",
-                  180
-                ) || null;
-
-              if (!key || seen.has(key)) continue;
-              seen.add(key);
-              mergedNeighbors.push(row);
-            }
-
-            return {
-              scanEmbedding: vector,
-              visualMatches: mergedNeighbors,
-            };
-          })();
+      // Embedding runs in background after response — never blocks the scan result
+      const embeddingPromise = Promise.resolve({ scanEmbedding: null, visualMatches: [] });
 
       console.log("🧠 CALLING OPENAI VISION", {
         rid: req.rid,
@@ -11942,16 +11919,42 @@ if (!openai) {
                   mode,
                   propContext,
                 }),
-                12000,
+                20000,
                 "vision_consensus_timeout"
               )
             )
         )
       );
 
-      const embeddingResult = await embeddingPromise;
-      scanEmbedding = embeddingResult.scanEmbedding;
-      visualMatches = embeddingResult.visualMatches;
+      // Embedding is background-only; scanEmbedding/visualMatches stay null for immediate response
+      scanEmbedding = null;
+      visualMatches = [];
+
+      // Fire embedding in background after response
+      if (allowFreshEmbedding) {
+        enqueueBackgroundJob(
+          "scan_embedding",
+          { imageHash: originalHash },
+          async () => {
+            try {
+              const vector = await getOrCreateStoredEmbedding(originalHash, processed.buffer);
+              if (vector) {
+                const q = result?.query || null;
+                if (q) storeVector(q, vector);
+                await upsertScanVector({
+                  imageHash: originalHash,
+                  query: q,
+                  vector,
+                  metadata: { imageHash: originalHash },
+                }).catch(() => {});
+              }
+            } catch (e) {
+              console.warn("bg_embedding_error", e?.message || e);
+            }
+            return { ok: true };
+          }
+        );
+      }
 
        const shaped = {
           ok: true,
@@ -12359,9 +12362,11 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
     timeout.cancel();
 
     let parsed = null;
-    
     try {
-      parsed = JSON.parse(response.output_text || "{}");
+      const rawEnrich = typeof response?.output_text === "string"
+        ? response.output_text
+        : response?.choices?.[0]?.message?.content || "{}";
+      parsed = JSON.parse(rawEnrich || "{}");
     } catch {
       parsed = null;
     }
@@ -17673,6 +17678,37 @@ app.post(
 });
 
 leaderElection.start();
+
+// Warm prompt cache on boot so first real user scan benefits from cached system prompt
+if (OPENAI_API_KEY && openai) {
+  setTimeout(async () => {
+    try {
+      // Minimal 1x1 white JPEG — just enough to warm the prompt cache for all 3 pass labels
+      const warmPixel = Buffer.from(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
+        "base64"
+      );
+      const warmDataUrl = `data:image/jpeg;base64,${warmPixel.toString("base64")}`;
+      for (const passLabel of ["master", "brand_model", "visual_shape"]) {
+        openai.responses.create({
+          model: VISION_MODEL,
+          temperature: 0.1,
+          max_output_tokens: 10,
+          prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
+          prompt_cache_retention: "24h",
+          text: { format: { type: "json_schema", name: `evan_ai_vision_${passLabel}`, strict: true, schema: buildVisionConsensusSchema() } },
+          input: [
+            { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
+            { role: "user", content: [{ type: "input_text", text: buildVisionPassPrompt(passLabel, "item", "") }, { type: "input_image", image_url: warmDataUrl }] },
+          ],
+        }).catch(() => {});
+      }
+      console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape passes");
+    } catch (e) {
+      // non-critical
+    }
+  }, 60_000);
+}
 
 let leaderLoopsStarted = false;
 
