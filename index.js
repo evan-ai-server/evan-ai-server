@@ -14114,6 +14114,145 @@ async function buildMarketSearchResponsePayload({
   };
 }
 // ── Price history API ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 3: RECEIPT SCAN — POST /api/receipt/analyze
+//
+// Body: { imageBase64: string }
+// Response: { ok, store, date, items: [{name,qty,paid,category,marketPrice,delta,overpaid}], subtotal, tax, total }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/receipt/analyze", async (req, res) => {
+  try {
+    const { imageBase64 } = req.body || {};
+    if (!imageBase64 || typeof imageBase64 !== "string" || imageBase64.length < 100) {
+      return res.status(400).json({ ok: false, error: "imageBase64 required" });
+    }
+    if (!openai) {
+      return res.status(503).json({ ok: false, error: "Vision unavailable" });
+    }
+
+    // ── Step 1: GPT-4 Vision OCR to extract structured receipt data ────────────
+    const ocrRes = await openai.responses.create({
+      model: VISION_MODEL,
+      temperature: 0.1,
+      max_output_tokens: 1200,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "receipt_extraction",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              store:    { type: ["string", "null"] },
+              date:     { type: ["string", "null"],  description: "YYYY-MM-DD or null" },
+              items: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    name:     { type: "string" },
+                    qty:      { type: "number" },
+                    paid:     { type: "number", description: "Line total in USD" },
+                    category: {
+                      type: "string",
+                      enum: ["electronics","clothing","sneakers","food","books","toys","home","sports","beauty","other"],
+                    },
+                  },
+                  required: ["name","qty","paid","category"],
+                  additionalProperties: false,
+                },
+              },
+              subtotal: { type: ["number", "null"] },
+              tax:      { type: ["number", "null"] },
+              total:    { type: ["number", "null"] },
+            },
+            required: ["store","date","items","subtotal","tax","total"],
+            additionalProperties: false,
+          },
+        },
+      },
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: "Extract all line items from this receipt exactly as printed. For each item provide: name (clean product name), qty, paid (line total USD as a float), and category. Skip tax lines, subtotals, and payment method lines — those go in subtotal/tax/total fields.",
+            },
+            {
+              type: "input_image",
+              image_url: `data:image/jpeg;base64,${imageBase64}`,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+    });
+
+    let parsed;
+    try {
+      const raw = ocrRes?.output_text || ocrRes?.output?.[0]?.content?.[0]?.text || "";
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return res.status(422).json({ ok: false, error: "Could not parse receipt text" });
+    }
+
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+
+    // ── Step 2: Parallel market lookups for non-food items (cap at 8) ─────────
+    const enrichable = items
+      .filter((i) => i?.category !== "food" && i?.name && i?.paid > 0)
+      .slice(0, 8);
+
+    const enriched = await Promise.all(
+      items.map(async (item) => {
+        const shouldEnrich = enrichable.some((e) => e === item);
+        if (!shouldEnrich) return { ...item, marketPrice: null, delta: null, overpaid: false };
+
+        try {
+          const serpResults = await serpShopping(item.name, { softFail: true });
+          const prices = serpResults
+            .map((r) => finitePrice(r.totalPrice ?? r.price))
+            .filter(Boolean)
+            .sort((a, b) => a - b);
+
+          if (!prices.length) return { ...item, marketPrice: null, delta: null, overpaid: false };
+
+          // Use median of found prices
+          const mid = Math.floor(prices.length / 2);
+          const marketPrice = prices[mid];
+          const delta = Number.isFinite(item.paid) ? round2(item.paid - marketPrice) : null;
+
+          return {
+            ...item,
+            marketPrice: round2(marketPrice),
+            delta,
+            overpaid: delta !== null && delta > 2,
+          };
+        } catch {
+          return { ...item, marketPrice: null, delta: null, overpaid: false };
+        }
+      }),
+    );
+
+    return res.json({
+      ok: true,
+      store:    parsed?.store    ?? null,
+      date:     parsed?.date     ?? null,
+      items:    enriched,
+      subtotal: parsed?.subtotal ?? null,
+      tax:      parsed?.tax      ?? null,
+      total:    parsed?.total    ?? null,
+    });
+  } catch (e) {
+    console.error("⚠️ /api/receipt/analyze error:", e?.message || e);
+    return res.status(500).json({ ok: false, error: "Receipt analysis failed" });
+  }
+});
+
+// helper used above
+function round2(v) { return Math.round(v * 100) / 100; }
+
 app.get("/api/price-history", async (req, res) => {
   try {
     const query = normalizeQuery(safeStr(req.query?.q, 220));
