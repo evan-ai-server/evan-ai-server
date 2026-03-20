@@ -14298,6 +14298,554 @@ async function buildMarketSearchResponsePayload({
 }
 // ── Price history API ──────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
+// Feature 8: Price Alert Persistence — POST /api/alert/set
+// Persists a user's price-drop target in Redis so the server can check it on
+// its own background loop (even when the app is closed).
+// Body: { userId, query, targetPrice, itemName? }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/alert/set", async (req, res) => {
+  try {
+    const userId      = safeStr(req.body?.userId, 64) || null;
+    const query       = normalizeQuery(safeStr(req.body?.query, 220)) || null;
+    const targetPrice = finitePrice(req.body?.targetPrice);
+    const itemName    = safeStr(req.body?.itemName, 200) || query;
+
+    if (!userId || !query || !targetPrice) {
+      return res.status(200).json({ ok: false, error: "userId, query, and targetPrice required" });
+    }
+
+    const alertId = `price_alert:${userId}:${hashString(query)}`;
+    const alert   = { userId, query, targetPrice, itemName, createdAt: Date.now(), active: true };
+
+    if (redis) {
+      await redis.set(alertId, JSON.stringify(alert), "EX", 90 * 24 * 3600);
+      await redis.sadd(`user_alerts:${userId}`, alertId);
+    }
+
+    // Immediate check — if market is already at or below target, notify now
+    try {
+      const items = await mergeCheapestSources(query);
+      const best  = finitePrice(items?.[0]?.totalPrice ?? items?.[0]?.price);
+      if (Number.isFinite(best) && best <= targetPrice) {
+        await notifyPriceDrop({
+          userId,
+          query,
+          bestPrice: best,
+          dropAmount: targetPrice - best,
+          dropPct: ((targetPrice - best) / targetPrice) * 100,
+          best: items?.[0] ?? null,
+        });
+      }
+    } catch { /* non-fatal */ }
+
+    return res.status(200).json({ ok: true, alertId, alert });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "alert_set_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 9: Auto-Relist Suggestions — POST /api/relist/suggestions
+// Analyzes watchlist items' price history + market trends to produce actionable
+// "Sell Now / Hold / Wait" recommendations with optimal listing prices.
+// Body: { items: [{ id, query, scannedPrice, lastBest, createdAt, targetPrice, history[] }] }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/relist/suggestions", async (req, res) => {
+  try {
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!rawItems.length) return res.status(200).json({ ok: true, suggestions: [] });
+
+    const now    = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    // For up to 5 items, fetch a fresh market pulse to sharpen the analysis
+    const liveChecks = await Promise.allSettled(
+      rawItems.slice(0, 5).map(async (w) => {
+        const q = normalizeQuery(w.query || "");
+        if (!q) return { query: q, livePrice: null };
+        try {
+          const items = await mergeCheapestSources(q);
+          const live  = finitePrice(items?.[0]?.totalPrice ?? items?.[0]?.price);
+          return { query: q, livePrice: live };
+        } catch {
+          return { query: q, livePrice: null };
+        }
+      })
+    );
+
+    const livePriceMap = {};
+    for (const r of liveChecks) {
+      if (r.status === "fulfilled" && r.value?.query) {
+        livePriceMap[r.value.query] = r.value.livePrice;
+      }
+    }
+
+    const fmtMoney = (n) => (Number.isFinite(n) ? `$${n.toFixed(2)}` : "—");
+
+    const suggestions = rawItems.map((w) => {
+      const scannedPrice = finitePrice(w.scannedPrice);
+      const lastBest     = finitePrice(w.lastBest);
+      const targetPrice  = finitePrice(w.targetPrice);
+      const createdAt    = Number(w.createdAt) || now;
+      const daysHeld     = Math.max(0, Math.round((now - createdAt) / DAY_MS));
+      const history      = Array.isArray(w.history) ? w.history : [];
+      const normQ        = normalizeQuery(w.query || "");
+      const livePrice    = livePriceMap[normQ] ?? lastBest;
+
+      if (!livePrice) return null;
+
+      // Price trend from history
+      let trend    = "stable";
+      let trendPct = 0;
+      if (history.length >= 3) {
+        const slice  = history.slice(-5);
+        const oldest = finitePrice(slice[0]?.best);
+        const newest = finitePrice(slice[slice.length - 1]?.best);
+        if (oldest && newest && oldest > 0) {
+          trendPct = ((newest - oldest) / oldest) * 100;
+          trend    = trendPct > 6 ? "rising" : trendPct < -6 ? "falling" : "stable";
+        }
+      }
+
+      // Net profit math (eBay default: 13.25% + $0.30)
+      const feeRate     = 0.1325;
+      const feeFixed    = 0.30;
+      const netProceeds = livePrice * (1 - feeRate) - feeFixed;
+      const profit      = scannedPrice ? Math.round((netProceeds - scannedPrice) * 100) / 100 : null;
+      const roiPct      = scannedPrice && scannedPrice > 0 && profit !== null
+        ? Math.round((profit / scannedPrice) * 100) : null;
+
+      const targetHit  = targetPrice && livePrice >= targetPrice;
+      const dropping   = trend === "falling" && trendPct < -8;
+      const rising     = trend === "rising"  && trendPct > 8;
+      const stale      = daysHeld > 45;
+      const goodROI    = roiPct !== null && roiPct >= 15 && profit !== null && profit > 15;
+      const greatROI   = roiPct !== null && roiPct >= 30 && profit !== null && profit > 30;
+
+      let action   = "hold";
+      let urgency  = "low";
+      let reason   = "";
+      let expiresIn = null;
+
+      if (targetHit && goodROI) {
+        action    = "sell_now";
+        urgency   = "high";
+        reason    = `🎯 Target hit! Market ${fmtMoney(livePrice)} — lock in ${fmtMoney(profit)} (${roiPct}% ROI) before conditions change`;
+        expiresIn = "48h";
+      } else if (dropping && goodROI) {
+        action    = "sell_now";
+        urgency   = "high";
+        reason    = `📉 Price falling ${Math.abs(Math.round(trendPct))}% — take ${fmtMoney(profit)} now before it drops further`;
+        expiresIn = "72h";
+      } else if (greatROI) {
+        action    = "sell_now";
+        urgency   = "high";
+        reason    = `🔥 ${roiPct}% ROI — exceptional return, market demand is strong right now`;
+        expiresIn = "5d";
+      } else if (stale && goodROI) {
+        action    = "sell_now";
+        urgency   = "medium";
+        reason    = `⏳ Held ${daysHeld} days — ${fmtMoney(profit)} profit available, capital is locked up`;
+        expiresIn = "7d";
+      } else if (rising) {
+        action   = "hold";
+        urgency  = "medium";
+        reason   = `📈 Price rising ${Math.round(trendPct)}% — hold ${daysHeld > 14 ? "a bit longer" : "for now"} to maximize exit`;
+      } else if (profit !== null && profit < 0) {
+        action  = "wait";
+        urgency = "low";
+        reason  = `Market at ${fmtMoney(livePrice)} — currently under cost. Watch for recovery`;
+      } else if (goodROI) {
+        action  = "hold";
+        urgency = "low";
+        reason  = `${fmtMoney(profit)} available (${roiPct}% ROI) — market stable, list when ready`;
+      } else {
+        action  = "wait";
+        urgency = "low";
+        reason  = `Margins thin at ${fmtMoney(livePrice)} — wait for a better market window`;
+      }
+
+      return {
+        id:               w.id || normQ,
+        query:            w.query,
+        action,
+        urgency,
+        reason,
+        currentMarket:    livePrice,
+        optimalListPrice: Math.round(livePrice * 0.97 * 100) / 100,
+        profitEstimate:   profit,
+        roiPct,
+        daysHeld,
+        trend,
+        trendPct:         Math.round(trendPct * 10) / 10,
+        expiresIn,
+      };
+    }).filter(Boolean);
+
+    // Sort: sell_now > urgency > roi
+    const urgOrd = { high: 0, medium: 1, low: 2 };
+    suggestions.sort((a, b) => {
+      const aS = a.action === "sell_now" ? 0 : a.action === "hold" ? 1 : 2;
+      const bS = b.action === "sell_now" ? 0 : b.action === "hold" ? 1 : 2;
+      if (aS !== bS) return aS - bS;
+      if (urgOrd[a.urgency] !== urgOrd[b.urgency]) return urgOrd[a.urgency] - urgOrd[b.urgency];
+      return (b.roiPct || 0) - (a.roiPct || 0);
+    });
+
+    return res.status(200).json({ ok: true, suggestions });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "relist_suggestions_failed", reason: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 10: Arbitrage Flip Scanner — POST /api/arbitrage/flip-scanner
+// Finds items selling cheap locally that command high prices nationally on eBay.
+// Body: { category, zipCode, seedQuery? }
+// Response: { opportunities: [{ query, localPrice, nationalSoldMedian, spread, profitAfterFees, roi, risk }] }
+// ─────────────────────────────────────────────────────────────────────────────
+const FLIP_HOTLIST = {
+  sneakers:     ["Jordan 1 Low", "Nike Dunk Low", "New Balance 550", "Adidas Samba OG", "Jordan 4 Retro"],
+  electronics:  ["AirPods Pro 2", "iPad Air", "Nintendo Switch OLED", "Sony WH-1000XM5", "Apple Watch Series 9"],
+  luxury:       ["Louis Vuitton Speedy 30", "Gucci Marmont bag", "Coach leather bag", "Kate Spade purse", "Michael Kors bag"],
+  vintage:      ["vintage Levi 501", "vintage band tee", "vintage Nike windbreaker", "vintage polo shirt", "vintage starter jacket"],
+  collectibles: ["Pokemon booster box", "Funko Pop rare", "vintage baseball cards", "sports card PSA", "vintage vinyl record"],
+  gaming:       ["PS5 controller", "Nintendo Switch OLED", "Steam Deck OLED", "rare Game Boy game", "retro console"],
+  apparel:      ["Supreme box logo hoodie", "Off-White hoodie", "Palace tee", "Fear of God essentials", "vintage Carhartt"],
+  jewelry:      ["gold chain", "diamond earrings", "vintage watch", "sterling silver bracelet", "Pandora charm"],
+};
+
+app.post("/api/arbitrage/flip-scanner", async (req, res) => {
+  try {
+    const category  = safeStr(req.body?.category, 60)?.toLowerCase() || "sneakers";
+    const zipCode   = safeStr(req.body?.zipCode, 20) || null;
+    const seedQuery = safeStr(req.body?.seedQuery, 220) || null;
+
+    if (!zipCode) {
+      return res.status(200).json({ ok: false, error: "zipCode required for local price scan" });
+    }
+
+    // Pick queries: seed expands first, then hotlist fills up to 5 total
+    const base = FLIP_HOTLIST[category] || FLIP_HOTLIST.sneakers;
+    const queries = seedQuery
+      ? [seedQuery, ...base.slice(0, 4)]
+      : base.slice(0, 5);
+
+    // Scan each query: local vs eBay sold, in parallel (cap at 5 to stay within rate limits)
+    const scanResults = await Promise.allSettled(
+      queries.slice(0, 5).map(async (q) => {
+        const [local, sold] = await Promise.allSettled([
+          serpLocalShopping(q, zipCode),
+          serpEbaySold(q),
+        ]);
+
+        const localData  = local.status  === "fulfilled" ? local.value  : null;
+        const soldData   = sold.status   === "fulfilled" ? sold.value   : null;
+
+        if (!localData?.median || !soldData?.median) return null;
+
+        const localPrice    = localData.median;
+        const nationalSold  = soldData.median;
+        const spread        = nationalSold - localPrice;
+
+        if (spread < 10) return null; // not worth it
+
+        // Profit after eBay fees
+        const feeRate        = 0.1325;
+        const feeFixed       = 0.30;
+        const shippingEst    = 12; // estimated shipping
+        const netProceeds    = nationalSold * (1 - feeRate) - feeFixed - shippingEst;
+        const profitAfterFees = Math.round((netProceeds - localPrice) * 100) / 100;
+        const roi             = localPrice > 0 ? Math.round((profitAfterFees / localPrice) * 100) : 0;
+
+        if (profitAfterFees < 5) return null;
+
+        // Risk scoring (0=low, 1=medium, 2=high)
+        const riskScore = (localData.count < 3 ? 1 : 0) + (soldData.count < 5 ? 1 : 0)
+          + (spread / nationalSold < 0.25 ? 1 : 0);
+        const risk = riskScore >= 2 ? "high" : riskScore === 1 ? "medium" : "low";
+
+        return {
+          query:            q,
+          category,
+          localPrice,
+          localCount:       localData.count,
+          nationalSoldMedian: nationalSold,
+          nationalSoldCount:  soldData.count,
+          spread:           Math.round(spread * 100) / 100,
+          profitAfterFees,
+          roi,
+          risk,
+          signal: roi >= 50
+            ? "🔥 High-ROI flip"
+            : roi >= 25
+            ? "💰 Good flip opportunity"
+            : "📊 Moderate spread",
+        };
+      })
+    );
+
+    const opportunities = scanResults
+      .filter((r) => r.status === "fulfilled" && r.value !== null)
+      .map((r) => r.value)
+      .sort((a, b) => b.roi - a.roi);
+
+    return res.status(200).json({
+      ok: true,
+      category,
+      zipCode,
+      scannedAt: new Date().toISOString(),
+      opportunities,
+      totalScanned: queries.length,
+    });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "flip_scanner_failed", reason: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 11: Deep Authenticity Scan — POST /api/auth/deep-scan
+// Uses GPT-4 Vision to examine the actual item photo and check specific fake
+// tells for the brand/category. Goes far beyond static rule matching.
+// Body: { imageBase64, brand, category, knownFakeTells?: string[] }
+// Response: { verdict, confidenceScore, specificTells[], redFlags[], passPoints[], recommendation }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/auth/deep-scan", async (req, res) => {
+  try {
+    const { imageBase64, brand = "", category = "", knownFakeTells = [] } = req.body || {};
+
+    if (!imageBase64 || typeof imageBase64 !== "string" || imageBase64.length < 100) {
+      return res.status(400).json({ ok: false, error: "imageBase64 required" });
+    }
+    if (!openai) {
+      return res.status(503).json({ ok: false, error: "Vision unavailable" });
+    }
+
+    // Build tells checklist from registry + any passed in by client
+    const { resolveBrandAuthProfile } = await import("./src/authenticityIntelligence.js");
+    const profile = resolveBrandAuthProfile({ brand });
+    const tellsToCheck = [
+      ...(profile.matched ? (profile.knownFakeTells || []) : []),
+      ...knownFakeTells,
+    ].slice(0, 8); // cap at 8 for token efficiency
+
+    const tellsPrompt = tellsToCheck.length
+      ? `\n\nKnown counterfeit tells for this brand/item:\n${tellsToCheck.map((t, i) => `${i + 1}. ${t}`).join("\n")}\n\nFor each tell above, assess if you can check it from this image: PASS (looks authentic), FAIL (red flag detected), or UNCLEAR (can't determine from this angle).`
+      : "\n\nIdentify any authenticity red flags or concerns you can see in this image.";
+
+    const authRes = await openai.responses.create({
+      model: VISION_MODEL,
+      temperature: 0.1,
+      max_output_tokens: 800,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "auth_scan_result",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              verdict: {
+                type: "string",
+                enum: ["authentic", "likely_fake", "suspicious", "inconclusive"],
+                description: "Overall authenticity verdict based on visible evidence",
+              },
+              confidenceScore: {
+                type: "number",
+                description: "0-100 confidence in verdict. 100 = certain. Be conservative.",
+              },
+              redFlags: {
+                type: "array",
+                items: { type: "string" },
+                description: "Specific visual red flags detected in the image",
+              },
+              passPoints: {
+                type: "array",
+                items: { type: "string" },
+                description: "Specific visual authenticity markers that look correct",
+              },
+              tellResults: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    tell:   { type: "string" },
+                    result: { type: "string", enum: ["pass", "fail", "unclear"] },
+                    note:   { type: "string" },
+                  },
+                  required: ["tell", "result", "note"],
+                  additionalProperties: false,
+                },
+              },
+              recommendation: { type: "string", description: "1-sentence action recommendation" },
+            },
+            required: ["verdict", "confidenceScore", "redFlags", "passPoints", "tellResults", "recommendation"],
+            additionalProperties: false,
+          },
+        },
+      },
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `You are a world-class authentication expert specializing in ${brand || category || "premium goods"}. Carefully examine this image for authenticity.${tellsPrompt}\n\nBe precise and conservative — only flag genuine concerns visible in the image.`,
+            },
+            {
+              type: "input_image",
+              image_url: `data:image/jpeg;base64,${imageBase64}`,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+    });
+
+    let parsed;
+    try {
+      const raw = authRes?.output_text || authRes?.output?.[0]?.content?.[0]?.text || "";
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return res.status(422).json({ ok: false, error: "Could not parse auth scan result" });
+    }
+
+    return res.status(200).json({ ok: true, ...parsed, brand, category });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "deep_scan_failed", reason: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 12: Visual Condition Assessment — POST /api/condition/visual-assess
+// GPT-4 Vision examines the item photo to detect actual visual wear vs the
+// stated condition, flagging mismatches and returning an adjusted fair price.
+// Body: { imageBase64, statedCondition, category, marketPrice }
+// Response: { visualCondition, statedCondition, hasMismatch, wearSigns[], adjustedPrice, adjustmentPct, signal }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/condition/visual-assess", async (req, res) => {
+  try {
+    const { imageBase64, statedCondition = "good", category = "", marketPrice } = req.body || {};
+
+    if (!imageBase64 || typeof imageBase64 !== "string" || imageBase64.length < 100) {
+      return res.status(400).json({ ok: false, error: "imageBase64 required" });
+    }
+    if (!openai) {
+      return res.status(503).json({ ok: false, error: "Vision unavailable" });
+    }
+
+    const condRes = await openai.responses.create({
+      model: VISION_MODEL,
+      temperature: 0.1,
+      max_output_tokens: 700,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "condition_assessment",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: {
+              visualCondition: {
+                type: "string",
+                enum: ["new", "like_new", "good", "fair", "poor"],
+                description: "Actual condition based on visible evidence in the image",
+              },
+              conditionConfidence: {
+                type: "number",
+                description: "0-100: how confident are you in the visual assessment",
+              },
+              wearSigns: {
+                type: "array",
+                items: { type: "string" },
+                description: "Specific visible wear, damage, or imperfections detected",
+              },
+              hasMismatch: {
+                type: "boolean",
+                description: "True if visual condition differs meaningfully from stated condition",
+              },
+              mismatchSeverity: {
+                type: "string",
+                enum: ["none", "minor", "significant", "major"],
+              },
+              reasoning: {
+                type: "string",
+                description: "1-2 sentence explanation of the condition assessment",
+              },
+            },
+            required: ["visualCondition", "conditionConfidence", "wearSigns", "hasMismatch", "mismatchSeverity", "reasoning"],
+            additionalProperties: false,
+          },
+        },
+      },
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `You are an expert resale condition grader. This item (category: ${category || "general"}) is listed as "${statedCondition}" condition.\n\nExamine the image and:\n1. Grade the ACTUAL visual condition (new/like_new/good/fair/poor)\n2. List every visible sign of wear, damage, or imperfection you can see\n3. Determine if the visual condition matches the stated "${statedCondition}" condition\n\nBe honest and specific — buyers depend on accurate grading.`,
+            },
+            {
+              type: "input_image",
+              image_url: `data:image/jpeg;base64,${imageBase64}`,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+    });
+
+    let parsed;
+    try {
+      const raw = condRes?.output_text || condRes?.output?.[0]?.content?.[0]?.text || "";
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return res.status(422).json({ ok: false, error: "Could not parse condition assessment" });
+    }
+
+    // Compute adjusted price using existing condition depreciation curves
+    const { computeConditionAdjustedPrice, detectConditionPriceMismatch } =
+      await import("./src/conditionPricingAdjuster.js");
+
+    const newMarketPrice = finitePrice(marketPrice);
+    const condAdj = newMarketPrice
+      ? computeConditionAdjustedPrice(newMarketPrice, parsed.visualCondition, category)
+      : null;
+
+    // Generate signal message
+    let signal = null;
+    if (parsed.hasMismatch && parsed.mismatchSeverity !== "none") {
+      const dir = ["new", "like_new"].includes(parsed.visualCondition) ? "better" : "worse";
+      if (dir === "worse") {
+        signal = `⚠️ Listed as "${statedCondition}" but looks "${parsed.visualCondition}" — ${condAdj?.adjustedPrice ? `fair value ~$${condAdj.adjustedPrice}` : "price adjustment needed"}`;
+      } else {
+        signal = `✅ Looks better than listed "${statedCondition}" condition — potential underpriced`;
+      }
+    } else if (parsed.wearSigns?.length > 0) {
+      signal = `Note: ${parsed.wearSigns.slice(0, 2).join("; ")}`;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      statedCondition,
+      visualCondition:      parsed.visualCondition,
+      conditionConfidence:  parsed.conditionConfidence,
+      wearSigns:            parsed.wearSigns || [],
+      hasMismatch:          parsed.hasMismatch,
+      mismatchSeverity:     parsed.mismatchSeverity,
+      reasoning:            parsed.reasoning,
+      adjustedPrice:        condAdj?.adjustedPrice  ?? null,
+      adjustmentPct:        condAdj?.depreciationPct ?? null,
+      signal,
+      category,
+    });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: "visual_assess_failed", reason: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Feature 3: RECEIPT SCAN — POST /api/receipt/analyze
 //
 // Body: { imageBase64: string }
