@@ -12821,6 +12821,189 @@ async function serpShopping(query, opts = {}) {
   }
 }
 
+// -------------------- SERP: eBay Sold Comps (Feature 4) --------------------
+// Fetches eBay *completed/sold* listings via SerpAPI eBay engine.
+// Returns an array of sold comp objects: { title, soldPrice, soldDate, condition, url }
+async function serpEbaySold(query) {
+  if (!SERPAPI_KEY) return [];
+  if (process.env.DISABLE_SERP === "true") return [];
+  if (isSourceCoolingDown("serpapi")) return [];
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    // SerpAPI eBay engine: _nkw = keyword, LH_Complete=1 & LH_Sold=1 via ebay params
+    const params = new URLSearchParams({
+      engine: "ebay",
+      _nkw: query,
+      ebay_domain: "ebay.com",
+      LH_Complete: "1",  // Completed listings
+      LH_Sold: "1",       // Sold listings only
+      _sop: "13",         // Sort by most recent first
+      api_key: SERPAPI_KEY,
+    });
+
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+
+    if (!r.ok) {
+      if (r.status === 429) {
+        const h = getSourceHealth("serpapi");
+        h.cooldownUntil = Math.max(Number(h.cooldownUntil || 0), Date.now() + 45 * 1000);
+      }
+      return [];
+    }
+
+    const data = await r.json();
+    const raw = Array.isArray(data.organic_results) ? data.organic_results : [];
+
+    const comps = raw
+      .filter((it) => it?.price?.raw || it?.price?.extracted || it?.prices?.[0]?.raw)
+      .slice(0, 25)
+      .map((it) => {
+        const priceRaw = it?.price?.extracted ?? it?.prices?.[0]?.extracted ?? 0;
+        const price = Number(priceRaw) || 0;
+        return {
+          title: String(it?.title || "").slice(0, 120),
+          soldPrice: price,
+          soldDate: it?.date?.human_date || it?.date?.raw || null,
+          condition: it?.condition || null,
+          url: it?.link || null,
+          shipping: it?.shipping?.extracted ?? null,
+          totalPrice: price + (Number(it?.shipping?.extracted) || 0),
+        };
+      })
+      .filter((c) => c.soldPrice > 0);
+
+    if (comps.length) {
+      const prices = comps.map((c) => c.totalPrice || c.soldPrice);
+      prices.sort((a, b) => a - b);
+      const mid = Math.floor(prices.length / 2);
+      const median = prices.length % 2 === 0
+        ? (prices[mid - 1] + prices[mid]) / 2
+        : prices[mid];
+
+      console.log("🏷️ EBAY SOLD COMPS", {
+        query,
+        count: comps.length,
+        low: prices[0],
+        median: Math.round(median),
+        high: prices[prices.length - 1],
+      });
+
+      return {
+        comps,
+        count: comps.length,
+        low: prices[0],
+        median: Math.round(median * 100) / 100,
+        high: prices[prices.length - 1],
+        avg: Math.round((prices.reduce((s, p) => s + p, 0) / prices.length) * 100) / 100,
+        recentSolds: comps.slice(0, 5),
+      };
+    }
+
+    return null;
+  } catch (err) {
+    if (err?.name !== "AbortError") {
+      console.warn("⚠️ serpEbaySold error:", err?.message || err, "query=", query);
+    }
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// -------------------- SERP: Local / Hyperlocal Shopping (Feature 5) --------------------
+// Fetches Google Shopping results filtered to a geographic area via location string.
+// Returns { low, median, high, avg, count, items[] } or null.
+async function serpLocalShopping(query, location) {
+  if (!SERPAPI_KEY) return null;
+  if (process.env.DISABLE_SERP === "true") return null;
+  if (!location) return null;
+  if (isSourceCoolingDown("serpapi")) return null;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const params = new URLSearchParams({
+      engine: "google_shopping",
+      q: `${query} near me`,
+      hl: "en",
+      gl: "us",
+      location: location, // e.g. "10001" zip or "New York, NY"
+      api_key: SERPAPI_KEY,
+    });
+
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+
+    if (!r.ok) {
+      if (r.status === 429) {
+        const h = getSourceHealth("serpapi");
+        h.cooldownUntil = Math.max(Number(h.cooldownUntil || 0), Date.now() + 45 * 1000);
+      }
+      return null;
+    }
+
+    const data = await r.json();
+    const raw = [
+      ...(Array.isArray(data.shopping_results) ? data.shopping_results : []),
+      ...(Array.isArray(data.inline_shopping_results) ? data.inline_shopping_results : []),
+    ];
+
+    const items = raw
+      .filter((it) => it?.price)
+      .slice(0, 20)
+      .map((it) => {
+        const price = Number(String(it.price || "0").replace(/[^0-9.]/g, "")) || 0;
+        const shipping = Number(String(it?.delivery || "0").replace(/[^0-9.]/g, "")) || 0;
+        return {
+          title: String(it?.title || "").slice(0, 100),
+          price,
+          shipping,
+          totalPrice: price + shipping,
+          source: it?.source || it?.merchant?.name || "local",
+          thumbnail: it?.thumbnail || null,
+        };
+      })
+      .filter((it) => it.price > 0);
+
+    if (!items.length) return null;
+
+    const prices = items.map((it) => it.totalPrice || it.price).sort((a, b) => a - b);
+    const mid = Math.floor(prices.length / 2);
+    const median = prices.length % 2 === 0
+      ? (prices[mid - 1] + prices[mid]) / 2
+      : prices[mid];
+
+    console.log("📍 LOCAL SHOPPING COMPS", {
+      query, location,
+      count: items.length,
+      low: prices[0],
+      median: Math.round(median),
+    });
+
+    return {
+      location,
+      count: items.length,
+      low: prices[0],
+      median: Math.round(median * 100) / 100,
+      high: prices[prices.length - 1],
+      avg: Math.round((prices.reduce((s, p) => s + p, 0) / prices.length) * 100) / 100,
+      items: items.slice(0, 8),
+    };
+  } catch (err) {
+    if (err?.name !== "AbortError") {
+      console.warn("⚠️ serpLocalShopping error:", err?.message || err, "query=", query);
+    }
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // -------------------- SERP: Amazon --------------------
 async function serpAmazon(query, opts = {}) {
   const { bypassCooldown = false, softFail = false } = opts || {};
@@ -14337,6 +14520,9 @@ query = categoryAdapter(
   req.body?.category || req.body?.visionIdentity?.category || null
 );
 
+// Feature 5: hyperlocal pricing — accept zipCode or location string from client
+const userLocation = safeStr(req.body?.zipCode || req.body?.location, 80) || null;
+
 let visionIdentity = normalizeVisionIdentityPayload(
   req.body?.visionIdentity || req.body?.identity || null,
   query
@@ -14595,23 +14781,33 @@ if (Array.isArray(items) && items.length > 0) {
   SERP_CACHE.set(cacheKey, items);
 }
 
-const responsePayload = await buildMarketSearchResponsePayload({
-  query,
-  searchedQueries,
-  variants,
-  items,
-  scannedPrice,
-  visionConfidence,
-  category,
-  visionIdentity,
-  authenticityFlags: _authFlags,
-  conditionFlags:    _condFlags,
-  retrievalMeta: {
-    source: Array.isArray(items) && items.length > 0 ? "live_market" : "empty",
-    kind: Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty",
-  },
-  persistSnapshot: true,
-});
+// Feature 4 + 5: fire eBay sold comps + local comps in parallel with payload build
+const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
+  buildMarketSearchResponsePayload({
+    query,
+    searchedQueries,
+    variants,
+    items,
+    scannedPrice,
+    visionConfidence,
+    category,
+    visionIdentity,
+    authenticityFlags: _authFlags,
+    conditionFlags:    _condFlags,
+    retrievalMeta: {
+      source: Array.isArray(items) && items.length > 0 ? "live_market" : "empty",
+      kind: Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty",
+    },
+    persistSnapshot: true,
+  }),
+  serpEbaySold(query).catch(() => null),
+  userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
+]);
+
+// Inject Feature 4 + 5 data into response
+if (ebaySoldComps) responsePayload.ebaySoldComps = ebaySoldComps;
+if (localComps)    responsePayload.localComps    = localComps;
+
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
 
