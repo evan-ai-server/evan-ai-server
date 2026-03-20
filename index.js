@@ -19784,6 +19784,151 @@ Respond ONLY with valid JSON in exactly this shape:
     }
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // BATCH: IDENTIFY — POST /api/batch/identify
+  //
+  // Lightweight JSON-body vision endpoint for batch scanning.
+  // Accepts a single base64 image, runs the 3-pass vision consensus,
+  // returns query + identity ready to pass to /market/search.
+  //
+  // Body:  { imageBase64: string }
+  // Response: { ok, query, variants, confidence, category, identity }
+  // ─────────────────────────────────────────────────────────────────────────
+  app.post("/api/batch/identify", async (req, res) => {
+    try {
+      const { imageBase64 } = req.body || {};
+      if (!imageBase64 || typeof imageBase64 !== "string" || imageBase64.length < 200) {
+        return res.status(200).json({ ok: false, error: "imageBase64 required" });
+      }
+
+      const buf = Buffer.from(imageBase64, "base64");
+      if (buf.length < 1000) {
+        return res.status(200).json({ ok: false, error: "image_too_small" });
+      }
+
+      // Construct minimal file + req objects for runVisionConsensus
+      const fakeFile = { buffer: buf, mimetype: "image/jpeg", size: buf.length };
+      const fakeReq  = { rid: `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}` };
+
+      const result = await withHardTimeout(
+        runVisionConsensus({ req: fakeReq, file: fakeFile, mode: "scan", propContext: "" }),
+        22000,
+        "batch_identify_timeout"
+      );
+
+      if (!result?.query) {
+        return res.status(200).json({ ok: false, error: "vision_no_result" });
+      }
+
+      return res.json({
+        ok: true,
+        query:      result.query,
+        variants:   Array.isArray(result.variants) ? result.variants.slice(0, 4) : [],
+        confidence: clamp01(Number(result.confidence || 0)),
+        category:   result.identity?.category || null,
+        identity:   result.identity || null,
+      });
+    } catch (e) {
+      console.error("❌ /api/batch/identify error:", e?.message);
+      return res.status(200).json({ ok: false, error: e?.message || "identify_failed" });
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // BATCH: PORTFOLIO ANALYZE — POST /api/batch/analyze
+  //
+  // Takes an array of completed scan results and returns portfolio analysis:
+  // total estimated value, top flip candidates, sell sequence recommendation.
+  //
+  // Body:  { items: Array<{ itemName, price, buyScore, buyVerdict, category,
+  //                          ebaySoldComps, flipPrediction }> }
+  // Response: { ok, totalValue, topFlips, portfolioTier, summary, sellSequence }
+  // ─────────────────────────────────────────────────────────────────────────
+  app.post("/api/batch/analyze", async (req, res) => {
+    try {
+      const { items } = req.body || {};
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(200).json({ ok: false, error: "items required" });
+      }
+
+      const validItems = items
+        .filter((it) => it && it.itemName)
+        .slice(0, 15);
+
+      if (validItems.length === 0) {
+        return res.status(200).json({ ok: false, error: "no_valid_items" });
+      }
+
+      const fmtPrice = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : "?");
+
+      // Build item summaries for GPT context
+      const itemLines = validItems.map((it, i) => {
+        const price   = Number.isFinite(Number(it.price)) ? Number(it.price) : null;
+        const verdict = it.buyVerdict || null;
+        const score   = it.buyScore   || null;
+        const vel     = it.ebaySoldComps?.velocityLabel || null;
+        const d2s     = it.ebaySoldComps?.avgDaysToSell ?? null;
+        const sold30  = it.ebaySoldComps?.soldCount30d  ?? it.ebaySoldComps?.count ?? null;
+        return [
+          `${i + 1}. ${it.itemName}`,
+          price    ? `  Price: ${fmtPrice(price)}`                              : null,
+          verdict  ? `  Deal verdict: ${verdict}${score ? ` (${score}/10)` : ""}` : null,
+          vel      ? `  Velocity: ${vel}${sold30 ? ` · ${sold30} sold/30d` : ""}${d2s ? ` · ~${d2s}d to sell` : ""}` : null,
+          it.category ? `  Category: ${it.category}`                            : null,
+        ].filter(Boolean).join("\n");
+      }).join("\n\n");
+
+      const totalValue = validItems.reduce((sum, it) => {
+        const p = Number.isFinite(Number(it.price)) ? Number(it.price) : 0;
+        return sum + p;
+      }, 0);
+
+      const systemPrompt = `You are an expert resale portfolio analyst. Analyze the items below and return a JSON portfolio analysis.
+
+RULES:
+- topFlips: rank top 3 items by flip potential (buyScore + velocity + margin). Include itemName, estimatedProfit, sellPlatform, daysToSell.
+- portfolioTier: "strong" (3+ hot/active velocity, avg score ≥7), "mixed" (balanced), or "weak" (mostly slow/rare, low scores).
+- summary: 2 sentences max — overall portfolio quality and the single best opportunity.
+- sellSequence: ordered array of itemNames from "sell first" (most liquid + profitable) to "hold or skip".
+- estimatedProfit: realistic net profit after typical eBay/platform fees (≈13%). Use price from data minus 13% fees.
+
+Return valid JSON only:
+{
+  "topFlips": [{ "itemName": "...", "estimatedProfit": 0.00, "sellPlatform": "...", "daysToSell": 0 }],
+  "portfolioTier": "strong"|"mixed"|"weak",
+  "summary": "...",
+  "sellSequence": ["itemName1", "itemName2", ...]
+}`;
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: `Portfolio items (${validItems.length} total, est. total value ${fmtPrice(totalValue)}):\n\n${itemLines}` },
+        ],
+        max_tokens: 600,
+        temperature: 0.25,
+        response_format: { type: "json_object" },
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "{}";
+      let analysis;
+      try { analysis = JSON.parse(raw); } catch { analysis = {}; }
+
+      return res.json({
+        ok:            true,
+        totalValue:    Math.round(totalValue * 100) / 100,
+        topFlips:      Array.isArray(analysis.topFlips)      ? analysis.topFlips.slice(0, 3) : [],
+        portfolioTier: analysis.portfolioTier || "mixed",
+        summary:       analysis.summary       || null,
+        sellSequence:  Array.isArray(analysis.sellSequence)  ? analysis.sellSequence : [],
+      });
+    } catch (e) {
+      console.error("❌ /api/batch/analyze error:", e?.message);
+      return res.status(200).json({ ok: false, error: e?.message || "batch_analyze_failed" });
+    }
+  });
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
