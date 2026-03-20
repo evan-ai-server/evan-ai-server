@@ -1,0 +1,20 @@
+[
+  {
+    "key": "a526c0ac8086fc7dd5834ead",
+    "fingerprint": "a526c0ac8086fc7dd5834ead",
+    "firstSeenAt": 1773910457759,
+    "lastSeenAt": 1773967467238,
+    "riskScore": 4,
+    "blockedUntil": 0,
+    "minuteHits": 4,
+    "hourHits": 4,
+    "recentKinds": {
+      "general": 27,
+      "market": 12,
+      "vision": 54
+    },
+    "lastIp": "127.0.0.1",
+    "lastUserAgent": "curl/8.7.1",
+    "lastReason": null
+  }
+]

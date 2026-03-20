@@ -78,6 +78,8 @@ import { createLeaderElection } from "./infra/leaderElection.js";
 import { createDistributedSingleflight } from "./infra/distributedSingleflight.js";
 import { createSourceBudgetManager } from "./profit/sourceBudget.js";
 import { createDurableIdempotencyMiddleware } from "./infra/durableIdempotency.js";
+import bcrypt from "bcryptjs";
+import cron from "node-cron";
 
 import {
   computeImageEmbedding,
@@ -16520,10 +16522,7 @@ app.get("/referral/stats", async (req, res) => {
   }
 });
 
-function round2(n) {
-  const v = Number(n);
-  return Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
-}
+// round2 defined above (line ~15498)
 
 function finitePrice(n) {
   const v = Number(n);
@@ -19926,6 +19925,301 @@ Return valid JSON only:
     } catch (e) {
       console.error("❌ /api/batch/analyze error:", e?.message);
       return res.status(200).json({ ok: false, error: e?.message || "batch_analyze_failed" });
+    }
+  });
+
+  // -------------------- Auth: Register + Login --------------------
+
+  const AUTH_USERS_DIR = path.join(".", "storage", "auth-users");
+  const AUTH_SIGN_SECRET = process.env.AUTH_JWT_SECRET || "evan-dev-secret";
+
+  function buildHs256Token(payload) {
+    const header = { alg: "HS256", typ: "JWT" };
+    const encode = (obj) =>
+      Buffer.from(JSON.stringify(obj))
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+    const encodedHeader = encode(header);
+    const encodedPayload = encode(payload);
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const sig = crypto
+      .createHmac("sha256", AUTH_SIGN_SECRET)
+      .update(signingInput)
+      .digest("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+    return `${signingInput}.${sig}`;
+  }
+
+  function authUserFilePath(email) {
+    const key = crypto
+      .createHash("sha256")
+      .update(String(email || "").toLowerCase().trim())
+      .digest("hex")
+      .slice(0, 32);
+    return path.join(AUTH_USERS_DIR, `${key}.json`);
+  }
+
+  app.post("/api/auth/register", async (req, res) => {
+    try {
+      const email = String(req.body?.email || "").toLowerCase().trim();
+      const password = String(req.body?.password || "");
+      const displayName = String(req.body?.displayName || "").trim();
+
+      if (!email || !password) {
+        return res.status(400).json({ ok: false, error: "email_and_password_required" });
+      }
+
+      await fs.mkdir(AUTH_USERS_DIR, { recursive: true });
+
+      const filePath = authUserFilePath(email);
+      let exists = false;
+      try {
+        await fs.access(filePath);
+        exists = true;
+      } catch {}
+
+      if (exists) {
+        return res.status(409).json({ ok: false, error: "email_taken" });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 12);
+      const userId = crypto.randomUUID();
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      const userRecord = {
+        userId,
+        email,
+        passwordHash,
+        displayName: displayName || null,
+        createdAt: new Date().toISOString(),
+      };
+
+      await fs.writeFile(filePath, JSON.stringify(userRecord, null, 2), "utf8");
+
+      const token = buildHs256Token({
+        sub: userId,
+        email,
+        plan: "free",
+        iat: nowSec,
+        exp: nowSec + 90 * 24 * 3600,
+      });
+
+      return res.json({ ok: true, token, userId, email });
+    } catch (e) {
+      console.error("❌ /api/auth/register error:", e?.message);
+      return res.status(500).json({ ok: false, error: "register_failed" });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const email = String(req.body?.email || "").toLowerCase().trim();
+      const password = String(req.body?.password || "");
+
+      if (!email || !password) {
+        return res.status(400).json({ ok: false, error: "email_and_password_required" });
+      }
+
+      const filePath = authUserFilePath(email);
+      let userRecord;
+      try {
+        const raw = await fs.readFile(filePath, "utf8");
+        userRecord = JSON.parse(raw);
+      } catch {
+        return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      }
+
+      const valid = await bcrypt.compare(password, userRecord.passwordHash || "");
+      if (!valid) {
+        return res.status(401).json({ ok: false, error: "invalid_credentials" });
+      }
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const token = buildHs256Token({
+        sub: userRecord.userId,
+        email: userRecord.email,
+        plan: "free",
+        iat: nowSec,
+        exp: nowSec + 90 * 24 * 3600,
+      });
+
+      return res.json({
+        ok: true,
+        token,
+        userId: userRecord.userId,
+        email: userRecord.email,
+        displayName: userRecord.displayName || null,
+      });
+    } catch (e) {
+      console.error("❌ /api/auth/login error:", e?.message);
+      return res.status(500).json({ ok: false, error: "login_failed" });
+    }
+  });
+
+  // -------------------- eBay Listing Auto-Post --------------------
+
+  app.post("/api/listing/post-to-ebay", async (req, res) => {
+    try {
+      const {
+        title,
+        description,
+        price,
+        category,
+        condition,
+        imageUrls,
+        ebayToken,
+      } = req.body || {};
+
+      if (!ebayToken) {
+        return res.status(400).json({ ok: false, error: "ebayToken_required" });
+      }
+      if (!title || String(title).length > 80) {
+        return res.status(400).json({
+          ok: false,
+          error: "title_required_max_80_chars",
+        });
+      }
+      const parsedPrice = Number(price);
+      if (!parsedPrice || parsedPrice <= 0) {
+        return res.status(400).json({ ok: false, error: "price_must_be_positive" });
+      }
+
+      const conditionMap = {
+        new: "NEW",
+        like_new: "LIKE_NEW",
+        very_good: "VERY_GOOD",
+        good: "GOOD",
+        acceptable: "ACCEPTABLE",
+      };
+      const ebayCondition = conditionMap[String(condition || "").toLowerCase()] || "USED_EXCELLENT";
+
+      const draftBody = {
+        product: {
+          title: String(title).slice(0, 80),
+          description: String(description || title),
+          imageUrls: Array.isArray(imageUrls) ? imageUrls.slice(0, 12) : [],
+          aspects: {},
+        },
+        condition: ebayCondition,
+        categoryId: String(category || ""),
+        format: "FIXED_PRICE",
+        availableQuantity: 1,
+        pricingSummary: {
+          price: {
+            value: parsedPrice.toFixed(2),
+            currency: "USD",
+          },
+        },
+      };
+
+      const ebayResp = await fetch(
+        "https://api.ebay.com/sell/listing/v1_beta/item_draft",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${ebayToken}`,
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+            "Accept-Language": "en-US",
+          },
+          body: JSON.stringify(draftBody),
+        }
+      );
+
+      const ebayData = await ebayResp.json().catch(() => ({}));
+
+      if (!ebayResp.ok) {
+        console.error("❌ eBay listing draft error:", ebayResp.status, ebayData);
+        return res.status(502).json({
+          ok: false,
+          error: "ebay_api_error",
+          status: ebayResp.status,
+          details: ebayData,
+        });
+      }
+
+      const listingId = ebayData.itemDraftId || ebayData.listingId || null;
+      const listingUrl = listingId
+        ? `https://www.ebay.com/itm/${listingId}`
+        : null;
+
+      return res.json({ ok: true, listingId, listingUrl, raw: ebayData });
+    } catch (e) {
+      console.error("❌ /api/listing/post-to-ebay error:", e?.message);
+      return res.status(500).json({ ok: false, error: "ebay_post_failed" });
+    }
+  });
+
+  // -------------------- Watchlist Server Cron --------------------
+
+  const watchCronLastPoll = new Map();
+
+  cron.schedule("*/30 * * * *", async () => {
+    try {
+      const usersDir = path.join(".", "storage", "product-scale", "users");
+      let entries;
+      try {
+        entries = await fs.readdir(usersDir);
+      } catch {
+        return; // directory doesn't exist yet
+      }
+
+      const MIN_POLL_INTERVAL_MS = 25 * 60 * 1000;
+      const MAX_USERS_PER_TICK = 20;
+      const now = Date.now();
+
+      let processed = 0;
+      for (const entry of entries) {
+        if (processed >= MAX_USERS_PER_TICK) break;
+        if (!entry.endsWith(".json")) continue;
+
+        const userId = entry.replace(/\.json$/, "");
+
+        const lastPoll = watchCronLastPoll.get(userId) || 0;
+        if (now - lastPoll < MIN_POLL_INTERVAL_MS) continue;
+
+        let profile;
+        try {
+          const raw = await fs.readFile(path.join(usersDir, entry), "utf8");
+          profile = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+
+        if (!Array.isArray(profile?.watchlist) || profile.watchlist.length === 0) continue;
+
+        watchCronLastPoll.set(userId, now);
+        processed++;
+
+        for (const item of profile.watchlist) {
+          if (!item?.query) continue;
+          try {
+            const result = await runWatchCheck(userId, item.query);
+            if (result?.delta?.priceDropped && result?.delta?.significant) {
+              await notifyPriceDrop({
+                userId,
+                query: item.query,
+                bestPrice: result.delta.bestPrice ?? result.best?.price ?? 0,
+                dropAmount: result.delta.dropAmount ?? 0,
+                dropPct: result.delta.dropPct ?? 0,
+                best: result.best ?? null,
+              });
+            }
+          } catch (watchErr) {
+            console.warn("⚠️ watchCron item error:", userId, item.query, watchErr?.message);
+          }
+        }
+      }
+
+      if (processed > 0) {
+        console.log(`[watchCron] Checked ${processed} user(s) at ${new Date().toISOString()}`);
+      }
+    } catch (e) {
+      console.error("❌ watchCron error:", e?.message);
     }
   });
 

@@ -1,0 +1,1502 @@
+// index.js (ESM)
+// Evan AI server — optimized, cache-safe, structured-output Vision
+
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+import fetch from "node-fetch";
+import multer from "multer";
+import crypto from "crypto";
+import rateLimit from "express-rate-limit";
+import pLimit from "p-limit";
+
+dotenv.config();
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+// -------------------- ENV --------------------
+const visionConcurrency = pLimit(6);
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+const HOST = process.env.HOST || "0.0.0.0";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
+const VISION_MODEL =
+  process.env.VISION_MODEL || "gpt-4.1-mini";
+const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1-mini";
+const TEXT_TIMEOUT_MS = process.env.TEXT_TIMEOUT_MS
+  ? Number(process.env.TEXT_TIMEOUT_MS)
+  : 8000;
+const VISION_TIMEOUT_MS = process.env.VISION_TIMEOUT_MS
+  ? Number(process.env.VISION_TIMEOUT_MS)
+  : 9500;
+
+// CORS: allow all by default; lock down in prod with ALLOWED_ORIGINS
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (!ALLOWED_ORIGINS.length) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"), false);
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  const oldJson = res.json;
+
+  res.json = function (data) {
+    try {
+      const size = Buffer.byteLength(JSON.stringify(data));
+      if (size > 5_000_000) {
+        console.warn("⚠️ Large response trimmed:", req.originalUrl);
+      }
+    } catch {}
+
+    return oldJson.call(this, data);
+  };
+
+  next();
+});
+
+// -------------------- Request logger + request id --------------------
+app.use((req, res, next) => {
+  const rid = crypto.randomBytes(8).toString("hex");
+  res.setHeader("x-request-id", rid);
+  req.rid = rid;
+
+  const start = Date.now();
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${
+        res.statusCode
+      } (${duration}ms) rid=${rid}`
+    );
+
+    if (duration > 4000) {
+      console.warn("⚠️ Slow request:", req.originalUrl, duration + "ms");
+    }
+  });
+
+  next();
+});
+
+// -------------------- Multer (images) --------------------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|jpg|png|webp|heic|heif)$/i.test(file.mimetype);
+    cb(ok ? null : new Error("invalid_file_type"), ok);
+  },
+});
+
+// -------------------- Tiny utils --------------------
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
+
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+
+function safeStr(s, max = 180) {
+  if (typeof s !== "string") return "";
+  const t = s.trim();
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+function normalizeQuery(q = "") {
+  return String(q)
+    .toLowerCase()
+    .replace(/\b(used|cheap|deal|best price|sale)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function resaleScore(items) {
+  if (!items.length) return 0;
+  const prices = items.map(i => i.price).filter(Boolean);
+  if (!prices.length) return 0;
+
+  const spread = Math.max(...prices) - Math.min(...prices);
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  return spread / avg;
+}
+
+global.metrics = {
+  visionCalls: 0,
+};
+
+// -------------------- Redis (production cache) --------------------
+import Redis from "ioredis";
+
+const redis =
+  process.env.REDIS_URL
+    ? new Redis(process.env.REDIS_URL)
+    : null;
+
+async function cacheGet(key) {
+  if (!redis) return null;
+  try {
+    const v = await redis.get(key);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheSet(key, value, ttlSec = 3600) {
+  if (!redis) return;
+  try {
+    await redis.setex(key, ttlSec, JSON.stringify(value));
+  } catch {}
+}
+
+// -------------------- REFERRAL ENGINE --------------------
+
+// Redis-backed referral store
+// Structure:
+// referral:CODE -> { ownerId, uses, createdAt }
+// referral_user:USERID -> { referredBy, redeemedAt }
+
+function generateReferralCode() {
+  return crypto.randomBytes(4).toString("hex").toUpperCase();
+}
+
+async function createReferral(ownerId) {
+  if (!redis) return null;
+
+  const code = generateReferralCode();
+  const key = `referral:${code}`;
+
+  await redis.set(
+    key,
+    JSON.stringify({
+      ownerId,
+      uses: 0,
+      createdAt: Date.now(),
+    })
+  );
+
+  return code;
+}
+
+async function redeemReferral(code, userId) {
+  if (!redis) return { ok: false };
+
+  const key = `referral:${code}`;
+  const raw = await redis.get(key);
+  if (!raw) return { ok: false, reason: "invalid_code" };
+
+  const referral = JSON.parse(raw);
+
+  const userKey = `referral_user:${userId}`;
+  const existing = await redis.get(userKey);
+  if (existing) return { ok: false, reason: "already_redeemed" };
+
+  referral.uses += 1;
+
+  await redis.set(key, JSON.stringify(referral));
+  await redis.set(
+    userKey,
+    JSON.stringify({
+      referredBy: referral.ownerId,
+      redeemedAt: Date.now(),
+    })
+  );
+
+  return { ok: true, ownerId: referral.ownerId };
+}
+
+// -------------------- TTL cache (prevents memory leak) --------------------
+class TTLCache {
+  constructor({ ttlMs, maxSize }) {
+    this.ttlMs = ttlMs;
+    this.maxSize = maxSize;
+    this.map = new Map(); // key -> { v, exp }
+  }
+  get(key) {
+    const hit = this.map.get(key);
+    if (!hit) return null;
+    if (hit.exp < Date.now()) {
+      this.map.delete(key);
+      return null;
+    }
+    return hit.v;
+  }
+  set(key, value) {
+    // basic prune if oversized
+    if (this.map.size >= this.maxSize) this.prune(0.15);
+    this.map.set(key, { v: value, exp: Date.now() + this.ttlMs });
+    return value;
+  }
+  prune(fraction = 0.2) {
+    const target = Math.floor(this.maxSize * (1 - fraction));
+    if (this.map.size <= target) return;
+
+    // remove expired first
+    const now = Date.now();
+    for (const [k, entry] of this.map) {
+      if (entry.exp < now) this.map.delete(k);
+    }
+    if (this.map.size <= target) return;
+
+    // then remove oldest insertion order
+    while (this.map.size > target) {
+      const firstKey = this.map.keys().next().value;
+      this.map.delete(firstKey);
+    }
+  }
+  size() {
+    return this.map.size;
+  }
+}
+
+// -------------------- In-flight dedupe (prevents stampede) --------------------
+const inflight = new Map();
+async function withInflight(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    try {
+      return await fn();
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+  inflight.set(key, p);
+  return p;
+}
+
+// -------------------- Caches --------------------
+// Vision results: long-ish TTL; limited size
+const visionCache = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 1200 });
+// SERP caches: short TTL
+const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
+const RESEARCH_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1000 });
+const LOCAL_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 600 });
+
+setInterval(() => {
+  visionCache.prune();
+  SERP_CACHE.prune();
+  RESEARCH_CACHE.prune();
+  LOCAL_CACHE.prune();
+}, 60 * 1000);
+
+// -------------------- OpenAI client --------------------
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+// -------------------- Health --------------------
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+app.get("/routes", (_req, res) => {
+  const routes = [];
+  const stack = app._router?.stack || [];
+  for (const layer of stack) {
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {}).map((m) =>
+        m.toUpperCase()
+      );
+      routes.push({ path: layer.route.path, methods });
+    }
+  }
+  res.status(200).json({ ok: true, routes });
+});
+
+app.get("/debug/metrics", (_req, res) => {
+  res.json(global.metrics);
+});
+
+app.get("/debug/cache", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    sizes: {
+      visionCache: visionCache.size(),
+      SERP_CACHE: SERP_CACHE.size(),
+      RESEARCH_CACHE: RESEARCH_CACHE.size(),
+      LOCAL_CACHE: LOCAL_CACHE.size(),
+      inflight: inflight.size,
+    },
+  });
+});
+
+// -------------------- Helpers: market normalize --------------------
+function parsePriceNumber(price) {
+  if (!price) return null;
+  const n = Number(String(price).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeItem(it) {
+  const price = it.extracted_price ?? parsePriceNumber(it.price);
+  return {
+    title: it.title || null,
+    price,
+    price_display: it.price || null,
+    source: it.source || null,
+    link: it.link || it.product_link || null,
+    image: it.thumbnail || it.thumbnail_url || it.serpapi_thumbnail || null,
+    rating: typeof it.rating === "number" ? it.rating : null,
+    reviews: typeof it.reviews === "number" ? it.reviews : null,
+  };
+}
+
+function sortCheapest(items) {
+  return [...items].sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+}
+
+function dedupeByLink(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    if (!it?.link) continue;
+    if (seen.has(it.link)) continue;
+    seen.add(it.link);
+    out.push(it);
+  }
+  return out;
+}
+
+// -------------------- INTELLIGENCE HELPERS --------------------
+function isBadListing(title = "") {
+  const t = title.toLowerCase();
+
+const badWords = [
+  "for parts",
+  "parts only",
+  "not working",
+  "broken",
+  "repair",
+  "refurbished",
+  "lot",
+  "bundle",
+  "pack",
+  "set of",
+  "x2",
+  "x3",
+  "x4",
+  "auction",
+  "bid",
+  "read description",
+  "as is",
+];
+
+  return badWords.some(w => t.includes(w));
+}
+
+function trimPriceOutliers(items) {
+  const prices = items.map(i => i.price).filter(Boolean);
+  if (!prices.length) return items;
+
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  return items.filter(i => {
+    if (!i.price) return false;
+    return i.price < avg * 2 && i.price > avg * 0.35;
+  });
+}
+
+function resaleProbability(items) {
+  if (!items.length) return 0;
+  const prices = items.map(i => i.price).filter(Boolean);
+  if (!prices.length) return 0;
+
+  const spread = Math.max(...prices) - Math.min(...prices);
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  return clamp01(spread / avg);
+}
+
+function trustScore(it) {
+  const rating = it.rating || 0;
+  const reviews = it.reviews || 0;
+
+  const ratingScore = rating / 5;
+  const reviewScore = Math.min(reviews / 500, 1);
+
+  return (ratingScore * 0.6) + (reviewScore * 0.4);
+}
+
+function hashString(s = "") {
+  return sha256(Buffer.from(s)).slice(0, 8);
+}
+
+function smartRank(items) {
+  return items
+    .map(it => {
+      const trust = trustScore(it);
+      const priceScore = 1 / Math.max(it.price || 1, 1);
+
+      const tie =
+        parseInt(hashString(it.link || it.title || "0"), 16) % 1000 / 1000;
+
+      it.__rank =
+        priceScore * 0.6 +
+        trust * 0.25 +
+        tie * 0.01;
+
+      return it;
+    })
+    .sort((a,b) => b.__rank - a.__rank);
+}
+
+// -------------------- Rate limit --------------------
+const visionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// -------------------- Vision prompt (compact + strict) --------------------
+const VISION_SYSTEM = `
+
+You are Evan AI — a high-precision, resale-first visual product identification engine built for thrift, vintage, used marketplaces, and real-world scanning in messy environments.
+
+Your output is used to power a user-facing shopping comparison experience:
+Image -> (your output) -> search marketplaces -> rank comps -> calculate savings -> show “buy / resell / profit” decisions.
+
+If you output a wrong or overly-specific query, the downstream search becomes noisy, comparisons break, and user trust collapses.
+Therefore: you must be conservative, evidence-based, and optimized for *search success*.
+
+========================
+NON-NEGOTIABLE OUTPUT RULES
+========================
+1) You must respond with ONLY valid JSON.
+2) No markdown. No explanations. No extra keys. No trailing text.
+3) Output schema must be EXACTLY:
+   {"query": string|null, "confidence": number}
+
+If you violate the schema, the system fails.
+
+========================
+PRIMARY OBJECT SELECTION (WHAT YOU IDENTIFY)
+========================
+Identify ONLY the single most prominent real-world item in the image.
+Use this priority:
+- Most centered + largest + most in-focus
+- Most readable text/logo
+- Most distinctive shape/features
+Ignore:
+- Hands, people, floors, shelves, backgrounds
+- Secondary items unless they are clearly the main subject
+If multiple items are equally prominent:
+Choose the one with the strongest evidence (readable text > logo > distinctive silhouette > packaging).
+
+If the image is mostly packaging/box/label:
+Identify the product indicated by the packaging.
+
+========================
+THRIFT / RESALE REALITY CHECK (CRITICAL)
+========================
+This system is for real thrift use:
+- items can be worn, faded, dirty, scratched
+- tags may be missing or partial
+- lighting can be terrible, glare is common
+- photos can be angled/cropped
+
+You MUST adapt:
+- prefer product line + type over guessing exact generation/year unless clearly supported
+- do NOT invent details (colors, materials, editions) unless truly visible
+- if the item is generic (plain hoodie, basic mug, random cable), you usually return null.
+
+========================
+ANTI-HALLUCINATION RULES (ABSOLUTE)
+========================
+You must NEVER invent:
+- brand names
+- collaborations
+- model numbers
+- limited editions
+- years
+- product variants
+You may name a brand/model ONLY if supported by direct evidence:
+- readable text, clear logo, unambiguous signature design
+If you are not sure, omit the brand or output null.
+
+If something resembles a known brand but could be generic:
+- do NOT name the brand
+- lower confidence and/or output null
+
+If counterfeit/dupe signals exist (weird logo, inconsistent font, suspicious stitching):
+- do NOT confidently identify a specific model
+- reduce confidence significantly
+
+========================
+QUERY QUALITY (SEARCH-READY OR NOTHING)
+========================
+Your query is used for marketplace search (Google Shopping / eBay / Etsy / resale apps).
+A great query is:
+- short
+- specific enough to find the exact item
+- not so specific that it becomes wrong
+- includes only verified details
+
+Preferred query format:
+"Brand + Product line/model + item type"
+Examples:
+- "Apple AirPods Pro 2nd generation"
+- "Nike Air Force 1 Low sneakers"
+- "Levi's 501 original fit jeans"
+- "Sony WH-1000XM4 headphones"
+- "Carhartt Detroit jacket"
+
+Optional attributes (ONLY if clearly visible and helpful):
+- color (only if obvious)
+- material (only if obvious)
+- version/gen (only if strongly supported)
+- edition keywords ONLY if printed on product or packaging
+
+Forbidden in query:
+- filler words ("looks like", "maybe", "probably", "similar to")
+- vague adjectives ("cool", "nice", "vintage style")
+- store names
+- “thrift”, “used”, “authentic”
+- multiple options (“Nike or Adidas…”)
+- size unless clearly visible (ex: “US 10”, “32x32”) — otherwise omit
+
+========================
+EVIDENCE PRIORITY (HOW YOU DECIDE)
+========================
+Rank evidence in this order:
+1) Readable text (labels, model numbers, product names, tags)
+2) Logos / brand marks
+3) Unique silhouette + distinctive features (stitching, hardware, ports, soles, button layout)
+4) Packaging cues (if packaging dominates frame)
+5) Color/material (only if clearly visible)
+
+If evidence is weak, DO NOT GUESS.
+
+========================
+MODE-SPECIFIC BEHAVIOR
+========================
+
+A) MODE: STANDARD ITEM (default)
+Goal: return the best marketplace search query for the main item.
+- if brand/model is supported, include it
+- if only type is known, return the best short resale-friendly generic search phrase
+- prefer useful marketplace phrases like:
+  "oval brown sunglasses"
+  "black leather handbag"
+  "wireless earbuds charging case"
+  "ceramic table lamp"
+  "vintage brass candlestick"
+- only return null when the image is too unclear to even identify the item category honestly
+
+B) MODE: MAKER’S MARK / STAMP (mark)
+Goal: identify the maker/brand from a stamp, engraving, tag, hallmark.
+- focus ONLY on the stamp/engraving/tag text, not the whole item
+- if you can read a maker name, the query should include stamp context:
+  Examples:
+  - "Wedgwood maker's mark"
+  - "925 Italy silver stamp"
+  - "Baccarat crystal hallmark"
+- if stamp is unreadable, query must be null and confidence low
+
+C) MODE: PART / COMPONENT (part)
+Goal: identify the exact part name with brand/model compatibility if visible.
+- prefer part numbers, connector types, compatibility cues
+- Examples:
+  - "Dyson V8 replacement filter"
+  - "KitchenAid stand mixer beater attachment"
+  - "Nikon F mount lens rear cap"
+- If only a generic component is visible without confirming info, output null
+
+D) MODE: LABEL / INGREDIENTS / MATERIALS (label)
+Goal: read label text and identify the exact product or key label identity.
+- extract what is readable: ingredients, fabric content, allergens, materials
+- query should help find the exact product/label
+- Examples:
+  - "CeraVe Hydrating Cleanser ingredients label"
+  - "Patagonia jacket fabric content tag"
+- if text is not readable, output null
+
+E) MODE: PROP / MEDIA MATCHING (prop)
+Goal: identify the specific real-world product using the provided context.
+- Use the context as a constraint, not an excuse to guess.
+- If you can only guess the category, return null.
+- If context conflicts with the image, trust the image more and reduce confidence.
+
+========================
+CONFIDENCE CALIBRATION (0.00 to 1.00)
+========================
+Confidence means:
+“If a user searches the query, how likely are top results to match the exact item?”
+
+Use this strict scale:
+- 0.95–1.00: brand + exact model confirmed by readable text + distinctive features
+- 0.85–0.94: brand confirmed; model very likely (strong distinctive cues) but not fully readable
+- 0.70–0.84: product line/type clear; brand likely with some evidence; exact model uncertain
+- 0.50–0.69: product category clear but brand/model not reliably supported
+- 0.30–0.49: only broad category guessable; too risky for search
+- 0.00–0.29: insufficient clarity
+
+CRITICAL HARD RULE:
+If confidence < 0.12, then "query" MUST be null.
+
+If confidence is between 0.12 and 0.39, still return the best short marketplace query you can, as long as it is honest and non-hallucinated.
+Prefer a broader but usable search phrase over null.
+
+========================
+FINAL OUTPUT REQUIREMENTS
+========================
+Return ONLY the JSON object:
+{"query": string|null, "confidence": number}
+
+Do not output ANY other text.
+Do not include any keys beyond query and confidence.
+
+Now analyze the image and return ONLY the JSON object.
+
+`.trim();
+
+function modeHeader(mode, propContext) {
+  if (mode === "mark") {
+    return `MODE: MAKER'S MARK. Focus ONLY on stamp/engraving/tag text. If unreadable => query=null.`;
+  }
+  if (mode === "part") {
+    return `MODE: PART/COMPONENT. Prefer part numbers + compatibility cues. If not supported => query=null.`;
+  }
+  if (mode === "label") {
+    return `MODE: LABEL. Extract readable ingredients/material/fabric content cues. If unreadable => query=null.`;
+  }
+  if (mode === "prop") {
+    return `MODE: PROP. Use context: "${propContext || "none"}". If only category-level guess => query=null.`;
+  }
+  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.`;
+}
+
+function cleanMode(m) {
+  const x = safeStr(m, 24).toLowerCase();
+  const allowed = new Set(["item", "mark", "part", "label", "prop"]);
+  return allowed.has(x) ? x : "item";
+}
+
+function requireApiKey(req, res, next) {
+  const key = req.headers["x-api-key"];
+  if (!process.env.API_KEY || key === process.env.API_KEY) {
+    return next();
+  }
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+}
+
+// -------------------- VISION ANALYZE --------------------
+app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    hint: 'POST multipart/form-data with field name "image"',
+  });
+});
+
+app.post(
+  ["/vision/analyze", "/api/vision/analyze"],
+  visionLimiter,
+  requireApiKey,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      console.log("📸 VISION HIT", {
+        rid: req.rid,
+        path: req.originalUrl,
+        hasFile: !!req.file,
+        bodyMode: req.body?.mode,
+        contentType: req.headers["content-type"],
+      });
+      if (!req.file) {
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          confidence: 0,
+          reason: "no_file_received",
+        });
+      }
+
+if (req.file.size < 4000) {
+  return res.status(200).json({
+    ok: true,
+    query: null,
+    confidence: 0,
+    reason: "image_too_small",
+  });
+}
+
+console.log("✅ VISION FILE ACCEPTED", {
+  rid: req.rid,
+  size: req.file.size,
+  mimetype: req.file.mimetype,
+});
+
+      if (!openai) {
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          confidence: 0,
+          reason: "missing_openai_api_key",
+        });
+      }
+
+      const mode = cleanMode(req.body?.mode);
+      const propContext = safeStr(req.body?.propContext, 220);
+
+      const imgHash = sha256(req.file.buffer);
+      const cacheKey = `vision|${mode}|${propContext}|${imgHash}`;
+
+      let cached = await cacheGet(cacheKey);
+if (!cached) cached = visionCache.get(cacheKey);
+      if (cached) {
+        return res.status(200).json({ ...cached, cached: true });
+      }
+
+      const base64 = req.file.buffer.toString("base64");
+      const dataUrl = `data:${req.file.mimetype || "image/jpeg"};base64,${base64}`;
+
+      const payloadText = `${modeHeader(mode, propContext)}\n\nReturn the best query or null.`;
+
+      const timeout = withTimeout(VISION_TIMEOUT_MS);
+
+console.log("🧠 CALLING OPENAI VISION", {
+  rid: req.rid,
+  mode,
+  model: VISION_MODEL,
+});
+
+const result = await withInflight(cacheKey, async () =>
+  visionConcurrency(async () => {
+        // Structured output: json_schema format on Responses API :contentReference[oaicite:3]{index=3}
+global.metrics.visionCalls++;        
+const response = await openai.responses.create(
+          {
+            model: VISION_MODEL,
+            temperature: 0.2,
+            max_output_tokens: 80,
+
+            // Prompt caching knobs (where supported) :contentReference[oaicite:4]{index=4}
+            prompt_cache_key: "evan-ai-vision-v2",
+            prompt_cache_retention: "24h",
+
+            text: {
+              format: {
+                type: "json_schema",
+                name: "evan_ai_vision_result",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["query", "confidence"],
+                  properties: {
+                    query: {
+                      anyOf: [{ type: "string" }, { type: "null" }],
+                    },
+                    confidence: { type: "number" },
+                  },
+                },
+              },
+            },
+
+            input: [
+              {
+                role: "system",
+                content: [{ type: "input_text", text: VISION_SYSTEM }],
+              },
+              {
+                role: "user",
+                content: [
+                  { type: "input_text", text: payloadText },
+                  { type: "input_image", image_url: dataUrl },
+                ],
+              },
+            ],
+            metadata: { rid: req.rid || "", mode },
+          },
+          { signal: timeout.signal }
+        );
+
+// 🔥 SAFE structured-output parser (Responses API)
+
+let parsed = null;
+let rawVisionText = "";
+
+try {
+  if (typeof response.output_text === "string" && response.output_text.trim()) {
+    rawVisionText = response.output_text;
+    parsed = JSON.parse(response.output_text);
+  } else if (
+    response.output &&
+    response.output[0] &&
+    response.output[0].content &&
+    typeof response.output[0].content[0]?.text === "string"
+  ) {
+    rawVisionText = response.output[0].content[0].text;
+    parsed = JSON.parse(response.output[0].content[0].text);
+  } else {
+    parsed = {};
+  }
+} catch (e) {
+  console.warn("⚠️ vision parse failed:", e?.message);
+  console.warn("⚠️ rawVisionText:", rawVisionText);
+  parsed = {};
+}
+
+console.log("VISION RAW TEXT", rawVisionText);
+console.log("VISION PARSED OBJECT", parsed);
+
+        let query =
+          typeof parsed?.query === "string" && parsed.query.trim()
+            ? parsed.query.trim()
+            : null;
+
+        let confidence =
+          typeof parsed?.confidence === "number" ? clamp01(parsed.confidence) : 0;
+
+        const fallbackFromMode = () => {
+          if (mode === "mark") return "maker's mark";
+          if (mode === "part") return "replacement part";
+          if (mode === "label") return "product label";
+          if (mode === "prop") return "collectible item";
+          return "fashion sunglasses";
+        };
+
+        // If model returned null/weak confidence, still provide a safe marketplace-searchable fallback
+        // so the pipeline can continue instead of dying at null.
+        if (!query || !String(query).trim()) {
+          query = fallbackFromMode();
+          confidence = Math.max(confidence, 0.41);
+        }
+
+        // Keep confidence clamped
+        confidence = clamp01(confidence);
+
+        return { ok: true, query, confidence };
+      })
+);
+
+      timeout.cancel();
+
+      visionCache.set(cacheKey, result);
+      await cacheSet(cacheKey, result, 86400);
+
+      return res.status(200).json(result);
+    } catch (err) {
+      const name = err?.name || "error";
+      const reason = name === "AbortError" ? "vision_timeout" : "vision_exception";
+      console.warn("❌ VISION ERROR:", reason, err?.message || err);
+      return res.status(200).json({ ok: true, query: null, confidence: 0, reason });
+    }
+  }
+);
+
+// -------------------- VISION ENRICH --------------------
+app.post("/vision/enrich", async (req, res) => {
+  try {
+    if (!openai) return res.status(200).json({ ok: false, reason: "missing_openai_api_key" });
+
+
+    const rawQuery = safeStr(req.body?.query, 220);
+    const query = normalizeQuery(rawQuery);
+    const mode = cleanMode(req.body?.mode);
+    const context = safeStr(req.body?.context, 220);
+
+    if (!query) return res.status(200).json({ ok: false, reason: "missing_query" });
+
+    const cacheKey = `enrich|${mode}|${context}|${query}`;
+    const cached = visionCache.get(cacheKey);
+    if (cached) return res.status(200).json({ ...cached, cached: true });
+
+    const enrichPrompt = `
+You are Evan AI enrichment.
+Input query: "${query}"
+Mode: "${mode}"
+Context: "${context || "none"}"
+
+Return practical, reseller-friendly structured JSON.
+`.trim();
+
+    const timeout = withTimeout(TEXT_TIMEOUT_MS);
+
+    const response = await openai.responses.create(
+      {
+        model: ENRICH_MODEL,
+        temperature: 0.4,
+        max_output_tokens: 450,
+
+        prompt_cache_key: "evan-ai-enrich-v2",
+        prompt_cache_retention: "24h",
+
+        text: {
+          format: {
+            type: "json_schema",
+            name: "evan_ai_enrich_result",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["ok", "collector", "materials", "alternatives", "local", "parts"],
+              properties: {
+                ok: { type: "boolean" },
+                collector: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["summary", "era", "maker", "model", "tells"],
+                  properties: {
+                    summary: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    era: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    maker: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    model: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    tells: { type: "array", items: { type: "string" } },
+                  },
+                },
+                materials: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["signals"],
+                  properties: {
+                    signals: { type: "array", items: { type: "string" } },
+                  },
+                },
+                alternatives: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["queries"],
+                  properties: {
+                    queries: { type: "array", items: { type: "string" } },
+                  },
+                },
+                local: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["keywords"],
+                  properties: {
+                    keywords: { type: "array", items: { type: "string" } },
+                  },
+                },
+                parts: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["keywords"],
+                  properties: {
+                    keywords: { type: "array", items: { type: "string" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+
+        input: [{ role: "user", content: [{ type: "input_text", text: enrichPrompt }] }],
+        metadata: { rid: req.rid || "", mode: mode || "item" },
+      },
+      { signal: timeout.signal }
+    );
+
+    timeout.cancel();
+
+    let parsed = null;
+    
+    try {
+      parsed = JSON.parse(response.output_text || "{}");
+    } catch {
+      parsed = null;
+    }
+
+    if (!parsed || parsed.ok !== true) {
+      return res.status(200).json({ ok: false, reason: "parse_failed" });
+    }
+
+    visionCache.set(cacheKey, parsed);
+    return res.status(200).json(parsed);
+  } catch (e) {
+    return res.status(200).json({ ok: false, reason: "enrich_exception" });
+  }
+});
+
+// -------------------- SERP: google shopping --------------------
+async function serpShopping(query) {
+  const params = new URLSearchParams({
+    engine: "google_shopping",
+    q: query,
+    hl: "en",
+    gl: "us",
+    api_key: SERPAPI_KEY,
+  });
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 7000);
+
+  try {
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+    const data = await r.json();
+
+    const raw = [
+      ...(data.shopping_results || []),
+      ...(data.inline_shopping_results || []),
+    ];
+
+    const items = raw.map(normalizeItem).filter((x) => x.title && x.link);
+    const sorted = sortCheapest(items);
+    return sorted.slice(0, 60);
+
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+app.get("/search/serp", async (req, res) => {
+  const rawQuery = safeStr(req.query?.q, 220);
+  const query = normalizeQuery(rawQuery);
+  if (!query || !SERPAPI_KEY)
+  return res.status(200).json([]);
+
+
+
+  const cacheKey = `serp|${query}`;
+  const cached = SERP_CACHE.get(cacheKey);
+  if (cached) return res.status(200).json(cached);
+
+  try {
+let items = await withInflight(cacheKey, async () => await serpShopping(query));
+
+items = items.filter(it => !isBadListing(it.title));
+items = trimPriceOutliers(items);
+items = smartRank(items);
+
+SERP_CACHE.set(cacheKey, items);
+    return res.status(200).json(items);
+  } catch (e) {
+    const fallback = SERP_CACHE.get(cacheKey);
+    return res.status(200).json(fallback || []);
+  }
+});
+
+// Ebay MVP (site filter)
+app.get("/search/ebay", async (req, res) => {
+  const query = safeStr(req.query?.q, 220);
+  if (!query || !SERPAPI_KEY) return res.status(200).json([]);
+
+  const cacheKey = `ebay|${query}`;
+  const cached = SERP_CACHE.get(cacheKey);
+  if (cached) return res.status(200).json(cached);
+
+  try {
+    const items = await withInflight(cacheKey, async () =>
+      serpShopping(`${query} site:ebay.com`)
+    );
+    SERP_CACHE.set(cacheKey, items);
+    return res.status(200).json(items);
+  } catch {
+    return res.status(200).json([]);
+  }
+});
+
+// -------------------- MARKET SEARCH (POST) --------------------
+app.post("/market/search", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    if (!query) return res.status(200).json({ ok: false, error: "Missing query" });
+    if (!SERPAPI_KEY) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        items: [],
+        top3: [],
+        reason: "missing_serpapi_key",
+      });
+    }
+
+    const cacheKey = `market|${query}`;
+    const cached = SERP_CACHE.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({ ok: true, query, items: cached, top3: cached.slice(0, 3), cached: true });
+    }
+
+    const items = await withInflight(cacheKey, async () => await serpShopping(query));
+    SERP_CACHE.set(cacheKey, items);
+
+return res.status(200).json({
+  ok: true,
+  query,
+  items,
+  top3: items.slice(0, 3),
+  resaleScore: resaleScore(items),
+});
+
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "market_search_failed" });
+  }
+});
+
+// -------------------- MARKET RESEARCH (POST) --------------------
+app.post("/market/research", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    const mode = safeStr(req.body?.mode, 24) || "resale";
+
+    if (!query) return res.status(200).json({ ok: false, error: "Missing query" });
+    if (!SERPAPI_KEY) return res.status(200).json({ ok: true, query, items: [], reason: "missing_serpapi_key" });
+
+    const cacheKey = `research|${mode}|${query}`;
+    const cached = RESEARCH_CACHE.get(cacheKey);
+    if (cached) return res.status(200).json({ ok: true, query, items: cached, cached: true });
+
+    const expansions =
+      mode === "cheaper"
+        ? [
+            `${query} used`,
+            `${query} pre-owned`,
+            `${query} ebay`,
+            `${query} etsy`,
+            `${query} poshmark`,
+            `${query} depop`,
+          ]
+        : [query];
+
+    const all = [];
+    for (const q of expansions.slice(0, 6)) {
+      const items = await serpShopping(q);
+      all.push(...items);
+    }
+
+    let cheapest = sortCheapest(dedupeByLink(all));
+
+cheapest = cheapest.filter(it => !isBadListing(it.title));
+cheapest = trimPriceOutliers(cheapest);
+cheapest = smartRank(cheapest);
+    RESEARCH_CACHE.set(cacheKey, cheapest);
+
+    return res.status(200).json({ ok: true, query, items: cheapest });
+  } catch {
+    return res.status(200).json({ ok: true, items: [], reason: "market_research_failed" });
+  }
+});
+
+// -------------------- MARKET CHECK (POST) --------------------
+app.post("/market/check", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    if (!query) return res.status(200).json({ ok: false, error: "Missing query" });
+    if (!SERPAPI_KEY) return res.status(200).json({ ok: true, query, bestPrice: null, reason: "missing_serpapi_key" });
+
+    const cacheKey = `check|${query}`;
+    const cached = SERP_CACHE.get(cacheKey);
+    if (cached) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        bestPrice: cached[0]?.price ?? null,
+        best: cached[0] ?? null,
+        cached: true,
+      });
+    }
+
+    const items = await withInflight(cacheKey, async () => await serpShopping(`${query} used`));
+    SERP_CACHE.set(cacheKey, items);
+
+    return res.status(200).json({
+      ok: true,
+      query,
+      bestPrice: items[0]?.price ?? null,
+      best: items[0] ?? null,
+    });
+  } catch {
+    return res.status(200).json({ ok: true, bestPrice: null, reason: "check_failed" });
+  }
+});
+
+// ✅ NEW FEATURE: batch check for watchlists
+app.post("/market/batch-check", async (req, res) => {
+  try {
+    const queries = Array.isArray(req.body?.queries) ? req.body.queries : [];
+    const cleaned = queries.map((q) => safeStr(q, 220)).filter(Boolean).slice(0, 25);
+
+    if (!cleaned.length) return res.status(200).json({ ok: false, error: "Missing queries[]" });
+    if (!SERPAPI_KEY) return res.status(200).json({ ok: true, results: [], reason: "missing_serpapi_key" });
+
+    const results = [];
+    for (const q of cleaned) {
+      const key = `check|${q}`;
+      const cached = SERP_CACHE.get(key);
+      const items = cached || (await serpShopping(`${q} used`));
+      if (!cached) SERP_CACHE.set(key, items);
+
+      results.push({
+        query: q,
+        bestPrice: items[0]?.price ?? null,
+        best: items[0] ?? null,
+      });
+    }
+
+    return res.status(200).json({ ok: true, results });
+  } catch {
+    return res.status(200).json({ ok: false, error: "batch_check_failed" });
+  }
+});
+
+// -------------------- LOCAL + ESTATE SEARCH (POST) --------------------
+app.post("/local/search", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    const near = safeStr(req.body?.near, 80) || "near me";
+    if (!query || !SERPAPI_KEY) return res.status(200).json({ ok: true, items: [] });
+
+    const cacheKey = `local|${query}|${near}`;
+    const cached = LOCAL_CACHE.get(cacheKey);
+    if (cached) return res.status(200).json({ ok: true, items: cached, cached: true });
+
+    const q = `${query} ${near} consignment OR thrift OR estate sale`;
+
+    const params = new URLSearchParams({
+      engine: "google",
+      q,
+      hl: "en",
+      gl: "us",
+      api_key: SERPAPI_KEY,
+    });
+
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 7000);
+
+    const r = await fetch(`https://serpapi.com/search.json?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+
+    const data = await r.json();
+    const organic = Array.isArray(data?.organic_results) ? data.organic_results : [];
+
+    const items = organic
+      .slice(0, 10)
+      .map((o) => ({
+        title: o.title || null,
+        link: o.link || null,
+        snippet: o.snippet || null,
+        source: o.source || "Local",
+      }))
+      .filter((x) => x.title && x.link);
+
+    LOCAL_CACHE.set(cacheKey, items);
+    return res.status(200).json({ ok: true, items });
+  } catch {
+    return res.status(200).json({ ok: true, items: [] });
+  }
+});
+
+// -------------------- REFERRAL ROUTES --------------------
+
+// Create referral code
+app.post("/referral/create", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_userId" });
+
+    const code = await createReferral(userId);
+    if (!code) return res.status(200).json({ ok: false, error: "redis_unavailable" });
+
+    return res.status(200).json({ ok: true, code });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// Redeem referral
+app.post("/referral/redeem", async (req, res) => {
+  try {
+    const code = safeStr(req.body?.code, 32).toUpperCase();
+    const userId = safeStr(req.body?.userId, 64);
+
+    if (!code || !userId)
+      return res.status(200).json({ ok: false, error: "missing_fields" });
+
+    const result = await redeemReferral(code, userId);
+    return res.status(200).json(result);
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// Get referral stats
+app.get("/referral/stats", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 64);
+    if (!userId || !redis)
+      return res.status(200).json({ ok: false });
+
+    const keys = await redis.keys("referral:*");
+    let totalUses = 0;
+    let codeFound = null;
+
+    for (const key of keys) {
+      const raw = await redis.get(key);
+      if (!raw) continue;
+      const data = JSON.parse(raw);
+      if (data.ownerId === userId) {
+        totalUses = data.uses;
+        codeFound = key.split(":")[1];
+        break;
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      code: codeFound,
+      totalUses,
+    });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// -------------------- LIGHTWEIGHT APP ROUTES REQUIRED BY FRONTEND --------------------
+
+// in-memory analytics sink (safe dev stub)
+const analyticsEvents = [];
+
+// analytics event
+app.post("/analytics/event", (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const event = safeStr(req.body?.event, 64);
+    const payload = req.body?.payload ?? {};
+    const ts =
+      typeof req.body?.ts === "number" ? req.body.ts : Date.now();
+
+    analyticsEvents.unshift({
+      userId,
+      event,
+      payload,
+      ts,
+    });
+
+    // keep memory bounded
+    if (analyticsEvents.length > 1000) {
+      analyticsEvents.length = 1000;
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// history load (safe dev stub)
+app.get("/history/load", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 64);
+    if (!userId) return res.status(200).json([]);
+
+    // if redis exists, try load per-user history
+    if (redis) {
+      const raw = await redis.get(`history:${userId}`);
+      if (!raw) return res.status(200).json([]);
+      try {
+        const parsed = JSON.parse(raw);
+        return res.status(200).json(Array.isArray(parsed) ? parsed : []);
+      } catch {
+        return res.status(200).json([]);
+      }
+    }
+
+    // local/dev fallback
+    return res.status(200).json([]);
+  } catch {
+    return res.status(200).json([]);
+  }
+});
+
+// watch recheck (frontend expects this)
+app.post("/watch/recheck", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const item = req.body?.item || null;
+    const query = safeStr(item?.query, 220);
+
+    if (!userId || !query) {
+      return res.status(200).json({ ok: false, error: "missing_fields" });
+    }
+
+    if (!SERPAPI_KEY) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        bestPrice: null,
+        best: null,
+        reason: "missing_serpapi_key",
+      });
+    }
+
+    const items = await serpShopping(`${query} used`);
+
+    return res.status(200).json({
+      ok: true,
+      query,
+      bestPrice: items[0]?.price ?? null,
+      best: items[0] ?? null,
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      bestPrice: null,
+      best: null,
+      reason: "watch_recheck_failed",
+    });
+  }
+});
+
+// -------------------- Start + graceful shutdown --------------------
+const server = app.listen(PORT, HOST, () => {
+  console.log(`✅ evan-ai-server running on http://${HOST}:${PORT}`);
+  if (!OPENAI_API_KEY) console.log("⚠️ OPENAI_API_KEY missing (Vision disabled)");
+  if (!SERPAPI_KEY) console.log("⚠️ SERPAPI_KEY missing (market search disabled)");
+});
+
+function shutdown(sig) {
+  console.log(`🛑 ${sig} received. Shutting down...`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 8000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// -------------------- Crash protection --------------------
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+setInterval(() => {
+  const used = process.memoryUsage().heapUsed / 1024 / 1024;
+
+  if (used > 700) {
+    console.warn("⚠️ High memory usage detected:", used.toFixed(1), "MB");
+
+    visionCache.prune(0.5);
+    SERP_CACHE.prune(0.5);
+    RESEARCH_CACHE.prune(0.5);
+    LOCAL_CACHE.prune(0.5);
+  }
+}, 30000);

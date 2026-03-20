@@ -1,0 +1,42 @@
+
+> evan-ai-server@1.0.0 dev
+> node index.js
+
+[dotenv@17.2.3] injecting env (7) from .env -- tip: 🔑 add access controls to secrets: https://dotenvx.com/ops
+✅ evan-ai-server running on http://0.0.0.0:3001
+[2026-03-04T11:17:51.604Z] GET /referral/stats?userId=u_1772233898411_60248231c8ea4c -> 200 (74ms) rid=452f7777e4f35b66
+[2026-03-04T11:17:51.606Z] GET /history/load?userId=u_1772233898411_60248231c8ea4c -> 200 (1ms) rid=c6d88ca8117d38aa
+[2026-03-04T11:17:51.859Z] POST /referral/create -> 200 (1ms) rid=20a8c9ed679116fa
+[2026-03-04T11:17:56.698Z] POST /analytics/event -> 200 (0ms) rid=d2025186b1807271
+[2026-03-04T11:17:59.591Z] POST /analytics/event -> 200 (1ms) rid=a1dd79dfd7b98a4a
+[2026-03-04T11:17:59.642Z] GET /health -> 200 (1ms) rid=c2e426dcc6fcf3b5
+📸 VISION HIT {
+  rid: '256679dd640d050b',
+  path: '/vision/analyze',
+  hasFile: true,
+  bodyMode: 'item',
+  contentType: 'multipart/form-data; boundary=xE391YUWRVP6wIG8AJxU8mbwbcrvqh_GHHW3ld7JWrYxI2aHPDyefqVR0ixqD6zlVFCWDi'
+}
+✅ VISION FILE ACCEPTED { rid: '256679dd640d050b', size: 536947, mimetype: 'image/jpeg' }
+🧠 CALLING OPENAI VISION { rid: '256679dd640d050b', mode: 'item', model: 'gpt-4.1' }
+VISION RAW TEXT {"query":"orange wraparound glasses","confidence":0.92}
+VISION PARSED OBJECT { query: 'orange wraparound glasses', confidence: 0.92 }
+VISION FINAL QUERY orange wraparound glasses
+VISION FINAL CONFIDENCE 0.92
+[2026-03-04T11:18:02.645Z] POST /vision/analyze -> 200 (2984ms) rid=256679dd640d050b
+⚠️ Etsy 403. Key/app access rejected. Disabling Etsy for 10m.
+🔥 MARKET MERGED CHEAPEST {
+  query: 'orange wraparound glasses',
+  etsyVariants: [ 'orange wraparound glasses', 'orange wraparound glasses vintage' ],
+  etsy: 0,
+  ebay: 0,
+  serp: 60,
+  merged: 6,
+  cheapestTotal: 6.99,
+  cheapestTitle: 'Summit Racing Bulk Wraparound Safety Glasses',
+  cheapestSource: 'Summit Racing',
+  etsyCooling: false,
+  serpCooling: false
+}
+[2026-03-04T11:18:05.464Z] POST /market/search -> 200 (2777ms) rid=68e316e41a78d9aa
+[2026-03-04T11:18:05.569Z] POST /analytics/event -> 200 (1ms) rid=527f7c34ae01b196

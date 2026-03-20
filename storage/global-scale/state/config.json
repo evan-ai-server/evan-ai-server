@@ -1,0 +1,14 @@
+{
+  "regions": [
+    "us-east-1",
+    "us-central-1",
+    "us-west-2",
+    "eu-west-1"
+  ],
+  "primaryRegion": "us-east-1",
+  "currentRegion": "us-east-1",
+  "activeRegion": "us-east-1",
+  "lastFailoverAt": 0,
+  "failoverCount": 0,
+  "replicationCount": 0
+}

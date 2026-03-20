@@ -1,0 +1,5957 @@
+// index.js (ESM)
+// Evan AI server — optimized, cache-safe, structured-output Vision
+
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+import fetch from "node-fetch";
+import multer from "multer";
+import crypto from "crypto";
+import rateLimit from "express-rate-limit";
+import pLimit from "p-limit";
+
+dotenv.config();
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.set("etag", false);
+
+// -------------------- ENV --------------------
+const visionConcurrency = pLimit(6);
+const marketSearchConcurrency = pLimit(4);
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
+const HOST = process.env.HOST || "0.0.0.0";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
+const ETSY_API_KEY = process.env.ETSY_API_KEY || "";
+let ETSY_COOLDOWN_UNTIL = 0;
+
+const VISION_MODEL =
+  process.env.VISION_MODEL || "gpt-4.1-mini";
+const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1-mini";
+const TEXT_TIMEOUT_MS = process.env.TEXT_TIMEOUT_MS
+  ? Number(process.env.TEXT_TIMEOUT_MS)
+  : 8000;
+
+const VISION_TIMEOUT_MS = process.env.VISION_TIMEOUT_MS
+  ? Number(process.env.VISION_TIMEOUT_MS)
+  : 12500;
+
+// CORS: allow all by default; lock down in prod with ALLOWED_ORIGINS
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (!ALLOWED_ORIGINS.length) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked"), false);
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  const oldJson = res.json;
+
+  res.json = function (data) {
+    try {
+      const size = Buffer.byteLength(JSON.stringify(data));
+      if (size > 5_000_000) {
+        console.warn("⚠️ Large response trimmed:", req.originalUrl);
+      }
+    } catch {}
+
+    return oldJson.call(this, data);
+  };
+
+  next();
+});
+
+// -------------------- Request logger + request id --------------------
+app.use((req, res, next) => {
+  const rid = crypto.randomBytes(8).toString("hex");
+  res.setHeader("x-request-id", rid);
+  req.rid = rid;
+
+  const start = Date.now();
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+
+    console.log(
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${
+        res.statusCode
+      } (${duration}ms) rid=${rid}`
+    );
+
+    if (duration > 4000) {
+      console.warn("⚠️ Slow request:", req.originalUrl, duration + "ms");
+    }
+  });
+
+  next();
+});
+
+// -------------------- Multer (images) --------------------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|jpg|png|webp|heic|heif)$/i.test(file.mimetype);
+    cb(ok ? null : new Error("invalid_file_type"), ok);
+  },
+});
+
+// -------------------- Tiny utils --------------------
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
+
+function withHardTimeout(promise, ms, label = "timeout") {
+  let id;
+
+  const killer = new Promise((_, reject) => {
+    id = setTimeout(() => {
+      const err = new Error(label);
+      err.name = "AbortError";
+      reject(err);
+    }, ms);
+  });
+
+  return Promise.race([promise, killer]).finally(() => {
+    clearTimeout(id);
+  });
+}
+
+function clamp01(n) {
+  return Math.max(0, Math.min(1, n));
+}
+
+function safeStr(s, max = 180) {
+  if (typeof s !== "string") return "";
+  const t = s.trim();
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+function normalizeQuery(q = "") {
+  return String(q)
+    .toLowerCase()
+    // keep "used", "pre owned", "marketplace" because they are useful intent
+    .replace(/\b(cheap|deal|best price|sale)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// -----------------------------------
+// QUERY VARIANT ENGINE (Evan AI Brain)
+// -----------------------------------
+function buildQueryVariants(query = "") {
+  const q = normalizeQuery(query);
+
+  const variants = new Set();
+  variants.add(q);
+
+  // eyewear intelligence
+  if (q.includes("orange")) {
+    variants.add("orange lens glasses");
+    variants.add("amber lens glasses");
+    variants.add("orange blue light glasses");
+  }
+
+  if (q.includes("blue light")) {
+    variants.add("gaming glasses");
+    variants.add("computer glasses");
+  }
+
+  if (q.includes("wrap")) {
+    variants.add("wraparound glasses");
+    variants.add("sports glasses");
+  }
+
+  if (q.includes("glasses")) {
+    variants.add(q.replace("glasses", "eyewear"));
+  }
+
+  return Array.from(variants).slice(0, 5);
+}
+
+// =====================================================
+// GOD MODE — LAST GOOD QUERY MEMORY
+// =====================================================
+let LAST_GOOD_QUERY = null;
+
+function rememberGoodQuery(q) {
+  if (!q) return;
+  const s = String(q).trim();
+  if (!s) return;
+  if (["item","object","product","thing"].includes(s.toLowerCase())) return;
+  LAST_GOOD_QUERY = s;
+}
+
+// =====================================================
+// ULTRA INTELLIGENCE MEMORY
+// =====================================================
+let LAST_GOOD_CATEGORY = null;
+
+function isGarbageQuery(q) {
+  const s = String(q || "").trim().toLowerCase();
+  if (!s) return true;
+
+  const junk = new Set([
+    "item",
+    "object",
+    "product",
+    "thing",
+    "stuff",
+    "consumer product",
+    "unknown",
+    "misc",
+    "misc item",
+    "general item",
+  ]);
+
+  return junk.has(s);
+}
+
+function inferVisionCategory(q) {
+  const s = String(q || "").toLowerCase();
+
+  // eyewear
+  if (
+    s.includes("glasses") ||
+    s.includes("eyewear") ||
+    s.includes("sunglasses") ||
+    s.includes("frames") ||
+    s.includes("eyeglass")
+  ) return "eyewear";
+
+  // headwear
+  if (
+    s.includes("hat") ||
+    s.includes("cap") ||
+    s.includes("snapback") ||
+    s.includes("beanie")
+  ) return "headwear";
+
+  // footwear
+  if (
+    s.includes("shoe") ||
+    s.includes("sneaker") ||
+    s.includes("boot") ||
+    s.includes("loafer") ||
+    s.includes("heel") ||
+    s.includes("trainer")
+  ) return "footwear";
+
+  // bags
+  if (
+    s.includes("bag") ||
+    s.includes("backpack") ||
+    s.includes("rucksack") ||
+    s.includes("tote") ||
+    s.includes("handbag") ||
+    s.includes("purse")
+  ) return "bags";
+
+  // clothing
+  if (
+    s.includes("shirt") ||
+    s.includes("hoodie") ||
+    s.includes("jacket") ||
+    s.includes("coat") ||
+    s.includes("pants") ||
+    s.includes("jeans") ||
+    s.includes("shorts") ||
+    s.includes("sweater")
+  ) return "apparel";
+
+  // electronics
+  if (
+    s.includes("headphones") ||
+    s.includes("earbuds") ||
+    s.includes("speaker") ||
+    s.includes("monitor") ||
+    s.includes("keyboard") ||
+    s.includes("mouse")
+  ) return "electronics";
+
+  // watches
+  if (
+    s.includes("watch") ||
+    s.includes("wristwatch")
+  ) return "watch";
+
+  return null;
+}
+
+function categoryFallback(category) {
+  if (category === "eyewear") return "glasses";
+  if (category === "headwear") return "hat";
+  if (category === "footwear") return "shoes";
+  if (category === "electronics") return "electronics";
+  if (category === "apparel") return "clothing";
+  return null;
+}
+
+function isWeakGenericVisionQuery(q, mode = "item") {
+  if (mode !== "item") return false;
+
+  const s = normalizeQuery(q || "");
+  if (!s) return true;
+
+  return new Set([
+    "item",
+    "object",
+    "product",
+    "thing",
+    "consumer product",
+    "glasses",
+    "eyewear",
+    "frames",
+    "sunglasses",
+    "hat",
+    "shoes",
+    "clothing",
+    "electronics",
+  ]).has(s);
+}
+
+function stabilizeVisionQuery(rawQuery, normalizedQuery, mode = "item") {
+  if (mode !== "item") return normalizedQuery || rawQuery || null;
+
+  const raw = normalizeQuery(rawQuery || "");
+  const norm = normalizeQuery(normalizedQuery || "");
+
+  if (raw && !isWeakGenericVisionQuery(raw, mode)) {
+    if (!norm || isWeakGenericVisionQuery(norm, mode)) {
+      return rawQuery;
+    }
+  }
+
+  return normalizedQuery || rawQuery || null;
+}
+
+function normalizeVisionQuery(query, mode = "item") {
+  if (mode !== "item") return query;
+
+  const q = String(query || "").toLowerCase().trim();
+  if (!q) return null;
+
+  const hasBlue =
+    q.includes("blue light") ||
+    q.includes("blue-light") ||
+    q.includes("computer glasses") ||
+    q.includes("computer") ||
+    q.includes("screen") ||
+    q.includes("anti blue") ||
+    q.includes("blue blocker") ||
+    q.includes("block blue") ||
+    q.includes("gaming glasses");
+
+  const hasOrange =
+    q.includes("orange") ||
+    q.includes("amber") ||
+    q.includes("yellow tint") ||
+    q.includes("yellow lens") ||
+    q.includes("amber lens") ||
+    q.includes("orange lens");
+
+  const hasClear =
+    q.includes("clear") ||
+    q.includes("clear lens");
+
+  const hasSun =
+    q.includes("sunglass") ||
+    q.includes("shade") ||
+    q.includes("shades") ||
+    q.includes("uv") ||
+    q.includes("uv400") ||
+    q.includes("polarized") ||
+    q.includes("sun ");
+
+  const hasGlasses =
+    q.includes("glasses") ||
+    q.includes("eyewear") ||
+    q.includes("frames") ||
+    q.includes("spectacles") ||
+    q.includes("eyeglass");
+
+  const hasLensWord =
+    q.includes("lens") ||
+    q.includes("lenses") ||
+    q.includes("tinted") ||
+    q.includes("tint");
+
+  const frameColor =
+    q.includes("black") ? "black" :
+    q.includes("brown") ? "brown" :
+    q.includes("white") ? "white" :
+    q.includes("clear frame") || q.includes("transparent frame") ? "clear frame" :
+    q.includes("tortoise") || q.includes("tortoiseshell") ? "tortoise" :
+    null;
+
+  const descriptors = [];
+
+  if (
+    q.includes("oversized") ||
+    q.includes("large frame") ||
+    q.includes("big frame")
+  ) {
+    descriptors.push("oversized");
+  }
+
+  if (q.includes("oval")) descriptors.push("oval");
+  if (q.includes("wrap")) descriptors.push("wraparound");
+  if (q.includes("shield")) descriptors.push("shield");
+  if (q.includes("aviator")) descriptors.push("aviator");
+  if (q.includes("rectangle")) descriptors.push("rectangle");
+  if (q.includes("round")) descriptors.push("round");
+  if (q.includes("square")) descriptors.push("square");
+  if (q.includes("wire")) descriptors.push("wire frame");
+  if (q.includes("rimless")) descriptors.push("rimless");
+
+  const stylePrefix = [frameColor, ...descriptors]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (hasOrange && hasBlue) {
+    const base = hasLensWord
+      ? "orange lens blue light glasses"
+      : "orange blue light glasses";
+    return [stylePrefix, base].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  if (hasBlue) {
+    return [stylePrefix, "blue light glasses"]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  if (hasSun) {
+    if (hasOrange) {
+      const base = hasLensWord ? "orange lens sunglasses" : "orange sunglasses";
+      return [stylePrefix, base].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    }
+
+    return [stylePrefix, "sunglasses"]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  if (hasClear) {
+    return [stylePrefix, "clear lens glasses"]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  if (hasOrange) {
+    const base = hasLensWord ? "orange lens glasses" : "orange glasses";
+    return [stylePrefix, base].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  if (hasGlasses) {
+    return [stylePrefix, "glasses"]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  return query;
+}
+
+function sha256(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function resaleScore(items) {
+  if (!items.length) return 0;
+  const prices = items.map(i => i.price).filter((n) => typeof n === "number" && Number.isFinite(n));
+  if (!prices.length) return 0;
+
+  const spread = Math.max(...prices) - Math.min(...prices);
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  return spread / Math.max(avg, 1);
+}
+
+// -------------------- HUMAN INTUITION PRICING --------------------
+function median(sorted) {
+  const n = sorted.length;
+  if (!n) return null;
+  const mid = Math.floor(n / 2);
+  return n % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function quantile(sorted, q) {
+  const n = sorted.length;
+  if (!n) return null;
+  const pos = (n - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const a = sorted[base];
+  const b = sorted[Math.min(base + 1, n - 1)];
+  return a + (b - a) * rest;
+}
+
+// Returns: typicalLow/High (human range), dealScore (0-1), weirdness flag
+function computeMarketIntuition(items, payingPrice = null) {
+  const prices = (items || [])
+    .map((i) => i?.totalPrice ?? i?.price)
+    .filter((n) => typeof n === "number" && Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+
+  if (prices.length < 4) {
+    return {
+      median: prices.length ? prices[Math.floor(prices.length / 2)] : null,
+      typicalLow: prices[0] ?? null,
+      typicalHigh: prices[prices.length - 1] ?? null,
+      dealScore: null,
+      isWeirdPrice: false,
+      reason: "not_enough_data",
+    };
+  }
+
+  const q1 = quantile(prices, 0.25);
+  const q3 = quantile(prices, 0.75);
+  const med = median(prices);
+
+  const iqr = Math.max((q3 ?? 0) - (q1 ?? 0), 0.01);
+  const lowFence = (q1 ?? 0) - 1.5 * iqr;
+  const highFence = (q3 ?? 0) + 1.5 * iqr;
+
+  // Human “typical range” = clamp within fences
+  const typical = prices.filter((p) => p >= lowFence && p <= highFence);
+  const typicalLow = typical[0] ?? prices[0];
+  const typicalHigh = typical[typical.length - 1] ?? prices[prices.length - 1];
+
+  let dealScore = null;
+  let isWeirdPrice = false;
+
+  if (
+    typeof payingPrice === "number" &&
+    Number.isFinite(payingPrice) &&
+    payingPrice > 0
+  ) {
+    // 1.0 = insanely good (bottom of typical), 0.0 = bad (above typicalHigh)
+    const denom = Math.max(typicalHigh - typicalLow, 0.01);
+    dealScore = 1 - (payingPrice - typicalLow) / denom;
+    dealScore = clamp01(dealScore);
+
+    isWeirdPrice =
+      payingPrice < typicalLow * 0.55 ||
+      payingPrice > typicalHigh * 1.8;
+  }
+
+  return {
+    median: med,
+    typicalLow,
+    typicalHigh,
+    dealScore,
+    isWeirdPrice,
+    reason: "ok",
+  };
+}
+
+// -------------------- HUMAN DEAL VERDICT ENGINE --------------------
+function buildDealVerdict(intuition, visionConfidence = 0.5) {
+  if (!intuition || intuition.reason !== "ok") {
+    return {
+      label: "UNKNOWN",
+      emoji: "🤔",
+      confidence: 0.35,
+      reason: "Not enough market data yet",
+    };
+  }
+
+  const score = intuition.dealScore;
+  const weird = intuition.isWeirdPrice;
+
+  const confidence = clamp01(
+    (typeof score === "number" ? score : 0.5) * 0.65 +
+      visionConfidence * 0.35
+  );
+
+  if (weird) {
+    return {
+      label: "RISKY",
+      emoji: "⚠️",
+      confidence,
+      reason: "Price sits outside normal market range",
+    };
+  }
+
+  if (score >= 0.82) {
+    return {
+      label: "STEAL",
+      emoji: "🔥",
+      confidence,
+      reason: "Far below typical market pricing",
+    };
+  }
+
+  if (score >= 0.62) {
+    return {
+      label: "GOOD DEAL",
+      emoji: "🟢",
+      confidence,
+      reason: "Below average market value",
+    };
+  }
+
+  if (score >= 0.40) {
+    return {
+      label: "FAIR",
+      emoji: "👌",
+      confidence,
+      reason: "Within normal market range",
+    };
+  }
+
+  return {
+    label: "OVERPRICED",
+    emoji: "💸",
+    confidence,
+    reason: "Above typical market pricing",
+  };
+}
+
+global.metrics = {
+  visionCalls: 0,
+};
+
+// --------------------------------------------------
+// VISION RATE LIMIT COOLDOWN
+// prevents infinite retry loops when OpenAI returns 429
+// --------------------------------------------------
+let VISION_COOLDOWN_UNTIL = 0;
+
+function visionCoolingDown() {
+  return Date.now() < VISION_COOLDOWN_UNTIL;
+}
+
+function triggerVisionCooldown(seconds = 60) {
+  VISION_COOLDOWN_UNTIL = Date.now() + seconds * 1000;
+  console.warn(`⚠️ Vision rate limited. Cooling down for ${seconds}s`);
+}
+
+// -------------------- Redis (production cache) --------------------
+import Redis from "ioredis";
+
+const redis =
+  process.env.REDIS_URL
+    ? new Redis(process.env.REDIS_URL)
+    : null;
+
+async function cacheGet(key) {
+  if (!redis) return null;
+  try {
+    const v = await redis.get(key);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheSet(key, value, ttlSec = 3600) {
+  if (!redis) return;
+  try {
+    await redis.setex(key, ttlSec, JSON.stringify(value));
+  } catch {}
+}
+
+// -------------------- REFERRAL ENGINE --------------------
+
+const REFERRAL_BONUS_REWARD = 3;
+
+function generateReferralCode() {
+  return crypto.randomBytes(4).toString("hex").toUpperCase();
+}
+
+function referralCodeKey(code) {
+  return `referral:${safeStr(code, 32).toUpperCase()}`;
+}
+
+function referralOwnerKey(ownerId) {
+  return `referral_owner:${safeStr(ownerId, 64)}`;
+}
+
+function referralUserKey(userId) {
+  return `referral_user:${safeStr(userId, 64)}`;
+}
+
+async function createReferral(ownerId) {
+  if (!redis) return null;
+
+  const cleanOwnerId = safeStr(ownerId, 64);
+  if (!cleanOwnerId) return null;
+
+  const existingCode = await redis.get(referralOwnerKey(cleanOwnerId));
+  if (existingCode) {
+    const existingRecord = await redis.get(referralCodeKey(existingCode));
+    if (existingRecord) return existingCode;
+  }
+
+  for (let i = 0; i < 8; i++) {
+    const code = generateReferralCode();
+    const codeKey = referralCodeKey(code);
+    const exists = await redis.get(codeKey);
+    if (exists) continue;
+
+    const payload = {
+      ownerId: cleanOwnerId,
+      code,
+      uses: 0,
+      createdAt: Date.now(),
+    };
+
+    await redis
+      .multi()
+      .set(codeKey, JSON.stringify(payload))
+      .set(referralOwnerKey(cleanOwnerId), code)
+      .exec();
+
+    return code;
+  }
+
+  return null;
+}
+
+async function getReferralByOwner(ownerId) {
+  if (!redis) return null;
+
+  const cleanOwnerId = safeStr(ownerId, 64);
+  if (!cleanOwnerId) return null;
+
+  const code = await redis.get(referralOwnerKey(cleanOwnerId));
+  if (!code) return null;
+
+  const raw = await redis.get(referralCodeKey(code));
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function redeemReferral({ code, userId, source = "manual" }) {
+  if (!redis) return { ok: false, reason: "redis_unavailable" };
+
+  const cleanCode = safeStr(code, 32).toUpperCase();
+  const cleanUserId = safeStr(userId || "", 64);
+  const cleanSource = safeStr(source || "manual", 24) || "manual";
+
+  if (!cleanCode || !cleanUserId) {
+    return { ok: false, reason: "sign_in_required" };
+  }
+
+  const raw = await redis.get(referralCodeKey(cleanCode));
+  if (!raw) return { ok: false, reason: "invalid_code" };
+
+  let referral = null;
+  try {
+    referral = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: "invalid_code" };
+  }
+
+  if (!referral?.ownerId) {
+    return { ok: false, reason: "invalid_code" };
+  }
+
+  if (String(referral.ownerId) === String(cleanUserId)) {
+    return { ok: false, reason: "self_referral_not_allowed" };
+  }
+
+  const existingUserRedeem = await redis.get(referralUserKey(cleanUserId));
+  if (existingUserRedeem) {
+    return { ok: false, reason: "already_redeemed" };
+  }
+
+  referral.uses = Number(referral.uses || 0) + 1;
+
+  const redeemPayload = {
+    code: cleanCode,
+    ownerId: referral.ownerId,
+    redeemedAt: Date.now(),
+    source: cleanSource,
+  };
+
+  await redis
+    .multi()
+    .set(referralCodeKey(cleanCode), JSON.stringify(referral))
+    .set(referralUserKey(cleanUserId), JSON.stringify(redeemPayload))
+    .exec();
+
+  return {
+    ok: true,
+    ownerId: referral.ownerId,
+    code: cleanCode,
+    uses: referral.uses,
+    source: cleanSource,
+  };
+}
+
+// -------------------- TTL cache (prevents memory leak) --------------------
+class TTLCache {
+  constructor({ ttlMs, maxSize }) {
+    this.ttlMs = ttlMs;
+    this.maxSize = maxSize;
+    this.map = new Map(); // key -> { v, exp }
+  }
+  get(key) {
+    const hit = this.map.get(key);
+    if (!hit) return null;
+    if (hit.exp < Date.now()) {
+      this.map.delete(key);
+      return null;
+    }
+    return hit.v;
+  }
+  set(key, value) {
+    // basic prune if oversized
+    if (this.map.size >= this.maxSize) this.prune(0.15);
+    this.map.set(key, { v: value, exp: Date.now() + this.ttlMs });
+    return value;
+  }
+  prune(fraction = 0.2) {
+    const target = Math.floor(this.maxSize * (1 - fraction));
+    if (this.map.size <= target) return;
+
+    // remove expired first
+    const now = Date.now();
+    for (const [k, entry] of this.map) {
+      if (entry.exp < now) this.map.delete(k);
+    }
+    if (this.map.size <= target) return;
+
+    // then remove oldest insertion order
+    while (this.map.size > target) {
+      const firstKey = this.map.keys().next().value;
+      this.map.delete(firstKey);
+    }
+  }
+  size() {
+    return this.map.size;
+  }
+}
+
+// -------------------- In-flight dedupe (prevents stampede) --------------------
+const inflight = new Map();
+async function withInflight(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    try {
+      return await fn();
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+  inflight.set(key, p);
+  return p;
+}
+
+// -------------------- Caches --------------------
+// Vision results: long-ish TTL; limited size
+const visionCache = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 1200 });
+// SERP caches: short TTL
+const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
+const RESEARCH_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1000 });
+const LOCAL_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 600 });
+
+const QUERY_LEARNING = new Map();
+const INSTANT_SCAN_CACHE = new TTLCache({
+  ttlMs: 2 * 60 * 60 * 1000,
+  maxSize: 2500,
+});
+const QUERY_PULSE = new Map();
+
+function rememberBetterQuery(original, improved) {
+  const o = normalizeQuery(original);
+  const i = normalizeQuery(improved);
+
+  if (!o || !i || o === i) return;
+  QUERY_LEARNING.set(o, i);
+}
+
+function scanFingerprint(query = "", variants = []) {
+  const payload = {
+    query: canonicalMarketQuery(query),
+    variants: uniqueQueries(variants)
+      .map((x) => canonicalMarketQuery(x))
+      .filter(Boolean)
+      .sort(),
+  };
+
+  return sha256(Buffer.from(JSON.stringify(payload))).slice(0, 24);
+}
+
+setInterval(() => {
+  visionCache.prune();
+  SERP_CACHE.prune();
+  RESEARCH_CACHE.prune();
+  LOCAL_CACHE.prune();
+}, 60 * 1000);
+
+// -------------------- OpenAI client --------------------
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+// -------------------- Health --------------------
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
+app.get("/routes", (_req, res) => {
+  const routes = [];
+  const stack = app._router?.stack || [];
+  for (const layer of stack) {
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {}).map((m) =>
+        m.toUpperCase()
+      );
+      routes.push({ path: layer.route.path, methods });
+    }
+  }
+  res.status(200).json({ ok: true, routes });
+});
+
+app.get("/pulse/top", (_req, res) => {
+  try {
+    return res.status(200).json({
+      ok: true,
+      items: getTopPulse(10),
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      items: [],
+    });
+  }
+});
+
+app.get("/debug/metrics", (_req, res) => {
+  res.json(global.metrics);
+});
+
+app.get("/debug/cache", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    sizes: {
+      visionCache: visionCache.size(),
+      SERP_CACHE: SERP_CACHE.size(),
+      RESEARCH_CACHE: RESEARCH_CACHE.size(),
+      LOCAL_CACHE: LOCAL_CACHE.size(),
+      inflight: inflight.size,
+    },
+  });
+});
+
+app.get("/debug/source-health", (_req, res) => {
+  const sources = {};
+
+  for (const [key, value] of SOURCE_HEALTH.entries()) {
+    sources[key] = {
+      ...value,
+      coolingDown: (value.cooldownUntil || 0) > Date.now(),
+      cooldownMsLeft: Math.max(0, (value.cooldownUntil || 0) - Date.now()),
+    };
+  }
+
+  res.status(200).json({
+    ok: true,
+    sources,
+  });
+});
+
+function safeDecodeUrl(value) {
+  try {
+    return decodeURIComponent(String(value || "").trim());
+  } catch {
+    return String(value || "").trim();
+  }
+}
+
+function unwrapGoogleishUrl(value) {
+  const raw = safeDecodeUrl(value);
+  if (!raw || !/^https?:\/\//i.test(raw)) return "";
+
+  try {
+    const u = new URL(raw);
+    const host = String(u.hostname || "").toLowerCase();
+
+    if (host.includes("google.")) {
+      const redirected =
+        u.searchParams.get("url") ||
+        u.searchParams.get("q") ||
+        u.searchParams.get("adurl");
+
+      if (redirected && /^https?:\/\//i.test(redirected)) {
+        return safeDecodeUrl(redirected);
+      }
+    }
+
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
+function urlHost(value) {
+  try {
+    return String(new URL(String(value || "")).hostname || "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isGoogleSearchUrl(value) {
+  try {
+    const u = new URL(String(value || ""));
+    const host = String(u.hostname || "").toLowerCase();
+    const path = String(u.pathname || "").toLowerCase();
+
+    return host.includes("google.") && path === "/search";
+  } catch {
+    return false;
+  }
+}
+
+function isGoogleShoppingProductUrl(value) {
+  try {
+    const u = new URL(String(value || ""));
+    const host = String(u.hostname || "").toLowerCase();
+    const path = String(u.pathname || "").toLowerCase();
+
+    if (!host.includes("google.")) return false;
+
+    return (
+      path.includes("/shopping/product/") ||
+      path.startsWith("/shopping/product")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function chooseBestListingUrl(it = {}) {
+  const googleProductLink = unwrapGoogleishUrl(
+    it.product_link ||
+      it.product_page_url ||
+      it.google_product_link ||
+      it.google_shopping_product_link ||
+      it.shopping_result_link ||
+      null
+  );
+
+  const merchantLink = unwrapGoogleishUrl(
+    it.offer_page_url ||
+      it.offer_link ||
+      it.merchant_link ||
+      it.product_url ||
+      it.url ||
+      it.link ||
+      null
+  );
+
+  const candidates = [
+    googleProductLink,
+    merchantLink,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (candidate && isGoogleShoppingProductUrl(candidate)) {
+      return {
+        link: candidate,
+        googleProductLink: candidate,
+        merchantLink: merchantLink || null,
+        linkVerified: true,
+        linkKind: "google_product",
+        linkHost: urlHost(candidate),
+      };
+    }
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (isGoogleSearchUrl(candidate)) continue;
+
+    return {
+      link: candidate,
+      googleProductLink: googleProductLink || null,
+      merchantLink: merchantLink || null,
+      linkVerified: true,
+      linkKind: urlHost(candidate).includes("google.") ? "google_product" : "merchant",
+      linkHost: urlHost(candidate),
+    };
+  }
+
+  return {
+    link: null,
+    googleProductLink: googleProductLink || null,
+    merchantLink: merchantLink || null,
+    linkVerified: false,
+    linkKind: "none",
+    linkHost: null,
+  };
+}
+
+// -------------------- Helpers: market normalize --------------------
+function parsePriceNumber(price) {
+  if (!price) return null;
+  const n = Number(String(price).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeItem(it) {
+  const price =
+    it.extracted_price ??
+    parsePriceNumber(it.price) ??
+    parsePriceNumber(it.price_string) ??
+    parsePriceNumber(it.price_display);
+
+  const shipping =
+    it.extracted_shipping ??
+    parsePriceNumber(it.shipping) ??
+    parsePriceNumber(it.shipping_cost) ??
+    null;
+
+  const totalPrice =
+    typeof price === "number" && Number.isFinite(price)
+      ? price +
+        (typeof shipping === "number" && Number.isFinite(shipping) ? shipping : 0)
+      : null;
+
+  const source =
+    it.source ||
+    it.store_name ||
+    it.store ||
+    it.seller ||
+    it.merchant_name ||
+    it.merchant?.name ||
+    it.vendor ||
+    null;
+
+  const bestLink = chooseBestListingUrl({
+    product_link: it.product_link,
+    product_page_url: it.product_page_url,
+    google_product_link: it.google_product_link,
+    google_shopping_product_link: it.google_shopping_product_link,
+    shopping_result_link: it.shopping_result_link,
+    offer_page_url: it.offer_page_url,
+    offer_link: it.offer_link,
+    merchant_link: it.merchant_link,
+    product_url: it.product_url,
+    url: it.url,
+    link: it.link,
+  });
+
+  return {
+    title: it.title || null,
+    price,
+    shipping,
+    totalPrice,
+    price_display: it.price || it.price_string || null,
+    source,
+
+    link: bestLink.link || null,
+    url: bestLink.link || null,
+    buyLink: bestLink.link || null,
+    googleProductLink: bestLink.googleProductLink || null,
+    merchantLink: bestLink.merchantLink || null,
+    linkVerified: !!bestLink.linkVerified,
+    linkKind: bestLink.linkKind || "none",
+    linkHost: bestLink.linkHost || null,
+
+    image:
+      it.thumbnail ||
+      it.thumbnail_url ||
+      it.serpapi_thumbnail ||
+      it.image ||
+      null,
+
+    rating: typeof it.rating === "number" ? it.rating : null,
+    reviews:
+      typeof it.reviews === "number"
+        ? it.reviews
+        : typeof it.review_count === "number"
+        ? it.review_count
+        : null,
+  };
+}
+
+function sortCheapest(items) {
+  return [...items].sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+}
+
+function normalizeTitleKey(t = "") {
+  return String(t)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleTokens(s = "") {
+  const stop = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "new",
+    "used",
+    "vintage",
+    "retro",
+    "style",
+    "rare",
+    "sale",
+    "best",
+    "price",
+    "a",
+    "an",
+    "of",
+  ]);
+
+  return normalizeTitleKey(s)
+    .split(" ")
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 3 && !stop.has(x));
+}
+
+function titleSimilarityLoose(a = "", b = "") {
+  const A = titleTokens(a);
+  const B = titleTokens(b);
+
+  if (!A.length || !B.length) return 0;
+
+  const setB = new Set(B);
+  let hits = 0;
+
+  for (const token of A) {
+    if (setB.has(token)) hits++;
+  }
+
+  return hits / Math.max(A.length, B.length);
+}
+
+function marketRelevanceScore(item, query) {
+  const title = String(item?.title || "");
+  const q = String(query || "");
+
+  if (!title || !q) return 0;
+
+  const normTitle = normalizeTitleKey(title);
+  const normQuery = normalizeTitleKey(q);
+
+  const loose = titleSimilarityLoose(normTitle, normQuery);
+  const exactPhrase = normTitle.includes(normQuery) ? 1 : 0;
+
+  const qTokens = titleTokens(normQuery);
+  const tTokens = new Set(titleTokens(normTitle));
+  const coreHits = qTokens.filter((x) => tTokens.has(x)).length;
+  const coreRatio = qTokens.length ? coreHits / qTokens.length : 0;
+
+  const src = String(item?.source || "").toLowerCase();
+  const marketplaceBonus = isMarketplaceSource(src) ? 0.10 : 0;
+  const retailPenalty = isRetailSource(src) ? -0.12 : 0;
+
+  const usedBonus =
+    normTitle.includes("used") ||
+    normTitle.includes("pre owned") ||
+    normTitle.includes("pre-owned") ||
+    normTitle.includes("secondhand") ||
+    normTitle.includes("vintage") ||
+    normTitle.includes("retro") ||
+    normTitle.includes("y2k")
+      ? 0.06
+      : 0;
+
+  const eyewearMode =
+    normQuery.includes("glasses") ||
+    normQuery.includes("eyewear") ||
+    normQuery.includes("frames") ||
+    normQuery.includes("sunglasses") ||
+    normQuery.includes("lens");
+
+  const wantsOrange =
+    normQuery.includes("orange") ||
+    normQuery.includes("amber") ||
+    normQuery.includes("yellow");
+
+  const wantsBlue =
+    normQuery.includes("blue light") ||
+    normQuery.includes("blue-light") ||
+    normQuery.includes("computer") ||
+    normQuery.includes("gaming") ||
+    normQuery.includes("block blue") ||
+    normQuery.includes("blue blocker") ||
+    normQuery.includes("blue blocking") ||
+    normQuery.includes("screen");
+
+  const wantsWrap = normQuery.includes("wrap");
+
+  const wantsSun =
+    normQuery.includes("sunglass") ||
+    normQuery.includes("shade") ||
+    normQuery.includes("shades") ||
+    normQuery.includes("uv") ||
+    normQuery.includes("uv400") ||
+    normQuery.includes("polarized");
+
+  const wantsOversized =
+    normQuery.includes("oversized") ||
+    normQuery.includes("large frame") ||
+    normQuery.includes("big frame");
+
+  const fashionOrangeWrap = eyewearMode && wantsOrange && wantsWrap && !wantsBlue;
+
+  const allowBlueFallback =
+    fashionOrangeWrap &&
+    !normQuery.includes("sunglasses") &&
+    !normQuery.includes("polarized") &&
+    !normQuery.includes("uv400") &&
+    !normQuery.includes("uv ");
+
+  const hasOrange =
+    normTitle.includes("orange") ||
+    normTitle.includes("amber") ||
+    normTitle.includes("yellow");
+
+  const hasBlue =
+    normTitle.includes("blue light") ||
+    normTitle.includes("blue-light") ||
+    normTitle.includes("computer") ||
+    normTitle.includes("gaming") ||
+    normTitle.includes("block blue") ||
+    normTitle.includes("blue blocker") ||
+    normTitle.includes("blue blocking") ||
+    normTitle.includes("screen") ||
+    normTitle.includes("blokz");
+
+  const hasWrap = normTitle.includes("wrap");
+
+  const hasSun =
+    normTitle.includes("sunglass") ||
+    normTitle.includes("shade") ||
+    normTitle.includes("shades") ||
+    normTitle.includes("uv") ||
+    normTitle.includes("uv400") ||
+    normTitle.includes("polarized");
+
+  const hasBlack = normTitle.includes("black");
+
+  const hasOversized =
+    normTitle.includes("oversized") ||
+    normTitle.includes("large frame") ||
+    normTitle.includes("big frame");
+
+  const hasFashion =
+    normTitle.includes("fashion") ||
+    normTitle.includes("retro") ||
+    normTitle.includes("vintage") ||
+    normTitle.includes("y2k") ||
+    normTitle.includes("oval");
+
+  const hasSport =
+    normTitle.includes("cycling") ||
+    normTitle.includes("running") ||
+    normTitle.includes("baseball") ||
+    normTitle.includes("golf") ||
+    normTitle.includes("ski") ||
+    normTitle.includes("fishing") ||
+    normTitle.includes("driving") ||
+    normTitle.includes("motorcycle") ||
+    normTitle.includes("sport") ||
+    normTitle.includes("sports");
+
+  let styleBonus = 0;
+
+  if (eyewearMode) {
+    if (wantsOrange) styleBonus += hasOrange ? 0.16 : -0.10;
+    if (wantsWrap) styleBonus += hasWrap ? 0.12 : -0.08;
+    if (wantsSun) styleBonus += hasSun ? 0.20 : -0.18;
+    if (wantsOversized) styleBonus += hasOversized ? 0.10 : -0.04;
+
+    if (wantsBlue) {
+      styleBonus += hasBlue ? 0.18 : -0.08;
+    } else if (hasBlue) {
+      styleBonus += allowBlueFallback ? 0.06 : -0.22;
+    }
+
+    if (wantsSun && hasBlue) {
+      styleBonus -= 0.20;
+    }
+
+    if (fashionOrangeWrap) {
+      if (hasBlack) styleBonus += 0.10;
+      if (hasOversized) styleBonus += 0.08;
+      if (hasFashion) styleBonus += 0.08;
+      if (hasSport) styleBonus -= 0.26;
+    }
+  }
+
+  return clamp01(
+    loose * 0.44 +
+      coreRatio * 0.24 +
+      exactPhrase * 0.14 +
+      marketplaceBonus +
+      retailPenalty +
+      usedBonus +
+      styleBonus
+  );
+}
+
+function filterRelevantListings(query, items) {
+  if (!Array.isArray(items)) return [];
+
+  const q = normalizeTitleKey(query);
+
+  const eyewearMode =
+    q.includes("glasses") ||
+    q.includes("eyewear") ||
+    q.includes("frames") ||
+    q.includes("sunglasses") ||
+    q.includes("lens");
+
+  const wantsOrange =
+    q.includes("orange") ||
+    q.includes("amber") ||
+    q.includes("yellow");
+
+  const wantsBlue =
+    q.includes("blue light") ||
+    q.includes("blue-light") ||
+    q.includes("computer") ||
+    q.includes("gaming") ||
+    q.includes("block blue") ||
+    q.includes("screen") ||
+    q.includes("blue blocker") ||
+    q.includes("blue blocking");
+
+  const wantsWrap = q.includes("wrap");
+
+  const wantsSun =
+    q.includes("sunglass") ||
+    q.includes("shade") ||
+    q.includes("shades") ||
+    q.includes("uv") ||
+    q.includes("uv400") ||
+    q.includes("polarized");
+
+  const wantsOversized =
+    q.includes("oversized") ||
+    q.includes("large frame") ||
+    q.includes("big frame");
+
+  const fashionOrangeWrap = eyewearMode && wantsOrange && wantsWrap && !wantsBlue;
+
+  const allowBlueFallback =
+    fashionOrangeWrap &&
+    !q.includes("sunglasses") &&
+    !q.includes("polarized") &&
+    !q.includes("uv400") &&
+    !q.includes("uv ");
+
+  const scored = items
+    .filter((it) => it?.title)
+    .map((it) => ({
+      ...it,
+      __relevance: marketRelevanceScore(it, query),
+    }))
+    .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0));
+
+  const preserved = scored.filter((it) => Number(it.__relevance || 0) >= 0.18);
+
+  if (!eyewearMode) {
+    const strong = preserved.filter((it) => it.__relevance >= 0.56);
+    const medium = preserved.filter((it) => it.__relevance >= 0.40);
+
+    if (strong.length >= 6) return strong.slice(0, 60);
+    if (medium.length >= 6) return medium.slice(0, 60);
+    return preserved.slice(0, 60);
+  }
+
+  const strict = preserved.filter((it) => {
+    const title = normalizeTitleKey(it?.title || "");
+    const src = String(it?.source || "").toLowerCase();
+
+    const hasOrange =
+      title.includes("orange") ||
+      title.includes("amber") ||
+      title.includes("yellow");
+
+    const hasBlue =
+      title.includes("blue light") ||
+      title.includes("blue-light") ||
+      title.includes("computer") ||
+      title.includes("gaming") ||
+      title.includes("block blue") ||
+      title.includes("blue blocker") ||
+      title.includes("blue blocking") ||
+      title.includes("screen") ||
+      title.includes("blokz");
+
+    const hasWrap = title.includes("wrap");
+
+    const hasSun =
+      title.includes("sunglass") ||
+      title.includes("shade") ||
+      title.includes("shades") ||
+      title.includes("uv") ||
+      title.includes("uv400") ||
+      title.includes("polarized");
+
+    const hasOversized =
+      title.includes("oversized") ||
+      title.includes("large frame") ||
+      title.includes("big frame");
+
+    const hasSport =
+      title.includes("cycling") ||
+      title.includes("running") ||
+      title.includes("baseball") ||
+      title.includes("golf") ||
+      title.includes("ski") ||
+      title.includes("fishing") ||
+      title.includes("driving") ||
+      title.includes("motorcycle") ||
+      title.includes("sport") ||
+      title.includes("sports");
+
+    const opticalRetailSource =
+      src.includes("zenni") ||
+      src.includes("firmoo") ||
+      src.includes("eyebuydirect") ||
+      src.includes("glassesusa") ||
+      src.includes("optical") ||
+      src.includes("arrowhead");
+
+    if (wantsOrange && !hasOrange && it.__relevance < 0.70) return false;
+    if (wantsWrap && !hasWrap && it.__relevance < 0.64) return false;
+    if (wantsSun && !hasSun && it.__relevance < 0.74) return false;
+    if (wantsOversized && !hasOversized && it.__relevance < 0.64) return false;
+
+    if (!wantsBlue && hasBlue && !allowBlueFallback && it.__relevance < 0.82) {
+      return false;
+    }
+
+    if (wantsSun && hasBlue && it.__relevance < 0.84) {
+      return false;
+    }
+
+    if (fashionOrangeWrap && hasSport && it.__relevance < 0.88) {
+      return false;
+    }
+
+    if (wantsSun && opticalRetailSource && !hasSun && it.__relevance < 0.88) {
+      return false;
+    }
+
+    return true;
+  });
+
+  const strong = strict.filter((it) => it.__relevance >= 0.56);
+  const medium = strict.filter((it) => it.__relevance >= 0.40);
+
+  if (strong.length >= 6) return strong.slice(0, 60);
+  if (medium.length >= 6) return medium.slice(0, 60);
+  if (strict.length >= 3) return strict.slice(0, 60);
+
+  return preserved.slice(0, 60);
+}
+
+function promoteQueryFromMarket(query, items = []) {
+  const q = normalizeQuery(query);
+  if (!q) return q;
+
+  // IMPORTANT:
+  // Do NOT auto-promote orange eyewear into blue-light queries.
+  // That drift is exactly what caused Zenni / Blokz / optical pollution.
+  return q;
+}
+
+function buildEtsyVariants(query) {
+  const base = normalizeQuery(query);
+  if (!base) return [];
+
+  const isEyewear =
+    /\b(glasses|eyewear|sunglasses|frames|eyeglass|lens)\b/i.test(base);
+
+  const wantsOrange =
+    base.includes("orange") ||
+    base.includes("amber") ||
+    base.includes("yellow");
+
+  const wantsBlue =
+    base.includes("blue light") ||
+    base.includes("blue-light") ||
+    base.includes("computer") ||
+    base.includes("gaming") ||
+    base.includes("block blue") ||
+    base.includes("blue blocker") ||
+    base.includes("blue blocking") ||
+    base.includes("screen");
+
+  const wantsWrap = base.includes("wrap");
+
+  const out = new Set([base]);
+
+  // Etsy / vintage angle
+  out.add(`${base} vintage`);
+  out.add(`${base} retro`);
+
+  if (isEyewear) {
+    out.add(`${base} y2k`);
+
+    if (wantsOrange) {
+      out.add(base.replace(/\borange lens\b/g, "amber lens"));
+      out.add("orange lens glasses");
+      out.add("amber lens glasses");
+    }
+
+    if (wantsOrange && wantsWrap && !wantsBlue) {
+      out.add("orange wraparound sunglasses");
+      out.add("orange tinted wraparound sunglasses");
+      out.add("black wraparound orange lens sunglasses");
+      out.add("y2k orange lens wraparound sunglasses");
+    }
+
+    if (wantsOrange && !wantsBlue && !wantsWrap) {
+      out.add("orange lens sunglasses");
+      out.add("black orange lens sunglasses");
+    }
+
+    if (wantsBlue) {
+      out.add("orange blue light glasses");
+      out.add("amber blue light glasses");
+    }
+  }
+
+  return [...out]
+    .map((x) => normalizeQuery(x))
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function dedupeByLink(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const link = String(it?.link || "").trim();
+    if (!link) continue;
+    if (seen.has(link)) continue;
+    seen.add(link);
+    out.push(it);
+  }
+  return out;
+}
+
+function preferMarketplaceIfHealthy(items = [], query = "") {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (!list.length) return list;
+
+  const enriched = list.map((it) => ({
+    ...it,
+    __relevance:
+      Number(it?.__relevance) || marketRelevanceScore(it, query),
+  }));
+
+  const verified = enriched.filter((it) => it?.linkVerified !== false);
+
+  const marketplace = verified.filter(
+    (it) =>
+      isMarketplaceSource(it?.source) &&
+      Number(it.__relevance || 0) >= 0.26
+  );
+
+  if (marketplace.length >= 3) {
+    return marketplace.slice(0, 60);
+  }
+
+  const strong = verified.filter(
+    (it) => Number(it.__relevance || 0) >= 0.46
+  );
+
+  if (marketplace.length >= 1 && strong.length >= 4) {
+    return dedupeSmart([...marketplace, ...strong]).slice(0, 60);
+  }
+
+  return verified.length >= 4 ? verified.slice(0, 60) : enriched.slice(0, 60);
+}
+
+function listingPriorityBucket(item, query = "") {
+  const relevance = Number(
+    item?.__relevance ?? marketRelevanceScore(item, query) ?? 0
+  );
+
+  const src = String(item?.source || "").toLowerCase();
+  const title = normalizeTitleKey(item?.title || "");
+
+  const marketplace =
+    isMarketplaceSource(src) ||
+    title.includes("used") ||
+    title.includes("pre owned") ||
+    title.includes("pre-owned") ||
+    title.includes("secondhand") ||
+    title.includes("vintage") ||
+    title.includes("retro") ||
+    title.includes("y2k");
+
+  if (relevance >= 0.82) return marketplace ? 4 : 3;
+  if (relevance >= 0.68) return marketplace ? 3 : 2;
+  if (relevance >= 0.52) return marketplace ? 2 : 1;
+  return 0;
+}
+
+function keepBestPriorityTier(items, query = "") {
+  if (!Array.isArray(items) || !items.length) return [];
+
+  const scored = items.map((it) => ({
+    item: it,
+    bucket: listingPriorityBucket(it, query),
+  }));
+
+  const maxBucket = Math.max(...scored.map((x) => x.bucket));
+
+  const filtered =
+    maxBucket >= 4
+      ? scored.filter((x) => x.bucket >= 3).map((x) => x.item)
+      : maxBucket >= 3
+      ? scored.filter((x) => x.bucket >= 2).map((x) => x.item)
+      : maxBucket >= 2
+      ? scored.filter((x) => x.bucket >= 2).map((x) => x.item)
+      : items;
+
+  return filtered.length >= 4 ? filtered : items;
+}
+
+function sortByAbsoluteCheapest(items, query = "", identity = null) {
+  return [...items].sort((a, b) => {
+    const aBucket = listingPriorityBucket(a, query);
+    const bBucket = listingPriorityBucket(b, query);
+
+    const aIdentity = identity ? listingIdentityScore(a, identity) : 0;
+    const bIdentity = identity ? listingIdentityScore(b, identity) : 0;
+
+    const aIdentityBucket =
+      aIdentity >= 0.82 ? 3 :
+      aIdentity >= 0.58 ? 2 :
+      aIdentity >= 0.34 ? 1 : 0;
+
+    const bIdentityBucket =
+      bIdentity >= 0.82 ? 3 :
+      bIdentity >= 0.58 ? 2 :
+      bIdentity >= 0.34 ? 1 : 0;
+
+    if (aIdentityBucket !== bIdentityBucket) {
+      return bIdentityBucket - aIdentityBucket;
+    }
+
+    if (aBucket !== bBucket) return bBucket - aBucket;
+
+    const aVerified = a?.linkVerified !== false ? 1 : 0;
+    const bVerified = b?.linkVerified !== false ? 1 : 0;
+
+    if (aVerified !== bVerified) return bVerified - aVerified;
+
+    const ap =
+      Number.isFinite(a?.totalPrice) ? a.totalPrice :
+      Number.isFinite(a?.price) ? a.price :
+      Infinity;
+
+    const bp =
+      Number.isFinite(b?.totalPrice) ? b.totalPrice :
+      Number.isFinite(b?.price) ? b.price :
+      Infinity;
+
+    if (ap !== bp) return ap - bp;
+
+    const ar = Number(
+      a?.__relevance ?? marketRelevanceScore(a, query) ?? 0
+    );
+    const br = Number(
+      b?.__relevance ?? marketRelevanceScore(b, query) ?? 0
+    );
+
+    if (ar !== br) return br - ar;
+
+    return bIdentity - aIdentity;
+  });
+}
+
+function dedupeByLinkOrTitlePrice(items) {
+  const seen = new Set();
+  const out = [];
+
+  for (const it of items) {
+    const key =
+      String(it?.link || "").trim() ||
+      `${String(it?.title || "").toLowerCase().trim()}|${Number(it?.price || 0)}`;
+
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+
+  return out;
+}
+
+// 🧠 SMART SELF-HEAL QUERY
+function selfHealQuery(q) {
+  const s = normalizeQuery(q);
+
+  if (!s) return q;
+
+  // remove overly specific noise
+  return s
+    .replace(/\b(vintage|rare|authentic|limited|collector)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalMarketQuery(q = "") {
+  let s = selfHealQuery(normalizeQuery(q));
+
+  if (!s) return "";
+
+  s = s.replace(/\bamber\b/g, "orange");
+  s = s.replace(/\byellow\b/g, "orange");
+  s = s.replace(/\bcomputer glasses\b/g, "blue light glasses");
+  s = s.replace(/\bgaming glasses\b/g, "blue light glasses");
+  s = s.replace(/\beyewear\b/g, "glasses");
+  s = s.replace(/\bframes\b/g, "glasses");
+  s = s.replace(/\s+/g, " ").trim();
+
+  return s;
+}
+
+function isMarketplaceSource(src = "") {
+  const s = String(src || "").toLowerCase();
+
+  return (
+    s.includes("ebay") ||
+    s.includes("etsy") ||
+    s.includes("mercari") ||
+    s.includes("poshmark") ||
+    s.includes("depop") ||
+    s.includes("grailed") ||
+    s.includes("offerup") ||
+    s.includes("facebook") ||
+    s.includes("marketplace") ||
+    s.includes("vinted") ||
+    s.includes("whatnot")
+  );
+}
+
+function isRetailSource(src = "") {
+  const s = String(src || "").toLowerCase();
+
+  return (
+    s.includes("zenni") ||
+    s.includes("firmoo") ||
+    s.includes("eyebuydirect") ||
+    s.includes("glassesusa") ||
+    s.includes("optical") ||
+    s.includes("arrowhead") ||
+    s.includes("forensics") ||
+    s.includes("walmart") ||
+    s.includes("target") ||
+    s.includes("best buy") ||
+    s.includes("amazon")
+  );
+}
+
+function marketplaceSourceScore(src = "") {
+  const s = String(src || "").toLowerCase();
+
+  if (!s) return 1.0;
+  if (isMarketplaceSource(s)) return 1.22;
+  if (isRetailSource(s)) return 0.64;
+  return 1.0;
+}
+
+function extractEyewearVisualTraits(q = "") {
+  const s = normalizeQuery(q);
+
+  const family =
+    s.includes("sunglasses")
+      ? "sunglasses"
+      : s.includes("glasses") || s.includes("eyewear") || s.includes("frames")
+      ? "glasses"
+      : "glasses";
+
+  const frameColor =
+    s.includes("black")
+      ? "black"
+      : s.includes("brown")
+      ? "brown"
+      : s.includes("white")
+      ? "white"
+      : s.includes("clear frame") || s.includes("transparent frame")
+      ? "clear frame"
+      : s.includes("tortoise") || s.includes("tortoiseshell")
+      ? "tortoise"
+      : "";
+
+  const lensColor =
+    s.includes("orange")
+      ? "orange"
+      : s.includes("amber")
+      ? "amber"
+      : s.includes("yellow")
+      ? "yellow"
+      : s.includes("clear lens") || s.includes("clear")
+      ? "clear"
+      : "";
+
+  const lensType =
+    s.includes("blue light")
+      ? "blue light"
+      : s.includes("computer")
+      ? "computer"
+      : s.includes("gaming")
+      ? "gaming"
+      : s.includes("polarized")
+      ? "polarized"
+      : s.includes("uv400")
+      ? "uv400"
+      : s.includes("tinted")
+      ? "tinted"
+      : lensColor
+      ? "lens"
+      : "";
+
+  const shape =
+    s.includes("wraparound")
+      ? "wraparound"
+      : s.includes("wrap")
+      ? "wraparound"
+      : s.includes("shield")
+      ? "shield"
+      : s.includes("aviator")
+      ? "aviator"
+      : s.includes("oval")
+      ? "oval"
+      : s.includes("round")
+      ? "round"
+      : s.includes("square")
+      ? "square"
+      : s.includes("rectangle")
+      ? "rectangle"
+      : "";
+
+  const wantsSun =
+    s.includes("sunglass") ||
+    s.includes("shade") ||
+    s.includes("shades") ||
+    s.includes("uv") ||
+    s.includes("uv400") ||
+    s.includes("polarized");
+
+  const wantsBlue =
+    s.includes("blue light") ||
+    s.includes("blue-light") ||
+    s.includes("computer") ||
+    s.includes("gaming") ||
+    s.includes("block blue") ||
+    s.includes("screen");
+
+  return {
+    s,
+    family,
+    frameColor,
+    lensColor,
+    lensType,
+    shape,
+    wantsSun,
+    wantsBlue,
+  };
+}
+
+function buildExactVisualSearchLadder(primaryQuery = "", extraVariants = []) {
+  const primary = normalizeQuery(primaryQuery);
+  if (!primary) return [];
+
+  const out = [];
+  const push = (...parts) => {
+    const value = parts
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (value) out.push(value);
+  };
+
+  const t = extractEyewearVisualTraits(primary);
+  push(primary);
+
+  for (const v of normalizeVariantList(extraVariants, primary, "item")) {
+    push(v);
+  }
+
+  const isEyewear =
+    t.s.includes("glasses") ||
+    t.s.includes("eyewear") ||
+    t.s.includes("frames") ||
+    t.s.includes("sunglasses") ||
+    t.s.includes("lens");
+
+  if (isEyewear) {
+    push(t.frameColor, t.shape, t.lensColor, t.lensType, t.family);
+    push(t.frameColor, t.shape, t.lensColor, t.family);
+    push(t.frameColor, t.lensColor, t.lensType, t.family);
+    push(t.shape, t.lensColor, t.lensType, t.family);
+    push(t.frameColor, t.lensColor, t.family);
+    push(t.shape, t.lensColor, t.family);
+    push(t.lensColor, t.lensType, t.family);
+
+    if (t.lensColor === "orange" || t.lensColor === "amber" || t.lensColor === "yellow") {
+      push(t.frameColor, t.shape, "orange lens", t.family);
+      push(t.shape, "orange lens", t.family);
+      push("orange lens", t.family);
+      push("amber lens", t.family);
+    }
+
+    if (t.wantsBlue) {
+      push(t.frameColor, t.shape, "blue light", "glasses");
+      push(t.shape, "blue light", "glasses");
+      push(t.frameColor, "blue light", "glasses");
+      push("computer", "glasses");
+      push("gaming", "glasses");
+    }
+
+    if (t.wantsSun) {
+      push(t.frameColor, t.shape, t.lensColor, "sunglasses");
+      push(t.shape, t.lensColor, "sunglasses");
+    }
+  }
+
+  return uniqueQueries(out).slice(0, 12);
+}
+
+
+
+function buildGoogleShoppingVariants(primaryQuery, extraVariants = []) {
+  const base = normalizeQuery(primaryQuery);
+  if (!base) return [];
+
+  const ordered = [];
+  const push = (q) => {
+    const n = normalizeQuery(q);
+    if (n) ordered.push(n);
+  };
+
+  const exactSeeds = buildExactVisualSearchLadder(base, extraVariants);
+  for (const seed of exactSeeds) {
+    push(seed);
+  }
+
+  const traits = extractEyewearVisualTraits(base);
+
+  const isEyewear =
+    traits.s.includes("glasses") ||
+    traits.s.includes("eyewear") ||
+    traits.s.includes("frames") ||
+    traits.s.includes("lens") ||
+    traits.s.includes("sunglasses");
+
+  const fashionOrangeWrap =
+    isEyewear &&
+    (traits.lensColor === "orange" || traits.lensColor === "amber" || traits.lensColor === "yellow") &&
+    traits.shape === "wraparound" &&
+    !traits.wantsBlue;
+
+  if (fashionOrangeWrap) {
+    push("black wraparound orange lens sunglasses");
+    push("orange wraparound sunglasses");
+    push("orange lens wraparound sunglasses");
+    push("y2k orange lens wraparound sunglasses");
+  }
+
+  if (traits.wantsBlue) {
+    push("blue light glasses");
+    push("computer glasses");
+    push("gaming glasses");
+  }
+
+  for (const seed of exactSeeds.slice(0, 6)) {
+    push(`${seed} used`);
+    push(`${seed} marketplace`);
+    push(`${seed} pre owned`);
+  }
+
+  return uniqueQueries(ordered).slice(0, 12);
+}
+
+function buildEmergencyShoppingFallbacks(primaryQuery = "", extraVariants = []) {
+  const base = normalizeQuery(primaryQuery);
+  if (!base) return [];
+
+  const out = new Set([
+    base,
+    ...normalizeVariantList(extraVariants, base, "item"),
+  ]);
+
+  const category = inferVisionCategory(base);
+
+  if (category === "eyewear") {
+    const t = extractEyewearVisualTraits(base);
+
+    if (t.frameColor && t.shape && t.family) {
+      out.add(`${t.frameColor} ${t.shape} ${t.family}`);
+    }
+
+    if (t.shape && t.family) {
+      out.add(`${t.shape} ${t.family}`);
+    }
+
+    if (t.frameColor && t.family) {
+      out.add(`${t.frameColor} ${t.family}`);
+    }
+
+    if (t.lensColor && t.family) {
+      out.add(`${t.lensColor} lens ${t.family}`);
+    }
+
+    if (t.lensColor === "orange" || t.lensColor === "amber" || t.lensColor === "yellow") {
+      out.add("orange lens sunglasses");
+      out.add("orange sunglasses");
+    }
+
+    if (t.shape === "oval") {
+      out.add("oval sunglasses");
+      out.add("retro oval sunglasses");
+    }
+
+    out.add("black oval sunglasses");
+  }
+
+  return uniqueQueries([...out]).slice(0, 10);
+}
+
+async function mergeCheapestSources(query, extraVariants = [], identity = null) {
+  let normalizedQuery = selfHealQuery(normalizeQuery(query));
+  if (!normalizedQuery) return [];
+
+  const learnedQuery = QUERY_LEARNING.get(normalizedQuery);
+  if (learnedQuery) {
+    normalizedQuery = learnedQuery;
+  }
+
+  const incomingVariants = normalizeVariantList(
+    extraVariants,
+    normalizedQuery,
+    "item"
+  );
+
+  const instantKey = scanFingerprint(normalizedQuery, incomingVariants);
+  const instantHit = INSTANT_SCAN_CACHE.get(instantKey);
+
+  if (instantHit && Array.isArray(instantHit) && instantHit.length) {
+    console.log("⚡ INSTANT SCAN CACHE HIT", {
+      query: normalizedQuery,
+      instantKey,
+      count: instantHit.length,
+    });
+    return instantHit;
+  }
+
+  const canUseEtsy =
+    !!ETSY_API_KEY &&
+    Date.now() >= ETSY_COOLDOWN_UNTIL &&
+    !isSourceCoolingDown("etsy");
+
+  const canUseSerpForce = !!SERPAPI_KEY;
+
+  if (!canUseEtsy && !canUseSerpForce) {
+    return [];
+  }
+
+const googleQueries = canUseSerpForce
+  ? buildServerQueryVariants(normalizedQuery, incomingVariants, "item", identity).slice(0, 10)
+  : [];
+
+const googleResults = await Promise.all(
+  googleQueries.map((q, idx) =>
+    marketSearchConcurrency(async () => ({
+      query: q,
+      items: await serpShopping(q, { softFail: idx > 0 }),
+    }))
+  )
+);
+
+  const googleAll = googleResults.flatMap((x) => x.items || []);
+
+  let ebayAll = [];
+  let etsyAll = [];
+  let etsyVariants = [];
+
+  const resaleLaneQueries = uniqueQueries([
+    `${normalizedQuery} used`,
+    `${normalizedQuery} pre owned`,
+    `${normalizedQuery} marketplace`,
+    `${normalizedQuery} ebay`,
+    ...googleQueries.filter(
+      (q) =>
+        q.includes("used") ||
+        q.includes("pre owned") ||
+        q.includes("marketplace") ||
+        q.includes("ebay")
+    ),
+  ]).slice(0, 3);
+
+  if (canUseSerpForce && resaleLaneQueries.length) {
+    const ebayResults = await Promise.all(
+      resaleLaneQueries.map((q) =>
+        marketSearchConcurrency(async () => ({
+          query: q,
+          items: await serpEbaySearch(q),
+        }))
+      )
+    );
+
+    ebayAll = ebayResults.flatMap((x) => x.items || []);
+  }
+
+  const shouldRunEtsyLane =
+    canUseEtsy &&
+    /glasses|eyewear|frames|sunglasses|bag|backpack|hat|cap|jacket|hoodie|shirt|shoe|sneaker/i.test(
+      normalizedQuery
+    );
+
+  if (shouldRunEtsyLane) {
+    etsyVariants = uniqueQueries(buildEtsyVariants(normalizedQuery)).slice(0, 2);
+
+    const etsyResults = await Promise.all(
+      etsyVariants.map((q) =>
+        marketSearchConcurrency(async () => ({
+          query: q,
+          items: await etsySearch(q),
+        }))
+      )
+    );
+
+    etsyAll = etsyResults.flatMap((x) => x.items || []);
+  }
+
+const rawMerged = [...googleAll, ...ebayAll, ...etsyAll];
+
+  const stageWithTitle = rawMerged.filter((it) => it?.title);
+  const stageWithPrice = stageWithTitle.filter(
+    (it) => Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)
+  );
+  const stageNotBad = stageWithPrice.filter(
+    (it) => !isBadListing(it.title, normalizedQuery)
+  );
+  const stageDeduped = dedupeSmart(stageNotBad);
+
+  const preservedPool = stageDeduped
+    .map((it) => ({
+      ...it,
+      __relevance:
+        Number(it?.__relevance) || marketRelevanceScore(it, normalizedQuery),
+    }))
+    .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0));
+
+  const stageRelevant = filterRelevantListings(normalizedQuery, stageDeduped);
+  const stageMarketplacePreferred = preferMarketplaceIfHealthy(
+    stageRelevant,
+    normalizedQuery
+  );
+  const stageTiered = keepBestPriorityTier(
+    stageMarketplacePreferred,
+    normalizedQuery
+  );
+  const stageTrimmed = trimPriceOutliers(stageTiered);
+  const stageIntuition = intuitionFilter(stageTrimmed);
+
+  let ranked = stageIntuition;
+
+  if (ranked.length < 6 && preservedPool.length) {
+    const rescue = preservedPool
+      .filter((it) => Number(it.__relevance || 0) >= 0.24)
+      .slice(0, 18);
+
+    ranked = dedupeSmart([...ranked, ...rescue]);
+  }
+
+  ranked = sortByAbsoluteCheapest(ranked, normalizedQuery).slice(0, 60);
+
+  if (ranked.length < 3 && stageTiered.length) {
+    ranked = sortByAbsoluteCheapest(stageTiered, normalizedQuery).slice(0, 60);
+  }
+
+  if (ranked.length < 3 && stageRelevant.length) {
+    ranked = sortByAbsoluteCheapest(stageRelevant, normalizedQuery).slice(0, 60);
+  }
+
+  if (ranked.length < 3 && preservedPool.length) {
+    ranked = sortByAbsoluteCheapest(
+      preservedPool.slice(0, 24),
+      normalizedQuery
+    ).slice(0, 60);
+  }
+
+  if (ranked.length < 3 && stageDeduped.length) {
+    ranked = sortByAbsoluteCheapest(stageDeduped, normalizedQuery).slice(0, 60);
+  }
+
+  let merged = ranked;
+
+  if (!merged.length && canUseSerpForce) {
+    const backupQueries = uniqueQueries([
+      ...buildGoogleShoppingVariants(normalizedQuery, incomingVariants),
+      ...buildEmergencyShoppingFallbacks(normalizedQuery, incomingVariants),
+    ]).slice(0, 10);
+
+const backupResults = await Promise.all(
+  backupQueries.map((q) =>
+    marketSearchConcurrency(() =>
+      serpShopping(q, { bypassCooldown: true, softFail: true })
+    )
+  )
+);
+
+    const backup = backupResults.flat();
+
+const backupStageWithTitle = backup.filter((it) => it?.title);
+    const backupStageWithPrice = backupStageWithTitle.filter(
+      (it) => Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)
+    );
+    const backupStageNotBad = backupStageWithPrice.filter(
+      (it) => !isBadListing(it.title, normalizedQuery)
+    );
+    const backupStageDeduped = dedupeSmart(backupStageNotBad);
+
+    const fallbackPool = backupStageDeduped
+      .map((it) => ({
+        ...it,
+        __relevance:
+          Number(it?.__relevance) || marketRelevanceScore(it, normalizedQuery),
+      }))
+      .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0));
+
+    let backupStageRelevant = filterRelevantListings(
+      normalizedQuery,
+      backupStageDeduped
+    );
+
+    if ((!backupStageRelevant || backupStageRelevant.length === 0) && backupStageDeduped.length) {
+      backupStageRelevant = backupStageDeduped
+        .map((it) => ({
+          ...it,
+          __relevance:
+            Number(it?.__relevance) || marketRelevanceScore(it, normalizedQuery),
+        }))
+        .filter((it) => Number(it.__relevance || 0) >= 0.14)
+        .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0))
+        .slice(0, 60);
+    }
+
+    const backupStageMarketplacePreferred = preferMarketplaceIfHealthy(
+      backupStageRelevant,
+      normalizedQuery
+    );
+    const backupStageTiered = keepBestPriorityTier(
+      backupStageMarketplacePreferred,
+      normalizedQuery
+    );
+    const backupStageTrimmed = trimPriceOutliers(backupStageTiered);
+    const backupStageIntuition = intuitionFilter(backupStageTrimmed);
+
+    let fallbackRanked = backupStageIntuition;
+
+    if (fallbackRanked.length < 6 && fallbackPool.length) {
+      const rescue = fallbackPool
+        .filter((it) => Number(it.__relevance || 0) >= 0.24)
+        .slice(0, 18);
+
+      fallbackRanked = dedupeSmart([...fallbackRanked, ...rescue]);
+    }
+
+    fallbackRanked = sortByAbsoluteCheapest(
+      fallbackRanked,
+      normalizedQuery
+    ).slice(0, 60);
+
+    if (fallbackRanked.length < 3 && backupStageTiered.length) {
+      fallbackRanked = sortByAbsoluteCheapest(
+        backupStageTiered,
+        normalizedQuery
+      ).slice(0, 60);
+    }
+
+    if (fallbackRanked.length < 3 && backupStageRelevant.length) {
+      fallbackRanked = sortByAbsoluteCheapest(
+        backupStageRelevant,
+        normalizedQuery
+      ).slice(0, 60);
+    }
+
+    if (fallbackRanked.length < 3 && fallbackPool.length) {
+      fallbackRanked = sortByAbsoluteCheapest(
+        fallbackPool.slice(0, 24),
+        normalizedQuery
+      ).slice(0, 60);
+    }
+
+    if (fallbackRanked.length < 3 && backupStageDeduped.length) {
+      fallbackRanked = sortByAbsoluteCheapest(
+        backupStageDeduped,
+        normalizedQuery
+      ).slice(0, 60);
+    }
+
+    merged = fallbackRanked;
+
+    console.log("🛟 MARKET FALLBACK RECOVERY", {
+      originalQuery: normalizedQuery,
+      fallbackQueries: backupQueries,
+      recovered: merged.length,
+    });
+  }
+
+  if (merged[0]?.source) {
+    rememberSourceWin(normalizedQuery, merged[0].source);
+  }
+
+  const finalQuery = promoteQueryFromMarket(normalizedQuery, merged);
+
+  if (finalQuery && finalQuery !== normalizedQuery) {
+    rememberBetterQuery(query, finalQuery);
+  }
+
+  if (Array.isArray(merged) && merged.length > 0) {
+    INSTANT_SCAN_CACHE.set(instantKey, merged);
+  }
+
+  console.log("🔥 MARKET MERGED CHEAPEST", {
+    query: normalizedQuery,
+    finalQuery,
+    googleQueries,
+    incomingVariants,
+    etsyVariants,
+    google: googleAll.length,
+    ebay: ebayAll.length,
+    etsy: etsyAll.length,
+    merged: merged.length,
+    cheapestTotal: merged[0]?.totalPrice ?? merged[0]?.price ?? null,
+    cheapestTitle: merged[0]?.title ?? null,
+    cheapestSource: merged[0]?.source ?? null,
+    instantKey,
+    etsyCooling: isSourceCoolingDown("etsy"),
+    serpCooling: isSourceCoolingDown("serpapi"),
+  });
+
+  merged = sortByAbsoluteCheapest(merged, normalizedQuery, identity).slice(0, 60);
+  return merged;
+}
+
+// Stronger dedupe: titleKey + rounded total
+function dedupeSmart(items) {
+  const seen = new Set();
+  const out = [];
+  for (const it of items) {
+    const titleKey = normalizeTitleKey(it?.title || "");
+    const total = it?.totalPrice ?? it?.price;
+    const bucket = typeof total === "number" ? Math.round(total * 2) / 2 : "na";
+    const key = `${titleKey}|${bucket}|${String(it?.source || "")}`;
+
+    if (!titleKey) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+  }
+  return out;
+}
+
+// -------------------- INTELLIGENCE HELPERS --------------------
+function isBadListing(title = "", query = "") {
+  const t = String(title || "").toLowerCase();
+  const q = String(query || "").toLowerCase();
+
+  const badWords = [
+    "for parts",
+    "parts only",
+    "not working",
+    "broken",
+    "repair",
+    "refurbished",
+    "lot",
+    "bundle",
+    "pack",
+    "set of",
+    "x2",
+    "x3",
+    "x4",
+    "auction",
+    "bid",
+    "read description",
+    "as is",
+  ];
+
+  if (badWords.some((w) => t.includes(w))) return true;
+
+  const queryIsEyewear =
+    q.includes("glasses") ||
+    q.includes("eyewear") ||
+    q.includes("frames") ||
+    q.includes("lens") ||
+    q.includes("sunglasses");
+
+  const queryWantsBlue =
+    q.includes("blue light") ||
+    q.includes("blue-light") ||
+    q.includes("computer") ||
+    q.includes("gaming") ||
+    q.includes("block blue") ||
+    q.includes("screen");
+
+  const queryWantsOrange =
+    q.includes("orange") ||
+    q.includes("amber") ||
+    q.includes("yellow");
+
+  const queryWantsSun =
+    q.includes("sunglass") ||
+    q.includes("shade") ||
+    q.includes("shades") ||
+    q.includes("uv") ||
+    q.includes("uv400") ||
+    q.includes("polarized");
+
+  const fashionOrangeWrap =
+    queryIsEyewear &&
+    queryWantsOrange &&
+    q.includes("wrap") &&
+    !queryWantsBlue;
+
+  const allowBlueFallback =
+    fashionOrangeWrap &&
+    !q.includes("sunglasses") &&
+    !q.includes("polarized") &&
+    !q.includes("uv400") &&
+    !q.includes("uv ");
+
+  const titleLooksBlue =
+    t.includes("blue light") ||
+    t.includes("blue-light") ||
+    t.includes("computer") ||
+    t.includes("gaming") ||
+    t.includes("block blue") ||
+    t.includes("blue blocker") ||
+    t.includes("blue blocking") ||
+    t.includes("screen") ||
+    t.includes("blokz");
+
+  const titleLooksSun =
+    t.includes("sunglass") ||
+    t.includes("shade") ||
+    t.includes("shades") ||
+    t.includes("uv") ||
+    t.includes("uv400") ||
+    t.includes("polarized");
+
+  const hardRejectWords = [
+    "forensic",
+    "forensics",
+    "laser",
+    "wavelength",
+    "nm",
+    "shooting glasses",
+    "ballistic",
+    "lab glasses",
+    "industrial glasses",
+    "protective glasses",
+    "safety glasses",
+    "goggles",
+    "phototherapy",
+    "therapy glasses",
+    "filter glasses",
+    "inspection glasses",
+    "exam glasses",
+  ];
+
+  if (hardRejectWords.some((w) => t.includes(w))) return true;
+
+  const sportWords = [
+    "cycling",
+    "running",
+    "baseball",
+    "golf",
+    "ski",
+    "fishing",
+    "driving",
+    "motorcycle",
+    "sport sunglasses",
+    "sports sunglasses",
+    "sports wrap",
+    "sport wrap",
+  ];
+
+  if (fashionOrangeWrap && sportWords.some((w) => t.includes(w))) return true;
+  if (fashionOrangeWrap && titleLooksBlue && !allowBlueFallback) return true;
+
+  // if query clearly wants sunglasses, aggressively reject optical/computer junk
+  if (queryWantsSun && titleLooksBlue && !titleLooksSun) return true;
+
+  return false;
+}
+
+function trimPriceOutliers(items) {
+  const prices = items
+    .map((i) => i?.totalPrice ?? i?.price)
+    .filter((n) => typeof n === "number" && Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+
+  if (prices.length < 4) return items;
+
+  const q1 = quantile(prices, 0.25);
+  const q3 = quantile(prices, 0.75);
+  const iqr = Math.max((q3 ?? 0) - (q1 ?? 0), 0.01);
+
+  const lowFence = Math.max(0, (q1 ?? 0) - 1.5 * iqr);
+  const highFence = (q3 ?? 0) + 1.5 * iqr;
+
+  const filtered = items.filter((i) => {
+    const p = i?.totalPrice ?? i?.price;
+    return typeof p === "number" && Number.isFinite(p) && p >= lowFence && p <= highFence;
+  });
+
+  return filtered.length >= Math.min(4, items.length) ? filtered : items;
+}
+
+// 🧠 HUMAN INTUITION FILTER
+function intuitionFilter(items) {
+  const prices = items
+    .map((i) => i?.totalPrice ?? i?.price)
+    .filter((n) => typeof n === "number" && n > 0)
+    .sort((a, b) => a - b);
+
+  if (prices.length < 5) return items;
+
+  const med = median(prices);
+  const lowCut = med * 0.35;
+
+  const filtered = items.filter((it) => {
+    const p = it?.totalPrice ?? it?.price;
+    if (!p) return false;
+    if (p < lowCut) return false;
+    return true;
+  });
+
+  return filtered.length >= Math.min(4, items.length) ? filtered : items;
+}
+
+function resaleProbability(items) {
+  if (!items.length) return 0;
+  const prices = items.map(i => i.price).filter(Boolean);
+  if (!prices.length) return 0;
+
+  const spread = Math.max(...prices) - Math.min(...prices);
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  return clamp01(spread / avg);
+}
+
+// 🧠 MARKET CONFIDENCE SCORE
+function marketConfidence(items) {
+  if (!items?.length) return 0;
+
+  const prices = items
+    .map(i => i?.totalPrice ?? i?.price)
+    .filter(n => typeof n === "number" && n > 0);
+
+  if (prices.length < 3) return 0.25;
+
+  const spread = Math.max(...prices) - Math.min(...prices);
+  const avg = prices.reduce((a,b)=>a+b,0)/prices.length;
+
+  // tighter spread = stronger confidence
+  const stability = 1 - clamp01(spread / Math.max(avg,1));
+
+  return clamp01(stability);
+}
+
+function buildMarketConsensus(items, payingPrice = null, visionConfidence = 0.5) {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  const intuition = computeMarketIntuition(list, payingPrice);
+
+  const sources = new Set(
+    list
+      .map((i) => String(i?.source || "").toLowerCase())
+      .filter(Boolean)
+  );
+
+  const listingCount = list.length;
+  const sourceDiversity = sources.size;
+  const confidence = marketConfidence(list);
+
+  const consensusScore = clamp01(
+    confidence * 0.55 +
+      Math.min(listingCount / 12, 1) * 0.25 +
+      Math.min(sourceDiversity / 4, 1) * 0.20
+  );
+
+  const thinMarket = listingCount < 5 || sourceDiversity < 2;
+  const suspiciousMarket =
+    intuition?.isWeirdPrice === true ||
+    confidence < 0.24 ||
+    listingCount < 3;
+
+  return {
+    median: intuition?.median ?? null,
+    typicalLow: intuition?.typicalLow ?? null,
+    typicalHigh: intuition?.typicalHigh ?? null,
+    listingCount,
+    sourceDiversity,
+    marketConfidence: confidence,
+    consensusScore,
+    thinMarket,
+    suspiciousMarket,
+    payingPrice: finitePrice(payingPrice),
+    deal: buildDealVerdict(intuition, visionConfidence),
+  };
+}
+
+function trustScore(it) {
+  const rating = it.rating || 0;
+  const reviews = it.reviews || 0;
+
+  const ratingScore = rating / 5;
+  const reviewScore = Math.min(reviews / 500, 1);
+
+  return (ratingScore * 0.6) + (reviewScore * 0.4);
+}
+
+function hashString(s = "") {
+  return sha256(Buffer.from(s)).slice(0, 8);
+}
+
+// 🧠 MARKET INTELLIGENCE MEMORY
+const SOURCE_MEMORY = new Map();
+const SOURCE_HEALTH = new Map();
+
+function rememberSourceWin(query, source) {
+  if (!query || !source) return;
+
+  const key = normalizeQuery(query);
+  const src = String(source).toLowerCase();
+
+  if (!SOURCE_MEMORY.has(key)) {
+    SOURCE_MEMORY.set(key, {});
+  }
+
+  const bucket = SOURCE_MEMORY.get(key);
+  bucket[src] = (bucket[src] || 0) + 1;
+}
+
+function getSourceHealth(source) {
+  const key = String(source || "unknown").toLowerCase();
+
+  if (!SOURCE_HEALTH.has(key)) {
+    SOURCE_HEALTH.set(key, {
+      successes: 0,
+      failures: 0,
+      timeouts: 0,
+      cooldownUntil: 0,
+      lastLatencyMs: null,
+      lastError: null,
+      updatedAt: 0,
+    });
+  }
+
+  return SOURCE_HEALTH.get(key);
+}
+
+function markSourceSuccess(source, latencyMs = 0) {
+  const h = getSourceHealth(source);
+
+  h.successes += 1;
+  h.failures = Math.max(0, h.failures - 1);
+  h.timeouts = Math.max(0, h.timeouts - 1);
+  h.lastLatencyMs = Number.isFinite(latencyMs) ? latencyMs : null;
+  h.lastError = null;
+  h.updatedAt = Date.now();
+
+  // Any real live success should immediately clear temporary cooldown.
+  h.cooldownUntil = 0;
+}
+
+function markSourceFailure(source, reason = "error") {
+  const h = getSourceHealth(source);
+
+  h.failures += 1;
+  if (reason === "timeout") h.timeouts += 1;
+
+  h.lastError = String(reason || "error");
+  h.updatedAt = Date.now();
+
+  const strike = h.failures + h.timeouts * 2;
+  if (strike >= 3) {
+    const cooldownMs = Math.min(180000, 30000 * strike);
+    h.cooldownUntil = Date.now() + cooldownMs;
+  }
+}
+
+function isSourceCoolingDown(source) {
+  const h = getSourceHealth(source);
+  return (h.cooldownUntil || 0) > Date.now();
+}
+
+function sourceInfraWeight(source) {
+  const h = getSourceHealth(source);
+
+  if (isSourceCoolingDown(source)) return 0.15;
+
+  let score = 1;
+
+  if (h.lastLatencyMs && h.lastLatencyMs > 5000) score -= 0.18;
+  if (h.failures > 0) score -= Math.min(h.failures * 0.07, 0.28);
+  if (h.timeouts > 0) score -= Math.min(h.timeouts * 0.12, 0.36);
+
+  return Math.max(0.35, score);
+}
+
+function sourceWeight(src = "", query = "") {
+  const s = String(src || "").toLowerCase();
+  let base = marketplaceSourceScore(s);
+
+  const memory = SOURCE_MEMORY.get(normalizeQuery(query));
+  if (memory && memory[s]) {
+    base += Math.min(memory[s] * 0.03, 0.15);
+  }
+
+  return base * sourceInfraWeight(s);
+}
+
+function smartRank(items, query = "", identity = null) {
+  return items
+    .map((it) => {
+      const total = it.totalPrice ?? it.price;
+      const priceScore = 1 / Math.max(total || 1, 1);
+
+      const identityScore = identity
+        ? listingIdentityScore(it, identity)
+        : 0;
+
+      const relevance =
+        marketRelevanceScore(it, query) * 0.7 +
+        identityScore * 0.3;
+
+      const trust = trustScore(it);
+      const marketBias = marketplaceSourceScore(it.source);
+
+      const tie =
+        (parseInt(hashString(it.link || it.title || "0"), 16) % 1000) / 1000;
+
+      it.__rank =
+        priceScore * 0.44 +
+        relevance * 0.34 +
+        marketBias * 0.18 +
+        trust * 0.03 +
+        tie * 0.01;
+
+      return it;
+    })
+    .sort((a, b) => b.__rank - a.__rank);
+}
+
+// -------------------- Rate limit --------------------
+const visionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// -------------------- Vision prompt (compact + strict) --------------------
+const VISION_SYSTEM = `
+You are Evan AI — a resale-first visual identity extractor for real marketplace search.
+
+You are NOT a generic captioner.
+You are NOT allowed to guess invisible details.
+You must extract grounded visual facts from the uploaded item photos and convert them into the strongest marketplace search identity possible.
+
+Return ONLY valid JSON.
+
+SCHEMA
+{
+  "query": string|null,
+  "variants": string[],
+  "confidence": number,
+  "identity": {
+    "itemType": string|null,
+    "category": string|null,
+    "brand": string|null,
+    "model": string|null,
+    "colors": string[],
+    "materials": string[],
+    "patterns": string[],
+    "styleWords": string[],
+    "visibleText": string[],
+    "condition": string|null,
+    "sizeHint": string|null,
+    "exactQuery": string|null,
+    "searchQueries": string[]
+  }
+}
+
+RULES
+
+1. Use ONLY grounded evidence.
+- brand/model only if directly supported by readable text, logo, or unmistakable signature design
+- do not invent collabs, years, editions, or fake model names
+
+2. Focus on marketplace usefulness.
+The final identity must help find the same item or the closest near-replica in used / resale / marketplace listings.
+
+3. Extract visual facts in this priority:
+- item type
+- brand
+- model
+- dominant colors
+- material
+- shape / silhouette
+- pattern / texture
+- visible text
+- size cue
+- condition cue
+
+4. Query behavior
+- "query" = best single marketplace query
+- "exactQuery" = strongest exact search wording
+- "searchQueries" = 4 to 10 descending search candidates from exact to broader
+- "variants" = alternate phrasings for the same item only
+
+5. For clothing / bags / backpacks / shoes / accessories:
+Prefer combinations like:
+- brand + model + itemType
+- brand + itemType + color
+- itemType + color + material + silhouette
+- itemType + visible text
+
+6. For eyewear:
+Preserve:
+- frame color
+- lens color
+- silhouette
+- use-case only if supported
+Do NOT call tinted glasses "sunglasses" unless sunwear evidence is clear.
+Do NOT call something "blue light" unless supported.
+
+7. visibleText
+Only include text that is actually visible or strongly legible.
+Short text fragments are okay.
+
+8. confidence
+Confidence means:
+"If I search these queries, how likely am I to get the same item or a near replica?"
+
+9. Hard honesty rule
+If only broad category is knowable, be broad.
+If category itself is unclear, query=null.
+
+You are seeing multiple views of the same item. Combine them carefully and output ONE unified grounded identity.
+`.trim();
+
+function modeHeader(mode, propContext) {
+  if (mode === "mark") {
+    return `MODE: MAKER'S MARK. Focus ONLY on stamp/engraving/tag text. If unreadable => query=null.`;
+  }
+  if (mode === "part") {
+    return `MODE: PART/COMPONENT. Prefer part numbers + compatibility cues. If not supported => query=null.`;
+  }
+  if (mode === "label") {
+    return `MODE: LABEL. Extract readable ingredients/material/fabric content cues. If unreadable => query=null.`;
+  }
+  if (mode === "prop") {
+    return `MODE: PROP. Use context: "${propContext || "none"}". If only category-level guess => query=null.`;
+  }
+  return `MODE: STANDARD ITEM. Identify exact product when supported by evidence.`;
+}
+
+function cleanMode(m) {
+  const x = safeStr(m, 24).toLowerCase();
+  const allowed = new Set(["item", "mark", "part", "label", "prop"]);
+  return allowed.has(x) ? x : "item";
+}
+
+function uniqueQueries(list = []) {
+  const seen = new Set();
+  const out = [];
+
+  for (const raw of list || []) {
+    const q = normalizeQuery(String(raw || ""));
+    if (!q) continue;
+    if (seen.has(q)) continue;
+    seen.add(q);
+    out.push(q);
+  }
+
+  return out;
+}
+
+function normalizeVariantList(variants = [], primary = null, mode = "item") {
+  if (mode !== "item") return [];
+
+  const primaryNorm = normalizeQuery(primary || "");
+  const out = [];
+
+  const primaryWantsOrange =
+    primaryNorm.includes("orange") ||
+    primaryNorm.includes("amber") ||
+    primaryNorm.includes("yellow");
+
+  const primaryWantsBlue =
+    primaryNorm.includes("blue light") ||
+    primaryNorm.includes("blue-light") ||
+    primaryNorm.includes("computer") ||
+    primaryNorm.includes("gaming") ||
+    primaryNorm.includes("block blue") ||
+    primaryNorm.includes("blue blocker") ||
+    primaryNorm.includes("blue blocking") ||
+    primaryNorm.includes("screen");
+
+const primaryWantsWrap = primaryNorm.includes("wrap");
+const primaryAllowBlueFallback = false;
+
+for (const raw of Array.isArray(variants) ? variants : []) {
+    let q = normalizeVisionQuery(raw, mode);
+    q = normalizeQuery(q || "");
+
+    if (!q) continue;
+    if (q === primaryNorm) continue;
+    if (isGarbageQuery(q)) continue;
+
+    const qHasOrange =
+      q.includes("orange") ||
+      q.includes("amber") ||
+      q.includes("yellow");
+
+    const qHasBlue =
+      q.includes("blue light") ||
+      q.includes("blue-light") ||
+      q.includes("computer") ||
+      q.includes("gaming") ||
+      q.includes("block blue") ||
+      q.includes("blue blocker") ||
+      q.includes("blue blocking") ||
+      q.includes("screen");
+
+    // If the primary scan is orange eyewear, do NOT allow generic variants
+    // that lose the orange identity.
+    if (primaryWantsOrange && !qHasOrange) continue;
+
+// Allow blue-light/computer fallback for ambiguous orange wraparound eyewear.
+if (!primaryWantsBlue && qHasBlue && !primaryAllowBlueFallback) continue;
+
+    // If the primary is wraparound orange eyewear, reject useless broad drift.
+    if (primaryWantsOrange && primaryWantsWrap && q === "wraparound glasses") {
+      continue;
+    }
+
+    out.push(q);
+  }
+
+  return uniqueQueries(out).slice(0, 3);
+}
+
+function cleanStringList(list, max = 12) {
+  const out = [];
+  const seen = new Set();
+
+  for (const raw of Array.isArray(list) ? list : []) {
+    const v = safeStr(String(raw || ""), 80).toLowerCase().trim();
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+    if (out.length >= max) break;
+  }
+
+  return out;
+}
+
+function normalizeVisionIdentityPayload(raw = null, fallbackQuery = "") {
+  if (!raw || typeof raw !== "object") return null;
+
+  const itemType = safeStr(raw.itemType || raw.type || "", 80) || null;
+  const category =
+    safeStr(raw.category || "", 80) ||
+    inferVisionCategory(itemType || fallbackQuery) ||
+    null;
+
+  const brand = safeStr(raw.brand || "", 80) || null;
+  const model = safeStr(raw.model || "", 100) || null;
+
+  const colors = cleanStringList(raw.colors, 6);
+  const materials = cleanStringList(raw.materials, 6);
+  const patterns = cleanStringList(raw.patterns, 6);
+  const styleWords = cleanStringList(raw.styleWords, 8);
+  const visibleText = cleanStringList(raw.visibleText, 8);
+
+  const condition = safeStr(raw.condition || "", 60) || null;
+  const sizeHint = safeStr(raw.sizeHint || "", 60) || null;
+
+  const incomingExact =
+    safeStr(raw.exactQuery || "", 220) ||
+    safeStr(fallbackQuery || "", 220) ||
+    null;
+
+  const searchQueries = uniqueQueries([
+    incomingExact,
+    ...(Array.isArray(raw.searchQueries) ? raw.searchQueries : []),
+    fallbackQuery,
+  ]).slice(0, 12);
+
+  return {
+    itemType,
+    category,
+    brand,
+    model,
+    colors,
+    materials,
+    patterns,
+    styleWords,
+    visibleText,
+    condition,
+    sizeHint,
+    exactQuery: searchQueries[0] || incomingExact || null,
+    searchQueries,
+  };
+}
+
+function buildIdentityDrivenQuerySet(primaryQuery = "", variants = [], identity = null) {
+  const base = normalizeQuery(primaryQuery);
+  const out = [];
+
+  const push = (...parts) => {
+    const q = normalizeQuery(
+      parts
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
+    if (q) out.push(q);
+  };
+
+  push(base);
+
+  for (const v of uniqueQueries(variants || [])) {
+    push(v);
+  }
+
+  const id = normalizeVisionIdentityPayload(identity, base);
+  if (!id) {
+    return uniqueQueries(out).slice(0, 16);
+  }
+
+  const c1 = id.colors?.[0] || "";
+  const c2 = id.colors?.[1] || "";
+  const m1 = id.materials?.[0] || "";
+  const p1 = id.patterns?.[0] || "";
+  const s1 = id.styleWords?.[0] || "";
+  const t1 = id.visibleText?.[0] || "";
+  const itemType = id.itemType || "";
+  const brand = id.brand || "";
+  const model = id.model || "";
+
+  if (id.exactQuery) push(id.exactQuery);
+  for (const q of id.searchQueries || []) push(q);
+
+  // exact-to-broad ladder
+  push(brand, model, itemType, c1, m1);
+  push(brand, model, itemType, c1);
+  push(brand, itemType, c1, m1);
+  push(brand, itemType, c1);
+  push(brand, itemType, m1);
+  push(itemType, c1, c2, m1, s1);
+  push(itemType, c1, m1, p1);
+  push(itemType, c1, s1);
+  push(itemType, c1, m1);
+  push(itemType, c1);
+  push(itemType, m1);
+  push(itemType, p1);
+  push(itemType, t1);
+
+  if (brand && t1) push(brand, itemType, t1);
+  if (brand && model && t1) push(brand, model, t1);
+
+  return uniqueQueries(out).slice(0, 16);
+}
+
+function titleContainsLoose(title = "", needle = "") {
+  const t = normalizeTitleKey(title);
+  const n = normalizeTitleKey(needle);
+  if (!t || !n) return false;
+
+  if (t.includes(n)) return true;
+
+  const nt = titleTokens(n);
+  const tt = new Set(titleTokens(t));
+  if (!nt.length) return false;
+
+  let hits = 0;
+  for (const x of nt) {
+    if (tt.has(x)) hits++;
+  }
+
+  return hits >= Math.max(1, Math.ceil(nt.length * 0.7));
+}
+
+function listingIdentityScore(item, identity = null) {
+  const id = normalizeVisionIdentityPayload(identity);
+  if (!id) return 0;
+
+  const title = String(item?.title || "");
+  if (!title) return 0;
+
+  let score = 0;
+
+  if (id.brand && titleContainsLoose(title, id.brand)) score += 0.30;
+  if (id.model && titleContainsLoose(title, id.model)) score += 0.26;
+  if (id.itemType && titleContainsLoose(title, id.itemType)) score += 0.18;
+
+  for (const c of id.colors || []) {
+    if (titleContainsLoose(title, c)) score += 0.07;
+  }
+
+  for (const m of id.materials || []) {
+    if (titleContainsLoose(title, m)) score += 0.07;
+  }
+
+  for (const p of id.patterns || []) {
+    if (titleContainsLoose(title, p)) score += 0.06;
+  }
+
+  for (const s of id.styleWords || []) {
+    if (titleContainsLoose(title, s)) score += 0.06;
+  }
+
+  for (const txt of id.visibleText || []) {
+    if (titleContainsLoose(title, txt)) score += 0.10;
+  }
+
+  return clamp01(score);
+}
+
+function buildServerQueryVariants(primaryQuery, modelVariants = [], mode = "item", identity = null) {
+  const primary = normalizeVisionQuery(primaryQuery, mode) || primaryQuery;
+  const base = normalizeQuery(primary || "");
+  if (!base) return [];
+
+  if (mode !== "item") {
+    return uniqueQueries([base, ...normalizeVariantList(modelVariants, base, mode)]).slice(0, 8);
+  }
+
+  const out = new Set();
+
+  for (const q of buildIdentityDrivenQuerySet(base, modelVariants, identity)) {
+    out.add(q);
+  }
+
+  for (const v of buildExactVisualSearchLadder(base, modelVariants)) {
+    out.add(v);
+  }
+
+  for (const v of normalizeVariantList(modelVariants, base, mode)) {
+    out.add(v);
+  }
+
+  for (const v of buildGoogleShoppingVariants(base, modelVariants)) {
+    out.add(v);
+  }
+
+const expanded = uniqueQueries([...out])
+  .filter(Boolean)
+  .filter((x) => x !== "glasses" && x !== "eyewear");
+
+const enhanced = new Set(expanded);
+
+for (const q of expanded) {
+  enhanced.add(`${q} used`);
+  enhanced.add(`${q} pre owned`);
+  enhanced.add(`${q} resale`);
+  enhanced.add(`${q} ebay`);
+  enhanced.add(`${q} marketplace`);
+  enhanced.add(`${q} second hand`);
+  enhanced.add(`${q} vintage`);
+  enhanced.add(`${q} collectible`);
+}
+
+return uniqueQueries([...enhanced]).slice(0, 8);
+}
+
+function buildDemandLabel(prob) {
+  if (prob >= 0.78) return "High";
+  if (prob >= 0.52) return "Medium";
+  return "Low";
+}
+
+function buildSellThroughDays(prob) {
+  if (prob >= 0.82) return 5;
+  if (prob >= 0.72) return 8;
+  if (prob >= 0.62) return 12;
+  if (prob >= 0.52) return 18;
+  return 30;
+}
+
+function buildFlipPrediction({
+  items = [],
+  scannedPrice = null,
+  visionConfidence = 0.5,
+  category = null,
+}) {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+
+  const prices = list
+    .map((i) => i?.totalPrice ?? i?.price)
+    .filter((n) => typeof n === "number" && Number.isFinite(n) && n > 0)
+    .sort((a, b) => a - b);
+
+  const medianPrice = median(prices);
+  const q1 = quantile(prices, 0.25);
+  const q3 = quantile(prices, 0.75);
+  const listingCount = list.length;
+  const marketConf = marketConfidence(list);
+  const resaleProb = resaleProbability(
+    list.map((i) => ({
+      ...i,
+      price: i?.totalPrice ?? i?.price,
+    }))
+  );
+
+  const demandMultiplier = clamp01(
+    0.45 +
+      Math.min(listingCount / 20, 1) * 0.25 +
+      marketConf * 0.20 +
+      Math.min(resaleProb, 1) * 0.10
+  );
+
+  const estimatedResale =
+    typeof medianPrice === "number"
+      ? round2(medianPrice * 0.94)
+      : finitePrice(list[0]?.totalPrice ?? list[0]?.price);
+
+  const buyPrice = finitePrice(scannedPrice);
+  const expectedProfit =
+    buyPrice != null && estimatedResale != null
+      ? round2(Math.max(0, estimatedResale - buyPrice))
+      : null;
+
+  const sellThroughProbability = clamp01(
+    marketConf * 0.45 +
+      Math.min(listingCount / 14, 1) * 0.20 +
+      clamp01(visionConfidence) * 0.20 +
+      Math.min(resaleProb, 1) * 0.15
+  );
+
+  const rawFlipScore =
+    expectedProfit == null
+      ? null
+      : Math.round(
+          Math.max(
+            0,
+            Math.min(
+              100,
+              expectedProfit * 2.1 +
+                sellThroughProbability * 28 +
+                marketConf * 18 +
+                demandMultiplier * 14
+            )
+          )
+        );
+
+  const flipScore = Number.isFinite(rawFlipScore) ? rawFlipScore : null;
+  const demand = buildDemandLabel(sellThroughProbability);
+  const sellThroughDays = buildSellThroughDays(sellThroughProbability);
+
+  const label =
+    flipScore == null
+      ? "Unknown"
+      : flipScore >= 82
+      ? "🔥 Flip Opportunity"
+      : flipScore >= 65
+      ? "🟢 Strong Resale"
+      : flipScore >= 45
+      ? "👌 Decent Flip"
+      : "⚠️ Weak Flip";
+
+  return {
+    category: category || null,
+    medianPrice: finitePrice(medianPrice),
+    estimatedResale: finitePrice(estimatedResale),
+    expectedProfit: finitePrice(expectedProfit),
+    flipScore,
+    sellThroughProbability: Math.round(sellThroughProbability * 100),
+    demand,
+    sellThroughDays,
+    marketConfidence: Math.round(marketConf * 100),
+    listingCount,
+    typicalLow: finitePrice(q1),
+    typicalHigh: finitePrice(q3),
+    label,
+  };
+}
+
+function buildResaleCoach({
+  prediction,
+  consensus,
+  scannedPrice = null,
+  finalQuery = "",
+}) {
+  const flipScore = Number(prediction?.flipScore || 0);
+  const expectedProfit = Number(prediction?.expectedProfit || 0);
+  const marketConfidence = Number(prediction?.marketConfidence || 0);
+  const thinMarket = !!consensus?.thinMarket;
+  const suspiciousMarket = !!consensus?.suspiciousMarket;
+
+  let headline = "⚠️ Weak flip — only buy if you personally want it";
+
+  if (flipScore >= 82) {
+    headline = "🔥 Buy signal — this looks like a real flip";
+  } else if (flipScore >= 65) {
+    headline = "🟢 Strong opportunity — worth grabbing if condition is clean";
+  } else if (flipScore >= 45) {
+    headline = "👌 Borderline flip — negotiate if possible";
+  }
+
+  const bullets = [];
+
+  if (expectedProfit >= 25) {
+    bullets.push("Profit room is strong enough to absorb normal fees and shipping.");
+  } else if (expectedProfit >= 10) {
+    bullets.push("There is usable margin here, but resale friction matters.");
+  } else {
+    bullets.push("Margin looks thin, so entry price discipline matters.");
+  }
+
+  if (thinMarket) {
+    bullets.push("Market depth is thin, so comps are less stable than usual.");
+  } else if (suspiciousMarket) {
+    bullets.push("Listing quality is noisy, so verify condition before buying.");
+  } else if (marketConfidence >= 70) {
+    bullets.push("Market signals look stable enough to trust this pricing range.");
+  } else {
+    bullets.push("Market confidence is moderate, so treat resale value as an estimate.");
+  }
+
+  if (flipScore >= 82) {
+    bullets.push("This is the kind of item Evan AI should aggressively highlight.");
+  } else if (flipScore >= 65) {
+    bullets.push("Good flip candidate if the actual item matches the comp condition.");
+  } else {
+    bullets.push("More of a fair-value buy than a premium resale opportunity.");
+  }
+
+  return {
+    headline,
+    bullets: bullets.slice(0, 3),
+    finalQuery: finalQuery || null,
+    scannedPrice: finitePrice(scannedPrice),
+  };
+}
+
+function getPulse(query = "") {
+  const key = canonicalMarketQuery(query);
+  if (!key) {
+    return {
+      query: null,
+      score: 0,
+      label: "Quiet",
+      scans24h: 0,
+    };
+  }
+
+  const now = Date.now();
+  const list = Array.isArray(QUERY_PULSE.get(key)) ? QUERY_PULSE.get(key) : [];
+  const active = list.filter((ts) => now - ts < 24 * 60 * 60 * 1000);
+
+  QUERY_PULSE.set(key, active);
+
+  const scans24h = active.length;
+  const score = Math.min(100, scans24h * 8);
+
+  const label =
+    score >= 72 ? "Hot" :
+    score >= 40 ? "Rising" :
+    score >= 16 ? "Active" :
+    "Quiet";
+
+  return {
+    query: key,
+    score,
+    label,
+    scans24h,
+  };
+}
+
+function recordPulse(query = "") {
+  const key = canonicalMarketQuery(query);
+  if (!key) return getPulse(query);
+
+  const now = Date.now();
+  const list = Array.isArray(QUERY_PULSE.get(key)) ? QUERY_PULSE.get(key) : [];
+  const active = list.filter((ts) => now - ts < 24 * 60 * 60 * 1000);
+
+  active.push(now);
+  QUERY_PULSE.set(key, active);
+
+  return getPulse(key);
+}
+
+function getTopPulse(limit = 10) {
+  return [...QUERY_PULSE.keys()]
+    .map((query) => getPulse(query))
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, limit);
+}
+
+function requireApiKey(req, res, next) {
+  const key = req.headers["x-api-key"];
+  if (!process.env.API_KEY || key === process.env.API_KEY) {
+    return next();
+  }
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+}
+
+function safeJsonParse(value, fallback = {}) {
+  try {
+    if (typeof value !== "string" || !value.trim()) return fallback;
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function extractFirstJsonObject(text = "") {
+  const s = String(text || "").trim();
+  if (!s) return null;
+
+  try {
+    return JSON.parse(s);
+  } catch {}
+
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  const candidate = s.slice(start, end + 1);
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
+function salvageVisionFields(rawText = "") {
+  const text = String(rawText || "");
+  if (!text.trim()) {
+    return {
+      query: null,
+      variants: [],
+      confidence: 0,
+      identity: null,
+    };
+  }
+
+  const queryMatch = text.match(/"query"\s*:\s*"([^"]+)"/i);
+  const confidenceMatch = text.match(/"confidence"\s*:\s*([0-9.]+)/i);
+  const variantsBlockMatch = text.match(/"variants"\s*:\s*\[([\s\S]*?)\]/i);
+
+  const variants = [];
+  if (variantsBlockMatch?.[1]) {
+    const rx = /"([^"]+)"/g;
+    let m;
+    while ((m = rx.exec(variantsBlockMatch[1])) !== null) {
+      const v = normalizeQuery(m[1] || "");
+      if (v) variants.push(v);
+      if (variants.length >= 8) break;
+    }
+  }
+
+  return {
+    query: queryMatch?.[1]?.trim() || null,
+    variants: uniqueQueries(variants),
+    confidence: confidenceMatch?.[1]
+      ? clamp01(Number(confidenceMatch[1]))
+      : 0,
+    identity: null,
+  };
+}
+
+function buildVisionConsensusSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["query", "variants", "confidence", "identity"],
+    properties: {
+      query: {
+        anyOf: [{ type: "string" }, { type: "null" }],
+      },
+      variants: {
+        type: "array",
+        items: { type: "string" },
+      },
+      confidence: {
+        type: "number",
+      },
+      identity: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "itemType",
+          "category",
+          "brand",
+          "model",
+          "colors",
+          "materials",
+          "patterns",
+          "styleWords",
+          "visibleText",
+          "condition",
+          "sizeHint",
+          "exactQuery",
+          "searchQueries",
+        ],
+        properties: {
+          itemType: { anyOf: [{ type: "string" }, { type: "null" }] },
+          category: { anyOf: [{ type: "string" }, { type: "null" }] },
+          brand: { anyOf: [{ type: "string" }, { type: "null" }] },
+          model: { anyOf: [{ type: "string" }, { type: "null" }] },
+          colors: { type: "array", items: { type: "string" } },
+          materials: { type: "array", items: { type: "string" } },
+          patterns: { type: "array", items: { type: "string" } },
+          styleWords: { type: "array", items: { type: "string" } },
+          visibleText: { type: "array", items: { type: "string" } },
+          condition: { anyOf: [{ type: "string" }, { type: "null" }] },
+          sizeHint: { anyOf: [{ type: "string" }, { type: "null" }] },
+          exactQuery: { anyOf: [{ type: "string" }, { type: "null" }] },
+          searchQueries: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+  };
+}
+
+function buildVisionPassPrompt(passLabel, mode, propContext) {
+  const header = modeHeader(mode, propContext);
+
+  if (passLabel === "brand_model") {
+    return `${header}
+
+PASS: BRAND + MODEL EXTRACTION
+
+Focus on:
+- logos
+- readable text
+- maker marks
+- model names
+- exact visible identifiers
+
+Return the strongest resale search identity possible.
+If brand/model are unclear, stay honest and broad.`;
+  }
+
+  if (passLabel === "visual_shape") {
+    return `${header}
+
+PASS: VISUAL SHAPE + MATERIAL + COLOR
+
+Focus on:
+- silhouette
+- category
+- colors
+- materials
+- shape words
+- fashion/style cues
+- lens/frame traits if eyewear
+
+Return the strongest visually grounded resale search identity possible.`;
+  }
+
+  return `${header}
+
+PASS: MASTER RESALE SEARCH
+
+Build the best marketplace search identity for this item.
+Prioritize exact matching and near-replica resale search usefulness.
+Return only grounded evidence.`;
+}
+
+async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
+  const timeout = withTimeout(VISION_TIMEOUT_MS);
+
+  try {
+
+const response = await withHardTimeout(
+  openai.responses.create(
+    {
+      model: VISION_MODEL,
+      temperature: 0.2,
+      max_output_tokens: 420,
+      prompt_cache_key: `evan-ai-vision-${passLabel}-v3`,
+      prompt_cache_retention: "24h",
+      text: {
+        format: {
+          type: "json_schema",
+          name: `evan_ai_vision_${passLabel}`,
+          strict: true,
+          schema: buildVisionConsensusSchema(),
+        },
+      },
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: VISION_SYSTEM }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: buildVisionPassPrompt(passLabel, mode, propContext),
+            },
+            {
+              type: "input_image",
+              image_url: dataUrl,
+            },
+          ],
+        },
+      ],
+      metadata: {
+        rid: rid || "",
+        mode,
+        pass: passLabel,
+      },
+    },
+    { signal: timeout.signal }
+  ),
+  VISION_TIMEOUT_MS + 1500,
+  `vision_pass_timeout:${passLabel}`
+);
+
+    timeout.cancel();
+
+const rawText =
+  typeof response?.output_text === "string" && response.output_text.trim()
+    ? response.output_text
+    : Array.isArray(response?.output)
+    ? response.output
+        .flatMap((block) => (Array.isArray(block?.content) ? block.content : []))
+        .map((part) => (typeof part?.text === "string" ? part.text : ""))
+        .find((x) => x && x.trim()) || ""
+    : "";
+
+const parsedRaw =
+  safeJsonParse(rawText, null) || extractFirstJsonObject(rawText) || null;
+
+const salvaged = salvageVisionFields(rawText);
+
+const parsed = {
+  query:
+    typeof parsedRaw?.query === "string" && parsedRaw.query.trim()
+      ? parsedRaw.query.trim()
+      : salvaged.query,
+  variants:
+    Array.isArray(parsedRaw?.variants) && parsedRaw.variants.length
+      ? uniqueQueries(parsedRaw.variants)
+      : salvaged.variants,
+  confidence: Number.isFinite(Number(parsedRaw?.confidence))
+    ? clamp01(Number(parsedRaw.confidence))
+    : salvaged.confidence,
+  identity:
+    parsedRaw?.identity && typeof parsedRaw.identity === "object"
+      ? parsedRaw.identity
+      : null,
+};
+
+console.log("🧾 VISION PASS RAW", {
+  rid: rid || "",
+  pass: passLabel,
+  parsedQuery: parsed.query,
+  parsedConfidence: parsed.confidence,
+  rawPreview: String(rawText || "").slice(0, 280),
+});
+
+return {
+  rawText,
+  parsed,
+};
+
+} catch (err) {
+  timeout.cancel?.();
+
+  console.warn("❌ VISION PASS FAILED", {
+    rid: rid || "",
+    pass: passLabel,
+    error: err?.message || err,
+  });
+
+  return {
+    rawText: "",
+    parsed: {},
+    error: err?.message || "vision_pass_failed",
+  };
+}
+}
+
+async function runVisionRecoveryPass({ req, file, mode, propContext }) {
+  const base64 = file.buffer.toString("base64");
+  const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
+  const timeout = withTimeout(7000);
+
+  try {
+    const response = await withHardTimeout(
+      openai.responses.create(
+        {
+          model: VISION_MODEL,
+          temperature: 0.1,
+          max_output_tokens: 180,
+          text: {
+            format: {
+              type: "json_schema",
+              name: "evan_ai_vision_recovery",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: ["query", "variants", "confidence"],
+                properties: {
+                  query: { anyOf: [{ type: "string" }, { type: "null" }] },
+                  variants: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                  confidence: { type: "number" },
+                },
+              },
+            },
+          },
+          input: [
+            {
+              role: "system",
+              content: [
+                {
+                  type: "input_text",
+text:
+  "You are Evan AI. Return the best marketplace search query for the photographed item. Be practical. Be broad if needed, but not useless. Never return 'item', 'object', 'product', or 'consumer product' unless the image is truly unreadable. Do not call eyewear 'safety glasses' unless visible side shields, industrial PPE styling, or clear protective-workwear cues are present.",
+                },
+              ],
+            },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: `Recovery mode. Original mode: ${mode}. Context: ${propContext || "none"}. Return the strongest resale search query you can.`,
+                },
+                {
+                  type: "input_image",
+                  image_url: dataUrl,
+                },
+              ],
+            },
+          ],
+          metadata: {
+            rid: req.rid || "",
+            mode,
+            pass: "recovery",
+          },
+        },
+        { signal: timeout.signal }
+      ),
+      8000,
+      "vision_recovery_timeout"
+    );
+
+    timeout.cancel();
+
+    const rawText =
+      typeof response?.output_text === "string" && response.output_text.trim()
+        ? response.output_text
+        : Array.isArray(response?.output)
+        ? response.output
+            .flatMap((block) => (Array.isArray(block?.content) ? block.content : []))
+            .map((part) => (typeof part?.text === "string" ? part.text : ""))
+            .find((x) => x && x.trim()) || ""
+        : "";
+
+    const parsedRaw =
+      safeJsonParse(rawText, null) || extractFirstJsonObject(rawText) || {};
+
+    const query =
+      typeof parsedRaw?.query === "string" && parsedRaw.query.trim()
+        ? parsedRaw.query.trim()
+        : null;
+
+    const variants = Array.isArray(parsedRaw?.variants) ? parsedRaw.variants : [];
+    const confidence = Number.isFinite(Number(parsedRaw?.confidence))
+      ? clamp01(Number(parsedRaw.confidence))
+      : 0.55;
+
+    console.log("🛟 VISION RECOVERY RESULT", {
+      rid: req.rid || "",
+      query,
+      confidence,
+      rawPreview: String(rawText || "").slice(0, 220),
+    });
+
+    return { query, variants, confidence };
+  } catch (err) {
+    timeout.cancel?.();
+
+    console.warn("❌ VISION RECOVERY FAILED", {
+      rid: req.rid || "",
+      error: err?.message || err,
+    });
+
+    return {
+      query: null,
+      variants: [],
+      confidence: 0,
+    };
+  }
+}
+
+function chooseMostSpecificVisionQuery(candidates = []) {
+  const cleaned = candidates
+    .map((q) => normalizeQuery(q || ""))
+    .filter(Boolean)
+    .filter((q) => !isGarbageQuery(q));
+
+  if (!cleaned.length) return null;
+
+  const scored = cleaned
+    .map((q) => {
+      const tokens = q.split(" ").filter(Boolean);
+
+let score = tokens.length * 10;
+
+if (tokens.length >= 4) score += 12;
+if (tokens.length >= 5) score += 8;
+
+      // item categories
+      if (/\b(glasses|sunglasses|eyewear|hoodie|jacket|sneakers|shoes|hat|bag|backpack|watch|handbag)\b/i.test(q)) {
+        score += 12;
+      }
+
+      // color detection
+      if (/\b(orange|amber|yellow|black|white|blue|brown|silver|gold|red|green|purple|pink)\b/i.test(q)) {
+        score += 6;
+      }
+
+      // shape / style detection
+      if (/\b(wraparound|shield|aviator|oval|round|square|rectangle|oversized|rimless|retro|vintage|y2k)\b/i.test(q)) {
+        score += 8;
+      }
+
+      // lens detection (huge for sunglasses)
+      if (/\b(lens|tinted|gradient|mirrored|polarized)\b/i.test(q)) {
+        score += 6;
+      }
+
+      // blue light detection
+      if (/\bblue light|computer glasses|gaming glasses\b/i.test(q)) {
+        score += 8;
+      }
+
+      return { q, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.q || cleaned[0];
+}
+
+function mergeVisionIdentityObjects(objects = [], fallbackQuery = "") {
+  const normalized = objects
+    .map((x) => normalizeVisionIdentityPayload(x, fallbackQuery))
+    .filter(Boolean);
+
+  if (!normalized.length) {
+    return normalizeVisionIdentityPayload(null, fallbackQuery);
+  }
+
+  const pickFirstTruthy = (key) => {
+    for (const obj of normalized) {
+      if (obj?.[key]) return obj[key];
+    }
+    return null;
+  };
+
+  const mergeList = (key, max = 8) => {
+    return cleanStringList(
+      normalized.flatMap((obj) => (Array.isArray(obj?.[key]) ? obj[key] : [])),
+      max
+    );
+  };
+
+  const merged = {
+    itemType: pickFirstTruthy("itemType"),
+    category: pickFirstTruthy("category"),
+    brand: pickFirstTruthy("brand"),
+    model: pickFirstTruthy("model"),
+    colors: mergeList("colors", 6),
+    materials: mergeList("materials", 6),
+    patterns: mergeList("patterns", 6),
+    styleWords: mergeList("styleWords", 8),
+    visibleText: mergeList("visibleText", 8),
+    condition: pickFirstTruthy("condition"),
+    sizeHint: pickFirstTruthy("sizeHint"),
+    exactQuery: pickFirstTruthy("exactQuery"),
+    searchQueries: uniqueQueries(
+      normalized.flatMap((obj) =>
+        Array.isArray(obj?.searchQueries) ? obj.searchQueries : []
+      )
+    ).slice(0, 12),
+  };
+
+  return normalizeVisionIdentityPayload(merged, fallbackQuery);
+}
+
+async function runVisionConsensus({ req, file, mode, propContext }) {
+  const base64 = file.buffer.toString("base64");
+  const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
+
+  const passes = await Promise.all([
+    runVisionPass({
+      dataUrl,
+      mode,
+      propContext,
+      passLabel: "master",
+      rid: req.rid,
+    }),
+    runVisionPass({
+      dataUrl,
+      mode,
+      propContext,
+      passLabel: "brand_model",
+      rid: req.rid,
+    }),
+    runVisionPass({
+      dataUrl,
+      mode,
+      propContext,
+      passLabel: "visual_shape",
+      rid: req.rid,
+    }),
+  ]);
+
+  const parsedList = passes.map((p) => p?.parsed || {});
+  const rawQueries = parsedList
+    .map((p) => (typeof p?.query === "string" ? p.query.trim() : null))
+    .filter(Boolean);
+
+  let query = chooseMostSpecificVisionQuery(rawQueries);
+
+  const mergedIdentity = mergeVisionIdentityObjects(
+    parsedList.map((p) => p?.identity || null),
+    query || ""
+  );
+
+  if (!query && mergedIdentity?.exactQuery) {
+    query = mergedIdentity.exactQuery;
+  }
+
+  if (!query && Array.isArray(mergedIdentity?.searchQueries) && mergedIdentity.searchQueries[0]) {
+    query = mergedIdentity.searchQueries[0];
+  }
+
+  query = stabilizeVisionQuery(
+    query,
+    normalizeVisionQuery(query, mode),
+    mode
+  );
+
+if (
+  !query ||
+  query.length < 6 ||
+  isGarbageQuery(query)
+) {
+
+  if (mergedIdentity?.exactQuery) {
+    query = mergedIdentity.exactQuery;
+  }
+}
+
+  let confidenceValues = parsedList
+    .map((p) => Number(p?.confidence))
+    .filter((n) => Number.isFinite(n));
+
+  let confidence =
+    confidenceValues.length > 0
+      ? clamp01(
+          confidenceValues.reduce((a, b) => a + b, 0) / confidenceValues.length
+        )
+      : 0;
+
+  let variants = uniqueQueries([
+    ...(Array.isArray(parsedList[0]?.variants) ? parsedList[0].variants : []),
+    ...(Array.isArray(parsedList[1]?.variants) ? parsedList[1].variants : []),
+    ...(Array.isArray(parsedList[2]?.variants) ? parsedList[2].variants : []),
+    ...(Array.isArray(mergedIdentity?.searchQueries) ? mergedIdentity.searchQueries : []),
+    mergedIdentity?.exactQuery,
+  ]);
+
+const consensusLooksEmpty =
+  (!query || !String(query).trim() || isGarbageQuery(query)) &&
+  (!variants || variants.length === 0) &&
+  confidence <= 0.05 &&
+  rawQueries.length === 0;
+
+if (consensusLooksEmpty && mode === "item") {
+  console.warn("⚠️ EMPTY VISION CONSENSUS -> running recovery pass", {
+    rid: req.rid,
+  });
+
+  const recovery = await runVisionRecoveryPass({
+    req,
+    file,
+    mode,
+    propContext,
+  });
+
+  if (recovery?.query) {
+    query = recovery.query;
+    variants = uniqueQueries([
+      ...(Array.isArray(recovery?.variants) ? recovery.variants : []),
+      ...variants,
+    ]);
+    confidence = Math.max(confidence, clamp01(Number(recovery?.confidence || 0.55)));
+  }
+}
+
+if (
+  !query ||
+  !String(query).trim() ||
+  isGarbageQuery(query)
+) {
+  const fallbackFromMode = () => {
+      if (mode === "mark") return "maker's mark";
+      if (mode === "part") return "replacement part";
+      if (mode === "label") return "product label";
+      if (mode === "prop") return "collectible item";
+
+      if (LAST_GOOD_CATEGORY) {
+        const catFallback = categoryFallback(LAST_GOOD_CATEGORY);
+        if (catFallback) return catFallback;
+      }
+
+      if (LAST_GOOD_QUERY && !isGarbageQuery(LAST_GOOD_QUERY)) {
+        return LAST_GOOD_QUERY;
+      }
+
+if (mergedIdentity?.exactQuery) {
+  return mergedIdentity.exactQuery;
+}
+
+if (mergedIdentity?.searchQueries?.length) {
+  return mergedIdentity.searchQueries[0];
+}
+
+if (mergedIdentity?.category) {
+  const catFallback = categoryFallback(mergedIdentity.category);
+  if (catFallback) return catFallback;
+}
+
+return LAST_GOOD_QUERY || "sunglasses";
+    };
+
+    query = fallbackFromMode();
+    confidence = Math.max(confidence, 0.41);
+  }
+
+  query = stabilizeVisionQuery(
+    query,
+    normalizeVisionQuery(query, mode) || query,
+    mode
+  );
+
+  if (isGarbageQuery(query)) {
+    if (LAST_GOOD_CATEGORY) {
+      query = categoryFallback(LAST_GOOD_CATEGORY) || query;
+    }
+  }
+
+  if (isGarbageQuery(query) && LAST_GOOD_QUERY && !isGarbageQuery(LAST_GOOD_QUERY)) {
+    query = LAST_GOOD_QUERY;
+  }
+
+  if (isGarbageQuery(query)) {
+    query = mode === "item" ? "consumer product" : query;
+  }
+
+  variants = normalizeVariantList(variants, query, mode);
+
+  if (mode === "item") {
+    variants = buildServerQueryVariants(query, variants, mode, mergedIdentity)
+      .filter((v) => normalizeQuery(v) !== normalizeQuery(query))
+      .slice(0, 8);
+  } else {
+    variants = [];
+  }
+
+  confidence = clamp01(confidence);
+
+  rememberGoodQuery(query);
+  LAST_GOOD_CATEGORY = inferVisionCategory(query) || mergedIdentity?.category || LAST_GOOD_CATEGORY;
+
+  return {
+    ok: true,
+    query,
+    variants,
+    confidence,
+    identity: mergedIdentity,
+    debug: {
+      passQueries: rawQueries,
+    },
+  };
+}
+
+// -------------------- VISION ANALYZE --------------------
+app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    hint: 'POST multipart/form-data with field name "image"',
+  });
+});
+
+app.post(
+  ["/vision/analyze", "/api/vision/analyze"],
+  visionLimiter,
+  requireApiKey,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      const file = req.file || null;
+
+      console.log("📸 VISION HIT", {
+        rid: req.rid,
+        path: req.originalUrl,
+        hasFile: !!file,
+        fileField: file?.fieldname || null,
+        fileSize: file?.size || 0,
+        bodyMode: req.body?.mode,
+        contentType: req.headers["content-type"],
+      });
+
+      if (!file) {
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          variants: [],
+          confidence: 0,
+          identity: null,
+          visionIdentity: null,
+          reason: "no_file_received",
+        });
+      }
+
+      if (file.size < 4000) {
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          variants: [],
+          confidence: 0,
+          identity: null,
+          visionIdentity: null,
+          reason: "image_too_small",
+        });
+      }
+
+      console.log("✅ VISION FILE ACCEPTED", {
+        rid: req.rid,
+        size: file.size,
+        mimetype: file.mimetype,
+      });
+
+      if (!openai) {
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          variants: [],
+          confidence: 0,
+          identity: null,
+          visionIdentity: null,
+          reason: "missing_openai_api_key",
+        });
+      }
+
+      if (visionCoolingDown()) {
+        console.warn("⚠️ Vision temporarily disabled (cooldown active)");
+        return res.status(200).json({
+          ok: true,
+          query: null,
+          variants: [],
+          confidence: 0,
+          identity: null,
+          visionIdentity: null,
+          reason: "vision_rate_limited",
+        });
+      }
+
+      const mode = cleanMode(req.body?.mode);
+      const propContext = safeStr(req.body?.propContext, 220);
+      const imgHash = sha256(file.buffer);
+      const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
+
+      let cached = await cacheGet(cacheKey);
+      if (!cached) cached = visionCache.get(cacheKey);
+
+      if (cached) {
+        return res.status(200).json({ ...cached, cached: true });
+      }
+
+      console.log("🧠 CALLING OPENAI VISION", {
+        rid: req.rid,
+        mode,
+        model: VISION_MODEL,
+      });
+
+      global.metrics.visionCalls++;
+
+const result = await withInflight(cacheKey, async () =>
+  visionConcurrency(async () =>
+    withHardTimeout(
+      runVisionConsensus({
+        req,
+        file,
+        mode,
+        propContext,
+      }),
+      12000,
+      "vision_consensus_timeout"
+    )
+  )
+);
+
+      const shaped = {
+        ok: true,
+        query: result?.query || null,
+        variants: Array.isArray(result?.variants) ? result.variants : [],
+        confidence: clamp01(Number(result?.confidence || 0)),
+        identity: result?.identity || null,
+        visionIdentity: result?.identity || null,
+        debug: result?.debug || null,
+      };
+
+      visionCache.set(cacheKey, shaped);
+      await cacheSet(cacheKey, shaped, 86400);
+
+      return res.status(200).json(shaped);
+    } catch (err) {
+      if (err?.status === 429 || String(err?.message || "").includes("429")) {
+        triggerVisionCooldown(60);
+      }
+
+      const name = err?.name || "error";
+      const reason = name === "AbortError" ? "vision_timeout" : "vision_exception";
+
+      console.warn("❌ VISION ERROR:", reason, err?.message || err);
+
+      return res.status(200).json({
+        ok: true,
+        query: null,
+        variants: [],
+        confidence: 0,
+        identity: null,
+        visionIdentity: null,
+        reason,
+      });
+    }
+  }
+);
+
+// -------------------- VISION ENRICH --------------------
+app.post("/vision/enrich", async (req, res) => {
+  try {
+    if (!openai) return res.status(200).json({ ok: false, reason: "missing_openai_api_key" });
+
+
+    const rawQuery = safeStr(req.body?.query, 220);
+    const query = normalizeQuery(rawQuery);
+    const mode = cleanMode(req.body?.mode);
+    const context = safeStr(req.body?.context, 220);
+
+    if (!query) return res.status(200).json({ ok: false, reason: "missing_query" });
+
+    const cacheKey = `enrich|${mode}|${context}|${query}`;
+    const cached = visionCache.get(cacheKey);
+    if (cached) return res.status(200).json({ ...cached, cached: true });
+
+    const enrichPrompt = `
+You are Evan AI enrichment.
+Input query: "${query}"
+Mode: "${mode}"
+Context: "${context || "none"}"
+
+Return practical, reseller-friendly structured JSON.
+`.trim();
+
+    const timeout = withTimeout(TEXT_TIMEOUT_MS);
+
+    const response = await openai.responses.create(
+      {
+        model: ENRICH_MODEL,
+        temperature: 0.4,
+        max_output_tokens: 450,
+
+        prompt_cache_key: "evan-ai-enrich-v2",
+        prompt_cache_retention: "24h",
+
+        text: {
+          format: {
+            type: "json_schema",
+            name: "evan_ai_enrich_result",
+            strict: true,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["ok", "collector", "materials", "alternatives", "local", "parts"],
+              properties: {
+                ok: { type: "boolean" },
+                collector: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["summary", "era", "maker", "model", "tells"],
+                  properties: {
+                    summary: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    era: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    maker: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    model: { anyOf: [{ type: "string" }, { type: "null" }] },
+                    tells: { type: "array", items: { type: "string" } },
+                  },
+                },
+                materials: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["signals"],
+                  properties: {
+                    signals: { type: "array", items: { type: "string" } },
+                  },
+                },
+                alternatives: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["queries"],
+                  properties: {
+                    queries: { type: "array", items: { type: "string" } },
+                  },
+                },
+                local: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["keywords"],
+                  properties: {
+                    keywords: { type: "array", items: { type: "string" } },
+                  },
+                },
+                parts: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["keywords"],
+                  properties: {
+                    keywords: { type: "array", items: { type: "string" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+
+        input: [{ role: "user", content: [{ type: "input_text", text: enrichPrompt }] }],
+        metadata: { rid: req.rid || "", mode: mode || "item" },
+      },
+      { signal: timeout.signal }
+    );
+
+    timeout.cancel();
+
+    let parsed = null;
+    
+    try {
+      parsed = JSON.parse(response.output_text || "{}");
+    } catch {
+      parsed = null;
+    }
+
+    if (!parsed || parsed.ok !== true) {
+      return res.status(200).json({ ok: false, reason: "parse_failed" });
+    }
+
+    visionCache.set(cacheKey, parsed);
+    return res.status(200).json(parsed);
+  } catch (e) {
+    return res.status(200).json({ ok: false, reason: "enrich_exception" });
+  }
+});
+
+
+
+
+// -------------------- SERP: google shopping --------------------
+async function serpShopping(query, opts = {}) {
+  const { bypassCooldown = false, softFail = false } = opts || {};
+
+  if (!SERPAPI_KEY) return [];
+  if (!bypassCooldown && isSourceCoolingDown("serpapi")) return [];
+
+  const startedAt = Date.now();
+
+  const params = new URLSearchParams({
+    engine: "google_shopping",
+    q: query,
+    hl: "en",
+    gl: "us",
+    api_key: SERPAPI_KEY,
+  });
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url, { signal: controller.signal });
+
+    if (!r.ok) {
+      if (!softFail) {
+        markSourceFailure("serpapi", `http_${r.status}`);
+      }
+      console.warn(
+        "⚠️ SerpAPI request failed:",
+        r.status,
+        "query=",
+        query,
+        "softFail=",
+        softFail
+      );
+      return [];
+    }
+
+    const data = await r.json();
+
+    const raw = [
+      ...(Array.isArray(data.shopping_results) ? data.shopping_results : []),
+      ...(Array.isArray(data.inline_shopping_results)
+        ? data.inline_shopping_results
+        : []),
+    ];
+
+    console.log("🛒 SERP RAW COUNT", {
+      query,
+      raw: raw.length,
+      hasShoppingResults: Array.isArray(data.shopping_results),
+      hasInlineShoppingResults: Array.isArray(data.inline_shopping_results),
+    });
+
+    let items = raw
+      .map((it, idx) => {
+        const normalized = normalizeItem({
+          ...it,
+          link:
+            it.link ||
+            it.product_link ||
+            it.product_page_url ||
+            it.google_product_link ||
+            it.google_shopping_product_link ||
+            it.offer_page_url ||
+            it.offer_link ||
+            it.merchant_link ||
+            it.product_url ||
+            it.url ||
+            it.serpapi_link ||
+            null,
+        });
+
+        const fallbackLink =
+          normalized.link ||
+          normalized.googleProductLink ||
+          normalized.merchantLink ||
+          it.link ||
+          it.product_link ||
+          it.product_page_url ||
+          it.google_product_link ||
+          it.google_shopping_product_link ||
+          it.offer_page_url ||
+          it.offer_link ||
+          it.merchant_link ||
+          it.product_url ||
+          it.url ||
+          it.serpapi_link ||
+          null;
+
+        return {
+          ...normalized,
+          link: fallbackLink,
+          url: fallbackLink,
+          buyLink: fallbackLink,
+          linkVerified: Boolean(fallbackLink),
+          source:
+            normalized.source ||
+            it.source ||
+            it.store_name ||
+            it.store ||
+            it.seller ||
+            it.merchant_name ||
+            "google shopping",
+          __fromMarketSearch: true,
+          __serverRank: idx + 1,
+        };
+      })
+      .filter((x) => x.title)
+      .filter(
+        (x) => Number.isFinite(x.totalPrice) || Number.isFinite(x.price)
+      );
+
+    items = dedupeSmart(items);
+
+    console.log("🛒 SERP NORMALIZED COUNT", {
+      query,
+      raw: raw.length,
+      kept: items.length,
+      top: items.slice(0, 3).map((x) => ({
+        title: x.title,
+        price: x.totalPrice ?? x.price ?? null,
+        link: x.link || null,
+        source: x.source || null,
+      })),
+    });
+
+    markSourceSuccess("serpapi", Date.now() - startedAt);
+
+    // IMPORTANT:
+    // keep serpShopping relaxed.
+    // mergeCheapestSources already does the smarter filtering/ranking later.
+    return items.slice(0, 60);
+  } catch (err) {
+    if (!softFail) {
+      markSourceFailure(
+        "serpapi",
+        err?.name === "AbortError" ? "timeout" : "exception"
+      );
+    }
+
+    console.warn(
+      "⚠️ SerpAPI search error:",
+      err?.name || "error",
+      err?.message || err,
+      "query=",
+      query,
+      "softFail=",
+      softFail
+    );
+
+    return [];
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// -------------------- ETSY ROUTE --------------------
+app.get("/search/etsy", async (req, res) => {
+  const rawQuery = safeStr(req.query?.q, 220);
+  const query = normalizeQuery(rawQuery);
+
+  if (!query || !ETSY_API_KEY) {
+    return res.status(200).json([]);
+  }
+
+  const cacheKey = `etsy_priority|${query}`;
+  const cached = SERP_CACHE.get(cacheKey);
+  if (cached) return res.status(200).json(cached);
+
+  try {
+    const items = await withInflight(cacheKey, async () => {
+      const variants = buildEtsyVariants(query);
+      let merged = [];
+
+      for (const q of variants) {
+        const rows = await etsySearch(q);
+        if (rows?.length) merged.push(...rows);
+      }
+
+      merged = dedupeSmart(merged);
+      merged = filterRelevantListings(query, merged);
+      merged = trimPriceOutliers(merged);
+      merged = intuitionFilter(merged);
+      merged = sortByAbsoluteCheapest(merged).slice(0, 60);
+
+      return merged;
+    });
+
+    SERP_CACHE.set(cacheKey, items);
+    return res.status(200).json(items);
+  } catch {
+    const fallback = SERP_CACHE.get(cacheKey);
+    return res.status(200).json(fallback || []);
+  }
+});
+
+app.get("/search/serp", async (req, res) => {
+  const rawQuery = safeStr(req.query?.q, 220);
+  const query = normalizeQuery(rawQuery);
+
+  if (!query || !SERPAPI_KEY) {
+    return res.status(200).json([]);
+  }
+
+  const cacheKey = `serp_cheapest|${query}`;
+  const cached = SERP_CACHE.get(cacheKey);
+  if (cached) return res.status(200).json(cached);
+
+  try {
+    const items = await withInflight(cacheKey, async () => {
+      let out = await serpShopping(query);
+      out = filterRelevantListings(query, out);
+      out = trimPriceOutliers(out);
+      out = sortByAbsoluteCheapest(out).slice(0, 60);
+      return out;
+    });
+
+    SERP_CACHE.set(cacheKey, items);
+    return res.status(200).json(items);
+  } catch {
+    const fallback = SERP_CACHE.get(cacheKey);
+    return res.status(200).json(fallback || []);
+  }
+});
+
+// Ebay MVP (site filter)
+app.get("/search/ebay", async (req, res) => {
+  const rawQuery = safeStr(req.query?.q, 220);
+  const query = normalizeQuery(rawQuery);
+
+  if (!query || !SERPAPI_KEY) return res.status(200).json([]);
+
+  const cacheKey = `ebay_cheapest|${query}`;
+  const cached = SERP_CACHE.get(cacheKey);
+  if (cached) return res.status(200).json(cached);
+
+  try {
+    const items = await withInflight(cacheKey, async () => {
+      let out = await serpEbaySearch(query);
+      out = filterRelevantListings(query, out);
+      out = trimPriceOutliers(out);
+      out = intuitionFilter(out);
+      out = sortByAbsoluteCheapest(out, query).slice(0, 60);
+      return out;
+    });
+
+    SERP_CACHE.set(cacheKey, items);
+    return res.status(200).json(items);
+  } catch {
+    return res.status(200).json([]);
+  }
+});
+
+
+// -------------------- ETSY SEARCH --------------------
+async function etsySearch(query) {
+  if (!ETSY_API_KEY) return [];
+  if (Date.now() < ETSY_COOLDOWN_UNTIL) return [];
+  if (isSourceCoolingDown("etsy")) return [];
+
+  const startedAt = Date.now();
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 7000);
+
+  try {
+    const url =
+      "https://openapi.etsy.com/v3/application/listings/active?" +
+      new URLSearchParams({
+        keywords: query,
+        limit: "48",
+      });
+
+    const r = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "x-api-key": ETSY_API_KEY,
+      },
+    });
+
+if (r.status === 429) {
+  ETSY_COOLDOWN_UNTIL = Date.now() + 90 * 1000;
+  markSourceFailure("etsy", "http_429");
+  console.warn("⚠️ Etsy rate limited. Cooling down for 90s.");
+  return [];
+}
+
+if (r.status === 403) {
+  ETSY_COOLDOWN_UNTIL = Date.now() + 10 * 60 * 1000;
+  console.warn("⚠️ Etsy 403. Key/app access rejected. Disabling Etsy for 10m.");
+  return [];
+}
+
+if (!r.ok) {
+  markSourceFailure("etsy", `http_${r.status}`);
+  console.warn("⚠️ Etsy request failed:", r.status);
+  return [];
+}
+
+    const data = await r.json();
+
+    const raw = (Array.isArray(data?.results) ? data.results : []).map((x) => {
+      const amount = Number(x?.price?.amount ?? x?.price_amount ?? 0);
+      const divisor = Number(x?.price?.divisor ?? 100) || 100;
+
+      return {
+        title: x?.title || null,
+        extracted_price: amount > 0 ? amount / divisor : null,
+        source: "etsy",
+        link: x?.url || null,
+        thumbnail:
+          x?.images?.[0]?.url_fullxfull ||
+          x?.images?.[0]?.url_570xN ||
+          null,
+        rating: x?.shop?.review_average ?? null,
+        reviews: x?.shop?.review_count ?? null,
+      };
+    });
+
+    let items = raw
+      .map(normalizeItem)
+      .filter((x) => x.title && x.link);
+
+    items = items.filter((it) => !isBadListing(it.title, query));
+    items = trimPriceOutliers(items);
+    items = dedupeSmart(items);
+    items = sortByAbsoluteCheapest(items, query);
+
+    markSourceSuccess("etsy", Date.now() - startedAt);
+
+    return items.slice(0, 60);
+  } catch (err) {
+    markSourceFailure(
+      "etsy",
+      err?.name === "AbortError" ? "timeout" : "exception"
+    );
+    console.warn("⚠️ Etsy search error:", err?.message || err);
+    return [];
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function serpEbaySearch(query) {
+  if (!SERPAPI_KEY) return [];
+  if (isSourceCoolingDown("serpapi")) return [];
+
+  const baseQuery = normalizeQuery(query);
+  if (!baseQuery) return [];
+
+  const wantsOrange =
+    baseQuery.includes("orange") ||
+    baseQuery.includes("amber") ||
+    baseQuery.includes("yellow");
+
+  const wantsBlue =
+    baseQuery.includes("blue light") ||
+    baseQuery.includes("blue-light") ||
+    baseQuery.includes("computer") ||
+    baseQuery.includes("gaming") ||
+    baseQuery.includes("block blue") ||
+    baseQuery.includes("screen");
+
+  const wantsWrap = baseQuery.includes("wrap");
+
+  const attempts = [
+    `${baseQuery} site:ebay.com`,
+    `${baseQuery} pre owned site:ebay.com`,
+    `${baseQuery} vintage site:ebay.com`,
+    `${baseQuery} retro site:ebay.com`,
+  ];
+
+  if (wantsOrange && wantsWrap && !wantsBlue) {
+    attempts.push("orange wraparound sunglasses site:ebay.com");
+    attempts.push("black wraparound orange lens sunglasses site:ebay.com");
+    attempts.push("y2k orange lens wraparound sunglasses site:ebay.com");
+  }
+
+  const dedupedAttempts = [...new Set(
+    attempts
+      .map((x) => String(x).toLowerCase().replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+  )];
+
+  let merged = [];
+
+  for (const q of dedupedAttempts) {
+    const rows = await serpShopping(q, { bypassCooldown: true, softFail: true });
+    if (!rows?.length) continue;
+
+    merged.push(...rows);
+
+    if (merged.length >= 48) break;
+  }
+
+  merged = dedupeSmart(merged);
+  merged = filterRelevantListings(baseQuery, merged);
+  merged = trimPriceOutliers(merged);
+  merged = intuitionFilter(merged);
+  merged = sortByAbsoluteCheapest(merged, baseQuery);
+
+  return merged.slice(0, 60);
+}
+
+// -------------------- MARKET SEARCH (POST) --------------------
+app.post("/market/search", async (req, res) => {
+  try {
+
+const rawQuery = safeStr(req.body?.query, 220);
+let query = normalizeQuery(rawQuery);
+
+const visionIdentity = normalizeVisionIdentityPayload(
+  req.body?.visionIdentity || req.body?.identity || null,
+  query
+);
+
+if ((!query || isGarbageQuery(query)) && visionIdentity?.exactQuery) {
+  query = normalizeQuery(visionIdentity.exactQuery);
+}
+
+if (
+  (!query || isGarbageQuery(query)) &&
+  Array.isArray(visionIdentity?.searchQueries) &&
+  visionIdentity.searchQueries.length
+) {
+  query = normalizeQuery(visionIdentity.searchQueries[0]);
+}
+
+const variants = normalizeVariantList(
+  [
+    ...(Array.isArray(req.body?.variants) ? req.body.variants : []),
+    ...(Array.isArray(visionIdentity?.searchQueries) ? visionIdentity.searchQueries : []),
+    visionIdentity?.exactQuery,
+  ],
+  query,
+  "item"
+);
+
+const scannedPrice = finitePrice(req.body?.scannedPrice);
+const visionConfidence = clamp01(
+  req.body?.visionConfidence ?? req.body?.confidence ?? 0.5
+);
+
+const category =
+  safeStr(req.body?.category, 80) ||
+  visionIdentity?.category ||
+  inferVisionCategory(query);
+    if (!query) {
+      return res.status(200).json({ ok: false, error: "Missing query" });
+    }
+const searchedQueries = buildServerQueryVariants(query, variants, "item", visionIdentity);
+
+if (!searchedQueries.length) {
+  searchedQueries.push(query);
+}
+
+if (searchedQueries.length < 3) {
+  searchedQueries.push(`${query} used`);
+  searchedQueries.push(`${query} ebay`);
+}
+
+const canonicalKey = canonicalMarketQuery(query);
+const canonicalVariantKey = uniqueQueries(
+  searchedQueries.map((q) => canonicalMarketQuery(q))
+).join("|");
+const identityKey = visionIdentity ? hashString(JSON.stringify(visionIdentity)) : "noid";
+const cacheKey = `market|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
+const cached = SERP_CACHE.get(cacheKey);
+
+    if (cached && Array.isArray(cached) && cached.length > 0) {
+      const consensus = buildMarketConsensus(cached, scannedPrice, visionConfidence);
+      const prediction = buildFlipPrediction({
+        items: cached,
+        scannedPrice,
+        visionConfidence,
+        category,
+      });
+
+      const finalQuery =
+        Array.isArray(cached) && cached.length > 0
+          ? promoteQueryFromMarket(query, cached)
+          : query;
+
+      const coach = buildResaleCoach({
+        prediction,
+        consensus,
+        scannedPrice,
+        finalQuery,
+      });
+
+const pulse = recordPulse(finalQuery || query);
+
+const uiItems = Array.isArray(cached)
+  ? cached
+      .slice(0, Math.min(cached.length, 12))
+      .map((it) => ({
+        ...it,
+        url: it?.url || it?.buyLink || it?.link || null,
+        buyLink: it?.buyLink || it?.url || it?.link || null,
+      }))
+  : [];
+
+const best = uiItems[0] || null;
+const bestPrice = finitePrice(best?.totalPrice ?? best?.price);
+
+return res.status(200).json({
+  ok: true,
+  query,
+  finalQuery,
+  searchedQueries,
+  variants,
+
+  // modern fields
+  items: uiItems,
+  top3: uiItems.slice(0, 3),
+
+  // legacy/front-end-safe aliases
+  market: uiItems,
+  results: uiItems,
+  best,
+  bestPrice,
+  totalMatches: uiItems.length,
+
+  visionIdentity,
+  consensus,
+  prediction,
+  coach,
+  pulse,
+});
+
+    }
+
+let items = await withInflight(cacheKey, async () => {
+  return await mergeCheapestSources(query, variants, visionIdentity);
+});
+
+if ((!Array.isArray(items) || items.length === 0) && Array.isArray(cached) && cached.length > 0) {
+  console.warn("⚠️ Using cached fallback market results");
+  items = cached;
+}
+
+    if (Array.isArray(items) && items.length > 0) {
+      SERP_CACHE.set(cacheKey, items);
+    }
+
+    const consensus = buildMarketConsensus(items, scannedPrice, visionConfidence);
+    const prediction = buildFlipPrediction({
+      items,
+      scannedPrice,
+      visionConfidence,
+      category,
+    });
+
+    const finalQuery =
+      Array.isArray(items) && items.length > 0
+        ? promoteQueryFromMarket(query, items)
+        : query;
+
+    const coach = buildResaleCoach({
+      prediction,
+      consensus,
+      scannedPrice,
+      finalQuery,
+    });
+
+const pulse = recordPulse(finalQuery || query);
+
+const uiItems = Array.isArray(items)
+  ? items.map((it) => ({
+      ...it,
+      url: it?.url || it?.buyLink || it?.link || null,
+      buyLink: it?.buyLink || it?.url || it?.link || null,
+    }))
+  : [];
+
+const best = uiItems[0] || null;
+const bestPrice = finitePrice(best?.totalPrice ?? best?.price);
+
+return res.status(200).json({
+  ok: true,
+  query,
+  finalQuery,
+  searchedQueries,
+  variants,
+
+  // modern fields
+  items: uiItems,
+  top3: uiItems.slice(0, 3),
+
+  // legacy/front-end-safe aliases
+  market: uiItems,
+  results: uiItems,
+  best,
+  bestPrice,
+  totalMatches: uiItems.length,
+
+  visionIdentity,
+  consensus,
+  prediction,
+  coach,
+  pulse,
+});
+
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      items: [],
+      top3: [],
+      searchedQueries: [],
+      variants: [],
+      consensus: buildMarketConsensus([]),
+      prediction: buildFlipPrediction({ items: [] }),
+      reason: "market_search_failed",
+    });
+  }
+});
+
+app.post("/market/check", async (req, res) => {
+  try {
+const rawQuery = safeStr(req.body?.query, 220);
+let query = normalizeQuery(rawQuery);
+
+const visionIdentity = normalizeVisionIdentityPayload(
+  req.body?.visionIdentity || req.body?.identity || null,
+  query
+);
+
+if ((!query || isGarbageQuery(query)) && visionIdentity?.exactQuery) {
+  query = normalizeQuery(visionIdentity.exactQuery);
+}
+
+if (
+  (!query || isGarbageQuery(query)) &&
+  Array.isArray(visionIdentity?.searchQueries) &&
+  visionIdentity.searchQueries.length
+) {
+  query = normalizeQuery(visionIdentity.searchQueries[0]);
+}
+
+const variants = normalizeVariantList(
+  [
+    ...(Array.isArray(req.body?.variants) ? req.body.variants : []),
+    ...(Array.isArray(visionIdentity?.searchQueries) ? visionIdentity.searchQueries : []),
+    visionIdentity?.exactQuery,
+  ],
+  query,
+  "item"
+);
+
+const scannedPrice = finitePrice(req.body?.scannedPrice);
+const visionConfidence = clamp01(
+  req.body?.visionConfidence ?? req.body?.confidence ?? 0.5
+);
+
+const category =
+  safeStr(req.body?.category, 80) ||
+  visionIdentity?.category ||
+  inferVisionCategory(query);
+
+    if (!query) {
+      return res.status(200).json({ ok: false, error: "Missing query" });
+    }
+
+const searchedQueries = buildServerQueryVariants(query, variants, "item", visionIdentity);
+const canonicalKey = canonicalMarketQuery(query);
+const canonicalVariantKey = uniqueQueries(
+  searchedQueries.map((q) => canonicalMarketQuery(q))
+).join("|");
+const identityKey = visionIdentity ? hashString(JSON.stringify(visionIdentity)) : "noid";
+const cacheKey = `market|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
+const cached = SERP_CACHE.get(cacheKey);
+
+    const items =
+      cached && Array.isArray(cached) && cached.length > 0
+        ? cached
+: await withInflight(cacheKey, async () => {
+    return await mergeCheapestSources(query, variants, visionIdentity);
+  });
+
+    if ((!cached || !cached.length) && Array.isArray(items) && items.length > 0) {
+      SERP_CACHE.set(cacheKey, items);
+    }
+
+    const best = Array.isArray(items) && items.length > 0 ? items[0] : null;
+    const consensus = buildMarketConsensus(items, scannedPrice, visionConfidence);
+    const prediction = buildFlipPrediction({
+      items,
+      scannedPrice,
+      visionConfidence,
+      category,
+    });
+
+    const finalQuery =
+      Array.isArray(items) && items.length > 0
+        ? promoteQueryFromMarket(query, items)
+        : query;
+
+    const coach = buildResaleCoach({
+      prediction,
+      consensus,
+      scannedPrice,
+      finalQuery,
+    });
+
+    const pulse = getPulse(finalQuery || query);
+
+    return res.status(200).json({
+      ok: true,
+      query,
+      searchedQueries,
+      variants,
+      bestPrice: finitePrice(best?.totalPrice ?? best?.price),
+      best,
+      items: Array.isArray(items) ? items.slice(0, 3) : [],
+      visionIdentity,
+      consensus,
+      prediction,
+      coach,
+      pulse,
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      query: null,
+      bestPrice: null,
+      best: null,
+      items: [],
+      searchedQueries: [],
+      variants: [],
+      consensus: buildMarketConsensus([]),
+      prediction: buildFlipPrediction({ items: [] }),
+      reason: "market_check_failed",
+    });
+  }
+});
+
+// -------------------- MARKET RESEARCH (POST) --------------------
+app.post("/market/research", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    const mode = safeStr(req.body?.mode, 24) || "resale";
+
+    if (!query) {
+      return res.status(200).json({ ok: false, error: "Missing query" });
+    }
+
+    if (!SERPAPI_KEY) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        items: [],
+        consensus: buildMarketConsensus([]),
+        reason: "missing_serpapi_key",
+      });
+    }
+
+    const cacheKey = `research|${mode}|${query}`;
+    const cached = RESEARCH_CACHE.get(cacheKey);
+
+    if (cached) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        items: cached,
+        consensus: buildMarketConsensus(cached),
+        cached: true,
+      });
+    }
+
+    const expansions =
+      mode === "cheaper"
+        ? [
+            `${query} used`,
+            `${query} pre-owned`,
+            `${query} ebay`,
+            `${query} etsy`,
+            `${query} poshmark`,
+            `${query} depop`,
+          ]
+        : [query];
+
+    const resultSets = await Promise.all(
+      expansions.slice(0, 6).map((q) =>
+        marketSearchConcurrency(() => serpShopping(q))
+      )
+    );
+
+    const all = resultSets.flat();
+
+    let cheapest = sortCheapest(dedupeByLink(all));
+    cheapest = cheapest.filter((it) => !isBadListing(it.title, query));
+    cheapest = trimPriceOutliers(cheapest);
+    cheapest = smartRank(cheapest, query, null);
+
+    RESEARCH_CACHE.set(cacheKey, cheapest);
+
+    return res.status(200).json({
+      ok: true,
+      query,
+      items: cheapest,
+      consensus: buildMarketConsensus(cheapest),
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      items: [],
+      consensus: buildMarketConsensus([]),
+      reason: "market_research_failed",
+    });
+  }
+});
+
+
+// ✅ NEW FEATURE: batch check for watchlists
+app.post("/market/batch-check", async (req, res) => {
+  try {
+    const queries = Array.isArray(req.body?.queries) ? req.body.queries : [];
+    const cleaned = queries
+      .map((q) => normalizeQuery(safeStr(q, 220)))
+      .filter(Boolean)
+      .slice(0, 25);
+
+    if (!cleaned.length) {
+      return res.status(200).json({ ok: false, error: "Missing queries[]" });
+    }
+
+    if (!SERPAPI_KEY && !ETSY_API_KEY) {
+      return res.status(200).json({
+        ok: true,
+        results: [],
+        reason: "missing_market_keys",
+      });
+    }
+
+    const batchLimiter = pLimit(4);
+
+    const results = await Promise.all(
+      cleaned.map((q) =>
+        batchLimiter(async () => {
+          const key = `check_cheapest|${q}`;
+          const cached = SERP_CACHE.get(key);
+          const items = cached || (await mergeCheapestSources(q));
+
+          if (!cached) {
+            SERP_CACHE.set(key, items);
+          }
+
+          const consensus = buildMarketConsensus(items);
+          const prediction = buildFlipPrediction({
+            items,
+            scannedPrice: null,
+            visionConfidence: 0.5,
+            category: inferVisionCategory(q),
+          });
+
+          return {
+            query: q,
+            bestPrice: finitePrice(items[0]?.totalPrice ?? items[0]?.price),
+            best: items[0] ?? null,
+            consensus,
+            prediction,
+            pulse: getPulse(q),
+          };
+        })
+      )
+    );
+
+    return res.status(200).json({ ok: true, results });
+  } catch {
+    return res.status(200).json({ ok: false, error: "batch_check_failed" });
+  }
+});
+
+// -------------------- LOCAL + ESTATE SEARCH (POST) --------------------
+app.post("/local/search", async (req, res) => {
+  try {
+    const query = safeStr(req.body?.query, 220);
+    const near = safeStr(req.body?.near, 80) || "near me";
+    if (!query || !SERPAPI_KEY) return res.status(200).json({ ok: true, items: [] });
+
+    const cacheKey = `local|${query}|${near}`;
+    const cached = LOCAL_CACHE.get(cacheKey);
+    if (cached) return res.status(200).json({ ok: true, items: cached, cached: true });
+
+    const q = `${query} ${near} consignment OR thrift OR estate sale`;
+
+    const params = new URLSearchParams({
+      engine: "google",
+      q,
+      hl: "en",
+      gl: "us",
+      api_key: SERPAPI_KEY,
+    });
+
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 7000);
+
+
+    const r = await fetch(`https://serpapi.com/search.json?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+
+    const data = await r.json();
+    const organic = Array.isArray(data?.organic_results) ? data.organic_results : [];
+
+    const items = organic
+      .slice(0, 10)
+      .map((o) => ({
+        title: o.title || null,
+        link: o.link || null,
+        snippet: o.snippet || null,
+        source: o.source || "Local",
+      }))
+      .filter((x) => x.title && x.link);
+
+    LOCAL_CACHE.set(cacheKey, items);
+    return res.status(200).json({ ok: true, items });
+  } catch {
+    return res.status(200).json({ ok: true, items: [] });
+  }
+});
+
+// -------------------- REFERRAL ROUTES --------------------
+
+// Create referral code
+app.post("/referral/create", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+
+    if (!userId) {
+      return res.status(200).json({
+        ok: false,
+        error: "sign_in_required",
+        reason: "sign_in_required",
+      });
+    }
+
+    const code = await createReferral(userId);
+    if (!code) {
+      return res.status(200).json({
+        ok: false,
+        error: "redis_unavailable",
+      });
+    }
+
+    const stats = await getReferralByOwner(userId);
+    const bonusScans = await getBonusScans(userId);
+
+    return res.status(200).json({
+      ok: true,
+      code,
+      totalUses: Number(stats?.uses || 0),
+      referralUses: Number(stats?.uses || 0),
+      bonusScans: Number(bonusScans || 0),
+    });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// Redeem referral
+app.post("/referral/redeem", async (req, res) => {
+  try {
+    const code = safeStr(req.body?.code, 32).toUpperCase();
+    const userId = safeStr(req.body?.userId, 64);
+    const source = safeStr(req.body?.source, 24) || "manual";
+
+    if (!code || !userId) {
+      return res.status(200).json({
+        ok: false,
+        error: "sign_in_required",
+        reason: "sign_in_required",
+      });
+    }
+
+    const result = await redeemReferral({
+      code,
+      userId,
+      source,
+    });
+
+    if (!result?.ok) {
+      return res.status(200).json(result);
+    }
+
+    const redeemerBonusScans = await addBonusScans(
+      userId,
+      REFERRAL_BONUS_REWARD
+    );
+    const ownerBonusScans = await addBonusScans(
+      result.ownerId,
+      REFERRAL_BONUS_REWARD
+    );
+
+    return res.status(200).json({
+      ok: true,
+      code: result.code,
+      ownerId: result.ownerId,
+      uses: Number(result.uses || 0),
+      bonusScans: Number(redeemerBonusScans || 0),
+      reward: {
+        amount: REFERRAL_BONUS_REWARD,
+        redeemerBonusScans: Number(redeemerBonusScans || 0),
+        ownerBonusScans: Number(ownerBonusScans || 0),
+      },
+      referredBy: result.code,
+      source: result.source || source,
+    });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+app.get("/referral/bonus", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 64);
+    if (!userId) {
+      return res.status(200).json({ ok: false, bonusScans: 0 });
+    }
+
+    const bonusScans = await getBonusScans(userId);
+    return res.status(200).json({ ok: true, bonusScans });
+  } catch {
+    return res.status(200).json({ ok: false, bonusScans: 0 });
+  }
+});
+
+// Get referral stats
+app.get("/referral/stats", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 64);
+
+    if (!userId || !redis) {
+      return res.status(200).json({
+        ok: false,
+        error: "sign_in_required",
+        reason: "sign_in_required",
+      });
+    }
+
+    const code = await createReferral(userId);
+    const record = await getReferralByOwner(userId);
+    const bonusScans = await getBonusScans(userId);
+
+    let referredBy = null;
+    try {
+      const rawRedeem = await redis.get(referralUserKey(userId));
+      if (rawRedeem) {
+        const parsed = JSON.parse(rawRedeem);
+        referredBy = parsed?.code || null;
+      }
+    } catch {}
+
+    return res.status(200).json({
+      ok: true,
+      code: code || null,
+      totalUses: Number(record?.uses || 0),
+      referralUses: Number(record?.uses || 0),
+      bonusScans: Number(bonusScans || 0),
+      referredBy,
+    });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+function round2(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
+}
+
+function finitePrice(n) {
+  const v = Number(n);
+  return Number.isFinite(v) && v > 0 ? round2(v) : null;
+}
+
+function watchStorageKey(userId, query) {
+  return `watch:${safeStr(userId, 64)}:${hashString(normalizeQuery(query))}`;
+}
+
+async function loadWatchState(userId, query) {
+  if (!redis || !userId || !query) return null;
+
+  try {
+    const raw = await redis.get(watchStorageKey(userId, query));
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveWatchState(userId, query, value) {
+  if (!redis || !userId || !query) return;
+
+  try {
+    await redis.set(watchStorageKey(userId, query), JSON.stringify(value));
+  } catch {}
+}
+
+function bonusScansKey(userId) {
+  return `bonus_scans:${safeStr(userId, 64)}`;
+}
+
+async function getBonusScans(userId) {
+  if (!redis || !userId) return 0;
+
+  try {
+    const raw = await redis.get(bonusScansKey(userId));
+    const n = Number(raw || 0);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function addBonusScans(userId, amount = 1) {
+  if (!redis || !userId || !Number.isFinite(amount) || amount <= 0) return 0;
+
+  try {
+    const next = await redis.incrby(bonusScansKey(userId), amount);
+    return Number(next || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function computeWatchDelta(prev, items = []) {
+  const best = items[0] || null;
+
+  const nextBestPrice = finitePrice(best?.totalPrice ?? best?.price);
+  const prevBestPrice = finitePrice(prev?.lastBestPrice);
+
+  const sourceChanged =
+    String(prev?.bestSource || "") !== String(best?.source || "");
+
+  const changed = prevBestPrice !== nextBestPrice || sourceChanged;
+
+  const priceDropped =
+    prevBestPrice != null &&
+    nextBestPrice != null &&
+    nextBestPrice < prevBestPrice;
+
+  const dropAmount = priceDropped
+    ? round2(prevBestPrice - nextBestPrice)
+    : 0;
+
+  const dropPct =
+    priceDropped && prevBestPrice > 0
+      ? round2((dropAmount / prevBestPrice) * 100)
+      : 0;
+
+  const newLow =
+    nextBestPrice != null &&
+    (!Number.isFinite(prev?.lowestSeen) || nextBestPrice < prev.lowestSeen);
+
+  const significant =
+    dropPct >= 8 ||
+    dropAmount >= 10 ||
+    newLow;
+
+  return {
+    changed,
+    priceDropped,
+    dropAmount,
+    dropPct,
+    newLow,
+    sourceChanged,
+    significant,
+  };
+}
+
+function buildWatchState(query, items = [], prev = null, delta = null) {
+  const best = items[0] || null;
+  const bestPrice = finitePrice(best?.totalPrice ?? best?.price);
+  const consensus = buildMarketConsensus(items);
+
+  const prevLowest = Number.isFinite(prev?.lowestSeen) ? prev.lowestSeen : null;
+  const prevHighest = Number.isFinite(prev?.highestSeen) ? prev.highestSeen : null;
+  const prevDropCount = Number(prev?.dropCount || 0);
+  const prevBiggestDrop = Number(prev?.biggestDrop || 0);
+
+  return {
+    query,
+    lastBestPrice: bestPrice,
+    previousBestPrice: finitePrice(prev?.lastBestPrice),
+    bestSource: best?.source || null,
+    bestTitle: best?.title || null,
+    firstSeenAt: prev?.firstSeenAt || Date.now(),
+    lastCheckedAt: Date.now(),
+    lowestSeen:
+      bestPrice == null
+        ? prevLowest
+        : prevLowest == null
+        ? bestPrice
+        : Math.min(prevLowest, bestPrice),
+    highestSeen:
+      bestPrice == null
+        ? prevHighest
+        : prevHighest == null
+        ? bestPrice
+        : Math.max(prevHighest, bestPrice),
+    dropCount: delta?.priceDropped ? prevDropCount + 1 : prevDropCount,
+    biggestDrop: delta?.priceDropped
+      ? Math.max(prevBiggestDrop, Number(delta.dropAmount || 0))
+      : prevBiggestDrop,
+    volatility: resaleProbability(
+      (items || []).map((it) => ({
+        ...it,
+        price: it?.totalPrice ?? it?.price,
+      }))
+    ),
+    marketConfidence: consensus.consensusScore,
+    lastDelta: delta || null,
+  };
+}
+
+async function runWatchCheck(userId, rawQuery) {
+  const query = normalizeQuery(safeStr(rawQuery, 220));
+  if (!userId || !query) return null;
+
+  const prev = await loadWatchState(userId, query);
+  const items = await mergeCheapestSources(query);
+  const delta = computeWatchDelta(prev, items);
+  const state = buildWatchState(query, items, prev, delta);
+  const consensus = buildMarketConsensus(items);
+
+  await saveWatchState(userId, query, state);
+
+  return {
+    query,
+    bestPrice: finitePrice(items[0]?.totalPrice ?? items[0]?.price),
+    best: items[0] ?? null,
+    delta,
+    state,
+    consensus,
+  };
+}
+
+// -------------------- LIGHTWEIGHT APP ROUTES REQUIRED BY FRONTEND --------------------
+
+// in-memory analytics sink (safe dev stub)
+const analyticsEvents = [];
+
+// analytics event
+app.post("/analytics/event", (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const event = safeStr(req.body?.event, 64);
+    const payload = req.body?.payload ?? {};
+    const ts =
+      typeof req.body?.ts === "number" ? req.body.ts : Date.now();
+
+    analyticsEvents.unshift({
+      userId,
+      event,
+      payload,
+      ts,
+    });
+
+    // keep memory bounded
+    if (analyticsEvents.length > 1000) {
+      analyticsEvents.length = 1000;
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch {
+    return res.status(200).json({ ok: false });
+  }
+});
+
+// history load (safe dev stub)
+app.get("/history/load", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 64);
+    if (!userId) return res.status(200).json([]);
+
+    // if redis exists, try load per-user history
+    if (redis) {
+      const raw = await redis.get(`history:${userId}`);
+      if (!raw) return res.status(200).json([]);
+      try {
+        const parsed = JSON.parse(raw);
+        return res.status(200).json(Array.isArray(parsed) ? parsed : []);
+      } catch {
+        return res.status(200).json([]);
+      }
+    }
+
+    // local/dev fallback
+    return res.status(200).json([]);
+  } catch {
+    return res.status(200).json([]);
+  }
+});
+
+// watch poll (frontend expects this)
+app.post("/watch/poll", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+    if (!userId || !items.length) {
+      return res.status(200).json({ ok: true, drops: [], updated: [] });
+    }
+
+    const cleaned = items
+      .map((it) => ({
+        id: it?.id || null,
+        query: normalizeQuery(safeStr(it?.query || it?.title, 220)),
+      }))
+      .filter((it) => it.query)
+      .slice(0, 25);
+
+    const drops = [];
+    const updated = [];
+
+    for (const it of cleaned) {
+      const result = await runWatchCheck(userId, it.query);
+      if (!result) continue;
+
+      updated.push({
+        id: it.id || result.query,
+        query: result.query,
+        bestPrice: result.bestPrice,
+        best: result.best,
+        delta: result.delta,
+        state: result.state,
+        consensus: result.consensus,
+      });
+
+      if (result.delta?.priceDropped && result.delta?.significant) {
+        drops.push({
+          id: it.id || result.query,
+          query: result.query,
+          bestPrice: result.bestPrice,
+          best: result.best,
+          delta: result.delta,
+          consensus: result.consensus,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      drops,
+      updated,
+    });
+  } catch {
+    return res.status(200).json({ ok: true, drops: [], updated: [] });
+  }
+});
+
+// watch recheck (frontend expects this)
+app.post("/watch/recheck", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const item = req.body?.item || null;
+    const query = normalizeQuery(safeStr(item?.query || item?.title, 220));
+
+    if (!userId || !query) {
+      return res.status(200).json({ ok: false, error: "missing_fields" });
+    }
+
+    if (!SERPAPI_KEY && !ETSY_API_KEY) {
+      return res.status(200).json({
+        ok: true,
+        query,
+        bestPrice: null,
+        best: null,
+        consensus: buildMarketConsensus([]),
+        reason: "missing_market_keys",
+      });
+    }
+
+    const result = await runWatchCheck(userId, query);
+
+    return res.status(200).json({
+      ok: true,
+      query: result?.query || query,
+      bestPrice: result?.bestPrice ?? null,
+      best: result?.best ?? null,
+      delta: result?.delta ?? null,
+      state: result?.state ?? null,
+      consensus: result?.consensus ?? buildMarketConsensus([]),
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      bestPrice: null,
+      best: null,
+      delta: null,
+      state: null,
+      consensus: buildMarketConsensus([]),
+      reason: "watch_recheck_failed",
+    });
+  }
+});
+
+// -------------------- Start + graceful shutdown --------------------
+const server = app.listen(PORT, HOST, () => {
+  console.log(`✅ evan-ai-server running on http://${HOST}:${PORT}`);
+  if (!OPENAI_API_KEY) console.log("⚠️ OPENAI_API_KEY missing (Vision disabled)");
+  if (!SERPAPI_KEY) console.log("⚠️ SERPAPI_KEY missing (market search disabled)");
+});
+
+function shutdown(sig) {
+  console.log(`🛑 ${sig} received. Shutting down...`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 8000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// -------------------- Crash protection --------------------
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+setInterval(() => {
+  const used = process.memoryUsage().heapUsed / 1024 / 1024;
+
+  if (used > 700) {
+    console.warn("⚠️ High memory usage detected:", used.toFixed(1), "MB");
+
+    visionCache.prune(0.5);
+    SERP_CACHE.prune(0.5);
+    RESEARCH_CACHE.prune(0.5);
+    LOCAL_CACHE.prune(0.5);
+  }
+}, 30000);

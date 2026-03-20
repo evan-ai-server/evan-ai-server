@@ -1,0 +1,37 @@
+{
+  "hash": "1a81bfbc3e68ca1541f0816b08f010eb213dc6ff97087599f0a88e80423eb2d4",
+  "createdAt": 1773913175174,
+  "objectStoreProvider": "s3",
+  "original": {
+    "key": "scan/original/1a81bfbc3e68ca1541f0816b08f010eb213dc6ff97087599f0a88e80423eb2d4.jpg",
+    "url": null,
+    "mimetype": "image/jpeg",
+    "size": 60429
+  },
+  "processed": {
+    "key": "scan/processed/1a81bfbc3e68ca1541f0816b08f010eb213dc6ff97087599f0a88e80423eb2d4.jpg",
+    "url": null,
+    "mimetype": "image/jpeg",
+    "size": 33251,
+    "width": 800,
+    "height": 533,
+    "transformed": true
+  },
+  "thumbnail": {
+    "key": "scan/thumb/1a81bfbc3e68ca1541f0816b08f010eb213dc6ff97087599f0a88e80423eb2d4.jpg",
+    "url": null,
+    "size": 5660
+  },
+  "quality": {
+    "width": 800,
+    "height": 533,
+    "format": "jpeg",
+    "detailScore": 0.21,
+    "brightnessScore": 0.73,
+    "contrastScore": 0.71,
+    "likelyBlurry": false,
+    "likelyDark": false,
+    "lowContrast": false,
+    "usable": true
+  }
+}
