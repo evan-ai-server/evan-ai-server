@@ -14846,6 +14846,153 @@ app.post("/api/condition/visual-assess", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Feature 13: Community Comps — crowdsourced paid/sold data per item
+//
+// POST /api/community/comp  — submit { query, type:"paid"|"sold", price, userId? }
+// GET  /api/community/comps?query=… — retrieve aggregated stats
+// ─────────────────────────────────────────────────────────────────────────────
+
+// In-memory fallback when Redis is unavailable
+const COMMUNITY_COMP_MEM = new Map(); // key → [{type,price,ts}]
+const COMMUNITY_COMP_MAX = 200;
+
+function normCompKey(q) {
+  return "community:comp:" + String(q || "").toLowerCase().trim().replace(/\s+/g, " ").slice(0, 120);
+}
+
+async function pushCommunityComp(query, entry) {
+  const key = normCompKey(query);
+  if (redis) {
+    try {
+      await redis.lpush(key, JSON.stringify(entry));
+      await redis.ltrim(key, 0, COMMUNITY_COMP_MAX - 1);
+      await redis.expire(key, 90 * 24 * 60 * 60); // 90 days
+    } catch { /* non-fatal */ }
+  } else {
+    const list = COMMUNITY_COMP_MEM.get(key) || [];
+    list.unshift(entry);
+    if (list.length > COMMUNITY_COMP_MAX) list.length = COMMUNITY_COMP_MAX;
+    COMMUNITY_COMP_MEM.set(key, list);
+  }
+}
+
+async function getCommunityComps(query) {
+  const key = normCompKey(query);
+  let raw = [];
+  if (redis) {
+    try {
+      const items = await redis.lrange(key, 0, COMMUNITY_COMP_MAX - 1);
+      raw = items.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+    } catch { /* non-fatal */ }
+  } else {
+    raw = COMMUNITY_COMP_MEM.get(key) || [];
+  }
+  return raw;
+}
+
+function compStats(prices) {
+  if (!prices.length) return null;
+  const sorted = [...prices].sort((a, b) => a - b);
+  const avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  return { avg: Math.round(avg * 100) / 100, median: Math.round(median * 100) / 100, count: prices.length };
+}
+
+app.post("/api/community/comp", async (req, res) => {
+  try {
+    const { query, type, price, userId } = req.body || {};
+    if (!query || !type || !["paid", "sold"].includes(type) || !Number.isFinite(Number(price)) || Number(price) <= 0) {
+      return res.status(400).json({ ok: false, error: "query, type (paid|sold), and positive price required" });
+    }
+    const entry = { type, price: Math.round(Number(price) * 100) / 100, ts: Date.now(), userId: userId ? String(userId).slice(0, 40) : null };
+    await pushCommunityComp(query, entry);
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: e?.message });
+  }
+});
+
+app.get("/api/community/comps", async (req, res) => {
+  try {
+    const query = safeStr(req.query?.query, 120);
+    if (!query) return res.status(400).json({ ok: false, error: "query required" });
+    const raw = await getCommunityComps(query);
+    const paid  = raw.filter((e) => e.type === "paid").map((e) => e.price);
+    const sold  = raw.filter((e) => e.type === "sold").map((e) => e.price);
+    const paidStats = compStats(paid);
+    const soldStats = compStats(sold);
+    // Recent samples (last 5, de-identified)
+    const samples = raw.slice(0, 5).map((e) => ({
+      type: e.type,
+      price: e.price,
+      daysAgo: Math.round((Date.now() - e.ts) / 86400000),
+    }));
+    return res.json({ ok: true, query, paidStats, soldStats, totalEntries: raw.length, samples });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Feature 14: Public Savings Profile
+//
+// POST /api/profile/savings         — upsert { userId, savingsTotal, scanCount, flipCount, topSave? }
+// GET  /api/profile/savings/:userId — fetch public stats card
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PROFILE_SAVINGS_MEM = new Map(); // in-memory fallback
+
+function profileKey(userId) {
+  return "profile:savings:" + String(userId).slice(0, 60);
+}
+
+app.post("/api/profile/savings", async (req, res) => {
+  try {
+    const { userId, savingsTotal, scanCount, flipCount, topSave } = req.body || {};
+    if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+    const payload = {
+      userId: String(userId).slice(0, 60),
+      savingsTotal: Number.isFinite(Number(savingsTotal)) ? Math.round(Number(savingsTotal) * 100) / 100 : 0,
+      scanCount: Number.isFinite(Number(scanCount)) ? Math.max(0, Math.round(Number(scanCount))) : 0,
+      flipCount: Number.isFinite(Number(flipCount)) ? Math.max(0, Math.round(Number(flipCount))) : 0,
+      topSave: Number.isFinite(Number(topSave)) ? Math.round(Number(topSave) * 100) / 100 : null,
+      updatedAt: Date.now(),
+    };
+    const key = profileKey(userId);
+    if (redis) {
+      try { await redis.setex(key, 90 * 24 * 60 * 60, JSON.stringify(payload)); } catch { /* non-fatal */ }
+    } else {
+      PROFILE_SAVINGS_MEM.set(key, payload);
+    }
+    return res.json({ ok: true, profile: payload });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: e?.message });
+  }
+});
+
+app.get("/api/profile/savings/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 60);
+    if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+    const key = profileKey(userId);
+    let profile = null;
+    if (redis) {
+      try {
+        const raw = await redis.get(key);
+        if (raw) profile = JSON.parse(raw);
+      } catch { /* non-fatal */ }
+    } else {
+      profile = PROFILE_SAVINGS_MEM.get(key) || null;
+    }
+    if (!profile) return res.json({ ok: false, error: "not_found" });
+    return res.json({ ok: true, profile });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: e?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Feature 3: RECEIPT SCAN — POST /api/receipt/analyze
 //
 // Body: { imageBase64: string }
