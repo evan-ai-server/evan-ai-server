@@ -10831,11 +10831,11 @@ Output the single best resale search query + 8 ranked variants (specific→broad
 
   return `${header}
 
-PASS: MASTER RESALE SEARCH
-
-Build the best marketplace search identity for this item.
-Prioritize exact matching and near-replica resale search usefulness.
-Return only grounded evidence.`;
+PASS: EXPERT RESALE BUYER
+You just photographed this item to resell it. What exact search term finds the most comparable sold listings?
+Priority: brand + exact model + colorway → brand + model → model alone → visual description.
+If box/label/tag text is visible, use it exactly. If logos are readable, use them.
+Synthesize all available signals into the single most effective resale search query.`;
 }
 
 async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
@@ -11429,7 +11429,9 @@ if (
   }
 
   if (isGarbageQuery(query)) {
-    query = mode === "item" ? "consumer product" : query;
+    // "consumer product" is meaningless for marketplace search — prefer null
+    // so the client knows to show an unidentified state rather than search garbage
+    query = null;
   }
 
 
