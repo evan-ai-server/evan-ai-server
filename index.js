@@ -19630,6 +19630,95 @@ app.post(
     }
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // AUTO-LISTING GENERATOR — POST /api/listing/generate
+  //
+  // Generates a ready-to-post resale listing from scan context.
+  // Returns: title, description, price, category, tags[], platforms[]
+  //
+  // Body: { scanContext }   (same shape as /api/ask)
+  // Response: { ok: true, listing: { title, description, price, category, tags, platforms } }
+  // ─────────────────────────────────────────────────────────────────────────
+  app.post("/api/listing/generate", async (req, res) => {
+    try {
+      const { scanContext } = req.body || {};
+      if (!scanContext || !scanContext.itemName) {
+        return res.status(200).json({ ok: false, error: "missing_scan_context" });
+      }
+
+      const ctx = scanContext;
+      const fmtPrice = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : null);
+
+      // Build context block
+      const contextLines = [
+        ctx.itemName        ? `Item: ${ctx.itemName}`                                         : null,
+        ctx.category        ? `Category: ${ctx.category}`                                     : null,
+        ctx.visionQuery     ? `Identified as: "${ctx.visionQuery}"`                           : null,
+        ctx.price != null   ? `Best market price: ${fmtPrice(ctx.price)}`                     : null,
+        ctx.scannedPrice != null ? `Current listing price: ${fmtPrice(ctx.scannedPrice)}`     : null,
+        ctx.avgMarket != null ? `Avg market value: ${fmtPrice(ctx.avgMarket)}`                : null,
+        ctx.historicalLow != null && ctx.historicalHigh != null
+          ? `Price range: ${fmtPrice(ctx.historicalLow)}–${fmtPrice(ctx.historicalHigh)}`     : null,
+        ctx.ebaySoldComps?.median
+          ? `eBay median sold: ${fmtPrice(ctx.ebaySoldComps.median)}`                         : null,
+        ctx.buyVerdict      ? `Condition/verdict: ${ctx.buyVerdict}`                          : null,
+        ctx.authenticityIntel?.tier ? `Authenticity tier: ${ctx.authenticityIntel.tier}`     : null,
+        ctx.trendIntel?.buyAdvice ? `Market trend: ${ctx.trendIntel.buyAdvice}`              : null,
+      ].filter(Boolean).join("\n");
+
+      const systemPrompt = `You are an expert resale listing copywriter for eBay, Poshmark, and Mercari. Generate optimized listings that sell fast at top dollar.
+
+RULES:
+- Title: max 80 chars, front-load brand + model + key attributes (size, color, condition). eBay/Poshmark SEO-optimized.
+- Description: 3–5 sentences. Lead with condition, list key features, end with a buyer confidence line. No fluff.
+- Price: Suggest optimal sell price in USD based on market data (number only, no $ sign).
+- Category: Single best-fit resale category string.
+- Tags: 6–10 relevant search keywords as a JSON array of strings.
+- Platforms: Best 2–3 platforms to sell on, as a JSON array (choose from: eBay, Poshmark, Mercari, StockX, GOAT, Facebook Marketplace, OfferUp, Depop).
+
+Respond ONLY with valid JSON in exactly this shape:
+{
+  "title": "...",
+  "description": "...",
+  "price": 00.00,
+  "category": "...",
+  "tags": ["...", "..."],
+  "platforms": ["...", "..."]
+}`;
+
+      const userMessage = `Generate a listing for this item:\n\n${contextLines}`;
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user",   content: userMessage },
+        ],
+        max_tokens: 480,
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "{}";
+      let listing;
+      try {
+        listing = JSON.parse(raw);
+      } catch {
+        return res.status(200).json({ ok: false, error: "parse_failed", raw });
+      }
+
+      // Normalize types
+      listing.price   = Number.isFinite(Number(listing.price)) ? Number(Number(listing.price).toFixed(2)) : null;
+      listing.tags     = Array.isArray(listing.tags)     ? listing.tags.slice(0, 10)     : [];
+      listing.platforms = Array.isArray(listing.platforms) ? listing.platforms.slice(0, 4) : [];
+
+      return res.json({ ok: true, listing });
+    } catch (e) {
+      console.error("❌ /api/listing/generate error:", e?.message);
+      return res.status(200).json({ ok: false, error: e?.message || "listing_failed" });
+    }
+  });
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
