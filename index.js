@@ -20943,6 +20943,9 @@ app.post("/intel/dead-stock", (req, res) => {
     else if (days >= 30) message = `Listed ${days} days with no buyer. Room to negotiate.`;
     else message = `Listed ${days} days. Worth a low offer.`;
 
+    const leverageBar = Math.round((leverage || 0) * 100);
+    const negotiationScript = `Hi, I noticed this has been listed for ${days} days. I can offer $${offerPrice} for a quick, hassle-free sale today.`;
+
     return res.json({
       ok: true,
       isDeadStock: true,
@@ -20951,6 +20954,8 @@ app.post("/intel/dead-stock", (req, res) => {
       leveragePct: Math.round(leverage * 100),
       urgencyLevel,
       message,
+      leverageBar,
+      negotiationScript,
     });
   } catch (err) {
     return res.json({ ok: true, isDeadStock: false });
@@ -21040,13 +21045,15 @@ app.post("/intel/thrift-heat", (req, res) => {
         tip: chain.tip,
         tagline: chain.tagline,
         nextHotDay,
+        bestTimeWindow: "9–11am",
+        tipOfDay: "Arrive within 1 hour of opening on hot days. Back-room stock hits floor fast.",
       };
     });
 
     // Sort by heat score desc
     stores.sort((a, b) => b.heatScore - a.heatScore);
 
-    return res.json({ ok: true, stores, generatedAt: Date.now() });
+    return res.json({ ok: true, stores, generatedAt: Date.now(), globalTip: "Pro tip: Talk to the sorting staff. They'll tell you what came in that morning." });
   } catch (err) {
     return res.json({ ok: false, stores: [], error: err?.message });
   }
@@ -21057,9 +21064,9 @@ app.post("/intel/lowball-script", async (req, res) => {
   try {
     const { itemName = "", price, platform = "", condition, daysListed, avgMarket } = req.body || {};
 
-    const systemPrompt = `You are a master reseller negotiator. Generate concise, psychologically-tuned offer messages for each platform. eBay: professional, cite market data. Facebook Marketplace: casual, friendly, mention you can pick up fast. OfferUp: direct, mention cash offer, low friction. Keep each message under 3 sentences. Base offer on: price ${price}, market avg ${avgMarket || "unknown"}, condition: ${condition || "unknown"}, days listed: ${daysListed || "unknown"}.`;
+    const systemPrompt = `You are a master reseller negotiator. Generate concise, psychologically-tuned offer messages for each platform. eBay: professional, cite market data. Facebook Marketplace: casual, friendly, mention you can pick up fast. OfferUp: direct, mention cash offer, low friction. Keep each message under 3 sentences. Base offer on: price ${price}, market avg ${avgMarket || "unknown"}, condition: ${condition || "unknown"}, days listed: ${daysListed || "unknown"}. For each script also include a 'tactic' field: one sentence explaining the psychological principle (anchoring, social proof, scarcity, reciprocity, etc.).`;
 
-    const userPrompt = `Generate 3 offer scripts for "${itemName}" listed at $${price}. Return a JSON object with a "scripts" array containing exactly 3 objects, each with keys: platform, tone, message. Platforms: eBay (professional), Facebook Marketplace (casual), OfferUp (direct).`;
+    const userPrompt = `Generate 3 offer scripts for "${itemName}" listed at $${price}. Return a JSON object with a "scripts" array containing exactly 3 objects, each with keys: platform, tone, message, tactic. Platforms: eBay (professional), Facebook Marketplace (casual), OfferUp (direct).`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -21199,6 +21206,11 @@ app.post("/intel/duplicate-scan", (req, res) => {
   if (!best) return res.json({ duplicate: false });
 
   const cheaper = best.priceDelta > 0; // old price was higher = now cheaper
+  const inferredReason = best.priceDelta > 15
+    ? "You likely passed because the price was too high."
+    : best.priceDelta < -15
+    ? "Price has gone up since you last saw it."
+    : "You hesitated. Same price, same item. What's stopping you?";
   res.json({
     duplicate: true,
     ageDays: best.ageDays,
@@ -21210,6 +21222,7 @@ app.post("/intel/duplicate-scan", (req, res) => {
       : best.priceDelta < 0
       ? `You scanned this ${best.ageDays} days ago at $${best.price}. Price went up $${Math.abs(best.priceDelta)}.`
       : `You scanned this ${best.ageDays} days ago at the same price. Still on the fence?`,
+    inferredReason,
   });
 });
 
@@ -21261,6 +21274,9 @@ app.post("/intel/category-saturation", (req, res) => {
     ? `${category} has moderate competition (${match.pct}% saturation).`
     : `${category} has low competition. Good hunting ground.`;
 
+  const trendArrow = match.trend === "rising" ? "↑" : match.trend === "declining" ? "↓" : "→";
+  const weeklyChange = match.trend === "rising" ? "+3%" : match.trend === "declining" ? "-2%" : "0%";
+
   res.json({
     category,
     saturationPct: match.pct,
@@ -21272,6 +21288,9 @@ app.post("/intel/category-saturation", (req, res) => {
     suggestion: match.hotAlternative
       ? `Switch to ${match.hotAlternative} — only ${match.hotPct}% saturated.`
       : null,
+    trendArrow,
+    localNote: "Saturation index based on national resale data. Local markets may vary ±15%.",
+    weeklyChange,
   });
 });
 
