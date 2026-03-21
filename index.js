@@ -7793,6 +7793,40 @@ async function buildFinalUiItemsWithIntelligence(
   };
 }
 
+// ── Oracle Platform URL Builder ───────────────────────────────────────────────
+// Generates real trusted-domain search URLs for oracle-generated listings.
+// These take users directly to the platform's search results for the item.
+const PLATFORM_SEARCH_URL_MAP = {
+  "ebay":                (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}&_sop=15`,
+  "mercari":             (q) => `https://www.mercari.com/search/?keyword=${encodeURIComponent(q)}`,
+  "poshmark":            (q) => `https://poshmark.com/search?query=${encodeURIComponent(q)}&type=listings&availability=sold_out%2Cavailable`,
+  "depop":               (q) => `https://www.depop.com/search/?q=${encodeURIComponent(q)}`,
+  "grailed":             (q) => `https://www.grailed.com/shop/search?query=${encodeURIComponent(q)}`,
+  "stockx":              (q) => `https://stockx.com/search?s=${encodeURIComponent(q)}`,
+  "goat":                (q) => `https://www.goat.com/search?query=${encodeURIComponent(q)}`,
+  "facebook marketplace":(q) => `https://www.facebook.com/marketplace/search?query=${encodeURIComponent(q)}`,
+  "offerup":             (q) => `https://offerup.com/search/?q=${encodeURIComponent(q)}`,
+  "amazon":              (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
+  "walmart":             (q) => `https://www.walmart.com/search?q=${encodeURIComponent(q)}`,
+  "target":              (q) => `https://www.target.com/s?searchTerm=${encodeURIComponent(q)}`,
+  "vestiaire collective":(q) => `https://www.vestiairecollective.com/search/?q=${encodeURIComponent(q)}`,
+  "the real real":       (q) => `https://www.therealreal.com/search#q=${encodeURIComponent(q)}`,
+  "thredup":             (q) => `https://www.thredup.com/product/type?search_text=${encodeURIComponent(q)}`,
+  "vinted":              (q) => `https://www.vinted.com/catalog?search_text=${encodeURIComponent(q)}`,
+  "chrono24":            (q) => `https://www.chrono24.com/search/index.htm?dosearch=true&query=${encodeURIComponent(q)}`,
+  "swappa":              (q) => `https://swappa.com/buy/${encodeURIComponent(q.toLowerCase().replace(/\s+/g,"-"))}`,
+  "1stdibs":             (q) => `https://www.1stdibs.com/search/all/?q=${encodeURIComponent(q)}`,
+};
+
+function buildOracleSearchUrl(platform, query) {
+  if (!platform || !query) return null;
+  const key = platform.toLowerCase().trim();
+  const builder = PLATFORM_SEARCH_URL_MAP[key]
+    || Object.entries(PLATFORM_SEARCH_URL_MAP).find(([k]) => key.includes(k))?.[1];
+  if (!builder) return `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&_sop=15`;
+  return builder(query);
+}
+
 // ── GPT-4.1 Market Oracle ─────────────────────────────────────────────────────
 // Generates synthetic but realistic market listings when no marketplace APIs
 // are available. Uses GPT-4.1-mini with structured JSON schema.
@@ -7918,14 +7952,16 @@ CRITICAL RULES:
     for (const listing of (parsed.exactListings || [])) {
       const price = finitePrice(listing?.price);
       if (!price || !listing?.title) continue;
+      const platform = String(listing.platform || "eBay").trim();
+      const searchUrl = buildOracleSearchUrl(platform, query);
       items.push({
         title: String(listing.title).trim(),
-        source: String(listing.platform || "Marketplace").trim(),
+        source: platform,
         price,
         totalPrice: price,
-        url: null,
-        link: null,
-        buyLink: null,
+        url: searchUrl,
+        link: searchUrl,
+        buyLink: searchUrl,
         image: null,
         rating: null,
         reviews: null,
@@ -7948,14 +7984,16 @@ CRITICAL RULES:
     for (const alt of (parsed.cheaperAlternatives || [])) {
       const price = finitePrice(alt?.price);
       if (!price || !alt?.title) continue;
+      const altPlatform = String(alt.platform || "eBay").trim();
+      const altUrl = buildOracleSearchUrl(altPlatform, alt.title);
       items.push({
         title: String(alt.title).trim(),
-        source: String(alt.platform || "Marketplace").trim(),
+        source: altPlatform,
         price,
         totalPrice: price,
-        url: null,
-        link: null,
-        buyLink: null,
+        url: altUrl,
+        link: altUrl,
+        buyLink: altUrl,
         image: null,
         rating: null,
         reviews: null,
