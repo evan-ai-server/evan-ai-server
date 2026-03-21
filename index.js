@@ -7726,6 +7726,210 @@ async function buildFinalUiItemsWithIntelligence(
   };
 }
 
+// ── GPT-4.1 Market Oracle ─────────────────────────────────────────────────────
+// Generates synthetic but realistic market listings when no marketplace APIs
+// are available. Uses GPT-4.1-mini with structured JSON schema.
+// Cache: 4 hours per (query + identity) pair.
+const GPT_ORACLE_CACHE = new Map(); // key → { items, ts }
+const GPT_ORACLE_TTL_MS = 4 * 60 * 60 * 1000;
+
+async function gptMarketOracle(query, identity = null) {
+  if (!openai || !query) return [];
+
+  const cacheKey = `oracle:${normalizeQuery(query)}:${identity?.brand || ""}:${identity?.model || ""}:${identity?.category || ""}`;
+  const cached = GPT_ORACLE_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.ts < GPT_ORACLE_TTL_MS) {
+    console.log("⚡ GPT Oracle cache hit:", query);
+    return cached.items;
+  }
+
+  // Build identity context for the prompt
+  const brand      = identity?.brand     || null;
+  const model      = identity?.model     || null;
+  const category   = identity?.category  || null;
+  const condition  = identity?.condition || null;
+  const colors     = Array.isArray(identity?.colors)     ? identity.colors.slice(0, 3).join(", ")   : null;
+  const materials  = Array.isArray(identity?.materials)  ? identity.materials.slice(0, 2).join(", ") : null;
+  const itemType   = identity?.itemType                  || null;
+  // Include visible text in item description (critical for university/team/brand names on items)
+  const visText    = Array.isArray(identity?.visibleText)
+    ? identity.visibleText.filter(t => t && t.trim().length > 1).slice(0, 3).join(" ")
+    : null;
+
+  // Build the richest possible item description — never drop the search query as fallback
+  const itemDesc = [
+    brand, model, itemType,
+    visText ? `(text: "${visText}")` : null,
+    colors, materials,
+    condition ? `[${condition}]` : null,
+  ].filter(Boolean).join(" ") || query;
+
+  // Category-specific platform distribution
+  const cat = (category || inferVisionCategory(query) || "general").toLowerCase();
+  let platformSets;
+  if (cat === "footwear") {
+    platformSets = ["eBay", "StockX", "GOAT", "Mercari", "Poshmark", "eBay", "eBay"];
+  } else if (cat === "apparel" || cat === "bags" || cat === "luxury") {
+    platformSets = ["Poshmark", "Depop", "eBay", "Mercari", "Grailed", "eBay", "Poshmark"];
+  } else if (cat === "watch") {
+    platformSets = ["eBay", "Chrono24", "StockX", "Watchuseek", "eBay", "Mercari", "eBay"];
+  } else if (cat === "electronics" || cat === "tech") {
+    platformSets = ["eBay", "Amazon", "Walmart", "Swappa", "eBay", "Facebook Marketplace", "eBay"];
+  } else {
+    platformSets = ["eBay", "Mercari", "Facebook Marketplace", "OfferUp", "eBay", "Poshmark", "eBay"];
+  }
+
+  const systemPrompt = `You are a resale market intelligence engine. You generate realistic, accurate market data for secondhand/resale items.
+You know real market prices from eBay, Mercari, Poshmark, StockX, Grailed, and other platforms.
+Return ONLY valid JSON matching the schema. No extra text.
+
+SCHEMA:
+{
+  "exactListings": [
+    {
+      "title": string,
+      "platform": string,
+      "price": number,
+      "condition": "new" | "like_new" | "good" | "fair" | "poor",
+      "sold": boolean
+    }
+  ],
+  "cheaperAlternatives": [
+    {
+      "title": string,
+      "platform": string,
+      "price": number,
+      "condition": "new" | "like_new" | "good" | "fair" | "poor",
+      "substituteReason": string
+    }
+  ],
+  "typicalRetailPrice": number | null,
+  "resalePriceLow": number,
+  "resalePriceHigh": number,
+  "marketSegment": "budget" | "mid-range" | "premium" | "luxury"
+}`;
+
+  const userPrompt = `Item: "${itemDesc}"
+Search query: "${query}"
+Category: ${category || "general"}
+
+Generate realistic resale market data:
+1. exactListings: 10-12 realistic current marketplace listings for this EXACT item at real prices. Mix of conditions. 2-3 should be sold=true (recent sold comps). Use realistic platform names: ${platformSets.join(", ")}.
+   IMPORTANT: titles must match the EXACT item. Use the search query as the basis for listing titles. Do NOT invent a different brand or item type.
+2. cheaperAlternatives: 3-4 substitute items (different brand/model but same function, significantly cheaper). Include substituteReason explaining the savings.
+3. typicalRetailPrice: what this costs brand new (null if unknown/vintage)
+4. resalePriceLow / resalePriceHigh: realistic used price range
+5. marketSegment: budget/mid-range/premium/luxury classification
+
+CRITICAL RULES:
+- Prices must be realistic market prices. Under-price = bad for users. Over-price = bad for users.
+- If visible text shows a university/team/brand name (e.g. "Stanford", "Lakers", "Nike"), listings MUST include that exact name.
+- Do NOT hallucinate brands or models that are not in the item description.
+- Use the search query verbatim as the basis for listing titles.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      max_tokens: 1200,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+
+    const raw = completion.choices?.[0]?.message?.content;
+    if (!raw) return [];
+
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { return []; }
+
+    const items = [];
+
+    // Normalize exact listings
+    for (const listing of (parsed.exactListings || [])) {
+      const price = finitePrice(listing?.price);
+      if (!price || !listing?.title) continue;
+      items.push({
+        title: String(listing.title).trim(),
+        source: String(listing.platform || "Marketplace").trim(),
+        price,
+        totalPrice: price,
+        url: null,
+        link: null,
+        buyLink: null,
+        image: null,
+        rating: null,
+        reviews: null,
+        dealScore: 0,
+        flipScore: 0,
+        sellerScore: 0.5,
+        trustModelScore: 0.6,
+        __trustScore: 0.6,
+        authRisk: 0,
+        visualScore: 0,
+        linkVerified: false,
+        sold: listing.sold === true,
+        status: listing.sold === true ? "sold" : "active",
+        condition: listing.condition || null,
+        __oracleGenerated: true,
+      });
+    }
+
+    // Normalize cheaper alternatives (mark as substitute)
+    for (const alt of (parsed.cheaperAlternatives || [])) {
+      const price = finitePrice(alt?.price);
+      if (!price || !alt?.title) continue;
+      items.push({
+        title: String(alt.title).trim(),
+        source: String(alt.platform || "Marketplace").trim(),
+        price,
+        totalPrice: price,
+        url: null,
+        link: null,
+        buyLink: null,
+        image: null,
+        rating: null,
+        reviews: null,
+        dealScore: 0,
+        flipScore: 0,
+        sellerScore: 0.5,
+        trustModelScore: 0.55,
+        __trustScore: 0.55,
+        authRisk: 0,
+        visualScore: 0,
+        linkVerified: false,
+        sold: false,
+        status: "active",
+        condition: alt.condition || "good",
+        __oracleGenerated: true,
+        __isSubstitute: true,
+        __substituteReason: alt.substituteReason || null,
+      });
+    }
+
+    // Stash market intel on the identity for downstream use
+    if (identity && typeof identity === "object") {
+      identity.__oracleIntel = {
+        typicalRetailPrice: finitePrice(parsed.typicalRetailPrice) || null,
+        resalePriceLow:     finitePrice(parsed.resalePriceLow)     || null,
+        resalePriceHigh:    finitePrice(parsed.resalePriceHigh)    || null,
+        marketSegment:      parsed.marketSegment                   || null,
+      };
+    }
+
+    console.log(`🧠 GPT Oracle: ${items.length} items for "${query}" (${category || "general"})`);
+
+    GPT_ORACLE_CACHE.set(cacheKey, { items, ts: Date.now() });
+    return items;
+
+  } catch (err) {
+    console.warn("gptMarketOracle error:", err?.message || err);
+    return [];
+  }
+}
+
 async function mergeCheapestSources(query, extraVariants = [], identity = null) {
 
   const killTimer = new Promise((resolve) =>
@@ -7860,12 +8064,21 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
 
   const maxQueries = isEyewearQuery ? 10 : (lowConfidence ? 14 : 12);
 
+  // Include vision-extracted substitute candidates as query variants
+  const substituteQueries = Array.isArray(identity?.substituteCandidates)
+    ? identity.substituteCandidates
+        .map((q) => normalizeQuery(q))
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
+
   const marketplaceQueries = uniqueQueries([
     normalizedQuery,
     ...incomingVariants,
     ...buildServerQueryVariants(normalizedQuery, incomingVariants, "item", identity),
     ...buildEmergencyShoppingFallbacks(normalizedQuery, incomingVariants),
     ...visibleTextQueries,
+    ...substituteQueries,
   ]).slice(0, maxQueries);
 
   if (marketplaceQueries.length) {
@@ -8111,6 +8324,16 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
     );
 
     rawMerged = rescueResults.flat();
+  }
+
+  // ── GPT-4.1 Oracle fallback — fires when all marketplace APIs return nothing ─
+  if (!rawMerged.length || rawMerged.length < 4) {
+    console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
+    const oracleItems = await gptMarketOracle(normalizedQuery, identity).catch(() => []);
+    if (oracleItems.length) {
+      rawMerged = [...rawMerged, ...oracleItems];
+      console.log(`✅ Oracle injected ${oracleItems.length} items`);
+    }
   }
 
   const stageWithTitle = rawMerged.filter((it) => it?.title);
@@ -9770,7 +9993,9 @@ SCHEMA
     "conditionNotes": string|null,
     "sizeHint": string|null,
     "exactQuery": string|null,
-    "searchQueries": string[]
+    "searchQueries": string[],
+    "substituteCandidates": string[],
+    "marketSegment": string|null
   },
   "authenticityFlags": string[],
   "conditionFlags": string[]
@@ -9972,7 +10197,23 @@ SECTION 5 — QUERY GENERATION RULES
 "variants" — alternate spellings, abbreviations, regional names for the same item
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 6 — STRICT RULES
+SECTION 6 — SUBSTITUTE CANDIDATES + MARKET SEGMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+"substituteCandidates" — 2-4 search queries for functionally equivalent alternatives that are typically CHEAPER:
+- Same use case, different brand or model
+- Budget alternatives to premium items (e.g. "Rothys flats" → ["Allbirds wool flats", "Quay sunglasses", "Cole Haan women flats"])
+- Near-replicas or previous generation (e.g. "AirPods Pro 2nd gen" → ["AirPods Pro 1st gen", "Samsung Galaxy Buds Pro"])
+- If no obvious substitutes exist: []
+
+"marketSegment" — price tier of this item on the resale market:
+- "budget" — typically resells <$30
+- "mid-range" — typically resells $30-$200
+- "premium" — typically resells $200-$1000
+- "luxury" — typically resells >$1000 or is a recognized luxury brand
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — STRICT RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 1. ONLY grounded evidence. Brand/model ONLY if directly supported by readable text, unmistakable logo, or signature design feature.
@@ -9984,6 +10225,8 @@ SECTION 6 — STRICT RULES
 7. sizeHint: Only from visible box tag, tongue label, or care label. Never estimate from proportions.
 8. If only broad category is knowable: be broad but honest (e.g. "black leather crossbody bag").
 9. If image is truly unidentifiable: query=null, confidence=0.
+10. substituteCandidates: only include items that are genuinely cheaper alternatives, not the same item.
+11. marketSegment: base this on typical resale price, not retail price.
 
 You are seeing multiple views of the same item. Synthesize all views into ONE unified output.
 `.trim();
@@ -10242,6 +10485,9 @@ function normalizeVisionIdentityPayload(raw = null, fallbackQuery = "") {
     }
   }
 
+  const substituteCandidates = cleanStringList(raw.substituteCandidates, 6);
+  const marketSegment = safeStr(raw.marketSegment || "", 40) || null;
+
   return {
     itemType,
     category,
@@ -10257,6 +10503,8 @@ function normalizeVisionIdentityPayload(raw = null, fallbackQuery = "") {
     imageHash,
     exactQuery: searchQueries[0] || incomingExact || null,
     searchQueries,
+    substituteCandidates,
+    marketSegment,
   };
 }
 
@@ -10903,6 +11151,8 @@ function buildVisionConsensusSchema() {
             "sizeHint",
             "exactQuery",
             "searchQueries",
+            "substituteCandidates",
+            "marketSegment",
           ],
           properties: {
             itemType:       { anyOf: [{ type: "string" }, { type: "null" }] },
@@ -10917,8 +11167,10 @@ function buildVisionConsensusSchema() {
             condition:      { anyOf: [{ type: "string" }, { type: "null" }] },
             conditionNotes: { anyOf: [{ type: "string" }, { type: "null" }] },
             sizeHint:       { anyOf: [{ type: "string" }, { type: "null" }] },
-            exactQuery:     { anyOf: [{ type: "string" }, { type: "null" }] },
-            searchQueries:  { type: "array", items: { type: "string" } },
+            exactQuery:           { anyOf: [{ type: "string" }, { type: "null" }] },
+            searchQueries:        { type: "array", items: { type: "string" } },
+            substituteCandidates: { type: "array", items: { type: "string" } },
+            marketSegment:        { anyOf: [{ type: "string" }, { type: "null" }] },
           },
         },
         authenticityFlags: {
@@ -14351,6 +14603,8 @@ async function buildMarketSearchResponsePayload({
       moatMode,
       marketHeat: marketPulseScore,
 
+      // Oracle intel (populated when GPT-4.1 market oracle was used as fallback)
+      oracleIntel: visionIdentity?.__oracleIntel || null,
 
     retrieval: retrievalMeta || {
       source: Array.isArray(sourceItems) && sourceItems.length ? "live_market" : "empty",
@@ -15838,7 +16092,27 @@ if ((!Array.isArray(items) || items.length === 0) && internalHit?.snapshot?.item
     .filter((x) => x?.title);
 }
 
-if (Array.isArray(items) && items.length > 0) {
+// ── GPT-4.1 Oracle fallback at route level (outside 7s kill timer) ─────────────
+// Fires when ALL marketplace sources + internal cache return nothing.
+let _oracleOnlyResult = false;
+if (!Array.isArray(items) || items.length < 4) {
+  console.log("🧠 Route-level oracle fallback for:", query);
+  const _oracleVi = visionIdentity ? { ...visionIdentity } : {};
+  const oracleItems = await gptMarketOracle(query, _oracleVi).catch(() => []);
+  if (oracleItems.length) {
+    const realItemCount = (items || []).length;
+    items = [...(items || []), ...oracleItems];
+    _oracleOnlyResult = realItemCount < 2; // true if oracle is the primary data source
+    // Propagate oracle intel to visionIdentity for downstream use
+    if (_oracleVi.__oracleIntel && visionIdentity) {
+      visionIdentity = { ...visionIdentity, __oracleIntel: _oracleVi.__oracleIntel };
+    }
+    console.log(`✅ Route oracle injected ${oracleItems.length} items for "${query}"`);
+  }
+}
+
+if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
+  // Only cache to SERP if we have real marketplace data (not oracle-only)
   SERP_CACHE.set(cacheKey, items);
 }
 
@@ -15856,10 +16130,10 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     authenticityFlags: _authFlags,
     conditionFlags:    _condFlags,
     retrievalMeta: {
-      source: Array.isArray(items) && items.length > 0 ? "live_market" : "empty",
-      kind: Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty",
+      source: _oracleOnlyResult ? "gpt_oracle" : (Array.isArray(items) && items.length > 0 ? "live_market" : "empty"),
+      kind:   _oracleOnlyResult ? "oracle"     : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
     },
-    persistSnapshot: true,
+    persistSnapshot: !_oracleOnlyResult, // don't pollute snapshot with oracle-only data
   }),
   serpEbaySold(query).catch(() => null),
   userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
