@@ -2957,7 +2957,7 @@ const sourceBudget = createSourceBudgetManager({
     },
     serpapi: {
       maxDailyUnits: Number(process.env.BUDGET_SERPAPI_DAILY || 50_000),
-      allow: { free: false, pro: true, internal: true },
+      allow: { free: true, pro: true, internal: true },
     },
   },
 });
@@ -8186,7 +8186,6 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
   const canUseSerpForce =
     !!SERPAPI_KEY &&
     !isSourceCoolingDown("serpapi") &&
-    runtimePlan !== "free" &&
     (await sourceBudget.canUse("serpapi", {
       plan: runtimePlan,
       costUnits: 6,
@@ -8195,7 +8194,6 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
   const canUseAmazonSerp =
     !!SERPAPI_KEY &&
     !isSourceCoolingDown("serpapi") &&
-    runtimePlan !== "free" &&
     (await sourceBudget.canUse("serpapi", {
       plan: runtimePlan,
       costUnits: 4,
@@ -8204,7 +8202,6 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
   const canUseResaleSerp =
     !!SERPAPI_KEY &&
     !isSourceCoolingDown("serpapi") &&
-    runtimePlan !== "free" &&
     (await sourceBudget.canUse("serpapi", {
       plan: runtimePlan,
       costUnits: 4,
