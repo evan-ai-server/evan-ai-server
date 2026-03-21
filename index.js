@@ -20871,6 +20871,100 @@ app.post("/api/profile/flip", async (req, res) => {
   }
 });
 
+  // -------------------- Privacy Policy + Terms --------------------
+
+  app.get("/privacy", (_req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evan AI – Privacy Policy</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 680px; margin: 0 auto; padding: 40px 24px; color: #1a1a1a; line-height: 1.7; }
+  h1 { font-size: 28px; font-weight: 800; }
+  h2 { font-size: 18px; font-weight: 700; margin-top: 32px; }
+  p, li { font-size: 15px; color: #333; }
+  a { color: #0070f3; }
+</style>
+</head>
+<body>
+<h1>Privacy Policy</h1>
+<p><strong>Evan AI</strong> · Last updated: ${new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</p>
+
+<h2>What We Collect</h2>
+<ul>
+  <li><strong>Photos you scan</strong> — sent to our server for AI price analysis, not stored permanently.</li>
+  <li><strong>Anonymous device ID</strong> — generated locally, used to sync your watchlist and history across sessions.</li>
+  <li><strong>Email address</strong> — only if you create an account (optional).</li>
+  <li><strong>Push token</strong> — used to send price drop alerts you request.</li>
+  <li><strong>Location (approximate)</strong> — only if you enable Thrift Heat Map, to show nearby deals. Never stored.</li>
+</ul>
+
+<h2>What We Don't Collect</h2>
+<ul>
+  <li>We do not sell your data to any third party.</li>
+  <li>We do not track your location continuously.</li>
+  <li>We do not collect payment information (handled by Apple/RevenueCat).</li>
+</ul>
+
+<h2>Third-Party Services</h2>
+<ul>
+  <li><strong>OpenAI</strong> — powers item recognition. Photos are sent per OpenAI's API terms.</li>
+  <li><strong>RevenueCat / App Store</strong> — handles subscription billing.</li>
+  <li><strong>Expo</strong> — push notification delivery.</li>
+</ul>
+
+<h2>Data Retention</h2>
+<p>Scan history and watchlists are stored locally on your device. If you create an account, your data is stored on our servers and can be deleted at any time by contacting us.</p>
+
+<h2>Children</h2>
+<p>Evan AI is not directed at children under 13 and we do not knowingly collect data from children.</p>
+
+<h2>Contact</h2>
+<p>Questions? Email <a href="mailto:support@evanai.app">support@evanai.app</a></p>
+</body>
+</html>`);
+  });
+
+  app.get("/terms", (_req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Evan AI – Terms of Service</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 680px; margin: 0 auto; padding: 40px 24px; color: #1a1a1a; line-height: 1.7; }
+  h1 { font-size: 28px; font-weight: 800; }
+  h2 { font-size: 18px; font-weight: 700; margin-top: 32px; }
+  p, li { font-size: 15px; color: #333; }
+</style>
+</head>
+<body>
+<h1>Terms of Service</h1>
+<p><strong>Evan AI</strong> · Last updated: ${new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })}</p>
+
+<h2>Use of the App</h2>
+<p>Evan AI provides AI-powered price intelligence for resale and retail shopping. Price data is sourced from public marketplaces and is provided for informational purposes only. We do not guarantee accuracy.</p>
+
+<h2>Subscriptions</h2>
+<p>Pro subscriptions are billed through the Apple App Store. Cancel any time in your Apple ID settings. No refunds for partial billing periods except where required by law.</p>
+
+<h2>Prohibited Use</h2>
+<p>You may not use Evan AI to scrape data, resell API access, or automate purchases in violation of marketplace terms.</p>
+
+<h2>Disclaimer</h2>
+<p>Price data is informational only. Evan AI is not responsible for purchase decisions made based on app data.</p>
+
+<h2>Contact</h2>
+<p>support@evanai.app</p>
+</body>
+</html>`);
+  });
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
