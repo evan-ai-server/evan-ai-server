@@ -3708,6 +3708,10 @@ const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
 const RESEARCH_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1000 });
 const LOCAL_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 600 });
 
+// ── Reseller Rivalry tracker (in-memory, rolling 2hr window) ───────────
+const RIVALRY_MAP = new Map(); // key: normalizedQuery → [{ userId, ts }]
+const RIVALRY_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
 const EBAY_RENDER_CACHE = new TTLCache({
   ttlMs: 10 * 60 * 1000,
   maxSize: 300,
@@ -20883,6 +20887,169 @@ process.on("uncaughtException", (err) => {
     .finally(() => {
       shutdown("UNCAUGHT_EXCEPTION");
     });
+});
+
+// ── POST /intel/rivalry ─────────────────────────────────────────────────
+app.post("/intel/rivalry", (req, res) => {
+  try {
+    const { query = "", category = "", userId = "anon" } = req.body || {};
+    const key = (category || query).toLowerCase().replace(/\s+/g, "_").slice(0, 60);
+    if (!key) return res.json({ ok: true, count: 0 });
+
+    const now = Date.now();
+    const cutoff = now - RIVALRY_TTL_MS;
+
+    // Get or create entry, prune old
+    let entries = (RIVALRY_MAP.get(key) || []).filter(e => e.ts > cutoff);
+
+    // Add this user if not already present in window
+    const alreadyTracked = entries.some(e => e.userId === userId);
+    if (!alreadyTracked) {
+      entries.push({ userId, ts: now });
+    }
+    RIVALRY_MAP.set(key, entries);
+
+    // Prune map if too large
+    if (RIVALRY_MAP.size > 5000) {
+      for (const [k, v] of RIVALRY_MAP.entries()) {
+        if (v.every(e => e.ts <= cutoff)) RIVALRY_MAP.delete(k);
+      }
+    }
+
+    // Return count excluding this user
+    const othersCount = entries.filter(e => e.userId !== userId).length;
+    return res.json({ ok: true, count: othersCount, window: "2h" });
+  } catch (err) {
+    return res.json({ ok: true, count: 0 });
+  }
+});
+
+// ── POST /intel/dead-stock ──────────────────────────────────────────────
+app.post("/intel/dead-stock", (req, res) => {
+  try {
+    const { listingPrice, daysListed = 0, avgMarket = null, itemName = "" } = req.body || {};
+    const price = Number(listingPrice);
+    const days = Number(daysListed);
+    const market = Number(avgMarket) || null;
+
+    if (!price || days < 14) return res.json({ ok: true, isDeadStock: false });
+
+    const leverage = Math.min(0.45, (days / 180) * 0.35 + (market && price > market * 1.05 ? 0.10 : 0));
+    const offerPrice = Math.round(price * (1 - leverage));
+    const urgencyLevel = days >= 60 ? "high" : days >= 30 ? "medium" : "low";
+
+    let message;
+    if (days >= 60) message = `Listed ${days} days. Seller is motivated — they need this gone.`;
+    else if (days >= 30) message = `Listed ${days} days with no buyer. Room to negotiate.`;
+    else message = `Listed ${days} days. Worth a low offer.`;
+
+    return res.json({
+      ok: true,
+      isDeadStock: true,
+      daysListed: days,
+      suggestedOffer: offerPrice,
+      leveragePct: Math.round(leverage * 100),
+      urgencyLevel,
+      message,
+    });
+  } catch (err) {
+    return res.json({ ok: true, isDeadStock: false });
+  }
+});
+
+// ── POST /intel/thrift-heat ─────────────────────────────────────────────
+app.post("/intel/thrift-heat", (req, res) => {
+  try {
+    const { lat = null, lon = null, userId = "anon" } = req.body || {};
+
+    // Day-of-week restocking patterns (0=Sun, 1=Mon, ... 6=Sat)
+    // Based on known Goodwill/Salvation Army drop patterns
+    const CHAIN_PATTERNS = [
+      {
+        name: "Goodwill",
+        emoji: "🏪",
+        hotDays: [2, 3, 4], // Tue, Wed, Thu
+        hotHours: [9, 10, 11, 14, 15],
+        tip: "Tue–Thu mornings after donation truck drops. Arrive at open.",
+        tagline: "New stock hits floor Tue–Thu"
+      },
+      {
+        name: "Salvation Army",
+        emoji: "🔴",
+        hotDays: [1, 2, 3], // Mon, Tue, Wed
+        hotHours: [10, 11, 12],
+        tip: "Monday–Wednesday. Staff sort weekend donations Mon morning.",
+        tagline: "Monday = freshest weekend haul"
+      },
+      {
+        name: "Savers / Value Village",
+        emoji: "🛒",
+        hotDays: [3, 4, 5], // Wed, Thu, Fri
+        hotHours: [11, 12, 13, 14],
+        tip: "Wednesday–Friday. Big mid-week restock days.",
+        tagline: "Wed–Fri for deepest selection"
+      },
+      {
+        name: "Habitat ReStore",
+        emoji: "🔨",
+        hotDays: [4, 5, 6], // Thu, Fri, Sat
+        hotHours: [9, 10, 11],
+        tip: "Thursday–Saturday. Major furniture + tool donations Thur.",
+        tagline: "Best for electronics & tools Thu–Sat"
+      },
+      {
+        name: "Local Consignment",
+        emoji: "💎",
+        hotDays: [1, 2], // Mon, Tue
+        hotHours: [10, 11, 12, 13],
+        tip: "Monday/Tuesday. Weekend consignors drop items for new week.",
+        tagline: "Hidden gems every Monday"
+      },
+    ];
+
+    const now = new Date();
+    const todayDow = now.getDay();
+    const currentHour = now.getHours();
+
+    const stores = CHAIN_PATTERNS.map(chain => {
+      const isHotDay = chain.hotDays.includes(todayDow);
+      const isHotHour = chain.hotHours.includes(currentHour);
+      const heat = isHotDay && isHotHour ? "🔥 HOT RIGHT NOW"
+        : isHotDay ? "WARM TODAY"
+        : "COLD TODAY";
+      const heatScore = (isHotDay ? 0.6 : 0.2) + (isHotHour ? 0.4 : 0);
+
+      // Next hot day
+      let nextHotDay = null;
+      for (let i = 1; i <= 7; i++) {
+        const d = (todayDow + i) % 7;
+        if (chain.hotDays.includes(d)) {
+          const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+          nextHotDay = i === 1 ? "Tomorrow" : days[d];
+          break;
+        }
+      }
+
+      return {
+        name: chain.name,
+        emoji: chain.emoji,
+        heat,
+        heatScore,
+        isHotNow: isHotDay && isHotHour,
+        isHotToday: isHotDay,
+        tip: chain.tip,
+        tagline: chain.tagline,
+        nextHotDay,
+      };
+    });
+
+    // Sort by heat score desc
+    stores.sort((a, b) => b.heatScore - a.heatScore);
+
+    return res.json({ ok: true, stores, generatedAt: Date.now() });
+  } catch (err) {
+    return res.json({ ok: false, stores: [], error: err?.message });
+  }
 });
 
 setInterval(() => {
