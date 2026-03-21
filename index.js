@@ -20738,6 +20738,139 @@ Return valid JSON only:
     }
   });
 
+// ── Negotiation Co-Pilot (SSE streaming) ──────────────────────────────────
+// POST /api/negotiate/chat
+// Body: { messages: [{role,content}], context: {itemName, listingPrice, marketMedian, dealVerdict, itemCategory} }
+// Streams GPT-4o response as SSE: data: {"chunk": "..."}\n\n
+// Final: data: {"done": true}\n\n
+app.post("/api/negotiate/chat", async (req, res) => {
+  try {
+    const { messages = [], context = {} } = req.body || {};
+    const { itemName = "this item", listingPrice = null, marketMedian = null, dealVerdict = "fair", itemCategory = "" } = context;
+
+    if (!openai) {
+      return res.status(503).json({ ok: false, error: "AI not available" });
+    }
+
+    const systemPrompt = [
+      "You are Evan, an expert negotiation coach for resale and thrift shopping.",
+      "You help buyers get the best price through confident, data-backed negotiation.",
+      `Current item: ${itemName}${itemCategory ? ` (${itemCategory})` : ""}.`,
+      listingPrice ? `Asking price: $${listingPrice}.` : "",
+      marketMedian ? `Market median: $${Math.round(marketMedian)}.` : "",
+      dealVerdict ? `Deal assessment: ${dealVerdict}.` : "",
+      "",
+      "Guidelines:",
+      "- Give specific dollar amounts, not ranges.",
+      "- Be concise and tactical — max 3 sentences per response.",
+      "- Provide exact scripts the user can say out loud.",
+      "- Be direct. No filler. No fluff.",
+      "- If the item is overpriced vs market, say so with confidence and give a specific counter-offer.",
+    ].filter(Boolean).join("\n");
+
+    const chatMessages = [
+      { role: "system", content: systemPrompt },
+      ...messages.slice(-12), // keep last 12 messages for context
+    ];
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.flushHeaders();
+
+    const stream = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: chatMessages,
+      stream: true,
+      max_tokens: 300,
+      temperature: 0.7,
+    });
+
+    for await (const chunk of stream) {
+      const text = chunk.choices?.[0]?.delta?.content;
+      if (text) {
+        res.write(`data: ${JSON.stringify({ chunk: text })}\n\n`);
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (e) {
+    console.error("❌ /api/negotiate/chat error:", e?.message);
+    try {
+      res.write(`data: ${JSON.stringify({ error: e?.message || "chat_failed" })}\n\n`);
+      res.end();
+    } catch {}
+  }
+});
+
+// ── Personalized Flip Profile ──────────────────────────────────────────────
+// POST /api/profile/flip
+// Body: { scanHistory: [{itemName, category, price, savedAmount, timestamp}] }
+// Returns: { personality, topCategory, avgMargin, totalFlips, badges, advice }
+app.post("/api/profile/flip", async (req, res) => {
+  try {
+    const { scanHistory = [] } = req.body || {};
+
+    if (!Array.isArray(scanHistory) || scanHistory.length === 0) {
+      return res.json({ ok: true, personality: "Explorer", topCategory: null, avgMargin: 0, totalFlips: 0, badges: [], advice: "Scan more items to unlock your flip profile." });
+    }
+
+    // Tally by category
+    const catCounts = {};
+    let totalSaved = 0;
+    let totalWithSavings = 0;
+
+    for (const item of scanHistory) {
+      const cat = (item.category || item.itemCategory || "general").toLowerCase();
+      catCounts[cat] = (catCounts[cat] || 0) + 1;
+      if (Number.isFinite(item.savedAmount) && item.savedAmount > 0) {
+        totalSaved += item.savedAmount;
+        totalWithSavings++;
+      }
+    }
+
+    const topCategory = Object.entries(catCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || "general";
+    const avgMargin = totalWithSavings > 0 ? Math.round(totalSaved / totalWithSavings) : 0;
+    const totalFlips = scanHistory.length;
+
+    const PERSONALITIES = {
+      sneakers: { name: "Sneaker Arbitrageur", icon: "👟", advice: "Focus on DS (deadstock) pairs — they command 40-80% premiums over beaters." },
+      electronics: { name: "Tech Flipper", icon: "📱", advice: "Watch for generation gaps — last-gen models drop 30% the week a new model drops." },
+      outerwear: { name: "Streetwear Hunter", icon: "🧥", advice: "Buy pre-season (Aug for winter gear) and sell in-season for 25-35% more." },
+      watches: { name: "Watch Arb Pro", icon: "⌚", advice: "Reference numbers are everything — verify before buying, fakes are common." },
+      bags: { name: "Luxury Bag Flipper", icon: "👜", advice: "Provenance matters — full set (box, dustbag, receipt) commands 20-40% premium." },
+      audio: { name: "Audio Gear Scalper", icon: "🎧", advice: "Limited colorways and collaborations are your edge — check release calendars weekly." },
+      general: { name: "Thrift Generalist", icon: "🔍", advice: "You're casting a wide net — consider specializing in 1-2 categories to increase edge." },
+    };
+
+    const personality = PERSONALITIES[topCategory] || PERSONALITIES.general;
+
+    const badges = [];
+    if (totalFlips >= 5) badges.push({ icon: "🔥", label: "Power Scanner" });
+    if (totalFlips >= 20) badges.push({ icon: "🏆", label: "Flip Elite" });
+    if (avgMargin >= 30) badges.push({ icon: "💰", label: "Margin Master" });
+    if (totalSaved >= 200) badges.push({ icon: "💎", label: "$200+ Saved" });
+    if (totalSaved >= 1000) badges.push({ icon: "🚀", label: "$1K Saver" });
+
+    return res.json({
+      ok: true,
+      personality: personality.name,
+      personalityIcon: personality.icon,
+      topCategory,
+      avgMargin,
+      totalSaved: Math.round(totalSaved),
+      totalFlips,
+      badges,
+      advice: personality.advice,
+    });
+  } catch (e) {
+    console.error("❌ /api/profile/flip error:", e?.message);
+    return res.status(500).json({ ok: false, error: "profile_failed" });
+  }
+});
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
