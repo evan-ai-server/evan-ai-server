@@ -21052,6 +21052,91 @@ app.post("/intel/thrift-heat", (req, res) => {
   }
 });
 
+// ── POST /intel/lowball-script ──────────────────────────────────────────────
+app.post("/intel/lowball-script", async (req, res) => {
+  try {
+    const { itemName = "", price, platform = "", condition, daysListed, avgMarket } = req.body || {};
+
+    const systemPrompt = `You are a master reseller negotiator. Generate concise, psychologically-tuned offer messages for each platform. eBay: professional, cite market data. Facebook Marketplace: casual, friendly, mention you can pick up fast. OfferUp: direct, mention cash offer, low friction. Keep each message under 3 sentences. Base offer on: price ${price}, market avg ${avgMarket || "unknown"}, condition: ${condition || "unknown"}, days listed: ${daysListed || "unknown"}.`;
+
+    const userPrompt = `Generate 3 offer scripts for "${itemName}" listed at $${price}. Return a JSON object with a "scripts" array containing exactly 3 objects, each with keys: platform, tone, message. Platforms: eBay (professional), Facebook Marketplace (casual), OfferUp (direct).`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      response_format: { type: "json_object" },
+      max_tokens: 512,
+      temperature: 0.7,
+    });
+
+    const parsed = JSON.parse(completion.choices[0].message.content || "{}");
+    return res.json({ scripts: parsed.scripts || [] });
+  } catch (err) {
+    return res.status(500).json({ error: "lowball_script_failed", reason: err?.message || String(err) });
+  }
+});
+
+// ── POST /intel/ghost-check ──────────────────────────────────────────────────
+app.post("/intel/ghost-check", (req, res) => {
+  try {
+    const { sellerFeedback, price, avgMarket, store, itemName } = req.body || {};
+
+    const signals = [];
+    let riskScore = 0;
+
+    if (sellerFeedback !== undefined && sellerFeedback < 10) { signals.push("New seller — less than 10 feedback"); riskScore += 35; }
+    if (sellerFeedback !== undefined && sellerFeedback < 3) riskScore += 25; // extra for truly new
+    if (price && avgMarket && price < avgMarket * 0.45) { signals.push("Price suspiciously below market"); riskScore += 30; }
+    if (store && store.toLowerCase().includes("ebay") && sellerFeedback === 0) { signals.push("Zero feedback on eBay"); riskScore += 20; }
+
+    const level = riskScore >= 60 ? "high" : riskScore >= 35 ? "medium" : "low";
+    const warning = riskScore >= 60
+      ? "High scam risk — verify seller before purchasing"
+      : riskScore >= 35
+      ? "Proceed with caution — some red flags detected"
+      : null;
+
+    return res.json({ riskScore: Math.min(riskScore, 100), level, signals, warning });
+  } catch (err) {
+    return res.status(500).json({ error: "ghost_check_failed", reason: err?.message || String(err) });
+  }
+});
+
+// ── POST /intel/scan-graveyard ───────────────────────────────────────────────
+app.post("/intel/scan-graveyard", (req, res) => {
+  try {
+    const { items } = req.body || {};
+
+    const now = Date.now();
+    const results = (items || []).slice(0, 10).map(item => {
+      const ageDays = (now - (item.scannedAt || now)) / 86400000;
+      // Synthetic drop: 1-3% per week after 2 weeks
+      const weeksSince = Math.max(0, (ageDays - 14) / 7);
+      const dropPct = Math.min(weeksSince * 2.5, 30); // cap at 30%
+      const currentEstimate = Math.round(item.originalPrice * (1 - dropPct / 100));
+      const dropped = dropPct >= 8;
+      return {
+        itemName: item.itemName,
+        originalPrice: item.originalPrice,
+        currentEstimate,
+        dropPct: Math.round(dropPct),
+        dropped,
+        ageDays: Math.round(ageDays),
+        message: dropped
+          ? `Price dropped ~${Math.round(dropPct)}% since you passed. Now worth a look.`
+          : null,
+      };
+    }).filter(r => r.dropped);
+
+    return res.json({ items: results });
+  } catch (err) {
+    return res.status(500).json({ error: "scan_graveyard_failed", reason: err?.message || String(err) });
+  }
+});
+
 setInterval(() => {
   const used = process.memoryUsage().heapUsed / 1024 / 1024;
 
