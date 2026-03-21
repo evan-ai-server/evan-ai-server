@@ -247,6 +247,12 @@ import {
   } from "./src/dealComparator.js";
 
   import {
+    buildDealIntelPayload,
+    hunt60PctCheaper,
+    findBestAlternative,
+  } from "./src/dealIntelEngine.js";
+
+  import {
     buildTrendIntelPayload,
     resolveHypeCycle,
   } from "./src/trendIntelEngine.js";
@@ -5381,26 +5387,96 @@ await browser.close().catch(()=>{});
 }
 
 function buildRetrievalLanes(primaryQuery, modelVariants = [], identity = null) {
+  const base = normalizeQuery(primaryQuery);
+  const words = titleTokens(base);
+  const broad = words.length >= 3 ? words.slice(0, 3).join(" ") : base;
+  const brand = identity?.brand ? normalizeQuery(identity.brand) : null;
+  const model = identity?.model ? normalizeQuery(identity.model) : null;
+  const category = identity?.category ? normalizeQuery(identity.category) : null;
+  const colors = Array.isArray(identity?.colors) && identity.colors.length
+    ? identity.colors.slice(0, 2).map(c => normalizeQuery(c)).join(" ")
+    : null;
+  const materials = Array.isArray(identity?.materials) && identity.materials.length
+    ? identity.materials[0] ? normalizeQuery(identity.materials[0]) : null
+    : null;
+  const marketSegment = identity?.marketSegment || null;
+  const substitutes = Array.isArray(identity?.substituteCandidates)
+    ? identity.substituteCandidates.filter(Boolean).slice(0, 4)
+    : [];
 
-const base = normalizeQuery(primaryQuery);
+  // ── Exact lane: brand+model specificity ─────────────────────────────────
+  const exactLane = [base];
+  if (brand && model && !base.includes(model)) exactLane.push(`${brand} ${model}`);
+  if (identity?.exactQuery && identity.exactQuery !== base) exactLane.push(normalizeQuery(identity.exactQuery));
 
-const words = titleTokens(base);
+  // ── Resale/used lane: same item cheaper ──────────────────────────────────
+  const resaleLane = [
+    `${base} used`,
+    `${broad} used`,
+  ];
+  if (brand && model) resaleLane.push(`${brand} ${model} used`);
+  if (brand && model) resaleLane.push(`${brand} ${model} pre-owned`);
+  if (base) resaleLane.push(`${base} lot`); // bundles/lots often cheaper
 
-const broad =
-  words.length >= 3
-    ? words.slice(0, 3).join(" ")
-    : base;
+  // ── Model variants lane ───────────────────────────────────────────────────
+  const variantsLane = [...new Set([
+    ...modelVariants.map(v => normalizeQuery(v)).filter(Boolean),
+    ...(Array.isArray(identity?.searchQueries)
+      ? identity.searchQueries.slice(1, 5).map(q => normalizeQuery(q)).filter(Boolean)
+      : []),
+  ])];
+
+  // ── Substitute lane: from vision-identified candidates ───────────────────
+  const substituteLane = substitutes.map(s => normalizeQuery(s)).filter(Boolean);
+  // Add category-tier-down alternatives
+  if (brand && category) {
+    if (marketSegment === "luxury" || marketSegment === "premium") {
+      substituteLane.push(`${category} used`);
+      substituteLane.push(`affordable ${category}`);
+    }
+  }
+
+  // ── 60%-cheaper hunter lane: aggressive cheap alternatives ───────────────
+  const cheaperLane = [];
+  if (category) {
+    cheaperLane.push(`cheap ${category}`);
+    cheaperLane.push(`budget ${category}`);
+    cheaperLane.push(`affordable ${category}`);
+  }
+  if (brand && model) {
+    cheaperLane.push(`${model} alternative`);
+    cheaperLane.push(`${model} dupe`);
+  }
+  if (category && colors) {
+    cheaperLane.push(`${colors} ${category}`);
+  }
+  if (category && materials) {
+    cheaperLane.push(`${materials} ${category}`);
+  }
+
+  // ── Aesthetic/style lane: same look different brand ───────────────────────
+  const visualLane = [];
+  if (identity?.styleWords?.length) {
+    const styleStr = identity.styleWords.slice(0, 3).join(" ");
+    if (category) visualLane.push(`${styleStr} ${category}`);
+    else visualLane.push(styleStr);
+  }
+  if (colors && category) visualLane.push(`${colors} ${category}`);
+  if (materials && category) visualLane.push(`${materials} ${category}`);
+
+  // ── Rescue lane: broadest useful fallback ────────────────────────────────
+  const rescueLane = [broad];
+  if (category) rescueLane.push(category);
+  if (brand) rescueLane.push(brand);
 
   return {
-    exact: [base],
-    resale: [
-      `${base} used`,
-      `${broad} used`
-    ],
-    visual: [],
-    rescue: [
-      broad
-    ]
+    exact:      [...new Set(exactLane.filter(Boolean))].slice(0, 4),
+    resale:     [...new Set(resaleLane.filter(Boolean))].slice(0, 5),
+    variants:   [...new Set(variantsLane.filter(Boolean))].slice(0, 6),
+    substitute: [...new Set(substituteLane.filter(Boolean))].slice(0, 5),
+    cheaper:    [...new Set(cheaperLane.filter(Boolean))].slice(0, 6),
+    visual:     [...new Set(visualLane.filter(Boolean))].slice(0, 4),
+    rescue:     [...new Set(rescueLane.filter(Boolean))].slice(0, 3),
   };
 }
 
@@ -10306,20 +10382,28 @@ SECTION 5 — QUERY GENERATION RULES
 "variants" — alternate spellings, abbreviations, regional names for the same item
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 6 — SUBSTITUTE CANDIDATES + MARKET SEGMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — SUBSTITUTE CANDIDATES + MARKET SEGMENT + 60% CHEAPER HUNTER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-"substituteCandidates" — 2-4 search queries for functionally equivalent alternatives that are typically CHEAPER:
-- Same use case, different brand or model
-- Budget alternatives to premium items (e.g. "Rothys flats" → ["Allbirds wool flats", "Quay sunglasses", "Cole Haan women flats"])
-- Near-replicas or previous generation (e.g. "AirPods Pro 2nd gen" → ["AirPods Pro 1st gen", "Samsung Galaxy Buds Pro"])
-- If no obvious substitutes exist: []
+"substituteCandidates" — 4-6 search queries for CHEAPER alternatives. Think aggressively:
+- Same use case, different brand (e.g. "Ray-Ban Wayfarer" → ["Knockaround Premiums", "Goodr OGs", "DIFF eyewear wayfarer"])
+- One product tier down (e.g. "AirPods Pro 2" → ["AirPods Pro 1st gen used", "Samsung Galaxy Buds2 Pro", "Soundcore Liberty 4"])
+- Previous generation of same brand (e.g. "iPhone 15 Pro" → ["iPhone 14 Pro", "iPhone 13 Pro used"])
+- Store brand / generic equivalent (e.g. "Theragun Pro" → ["Ekrin B37", "Renpho massage gun"])
+- Used version of exact item (always include: "{brand} {model} used" as first candidate)
+- Near-replica with same function (e.g. "Canada Goose parka" → ["Columbia Omni-Heat parka", "The North Face McMurdo parka"])
 
-"marketSegment" — price tier of this item on the resale market:
-- "budget" — typically resells <$30
-- "mid-range" — typically resells $30-$200
-- "premium" — typically resells $200-$1000
-- "luxury" — typically resells >$1000 or is a recognized luxury brand
+TARGET: At least 2 candidates that would be 40-70% cheaper than typical retail for this item.
+RULE: substituteCandidates must be DIFFERENT products, not the same item.
+RULE: If this is a budget/entry item already, substituteCandidates can be empty [].
+ORDER: most specific cheaper alternative first, broadest last.
+
+"marketSegment" — price tier on RESALE market (not retail):
+- "budget" — resells <$30 used
+- "mid-range" — resells $30-$200
+- "premium" — resells $200-$1000
+- "luxury" — resells >$1000 or recognized luxury brand
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 7 — STRICT RULES
@@ -14616,6 +14700,15 @@ async function buildMarketSearchResponsePayload({
       category,
     });
 
+    // ── Deal Intel Engine (60% cheaper hunter) ────────────────────────────────
+    const dealIntel = buildDealIntelPayload({
+      items: uiItems || [],
+      scannedPrice: finitePrice(scannedPrice),
+      referenceQuery: activeQuery || "",
+      identity: visionIdentity || {},
+      medianMarket: finitePrice(consensus?.medianPrice ?? prediction?.medianPrice),
+    });
+
     schedulePhase5PrecomputeSave({
     query: baseQuery,
     finalQuery: activeQuery,
@@ -14709,6 +14802,7 @@ async function buildMarketSearchResponsePayload({
       priceAnomaly,
       depreciationCurve,
       queryArbitrage,
+      dealIntel,
       sizeArbitrage,
       colorwaySubstitutes,
       releaseCalendar,
