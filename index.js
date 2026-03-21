@@ -7696,6 +7696,73 @@ function startPrecomputeLoop() {
   timer.unref?.();
 }
 
+// ── Accuracy Firewall: Query De-Hallucination ─────────────────────────────────
+// Strips over-specific terms that were likely hallucinated when confidence is low.
+// Returns { stripped: bool, safeQuery, originalQuery, confidence }
+function queryAccuracyFirewall(shaped = {}) {
+  const confidence = Number(shaped.confidence ?? shaped.visionConfidence ?? 1);
+  const query = shaped.query || "";
+  const identity = shaped.identity || {};
+  const visibleText = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const attributeCertainty = shaped.attributeCertainty || {};
+
+  // Only fire when confidence is low enough to warrant stripping
+  if (confidence >= 0.65 || !query) {
+    return { stripped: false, safeQuery: query, originalQuery: query, confidence };
+  }
+
+  let safeQuery = query;
+  let didStrip = false;
+
+  // Strip colorway names in single quotes (e.g., 'Volt/Black', 'Bred', 'Chicago')
+  // when they are NOT present in visible text
+  const colorwayPattern = /'[A-Z][a-zA-Z /]+'/g;
+  const colorwayMatches = safeQuery.match(colorwayPattern) || [];
+  for (const cw of colorwayMatches) {
+    const cwName = cw.replace(/'/g, "").toLowerCase();
+    const inVisibleText = visibleText.some(t => t.toLowerCase().includes(cwName));
+    if (!inVisibleText && confidence < 0.55) {
+      safeQuery = safeQuery.replace(cw, "").trim().replace(/\s+/g, " ");
+      didStrip = true;
+    }
+  }
+
+  // Strip year numbers (e.g., "2019", "1985") when brand cert is low
+  if ((attributeCertainty.brand ?? 1) < 0.4 && confidence < 0.5) {
+    safeQuery = safeQuery.replace(/\b(19|20)\d{2}\b/g, "").trim().replace(/\s+/g, " ");
+  }
+
+  // Strip "Limited Edition", "Special Edition" if not in visible text
+  const editionMatch = safeQuery.match(/\b(limited edition|special edition|anniversary edition)\b/i);
+  if (editionMatch) {
+    const editionText = editionMatch[0].toLowerCase();
+    const inVisibleText = visibleText.some(t => t.toLowerCase().includes("edition") || t.toLowerCase().includes("limited"));
+    if (!inVisibleText && confidence < 0.60) {
+      safeQuery = safeQuery.replace(new RegExp(editionText, "i"), "").trim().replace(/\s+/g, " ");
+      didStrip = true;
+    }
+  }
+
+  // If brand certainty is very low (<0.3), strip the brand from query
+  if ((attributeCertainty.brand ?? 1) < 0.30 && identity.brand) {
+    const brandRe = new RegExp(`\\b${identity.brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "i");
+    const brandInVisibleText = visibleText.some(t => brandRe.test(t));
+    if (!brandInVisibleText) {
+      safeQuery = safeQuery.replace(brandRe, "").trim().replace(/\s+/g, " ");
+      didStrip = true;
+    }
+  }
+
+  safeQuery = normalizeQuery(safeQuery) || query;
+
+  return {
+    stripped: didStrip && safeQuery !== query,
+    safeQuery: didStrip && safeQuery ? safeQuery : query,
+    originalQuery: query,
+    confidence,
+  };
+}
+
 async function buildFinalUiItemsWithIntelligence(
   query,
   items,
@@ -12620,6 +12687,24 @@ if (!openai) {
           }
         } catch (e) { console.warn("logo_confidence_error", e?.message || e); }
 
+        // ── Accuracy Firewall — query de-hallucination ─────────────────────────
+        // When vision confidence is low (<0.55), strip over-specific terms that
+        // are likely hallucinated: colorway names in quotes, edition years,
+        // specific SKU fragments that weren't in visible text.
+        try {
+          const firewall = queryAccuracyFirewall(shaped);
+          if (firewall.stripped) {
+            shaped.query = firewall.safeQuery;
+            shaped.identity.exactQuery = firewall.safeQuery;
+            shaped.firewallStripped = firewall.stripped;
+            console.log("🛡️ Accuracy firewall stripped hallucinated specificity:", {
+              original: firewall.originalQuery,
+              safe: firewall.safeQuery,
+              confidence: firewall.confidence,
+            });
+          }
+        } catch (e) { /* non-fatal */ }
+
         // ── Seller Jargon Normalization (Feature 66) ──────────────────────────
         try {
           if (shaped.query) {
@@ -13976,6 +14061,26 @@ async function buildMarketSearchResponsePayload({
       scannedPrice,
       category,
     });
+
+    // Inject oracle-generated substitute candidates into substituteIntel
+    if (visionIdentity?.substituteCandidates?.length && substituteIntel) {
+      substituteIntel.visionCandidates = visionIdentity.substituteCandidates;
+    }
+    // Inject oracle market intel
+    if (visionIdentity?.__oracleIntel && substituteIntel) {
+      substituteIntel.oracleIntel = visionIdentity.__oracleIntel;
+    }
+
+    // Pull cheaper alt items from oracle results (marked __isSubstitute)
+    const oracleSubstituteItems = uiItems.filter(i => i?.__isSubstitute === true);
+    if (oracleSubstituteItems.length && substituteIntel) {
+      substituteIntel.cheaperAlts = oracleSubstituteItems.map(i => ({
+        title: i.title,
+        source: i.source,
+        price: i.price || i.totalPrice,
+        reason: i.__substituteReason || null,
+      }));
+    }
 
     // ── Cheaper alternative / don't buy this ──────────────────────────────────
     const dontBuyThis = buildDontBuyThisPayload({
