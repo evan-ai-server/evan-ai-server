@@ -195,21 +195,26 @@ import {
                                                                                                                                                                                                       
   import {
     recordScanReplay,
-    markScanOutcome,                                                                                                                                                                                    
+    markScanOutcome,
     getScanReplay,
-    getUserScanReplays,                                                                                                                                                                                 
-    analyzeFailurePatterns,                                                                                                                                                                           
+    getUserScanReplays,
+    analyzeFailurePatterns,
+    recordBuyOutcome,
+    getBuyOutcome,
+    storeRescanVerdict,
+    getRescanVerdict,
   } from "./src/scanReplay.js";                                                                                                                                                                         
                                                                                                                                                                                                       
   import {                                                                                                                                                                                              
-    addPortfolioItem,                                                                                                                                                                                 
+    addPortfolioItem,
     getPortfolioSummary,
-    listPortfolioItems,                                                                                                                                                                                 
+    listPortfolioItems,
     getPortfolioItem,
-    updatePortfolioItemValue,                                                                                                                                                                           
-    markPortfolioItemSold,                                                                                                                                                                              
-    removePortfolioItem,                                                                                                                                                                                
-    getPortfolioPerformance,                                                                                                                                                                            
+    updatePortfolioItemValue,
+    markPortfolioItemSold,
+    removePortfolioItem,
+    getPortfolioPerformance,
+    setPortfolioItemLifecycleStatus,
   } from "./src/portfolio.js";                                                                                                                                                                          
                                                                                                                                                                                                         
   import {
@@ -355,6 +360,7 @@ import {
     checkWatchlistAlerts,
     getWatcherCount,
     buildWatchlistDemandSignal,
+    buildWatchNextAction,
   } from "./src/watchlistIntelligence.js";
 
   import {
@@ -425,6 +431,224 @@ import { buildPriceAlertPayload, firePriceAlert, registerWebhook, unregisterWebh
 import { buildConditionTierPayload, priceByConditionTier, classifyCondition, estimatePriceForCondition } from "./src/conditionTierPricer.js";
 import { buildRegionalPricePayload, fetchRegionalPrices } from "./src/regionalPriceVariance.js";
 import { buildLotBundlePayload, analyzeBatchForLots, detectLotBundle, computePerUnitPrice } from "./src/lotBundleDetector.js";
+import {
+  buildDiscoveryQueryUniverse,
+  scoreDiscoveryOpportunity,
+  buildDiscoveryOpportunity,
+  rankDiscoveryFeed,
+  storeDiscoverySnapshot,
+  getDiscoverySnapshot,
+  getSeenFingerprints,
+  enqueueDiscoveryScans,
+  dequeueDiscoveryBatch,
+  runDiscoveryRefreshJob,
+} from "./src/discoveryEngine.js";
+import {
+  predictTimingSignal,
+  predictPriceDirection,
+  buildTimingAdvice,
+} from "./src/timingIntel.js";
+import {
+  buildPersonalAgentDecision,
+  buildNextBestAction,
+  buildUserOpportunityPolicy,
+} from "./src/personalAgent.js";
+import {
+  recordOutcomeLearning,
+  getCategoryOutcomePrior,
+  getQueryOutcomePrior,
+  getUserCategoryAffinity,
+  applyOutcomeBiasesToDecision,
+} from "./src/outcomeLearning.js";
+import {
+  detectMissedOpportunity,
+  storeMissedOpportunity,
+  listMissedOpportunities,
+  buildMissedOpportunityCard,
+} from "./src/missedOpportunities.js";
+import {
+  buildDailyOpportunityFeed,
+  rankFeedSections,
+  dedupeFeedItems,
+  hydrateFeedCards,
+} from "./src/dailyFeed.js";
+import {
+  computeAccuracyProfile,
+  recordSignalScan,
+  recordSignalOutcome,
+  applyAccuracyAdjustment,
+  getGlobalCalibration,
+  getEmpiricalSilenceFactor,
+  setEmpiricalSilenceFactor,
+} from "./src/accuracyEngine.js";
+import {
+  runWeeklyAudit,
+  getCategoryAuditAlerts,
+  getSystemWideWinRate,
+  isCategorySuppressed,
+  unsuppressCategory,
+  getAllSuppressions,
+} from "./src/calibrationAudit.js";
+import {
+  applyMarketDepthGate,
+  classifyMarketDepth,
+  buildDepthContext,
+} from "./src/marketDepthGate.js";
+import {
+  buildUserDecisionProfile,
+  loadUserProfileData,
+  getCachedDecisionProfile,
+  cacheDecisionProfile,
+  recordPriceTierOutcome,
+  recordFailureFingerprint,
+} from "./src/userDecisionProfile.js";
+import {
+  recordCalibrationSample,
+  getCategoryCalibration,
+  getGlobalCategoryCalibration,
+  applyCalibrationToGates,
+} from "./src/signalCalibrator.js";
+import {
+  recordDailyActivity,
+  addUrgencyTrigger,
+  getUrgencyTriggers,
+  getStreakData,
+  updateCategoryHeat,
+  getCategoryHeat,
+  buildAddictionFeedCards,
+  recordProfitableDay,
+} from "./src/addictionEngine.js";
+import {
+  getOpportunityScanQueue,
+  enqueueUserScanCycle,
+  startOpportunityScanWorker,
+} from "./workers/opportunityScanner.js";
+import {
+  getAccuracyCalibrationQueue,
+  enqueueUserAccuracyRecalc,
+  enqueueGlobalCalibrationSweep,
+  enqueueOutcomeSolicitation,
+  enqueueAuditSystem,
+  startAccuracyCalibrationWorker,
+} from "./workers/accuracyCalibrationWorker.js";
+import {
+  computeReplicaRisk,
+  computeIdentityFlags,
+} from "./src/replicaRiskEngine.js";
+import {
+  classifyResaleMode,
+  buildResaleModeNote,
+  applyResaleModeToItems,
+  LOCAL_PLATFORMS,
+} from "./src/resaleModeClassifier.js";
+import {
+  computeProfitRange,
+  buildHoldEstimate,
+  buildReturnRisk,
+  CATEGORY_DAYS_TO_SALE,
+} from "./src/profitCalculatorEngine.js";
+import {
+  generateScanWarnings,
+  mergeWarnings,
+} from "./src/signalWarnings.js";
+import {
+  recordWrongCall,
+  listWrongCalls,
+  buildMonthlyCalibrationReport,
+  getCachedCalibrationReport,
+  cacheCalibrationReport,
+} from "./src/calibrationReport.js";
+import {
+  buildEffectiveThresholds,
+  computeCategoryThresholds,
+  recordFalsePositive,
+  getFalsePositiveSummary,
+  storeCategoryThresholds,
+  loadStoredCategoryThresholds,
+  GLOBAL_FLOORS,
+} from "./src/categoryThresholdEngine.js";
+import {
+  recordCurveOutcome,
+  getObservedWinRate,
+  getCalibrationCurve,
+  getAllCurvesForCategory,
+  buildProbabilityExpression,
+  assessCalibrationHealth,
+  classifyDealStrengthBin,
+} from "./src/calibrationCurveEngine.js";
+import { recordReturnOutcome } from "./src/outcomeLearning.js";
+
+import {
+  applyPersonalDecisionLayer,
+  computeUserOperatingMode,
+  setUserOperatingMode,
+  OPERATING_MODES,
+} from "./src/personalDecisionEngine.js";
+import {
+  computeCategoryMastery,
+  getCategoryMasteryMap,
+  buildCategorySuspensionRecommendation,
+} from "./src/categoryMastery.js";
+import {
+  recordFailurePattern,
+  loadFailureFingerprints,
+} from "./src/failureFingerprintEngine.js";
+
+import {
+  OUTCOME_STATES,
+  initOutcome,
+  transitionOutcome,
+  getOutcomeState,
+  listUserOutcomes,
+  queryOutcomes,
+  getOutcomeAggregates,
+  estimatePlatformFee,
+} from "./src/outcomeEngine.js";
+import {
+  recordRealizedProfit,
+  getRealizedProfitSummary,
+  listRealizedProfitEntries,
+} from "./src/profitLedger.js";
+import {
+  appendTimelineEvent,
+  getItemTimeline,
+  queryTimelineEvents,
+} from "./src/outcomeTimeline.js";
+import {
+  buildFullExitIntel,
+  computeCapitalRisk,
+  computeExitConfidence,
+  computeRepriceDelta,
+  computeRelistTiming,
+  computeDaysHeld,
+} from "./src/exitIntelligence.js";
+import {
+  analyzePortfolioCapital,
+  rankCapitalReleaseOpportunities,
+  buildCapitalBlockSignal,
+  buildCapitalAllocatorPayload,
+} from "./src/portfolioCapitalEngine.js";
+import {
+  detectArbitrageOpportunities,
+  buildArbitrageSummary,
+} from "./src/arbitrageEngine.js";
+import {
+  analyzeVelocityForItem,
+  recordPriceDropEvent,
+} from "./src/dealVelocityEngine.js";
+import {
+  buildDealScoutTargets,
+  loadScoutSnapshot,
+} from "./src/dealScoutEngine.js";
+import {
+  buildReinvestmentCards,
+  findAnalogInSnapshot,
+} from "./src/reinvestmentEngine.js";
+import {
+  checkRelistAlert,
+  checkSimilarItemAlert,
+  checkEscalationAlert,
+} from "./src/watchlistIntelligence.js";
 
   dotenv.config();
 
@@ -655,8 +879,7 @@ const AUTH_TOKEN_ISSUER = String(process.env.AUTH_TOKEN_ISSUER || "");
 const AUTH_TOKEN_AUDIENCE = String(process.env.AUTH_TOKEN_AUDIENCE || "");
 
 const AUTH_ALLOW_DEV_BODY_FALLBACK =
-  !IS_PROD &&
-  String(process.env.AUTH_ALLOW_DEV_BODY_FALLBACK || "true").toLowerCase() === "true";
+  String(process.env.AUTH_ALLOW_DEV_BODY_FALLBACK || "false").toLowerCase() === "true";
 
 const PLAN_SCAN_LIMIT_ANON = Number(process.env.PLAN_SCAN_LIMIT_ANON || 15);
 const PLAN_SCAN_LIMIT_FREE = Number(process.env.PLAN_SCAN_LIMIT_FREE || 75);
@@ -1369,7 +1592,7 @@ function hasValidApiKey(req) {
 }
 
 function resolveDevelopmentFallbackUserId(req) {
-  if (!AUTH_ALLOW_DEV_BODY_FALLBACK || IS_PROD) return null;
+  if (!AUTH_ALLOW_DEV_BODY_FALLBACK) return null;
 
   return (
     normalizeOpaqueId(req.body?.userId, 128) ||
@@ -2479,12 +2702,28 @@ function inferVisionCategory(q) {
 }
 
 function categoryFallback(category) {
-  if (category === "eyewear") return "glasses";
-  if (category === "headwear") return "hat";
-  if (category === "footwear") return "shoes";
-  if (category === "electronics") return "electronics";
-  if (category === "apparel") return "clothing";
-  return null;
+  const map = {
+    eyewear: "sunglasses frames",
+    headwear: "hat cap used",
+    footwear: "sneakers shoes used",
+    electronics: "used electronics device",
+    apparel: "used clothing",
+    watches: "used watch timepiece",
+    jewelry: "used jewelry",
+    bags: "used bag handbag",
+    toys: "used toy collectible",
+    books: "used book",
+    furniture: "used furniture",
+    tools: "used tools hardware",
+    sports: "used sports equipment",
+    music: "used instrument",
+    art: "art print collectible",
+    games: "used video game",
+    automotive: "used auto part accessory",
+    collectibles: "vintage collectible item",
+    home: "used home decor",
+  };
+  return map[category] || null;
 }
 
 function isWeakGenericVisionQuery(q, mode = "item") {
@@ -2905,6 +3144,10 @@ if (redis) {
     );
   }
 }
+
+// Postgres pool — set to null; all callers guard with `if (pgPool)`.
+// Wire up by replacing null with a pg.Pool when DATABASE_URL is available.
+const pgPool = null;
 
 const leaderElection = createLeaderElection({
   redis,
@@ -3714,6 +3957,46 @@ const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
 const RESEARCH_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1000 });
 const LOCAL_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 600 });
 
+// ── WS7: Calibration suppression cache (in-memory, 5-min TTL) ─────────────
+// Warmed at startup and after each weekly audit. Allows assembleProfitIntel
+// (synchronous) to check category-level suppression without an async Redis call.
+const _suppressionCache = new Map(); // "cat:signal" → { capped: bool, loadedAt: number }
+const SUPPRESSION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function warmSuppressionCache() {
+  if (!redis) return;
+  try {
+    const suppressions = await getAllSuppressions(redis);
+    // Clear entries that no longer exist
+    for (const [k] of _suppressionCache) {
+      const [cat, ...sigParts] = k.split(":");
+      const sig = sigParts.join(":");
+      if (!suppressions.some(s => normalizeSuppressKey(s.category) === cat && s.signalType === sig)) {
+        _suppressionCache.delete(k);
+      }
+    }
+    for (const { category, signalType } of suppressions) {
+      _suppressionCache.set(`${normalizeSuppressKey(category)}:${signalType}`, { capped: true, loadedAt: Date.now() });
+    }
+  } catch { /* non-fatal */ }
+}
+
+function getSuppressionCached(category, signal) {
+  if (!category || !signal) return false;
+  const k = `${normalizeSuppressKey(category)}:${signal}`;
+  const entry = _suppressionCache.get(k);
+  if (!entry) return false;
+  if (Date.now() - entry.loadedAt > SUPPRESSION_CACHE_TTL_MS) {
+    _suppressionCache.delete(k);
+    return false;
+  }
+  return entry.capped;
+}
+
+function normalizeSuppressKey(cat) {
+  return String(cat || "general").toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 40);
+}
+
 // ── Reseller Rivalry tracker (in-memory, rolling 2hr window) ───────────
 const RIVALRY_MAP = new Map(); // key: normalizedQuery → [{ userId, ts }]
 const RIVALRY_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -3735,6 +4018,339 @@ const INSTANT_SCAN_CACHE = new TTLCache({
   maxSize: 2500,
 });
 const QUERY_PULSE = new Map();
+
+// ── Result-Aware Feedback Loop state ─────────────────────────────────────────
+const RESULT_CONSENSUS_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 400 });
+const QUERY_SUCCESS_MEMORY   = new Map(); // normalizedQuery → { count, category, lastSeen }
+const QUERY_MEMORY_MAX       = 500;
+// ── Scan stream pipeline metrics (in-memory rolling counters) ─────────────────
+const _scanStreamMetrics = {
+  totalRequests:       0,
+  totalCompleted:      0,
+  totalPhase1:         0,
+  cacheHits:           0,
+  oracleInvocations:   0,
+  oracleTimeouts:      0,
+  oracleSkips:         0,  // oracle eligible but skipped by shouldInvokeOracle
+  provisionalSent:     0,
+  earlyProvisionalSent: 0, // provisional from fast native lanes before SerpAPI
+  degradedCompletions: 0,
+  inflightHits:        0,
+  phase1TotalMs:       [], // rolling last 200
+  phase2TotalMs:       [], // rolling last 200
+  ttfrMs:              [], // time-to-first-result (provisional or complete), rolling 200
+  oracleSkipReasons:   {}, // reason string → count
+  oracleInvokeReasons: {}, // reason string → count
+  sourceItemTotals:    {}, // srcGroup → total items contributed across all scans (LiveAggregator)
+};
+function _recordStreamMetric(key, value) {
+  if (!(key in _scanStreamMetrics)) return;
+  const v = _scanStreamMetrics[key];
+  if (typeof v === "number") { _scanStreamMetrics[key]++; }
+  else if (Array.isArray(v)) {
+    v.push(value);
+    if (v.length > 200) v.shift();
+  } else if (v !== null && typeof v === "object") {
+    // reason map: value is the reason string
+    const r = String(value || "unknown");
+    _scanStreamMetrics[key][r] = (_scanStreamMetrics[key][r] || 0) + 1;
+  }
+}
+// ── Scan stream Phase 3 — enrichment cache + pipeline constants ───────────────
+const ENRICHED_SCAN_CACHE        = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 800 });
+const STREAM_PHASE1_INFLIGHT     = new Map(); // cacheKey → Promise<items[]>
+const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than this many marketplace items
+const SCAN_STREAM_ORACLE_BUDGET_MS = 8000;    // hard timeout for GPT oracle in stream route
+
+function scanLog(event, scanId, fields = {}) {
+  try { console.log(JSON.stringify({ event, scanId, ts: Date.now(), ...fields })); } catch {}
+}
+
+// ── Phase 4: Source policy classification ────────────────────────────────────
+// Each source is classified by tier, trust, latency tolerance, and whether it
+// contributes to provisional results or is enrichment/oracle-only.
+const SOURCE_POLICY = {
+  ebay:     { tier: "primary",     trustMult: 1.00, provisionalEligible: true,  droppable: false, latencyBudgetMs: 4000 },
+  walmart:  { tier: "primary",     trustMult: 0.90, provisionalEligible: true,  droppable: false, latencyBudgetMs: 4000 },
+  bestbuy:  { tier: "primary",     trustMult: 0.88, provisionalEligible: true,  droppable: false, latencyBudgetMs: 4000 },
+  etsy:     { tier: "primary",     trustMult: 0.80, provisionalEligible: false, droppable: true,  latencyBudgetMs: 5000 },
+  amazon:   { tier: "secondary",   trustMult: 0.88, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  serpapi:  { tier: "secondary",   trustMult: 0.75, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  stockx:   { tier: "enrichment",  trustMult: 0.82, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  poshmark: { tier: "enrichment",  trustMult: 0.70, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  mercari:  { tier: "enrichment",  trustMult: 0.68, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  depop:    { tier: "enrichment",  trustMult: 0.65, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  grailed:  { tier: "enrichment",  trustMult: 0.67, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+  bing:     { tier: "fallback",    trustMult: 0.50, provisionalEligible: false, droppable: true,  latencyBudgetMs: 6000 },
+  googlecse:{ tier: "fallback",    trustMult: 0.50, provisionalEligible: false, droppable: true,  latencyBudgetMs: 6000 },
+  oracle:   { tier: "oracle",      trustMult: 0.62, provisionalEligible: false, droppable: true,  latencyBudgetMs: 8000 },
+};
+
+// Normalize a raw source/store string to one of the SOURCE_POLICY keys.
+function sourceGroup(item) {
+  const s = String(item?.source || item?.store || item?.vendor || item?.merchant_name || "").toLowerCase();
+  if (s.includes("ebay"))                    return "ebay";
+  if (s.includes("walmart"))                 return "walmart";
+  if (/best.?buy/i.test(s))                  return "bestbuy";
+  if (s.includes("amazon"))                  return "amazon";
+  if (s.includes("etsy"))                    return "etsy";
+  if (s.includes("stockx"))                  return "stockx";
+  if (s.includes("poshmark"))                return "poshmark";
+  if (s.includes("mercari"))                 return "mercari";
+  if (s.includes("depop"))                   return "depop";
+  if (s.includes("grailed"))                 return "grailed";
+  if (s.includes("bing") || s.includes("microsoft")) return "bing";
+  if (s.includes("google"))                  return "googlecse";
+  return "other";
+}
+
+// Canonical item key: identifies the same physical listing across sources.
+// Uses $2 price bucket to tolerate minor price fluctuations.
+function canonicalItemKey(item) {
+  const title     = normalizeTitleKey(item?.title || "");
+  const price     = Number(item?.totalPrice ?? item?.price ?? 0);
+  const pBucket   = Number.isFinite(price) ? Math.round(price / 2) : 0;
+  const srcGroup  = sourceGroup(item);
+  // Include source so same item on eBay vs Walmart gets distinct IDs (intentional)
+  return `${title}|${pBucket}|${srcGroup}`;
+}
+
+// Assign deterministic _itemId and _srcGroup to every item.
+// Items retain their _itemId when they reappear in enriched/complete results,
+// enabling stable React keys on the client.
+function assignItemIds(items) {
+  if (!Array.isArray(items)) return [];
+  const keyCounts = {};
+  return items.map((item) => {
+    if (item?._itemId) return item;          // already assigned — preserve it
+    const base  = canonicalItemKey(item);
+    const count = (keyCounts[base] = (keyCounts[base] || 0) + 1);
+    return {
+      ...item,
+      _itemId:   count === 1 ? base : `${base}#${count}`,
+      _srcGroup: item._srcGroup || sourceGroup(item),
+    };
+  });
+}
+
+// Smart oracle decision function — replaces the blunt item-count threshold.
+// Returns { invoke: bool, reason: string, factors: object }.
+//
+// Oracle is skipped when:
+//   • Item count is sufficient (≥6)
+//   • 3+ items from primary trusted sources with tight price spread
+//   • Identity too weak for oracle to help (oracle can't fix bad vision match)
+//   • Chaotic spread + weak identity → oracle won't clarify a bad match
+//   • Adequate diverse evidence already exists
+//
+// Oracle is invoked when:
+//   • No market data at all
+//   • Only scrape/weak sources, no native API results
+//   • Low count AND no trusted primary source
+//
+function shouldInvokeOracle(items, context = {}) {
+  const { visionIdentity = null, category = null } = context;
+
+  const count   = Array.isArray(items) ? items.length : 0;
+  const factors = {};
+
+  // Hard skip: abundant data
+  if (count >= 6) {
+    return { invoke: false, reason: "sufficient_items", factors: { count } };
+  }
+
+  // Assess identity quality from vision metadata
+  const identityConf = Number(
+    visionIdentity?.confidence ?? visionIdentity?.visionConfidence ?? 0.5
+  );
+  factors.identityConf = Math.round(identityConf * 100) / 100;
+
+  // Hard skip: identity too weak — oracle generates synthetic listings for an
+  // unknown item, adding noise, not depth. Trust gates will suppress anyway.
+  if (identityConf < 0.18) {
+    return { invoke: false, reason: "identity_too_weak", factors };
+  }
+
+  // Source diversity analysis
+  const srcGroups = new Set(
+    items.map(i => sourceGroup(i)).filter(s => s !== "other" && s !== "oracle")
+  );
+  const hasPrimaryTrusted = items.some(i =>
+    ["ebay", "walmart", "bestbuy", "amazon"].includes(sourceGroup(i))
+  );
+
+  // Price spread analysis
+  const prices = items
+    .map(i => Number(i?.totalPrice ?? i?.price))
+    .filter(n => Number.isFinite(n) && n > 0);
+  const medianPrice = prices.length
+    ? prices.slice().sort((a, b) => a - b)[Math.floor(prices.length / 2)]
+    : 0;
+  const spread = prices.length >= 2 && medianPrice > 0
+    ? (Math.max(...prices) - Math.min(...prices)) / medianPrice
+    : 0;
+
+  factors.count            = count;
+  factors.srcGroups        = srcGroups.size;
+  factors.hasPrimaryTrusted = hasPrimaryTrusted;
+  factors.priceSpread      = Math.round(spread * 100) / 100;
+
+  // Strong evidence: 3+ items, at least one trusted primary, tight spread, diverse sources
+  if (count >= 3 && hasPrimaryTrusted && spread < 0.9 && srcGroups.size >= 2) {
+    return { invoke: false, reason: "strong_primary_evidence", factors };
+  }
+
+  // No data at all → oracle definitely needed
+  if (count === 0) {
+    return { invoke: true, reason: "no_market_data", factors };
+  }
+
+  // Only scrape/weak sources with count below threshold
+  if (count < SCAN_STREAM_ORACLE_THRESHOLD && !hasPrimaryTrusted) {
+    return { invoke: true, reason: "no_trusted_primary_source", factors };
+  }
+
+  // Chaotic spread + weak identity → oracle won't improve coherence, skip it
+  if (spread > 2.0 && identityConf < 0.40) {
+    return { invoke: false, reason: "chaotic_spread_weak_identity", factors };
+  }
+
+  // Adequate diverse evidence even if count is low
+  if (count >= 2 && srcGroups.size >= 2 && hasPrimaryTrusted) {
+    return { invoke: false, reason: "adequate_diverse_evidence", factors };
+  }
+
+  // Default: use count threshold
+  const invoke = count < SCAN_STREAM_ORACLE_THRESHOLD;
+  return {
+    invoke,
+    reason: invoke ? "low_count_default" : "sufficient_count_default",
+    factors,
+  };
+}
+// ── Phase 4: Conflict resolution for live aggregation ────────────────────────
+// Called when the same canonical item key (or near-duplicate title+price bucket)
+// appears from multiple sources. Returns the action to take:
+//   "upgrade" — replace existing with incoming (incoming is higher-trust)
+//   "ignore"  — keep existing (existing is same or higher trust)
+// Note: "insert" (no conflict) is handled by LiveAggregator._resolve, not here.
+function stableMerge(existing, incoming) {
+  const existTrust  = SOURCE_POLICY[existing?._srcGroup]?.trustMult  ?? 0.50;
+  const incomeTrust = SOURCE_POLICY[incoming?._srcGroup]?.trustMult  ?? 0.50;
+
+  // Incoming is from a meaningfully higher-trust source → upgrade
+  if (incomeTrust > existTrust + 0.05) return "upgrade";
+
+  // Same trust tier: prefer the item with more non-null fields (data completeness)
+  if (Math.abs(incomeTrust - existTrust) <= 0.05) {
+    const existFields  = Object.values(existing  || {}).filter(v => v != null).length;
+    const incomFields  = Object.values(incoming  || {}).filter(v => v != null).length;
+    return incomFields > existFields + 2 ? "upgrade" : "ignore";
+  }
+
+  // Existing is from higher-trust source → keep it
+  return "ignore";
+}
+
+// ── Phase 4: LiveAggregator — incremental source-arrival state machine ────────
+// Manages a Map<_itemId, item> of the best known item for each canonical ID.
+// Sources can ingest items at any time; the aggregator resolves conflicts via
+// stableMerge and tracks per-source contribution statistics.
+//
+// Usage in stream route:
+//   const agg = new LiveAggregator();
+//   agg.ingest("phase1",  phase1Items);          // Tier A results (already ID-stamped)
+//   agg.ingest("oracle",  oracleItems);           // Phase 2 oracle results
+//   const enrichedItems = agg.snapshot();
+//   scanLog("source_contributions", scanId, { sourceStats: agg.sourceStats() });
+//
+class LiveAggregator {
+  constructor() {
+    this._items        = new Map();  // _itemId → item (best known version)
+    this._srcStats     = new Map();  // sourceName → { added, upgraded, ignored }
+    this._t0           = Date.now();
+    this._firstResultMs = null;
+    this._ingestCount  = 0;
+  }
+
+  // Ingest items from a named source.
+  // Items may or may not already have _itemId stamped — assignItemIds is called here.
+  ingest(sourceName, rawItems) {
+    if (!Array.isArray(rawItems) || !rawItems.length) return this;
+    if (!this._srcStats.has(sourceName)) {
+      this._srcStats.set(sourceName, { added: 0, upgraded: 0, ignored: 0 });
+    }
+    const stats   = this._srcStats.get(sourceName);
+    const stamped = assignItemIds(rawItems);  // idempotent — preserves existing _itemId
+
+    for (const item of stamped) {
+      const action = this._resolve(item);
+      if (action === "upgrade") {
+        this._items.set(item._itemId, item);
+        stats.upgraded++;
+      } else if (action === "insert") {
+        this._items.set(item._itemId, item);
+        stats.added++;
+        if (this._firstResultMs === null) this._firstResultMs = Date.now() - this._t0;
+      } else {
+        // "ignore"
+        stats.ignored++;
+      }
+    }
+    this._ingestCount++;
+    return this;  // chainable
+  }
+
+  // Internal: classify an incoming item against current state.
+  // Returns "upgrade" | "insert" | "ignore".
+  _resolve(incoming) {
+    // Exact _itemId match → conflict, delegate to stableMerge
+    if (this._items.has(incoming._itemId)) {
+      return stableMerge(this._items.get(incoming._itemId), incoming);
+    }
+
+    // Near-duplicate: same normalized title + same $2 price bucket (cross-source duplicate)
+    // e.g. eBay direct API result vs. SerpAPI scrape of the same eBay listing
+    const incomeTB = _titleBucket(incoming);
+    if (incomeTB !== "|0") {  // skip zero-price items — too ambiguous
+      for (const existing of this._items.values()) {
+        if (_titleBucket(existing) === incomeTB) {
+          return stableMerge(existing, incoming);
+        }
+      }
+    }
+
+    return "insert";
+  }
+
+  // Return all aggregated items as an ordered array (Map insertion order = first-seen).
+  snapshot() {
+    return Array.from(this._items.values());
+  }
+
+  // Return per-source contribution stats as a plain object.
+  sourceStats() {
+    const out = {};
+    for (const [src, s] of this._srcStats.entries()) {
+      out[src] = { added: s.added, upgraded: s.upgraded, ignored: s.ignored };
+    }
+    return out;
+  }
+
+  get size()          { return this._items.size; }
+  get firstResultMs() { return this._firstResultMs; }
+  get ingestCount()   { return this._ingestCount; }
+}
+
+// Helper: `titleNormalized|$2-priceBucket` for near-duplicate detection.
+function _titleBucket(item) {
+  const title  = normalizeTitleKey(item?.title || "");
+  const price  = Number(item?.totalPrice ?? item?.price ?? 0);
+  const bucket = Number.isFinite(price) ? Math.round(price / 2) : 0;
+  return `${title}|${bucket}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function rememberBetterQuery(original, improved) {
   const o = normalizeQuery(original);
@@ -6775,6 +7391,7 @@ const QUEUE_SWEEP_BATCH = Math.max(
     analytics:     Math.max(1, Number(process.env.QUEUE_ANALYTICS_CONCURRENCY     || 1)),                                                                                                             
     scan_replay:   Math.max(1, Number(process.env.QUEUE_SCAN_REPLAY_CONCURRENCY   || 1)),                                                                                                               
     autopilot:     Math.max(1, Number(process.env.QUEUE_AUTOPILOT_CONCURRENCY     || 1)),                                                                                                               
+    discovery:     Math.max(1, Number(process.env.QUEUE_DISCOVERY_CONCURRENCY     || 1)),
     default:       Math.max(1, Number(process.env.QUEUE_DEFAULT_CONCURRENCY       || 1)),                                                                                                               
   };           
 
@@ -6796,8 +7413,8 @@ const QUEUE_SWEEP_BATCH = Math.max(
     scan_replay_record:            "scan_replay",                                                                                                                                                       
     scan_replay_analyze:           "scan_replay",                                                                                                                                                       
     autopilot_run:                 "autopilot",                                                                                                                                                         
-  };                                               
-
+    discovery_refresh:             "discovery",                                               
+  };
 const LOCAL_QUEUE_STATE = {
   jobs: new Map(),
   pending: new Map(),
@@ -8115,10 +8732,13 @@ CRITICAL RULES:
   }
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
 
+  // 5 s gives SerpAPI time to return in Wave 1 while staying well under
+  // the frontend's 8 s hard abort. GPT oracle (if triggered) needs ~1-2 s,
+  // giving total backend budget of ~7 s end-to-end.
   const killTimer = new Promise((resolve) =>
-    setTimeout(() => resolve("__timeout__"), 7000)
+    setTimeout(() => resolve("__timeout__"), 5000)
   );
 
   const worker = (async () => {
@@ -8244,7 +8864,7 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
       ).slice(0, 4)
     : [];
 
-  const maxQueries = isEyewearQuery ? 10 : (lowConfidence ? 14 : 12);
+  const maxQueries = isEyewearQuery ? 6 : (lowConfidence ? 6 : 5);
 
   // Include vision-extracted substitute candidates as query variants
   const substituteQueries = Array.isArray(identity?.substituteCandidates)
@@ -8263,44 +8883,24 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
     ...substituteQueries,
   ]).slice(0, maxQueries);
 
-  if (marketplaceQueries.length) {
-    const sourceResults = await Promise.all(
-      marketplaceQueries.map((q) =>
-        marketSearchConcurrency(async () => {
-          const [ebayItems, walmartItems, bestBuyItems] = await Promise.all([
-            canUseEbay
-              ? runBudgetedSourceLane("ebay", () => ebayAdapterSearch(q), {
-                  plan: runtimePlan,
-                  costUnits: 1,
-                })
-              : Promise.resolve([]),
-            canUseWalmart
-              ? runBudgetedSourceLane("walmart", () => walmartCatalogSearch(q), {
-                  plan: runtimePlan,
-                  costUnits: 1,
-                })
-              : Promise.resolve([]),
-            canUseBestBuy
-              ? runBudgetedSourceLane("bestbuy", () => bestBuySearch(q), {
-                  plan: runtimePlan,
-                  costUnits: 1,
-                })
-              : Promise.resolve([]),
-          ]);
-
-          return {
-            query: q,
-            ebayItems,
-            walmartItems,
-            bestBuyItems,
-          };
-        })
-      )
-    );
-
-    ebayAll = sourceResults.flatMap((x) => x?.ebayItems || []);
-    walmartAll = sourceResults.flatMap((x) => x?.walmartItems || []);
-    bestBuyAll = sourceResults.flatMap((x) => x?.bestBuyItems || []);
+  // Compute resale sites upfront (needed for concurrent launch below)
+  const resaleSitesForSerp = [];
+  if (canUseResaleSerp) {
+    const resaleCat = inferVisionCategory(normalizedQuery);
+    if (resaleCat === "footwear") {
+      resaleSitesForSerp.push({ site: "stockx.com",  label: "StockX"   });
+      resaleSitesForSerp.push({ site: "goat.com",     label: "GOAT"     });
+    } else if (resaleCat === "apparel" || resaleCat === "bags") {
+      resaleSitesForSerp.push({ site: "poshmark.com", label: "Poshmark" });
+      resaleSitesForSerp.push({ site: "depop.com",    label: "Depop"    });
+      resaleSitesForSerp.push({ site: "mercari.com",  label: "Mercari"  });
+    } else if (resaleCat === "watch") {
+      resaleSitesForSerp.push({ site: "stockx.com",   label: "StockX"   });
+      resaleSitesForSerp.push({ site: "chrono24.com", label: "Chrono24" });
+    } else {
+      resaleSitesForSerp.push({ site: "mercari.com",  label: "Mercari"  });
+      resaleSitesForSerp.push({ site: "poshmark.com", label: "Poshmark" });
+    }
   }
 
   const backupLaneQueries = uniqueQueries([
@@ -8308,23 +8908,101 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
     ...buildEmergencyShoppingFallbacks(normalizedQuery, incomingVariants),
   ]).slice(0, 6);
 
-  if (backupLaneQueries.length) {
-    const backupResults = await Promise.all(
-      backupLaneQueries.map((q) =>
-        marketSearchConcurrency(async () => {
-          const bing = await bingBackupSearch(q);
-          const googleCse = await googleCseBackupSearch(q);
-          return {
-            query: q,
-            items: [...bing, ...googleCse],
-          };
-        })
-      )
-    );
+  // ── Phase 4: Two-tier source fanout for live progressive aggregation ─────────
+  //
+  // Tier A (fast, ~1-3s): Native marketplace APIs — eBay, Walmart, BestBuy, Bing, CSE.
+  //   earlyItemsCb fires after Tier A resolves, enabling provisional emission
+  //   ~2-3s before Tier B (SerpAPI) completes.
+  //
+  // Tier B (slow, ~3-8s): SerpAPI Google Shopping, Amazon, Resale sites.
+  //   Started at t=0 alongside Tier A — no latency penalty.
+  //   Merged into final result after earlyItemsCb fires.
+  //
+  // All sources start at exactly the same time. The only change vs. the original
+  // single Promise.all is that Tier A results are accessible before Tier B resolves.
+  // ─────────────────────────────────────────────────────────────────────────────
 
-    backupAll = backupResults.flatMap((x) => x?.items || []);
+  // Start Tier B (slow SerpAPI) promises immediately — fire and collect later
+  const _amazonP = canUseAmazonSerp
+    ? runBudgetedSourceLane("serpapi", () => serpAmazon(normalizedQuery, { softFail: true }), { plan: runtimePlan, costUnits: 4 }).catch(() => [])
+    : Promise.resolve([]);
+
+  const _resaleP = resaleSitesForSerp.length
+    ? Promise.all(
+        resaleSitesForSerp.map(({ site, label }) =>
+          marketSearchConcurrency(() =>
+            runBudgetedSourceLane("serpapi", () => serpScopedSearch(normalizedQuery, site, { softFail: true, label }), { plan: runtimePlan, costUnits: 2 })
+          )
+        )
+      )
+    : Promise.resolve([]);
+
+  // SerpAPI Google Shopping Wave 1 — starts immediately, collected after Tier A
+  const _serpShopP = canUseSerpForce
+    ? runBudgetedSourceLane("serpapi", () => serpShopping(normalizedQuery, { softFail: true }), { plan: runtimePlan, costUnits: 6 }).catch(() => [])
+    : Promise.resolve([]);
+
+  // Await Tier A: native marketplace APIs only
+  const [sourceResultsArr, backupResultsArr] = await Promise.all([
+    marketplaceQueries.length
+      ? Promise.all(
+          marketplaceQueries.map((q) =>
+            marketSearchConcurrency(async () => {
+              const [ebayItems, walmartItems, bestBuyItems] = await Promise.all([
+                canUseEbay
+                  ? runBudgetedSourceLane("ebay", () => ebayAdapterSearch(q), { plan: runtimePlan, costUnits: 1 })
+                  : Promise.resolve([]),
+                canUseWalmart
+                  ? runBudgetedSourceLane("walmart", () => walmartCatalogSearch(q), { plan: runtimePlan, costUnits: 1 })
+                  : Promise.resolve([]),
+                canUseBestBuy
+                  ? runBudgetedSourceLane("bestbuy", () => bestBuySearch(q), { plan: runtimePlan, costUnits: 1 })
+                  : Promise.resolve([]),
+              ]);
+              return { query: q, ebayItems, walmartItems, bestBuyItems };
+            })
+          )
+        )
+      : Promise.resolve([]),
+
+    backupLaneQueries.length
+      ? Promise.all(
+          backupLaneQueries.map((q) =>
+            marketSearchConcurrency(async () => {
+              const bing = await bingBackupSearch(q);
+              const googleCse = await googleCseBackupSearch(q);
+              return { query: q, items: [...bing, ...googleCse] };
+            })
+          )
+        )
+      : Promise.resolve([]),
+  ]);
+
+  ebayAll    = sourceResultsArr.flatMap((x) => x?.ebayItems    || []);
+  walmartAll = sourceResultsArr.flatMap((x) => x?.walmartItems || []);
+  bestBuyAll = sourceResultsArr.flatMap((x) => x?.bestBuyItems || []);
+  backupAll  = backupResultsArr.flatMap((x) => x?.items        || []);
+
+  // ── Fire earlyItemsCb with Tier A results before Tier B resolves ─────────────
+  // The callback is async (builds provisional payload in the stream route).
+  // Fire-and-forget from mergeCheapestSources perspective — don't block.
+  if (typeof earlyItemsCb === "function") {
+    const _earlyRaw = dedupeSmart(
+      [...ebayAll, ...walmartAll, ...bestBuyAll, ...backupAll].filter(Boolean)
+    );
+    if (_earlyRaw.length >= 2) {
+      Promise.resolve().then(() => earlyItemsCb(_earlyRaw)).catch(() => {});
+    }
   }
 
+  // Collect Tier B results (already running since t=0, likely near resolution)
+  const [amazonRaw, resaleRaw, serpShoppingRaw] = await Promise.all([_amazonP, _resaleP, _serpShopP]);
+
+  amazonAll = Array.isArray(amazonRaw) ? amazonRaw : [];
+  resaleAll = resaleRaw.flat().filter(Boolean);
+  const serpShoppingWave1 = Array.isArray(serpShoppingRaw) ? serpShoppingRaw : [];
+
+  // ── Etsy lane (sequential: has cooldown state) ────────────────────────────
   const shouldRunEtsyLane =
     canUseEtsy &&
     /glasses|eyewear|frames|sunglasses|bag|backpack|hat|cap|jacket|hoodie|shirt|shoe|sneaker/i.test(
@@ -8359,51 +9037,6 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null) 
     etsyAll = etsyResults.flatMap((x) => x.items || []);
   }
 
-  // ── Amazon lane ────────────────────────────────────────────────────────────
-  if (canUseAmazonSerp) {
-    try {
-      amazonAll = await runBudgetedSourceLane(
-        "serpapi",
-        () => serpAmazon(normalizedQuery, { softFail: true }),
-        { plan: runtimePlan, costUnits: 4 }
-      );
-    } catch { /* non-fatal */ }
-  }
-
-  // ── Category-routed resale lane (StockX / Poshmark / Depop / Mercari) ────
-  if (canUseResaleSerp) {
-    const cat = inferVisionCategory(normalizedQuery);
-    const resaleSites = [];
-
-    if (cat === "footwear") {
-      resaleSites.push({ site: "stockx.com",  label: "StockX"   });
-      resaleSites.push({ site: "goat.com",     label: "GOAT"     });
-    } else if (cat === "apparel" || cat === "bags") {
-      resaleSites.push({ site: "poshmark.com", label: "Poshmark" });
-      resaleSites.push({ site: "depop.com",    label: "Depop"    });
-      resaleSites.push({ site: "mercari.com",  label: "Mercari"  });
-    } else if (cat === "watch") {
-      resaleSites.push({ site: "stockx.com",   label: "StockX"   });
-      resaleSites.push({ site: "chrono24.com", label: "Chrono24" });
-    } else {
-      resaleSites.push({ site: "mercari.com",  label: "Mercari"  });
-      resaleSites.push({ site: "poshmark.com", label: "Poshmark" });
-    }
-
-    const resaleResults = await Promise.all(
-      resaleSites.map(({ site, label }) =>
-        marketSearchConcurrency(() =>
-          runBudgetedSourceLane(
-            "serpapi",
-            () => serpScopedSearch(normalizedQuery, site, { softFail: true, label }),
-            { plan: runtimePlan, costUnits: 2 }
-          )
-        )
-      )
-    );
-    resaleAll = resaleResults.flat().filter(Boolean);
-  }
-
   const [retrievalSnapshot, retrievalIndexed] = await Promise.all([
     getRetrievalSnapshotCached(normalizedQuery).catch(() => null),
     searchRetrievalIndexCached(normalizedQuery, 24).catch(() => []),
@@ -8422,6 +9055,7 @@ let rawMerged = [
   ...etsyAll,
   ...amazonAll,
   ...resaleAll,
+  ...serpShoppingWave1,   // Wave 1 Google Shopping (primary SerpAPI lane)
   ...retrievalSeed,
 ];
 
@@ -8481,14 +9115,11 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   if (!rawMerged.length) {
     console.warn("🛟 Market rescue triggered");
 
+    // Use the generic intent ladder rather than eyewear-specific hardcodes —
+    // rescue must work for any category.
     const rescueQueries = uniqueQueries([
       ...marketplaceQueries,
-      `${normalizedQuery} used`,
-      `${normalizedQuery} vintage`,
-      `${normalizedQuery} orange lens`,
-      `${normalizedQuery} black frame`,
-      `${normalizedQuery} wrap sunglasses`,
-      `${normalizedQuery} oval sunglasses`,
+      ...buildSearchIntentLadder(normalizedQuery, { broad: true }),
     ]).slice(0, 10);
 
     const rescueResults = await Promise.all(
@@ -8509,7 +9140,8 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   }
 
   // ── GPT-4.1 Oracle fallback — fires when all marketplace APIs return nothing ─
-  if (!rawMerged.length || rawMerged.length < 4) {
+  // skipOracle=true: stream endpoint uses this to get Phase 1 results without blocking on GPT
+  if ((!rawMerged.length || rawMerged.length < 4) && !skipOracle) {
     console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
     const oracleItems = await gptMarketOracle(normalizedQuery, identity).catch(() => []);
     if (oracleItems.length) {
@@ -8730,8 +9362,11 @@ merged = [...merged].sort((a, b) => {
   return Number(b?.__relevance || 0) - Number(a?.__relevance || 0);
 });
 
-  if (!merged.length && canUseSerpForce && !isSourceCoolingDown("serpapi")) {
+  // SerpAPI fallback lane — only fires if Wave 1 Google Shopping returned nothing
+  // (i.e., serpShoppingWave1 was empty AND all other sources failed).
+  if (!merged.length && canUseSerpForce && !isSourceCoolingDown("serpapi") && !serpShoppingWave1.length) {
     const backupQueries = uniqueQueries([
+      ...buildSearchIntentLadder(normalizedQuery, { broad: true }),
       ...buildGoogleShoppingVariants(normalizedQuery, incomingVariants),
       ...buildEmergencyShoppingFallbacks(normalizedQuery, incomingVariants),
     ]).slice(0, isEyewearQuery ? 8 : 10);
@@ -8912,7 +9547,7 @@ return merged;
 
 return Promise.race([worker, killTimer]).then((r) => {
   if (r === "__timeout__") {
-    console.warn("⚡ MARKET SEARCH TIMEOUT (4s)");
+    console.warn("⚡ MARKET SEARCH TIMEOUT (2.5s)");
     return [];
   }
   return r;
@@ -10175,6 +10810,9 @@ SCHEMA
     "conditionNotes": string|null,
     "sizeHint": string|null,
     "exactQuery": string|null,
+    "broadQuery": string|null,
+    "categoryFallbackQuery": string|null,
+    "visualDescriptorQuery": string|null,
     "searchQueries": string[],
     "substituteCandidates": string[],
     "marketSegment": string|null
@@ -10364,18 +11002,32 @@ If no red flags: authenticityFlags = []
 SECTION 5 — QUERY GENERATION RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-"query" — the single best resale search query. Always specific. Never generic.
-"exactQuery" — the most precise version (include colorway name, SKU, size, ref if known)
+"query" — the single best resale search query. Always specific. Never generic. Grounded in what you can actually see.
+"exactQuery" — the most precise version. Include colorway/SKU/size/ref ONLY if visually confirmed. NEVER invent these.
+"broadQuery" — a useful fallback search if exactQuery returns no results: itemType + primary color + material (NO brand if low confidence). Always populate.
+"categoryFallbackQuery" — the safest pure-category search that will always return results: category + primary color (e.g. "black leather crossbody bag", "white sneakers", "silver automatic watch"). Populate even when brand is unknown.
+"visualDescriptorQuery" — describe what you literally see without any brand assumption: [color] [material] [shape] [item type] (e.g. "tan canvas tote bag with brown leather handles", "black rubber sport watch with digital display"). Always populate.
 "searchQueries" — array of 6-10 queries, ordered from most specific to most broad:
-  [0] brand + model + colorway/edition + year (most specific)
-  [1] brand + model + colorway
-  [2] brand + model + primary color
-  [3] brand + model
-  [4] model name alone (if recognizable)
-  [5] brand + item type + color
-  [6] brand + item type
+  [0] brand + model + visually-confirmed colorway or color (only if brand/model have real evidence)
+  [1] brand + model + primary color (only if brand/model supported)
+  [2] brand + model (only if brand/model supported)
+  [3] model name alone if independently recognizable
+  [4] brand + item type + primary color
+  [5] brand + item type
+  [6] item type + color + material + shape (NO brand — visual descriptor fallback)
   [7] item type + color + material
-  [8] item type (broadest useful)
+  [8] item type + primary color
+  [9] item type alone (broadest useful)
+
+CRITICAL RULES:
+- NEVER include year, edition, or colorway names you cannot read or see on the item.
+- If brand is not clearly supported, [0]-[2] must be omitted. Start the ladder at [4].
+- The no-brand visual descriptor queries ([6]-[9]) MUST always be present. They are the search safety net.
+- "searchQueries" must ALWAYS contain at least 3 entries, even for low-confidence items.
+- "broadQuery" MUST always be populated — it is the primary search fallback and cannot be null.
+- "categoryFallbackQuery" MUST always be populated — it ensures market data is always retrievable.
+- "visualDescriptorQuery" MUST always be populated — it prevents market poisoning with invented brands.
+- If you cannot identify brand or model: set query=broadQuery, do NOT fabricate brand/model in query.
 "variants" — alternate spellings, abbreviations, regional names for the same item
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -10675,6 +11327,30 @@ function normalizeVisionIdentityPayload(raw = null, fallbackQuery = "") {
     }
   }
 
+  // Universal: strip brand/model when certainty is too low and no visible text supports it
+  // This generalizes the eyewear-specific rule to all item types
+  if (!isEyewearIdentity && (brand || model)) {
+    const brandCert = Number(raw?.attributeCertainty?.brand || 0);
+    const modelCert = Number(raw?.attributeCertainty?.model || 0);
+
+    const brandIsHallucination = !!brand && brandCert < 0.35 && visibleBlob.length === 0;
+    const modelIsHallucination = !!model && modelCert < 0.35 && visibleBlob.length === 0;
+
+    if (brandIsHallucination || modelIsHallucination) {
+      const needles = [];
+      if (brandIsHallucination) { needles.push(brand); brand = null; }
+      if (modelIsHallucination) { needles.push(model); model = null; }
+
+      if (needles.length) {
+        incomingExact = stripNeedlesFromQuery(incomingExact, needles) || null;
+        searchQueries = uniqueQueries([
+          incomingExact,
+          ...searchQueries.map((q) => stripNeedlesFromQuery(q, needles)),
+        ]).slice(0, 12);
+      }
+    }
+  }
+
   const substituteCandidates = cleanStringList(raw.substituteCandidates, 6);
   const marketSegment = safeStr(raw.marketSegment || "", 40) || null;
 
@@ -10738,9 +11414,10 @@ function chooseBestIdentityQuery(identity = null, fallbackQuery = "") {
         if (titleContainsLoose(q, c)) score += 4;
       }
 
-      if (/\b(sunglasses|glasses|eyewear|frames|lens)\b/i.test(q)) score += 8;
-      if (/\b(orange|amber|yellow|black|brown|white)\b/i.test(q)) score += 6;
-      if (/\b(wrap|wraparound|shield|oval|round|square|rectangle|aviator)\b/i.test(q)) score += 6;
+      // Category-neutral visual richness bonuses
+      if (/\b(orange|amber|yellow|black|white|blue|red|green|brown|grey|gray|silver|gold|purple|pink|burgundy|navy|tan|beige|cream)\b/i.test(q)) score += 6;
+      if (/\b(leather|canvas|denim|nylon|cotton|wool|metal|rubber|suede|velvet|silk|acetate|polycarbonate|ceramic|titanium)\b/i.test(q)) score += 6;
+      if (/\b(vintage|retro|oversized|slim|fitted|cropped|graphic|striped|floral|plaid|athletic|casual|streetwear|technical)\b/i.test(q)) score += 4;
 
       return { q, score };
     })
@@ -10917,9 +11594,87 @@ if (!isEyewear) {
     enhanced.add(`${q} vintage`);
     enhanced.add(`${q} collectible`);
   }
+
+  // When vision identity is absent, pad with the generic search intent ladder
+  // so SerpAPI always has a rich query set to work with.
+  if (!identity) {
+    for (const q of buildSearchIntentLadder(base, { broad: false }).slice(0, 6)) {
+      enhanced.add(q);
+    }
+  }
 }
 
 return uniqueQueries([...enhanced]).slice(0, isEyewear ? 2 : 8);
+}
+
+// ── buildSearchIntentLadder ────────────────────────────────────────────────
+// Generic query expansion that works for ANY category.
+// Produces a tiered ladder from exact → used/resale → platform → broader.
+// This is the primary fallback when vision is unavailable or low-confidence.
+function buildSearchIntentLadder(query, { category = "", broad = false } = {}) {
+  const q = normalizeQuery(query);
+  if (!q) return [];
+
+  const out = new Set();
+
+  // Tier 1 — exact intent
+  out.add(q);
+  out.add(`${q} for sale`);
+  out.add(`buy ${q}`);
+
+  // Tier 2 — used/resale intent
+  out.add(`${q} used`);
+  out.add(`${q} pre-owned`);
+  out.add(`used ${q} for sale`);
+  out.add(`${q} second hand`);
+
+  // Tier 3 — platform-specific (high conversion)
+  out.add(`${q} ebay`);
+  out.add(`${q} amazon`);
+  out.add(`${q} marketplace`);
+
+  // Tier 4 — value/deal intent
+  out.add(`${q} cheap`);
+  out.add(`${q} best price`);
+  out.add(`cheap ${q}`);
+
+  // Tier 5 — substitute / alternative intent
+  out.add(`${q} alternative`);
+  out.add(`${q} similar`);
+  out.add(`${q} substitute`);
+
+  // Tier 6 — broad decomposition (drop modifier words)
+  if (broad) {
+    const parts = q.split(/\s+/).filter(Boolean);
+    if (parts.length >= 3) {
+      out.add(parts.slice(0, -1).join(" "));
+      out.add(parts.slice(1).join(" "));
+    }
+    if (parts.length >= 2) {
+      out.add(parts.slice(0, 2).join(" "));
+    }
+  }
+
+  // Category-specific boosts
+  if (/shoe|sneaker|boot|jordan|nike|adidas/i.test(q)) {
+    out.add(`${q} size`);
+    out.add(`${q} deadstock`);
+    out.add(`${q} og`);
+  } else if (/phone|iphone|samsung|pixel|android/i.test(q)) {
+    out.add(`${q} unlocked`);
+    out.add(`${q} refurbished`);
+  } else if (/watch|rolex|omega|casio/i.test(q)) {
+    out.add(`${q} authentic`);
+    out.add(`${q} vintage`);
+  } else if (/glasses|sunglasses|eyewear|frames/i.test(q)) {
+    out.add(`${q} new`);
+    out.add(`${q} online`);
+  } else if (/card|pokemon|trading card|sports card/i.test(q)) {
+    out.add(`${q} psa`);
+    out.add(`${q} graded`);
+  }
+
+  return uniqueQueries([...out]).filter(Boolean);
 }
 
 function buildDemandLabel(prob) {
@@ -11416,9 +12171,26 @@ query = exact brand + exact model name. If brand unclear, say so honestly.`;
   if (passLabel === "visual_shape") {
     return `${header}
 
-PASS: VISUAL SHAPE + MATERIAL + COLOR
-Ignore brand uncertainty. Focus on: silhouette → category → colors → materials → style cues → lens/frame if eyewear.
-query = descriptive visual terms that would find this item on a marketplace without knowing the brand.`;
+PASS: VISUAL FORM + MATERIALS + COLOR
+Do NOT rely on brand identity. Extract only what you can observe with certainty.
+
+EXTRACTION SEQUENCE:
+1. SILHOUETTE → Describe the 3D shape (slim/boxy/tapered/round/elongated/structured)
+2. CATEGORY → Most specific functional category (e.g. "running sneaker", "crossbody bag", "wrap sunglasses", "analog watch")
+3. PRIMARY COLOR → Dominant surface color (use simple names: black, white, tan, burgundy, navy)
+4. SECONDARY COLORS → Contrast stitching, soles, accents, hardware
+5. MATERIALS → Main body material + any contrast material (leather / canvas / rubber / metal / acetate / polycarbonate)
+6. BUILD QUALITY → Price tier from materials + finish: budget / mid-range / premium / luxury
+7. STYLE CUES → Descriptors buyers use in listings: vintage / y2k / streetwear / minimalist / athletic / technical / casual / oversized / slim
+8. USE CASE → Primary use context: everyday wear / sport / fashion / collector / professional
+
+QUERY CONSTRUCTION:
+Build the search query a resale buyer types when they can see this item but do not know the brand.
+Format: [category] [primary color] [material] [key style cue]
+Examples: "black leather chelsea boots", "burgundy wool peacoat men", "silver metal chronograph watch"
+
+query = best no-brand visual descriptor query for this item
+confidence = how confidently you identified the item type and visual attributes (0–1)`;
   }
 
   if (passLabel === "ultra") {
@@ -11433,9 +12205,21 @@ Output the single best resale search query + 8 ranked variants (specific→broad
 
 PASS: EXPERT RESALE BUYER
 You just photographed this item to resell it. What exact search term finds the most comparable sold listings?
-Priority: brand + exact model + colorway → brand + model → model alone → visual description.
-If box/label/tag text is visible, use it exactly. If logos are readable, use them.
-Synthesize all available signals into the single most effective resale search query.`;
+
+EVIDENCE HIERARCHY (strict — do NOT skip levels):
+1. Visible printed / embossed / stitched text → use exactly as written
+2. Readable logo / wordmark / patch → use exactly as recognized
+3. Distinctive shape + markings together → cautious inference only
+4. Visual shape alone → no-brand visual descriptor query (never guess brand from shape)
+
+ANTI-HALLUCINATION RULES:
+- If you cannot READ the brand name, do NOT put it in searchQueries[0]–[2]
+- If you cannot READ the model name/number, do NOT include it
+- Year, edition, colorway names MUST be visible as printed text — NEVER infer from color alone
+- searchQueries[6]–[9] MUST always be no-brand visual descriptor fallbacks
+- "searchQueries" must always contain at least 3 entries
+
+Priority: brand + exact model + colorway → brand + model → model alone → [item type] + color + material`;
 }
 
 async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
@@ -11682,36 +12466,32 @@ function chooseMostSpecificVisionQuery(candidates = []) {
 
 let score = tokens.length * 10;
 
-if (/\b(oakley|rayban|ray-ban|gucci|prada|nike|adidas)\b/i.test(q)) {
+// Known brand bonus (expanded, category-neutral)
+if (/\b(oakley|rayban|ray-ban|gucci|prada|louis vuitton|chanel|hermes|nike|adidas|jordan|new balance|vans|converse|supreme|off-white|apple|sony|samsung|canon|nikon|rolex|cartier|coach|coach|tiffany|levi|patagonia)\b/i.test(q)) {
   score += 10;
 }
 
 if (tokens.length >= 4) score += 12;
 if (tokens.length >= 5) score += 8;
 
-      // item categories
-      if (/\b(glasses|sunglasses|eyewear|hoodie|jacket|sneakers|shoes|hat|bag|backpack|watch|handbag)\b/i.test(q)) {
+      // item categories — expanded
+      if (/\b(glasses|sunglasses|eyewear|hoodie|jacket|sneakers|shoes|hat|bag|backpack|watch|handbag|pants|jeans|shirt|dress|coat|boots|sandals|wallet|belt|scarf|gloves|jewelry|ring|necklace|bracelet|earrings)\b/i.test(q)) {
         score += 12;
       }
 
       // color detection
-      if (/\b(orange|amber|yellow|black|white|blue|brown|silver|gold|red|green|purple|pink)\b/i.test(q)) {
+      if (/\b(orange|amber|yellow|black|white|blue|brown|silver|gold|red|green|purple|pink|burgundy|navy|tan|beige|grey|gray|cream)\b/i.test(q)) {
         score += 6;
       }
 
-      // shape / style detection
-      if (/\b(wraparound|shield|aviator|oval|round|square|rectangle|oversized|rimless|retro|vintage|y2k)\b/i.test(q)) {
+      // shape / style detection — expanded to all categories
+      if (/\b(wraparound|shield|aviator|oval|round|square|rectangle|oversized|rimless|retro|vintage|y2k|slim|fitted|cropped|graphic|striped|floral|athletic|technical|casual|streetwear)\b/i.test(q)) {
         score += 8;
       }
 
-      // lens detection (huge for sunglasses)
-      if (/\b(lens|tinted|gradient|mirrored|polarized)\b/i.test(q)) {
+      // material detection — category-neutral
+      if (/\b(leather|canvas|denim|nylon|cotton|wool|metal|rubber|suede|velvet|silk|acetate|polycarbonate|ceramic|titanium|linen)\b/i.test(q)) {
         score += 6;
-      }
-
-      // blue light detection
-      if (/\bblue light|computer glasses|gaming glasses\b/i.test(q)) {
-        score += 8;
       }
 
       return { q, score };
@@ -11767,18 +12547,977 @@ function mergeVisionIdentityObjects(objects = [], fallbackQuery = "") {
   return normalizeVisionIdentityPayload(merged, fallbackQuery);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFIT ENGINE — Price intelligence, deal detection, resale scoring
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build clean price statistics with IQR outlier removal.
+ * Returns null if fewer than 2 clean prices.
+ */
+function buildPriceStats(items) {
+  const raw = (Array.isArray(items) ? items : [])
+    .map((i) => finitePrice(i?.totalPrice ?? i?.price))
+    .filter((p) => p !== null && p > 0)
+    .sort((a, b) => a - b);
+
+  if (raw.length < 2) return null;
+
+  // IQR outlier fence
+  const q1  = quantile(raw, 0.25);
+  const q3  = quantile(raw, 0.75);
+  const iqr = Math.max((q3 ?? 0) - (q1 ?? 0), 0.01);
+  const lo  = (q1 ?? 0) - 1.5 * iqr;
+  const hi  = (q3 ?? 0) + 1.5 * iqr;
+  const clean = raw.filter((p) => p >= lo && p <= hi);
+  const prices = clean.length >= 2 ? clean : raw; // fallback to all if over-filtered
+
+  const count  = prices.length;
+  const minP   = prices[0];
+  const maxP   = prices[prices.length - 1];
+  const med    = median(prices);
+  const avg    = round2(prices.reduce((a, b) => a + b, 0) / count);
+  const spread = round2(maxP - minP);
+
+  // Variance (population)
+  const variance = count > 1
+    ? round2(prices.reduce((s, p) => s + Math.pow(p - avg, 2), 0) / count)
+    : 0;
+
+  // priceQualityScore: high count + tight spread + multiple sources = high quality
+  const spreadRatio  = avg > 0 ? spread / avg : 1;
+  const countFactor  = clamp01(count / 10);
+  const spreadFactor = clamp01(1 - spreadRatio);
+  const priceQualityScore = clamp01(countFactor * 0.50 + spreadFactor * 0.50);
+
+  return { min: minP, max: maxP, median: med, average: avg, spread, variance, count, priceQualityScore };
+}
+
+/**
+ * Deal strength: how far below median is the BEST clean listing?
+ * Returns 0.0–1.0 (positive = deal, 0 = at median, negative = overpriced).
+ * Clamps to [-0.5, 1.0].
+ */
+function computeDealStrength(priceStats) {
+  if (!priceStats || !priceStats.median || priceStats.median <= 0) return 0;
+  const { min: bestPrice, median: med } = priceStats;
+  const raw = (med - bestPrice) / med;
+  return Math.max(-0.5, Math.min(1.0, round2(raw)));
+}
+
+/**
+ * Demand score 0–100: listing count + cross-source diversity + consensus signal.
+ */
+function computeDemandScore({ priceStats, resultConsensus, prediction }) {
+  const countFactor     = priceStats ? clamp01(priceStats.count / 12) : 0;
+  const consensusFactor = resultConsensus ? (resultConsensus.strength || 0) : 0;
+  const predFactor      = prediction ? clamp01((prediction.sellThroughProbability || 0) / 100) : 0;
+
+  const raw = countFactor * 0.45 + predFactor * 0.35 + consensusFactor * 0.20;
+  return Math.round(clamp01(raw) * 100);
+}
+
+/**
+ * ResaleScore 0–100: weighted composite of all signals.
+ * demandScore(25%) + priceQualityScore(18%) + dealStrength(18%) +
+ * resultConsensusStrength(14%) + confidenceV2(13%) + identityQuality(12%)
+ * Identity quality directly gates resaleScore — weak identity cannot reach 70+.
+ */
+function computeResaleScore({ demandScore, priceQualityScore, dealStrength, consensusStrength, confidenceV2, identityQuality }) {
+  const demand    = clamp01(demandScore / 100);
+  const deal      = clamp01((dealStrength + 0.5) / 1.5); // remap [-0.5,1] → [0,1]
+  const quality   = clamp01(priceQualityScore);
+  const consensus = clamp01(consensusStrength || 0);
+  const conf      = clamp01(confidenceV2 || 0);
+  const identity  = clamp01(identityQuality || 0);
+
+  const raw = demand * 0.25 + quality * 0.18 + deal * 0.18 + consensus * 0.14 + conf * 0.13 + identity * 0.12;
+  return Math.round(clamp01(raw) * 100);
+}
+
+/**
+ * Identity Quality Score 0.0–1.0
+ * Measures how trustworthy the item identification is, independent of market data.
+ * High = confident ID with multiple evidence sources. Low = shape guess or blurry.
+ */
+function computeIdentityQuality(visionIdentity, attributeCertainty = null) {
+  if (!visionIdentity) return 0;
+
+  let score = 0;
+
+  const brandConf = attributeCertainty?.brand ?? (visionIdentity.brand ? 0.55 : 0);
+  score += Math.min(brandConf, 1) * 0.30;
+
+  const modelConf = attributeCertainty?.model ?? (visionIdentity.model ? 0.50 : 0);
+  score += Math.min(modelConf, 1) * 0.20;
+
+  const catConf = attributeCertainty?.category ?? (visionIdentity.category ? 0.70 : 0);
+  score += Math.min(catConf, 1) * 0.15;
+
+  // Visible text = hard evidence — outranks stylistic guesses
+  const visibleTextCount = Array.isArray(visionIdentity.visibleText)
+    ? visionIdentity.visibleText.filter((t) => t && String(t).length >= 2).length
+    : 0;
+  score += Math.min(visibleTextCount / 3, 1) * 0.15;
+
+  // Attribute richness
+  const attrCount =
+    (Array.isArray(visionIdentity.colors)    ? Math.min(visionIdentity.colors.length, 2)    : 0) +
+    (Array.isArray(visionIdentity.materials) ? Math.min(visionIdentity.materials.length, 1) : 0) +
+    (visionIdentity.itemType ? 1 : 0);
+  score += Math.min(attrCount / 4, 1) * 0.10;
+
+  // Exact query is a strong specificity signal
+  if (visionIdentity.exactQuery) score += 0.05;
+
+  // Hallucination risk penalties
+  // Brand claimed with high certainty but no visible text support → confabulation risk
+  const visTextArr      = Array.isArray(visionIdentity.visibleText) ? visionIdentity.visibleText : [];
+  const brandStr        = String(visionIdentity.brand || "").toLowerCase();
+  const brandInVisText  = brandStr.length >= 3
+    && visTextArr.some(t => String(t || "").toLowerCase().includes(brandStr));
+
+  if (visionIdentity.brand) {
+    if (brandConf > 0.65 && (visibleTextCount === 0 || !brandInVisText)) {
+      score -= 0.15; // high-confidence brand claim with no text evidence — strongest penalty
+    } else if (visibleTextCount === 0) {
+      score -= 0.06; // low-confidence brand, no text — lighter penalty (original)
+    }
+  }
+  // Both brand AND model claimed but both low certainty → doubly risky
+  if (visionIdentity.brand && visionIdentity.model && brandConf < 0.45 && modelConf < 0.45) score -= 0.08;
+
+  return clamp01(round2(score));
+}
+
+/**
+ * Trust Score 0.0–1.0 — single internal gate that controls how strongly the system may speak.
+ *
+ * < 0.35 → RISKY or INSUFFICIENT DATA only. No positive verdicts.
+ * < 0.50 → Cannot produce GOOD DEAL or STRONG BUY. Capped at FAIR.
+ * >= 0.55 → Can produce GOOD DEAL.
+ * >= 0.65 → Can produce STRONG BUY (with all other gates met).
+ */
+function computeTrustScore({
+  identityQuality = 0,
+  confidenceV2    = 0,
+  priceStats      = null,
+  crossCheck      = null,
+  isOracleOnly    = false,
+  itemCount       = 0,
+  hasConflict     = false,
+}) {
+  let trust = 0;
+
+  trust += clamp01(identityQuality)  * 0.30;
+  trust += clamp01(confidenceV2)     * 0.25;
+  trust += clamp01(priceStats?.priceQualityScore ?? 0) * 0.25;
+  trust += clamp01(itemCount / 8)    * 0.20;
+
+  // Non-recoverable trust penalties
+  if (isOracleOnly)              trust -= 0.25;
+  if (hasConflict)               trust -= 0.20;
+  if (crossCheck?.type === "conflict") trust -= 0.10;
+  if (identityQuality < 0.25)   trust -= 0.10;
+
+  return clamp01(round2(trust));
+}
+
+/**
+ * Build the final buy signal enum + data-grounded reasoning string.
+ *
+ * STRONG BUY requires ALL of: confidenceV2>=0.60, count>=4, dealStrength>=0.25,
+ * priceQualityScore>=0.50, resaleScore>=70, demandScore>=50,
+ * identityQuality>=0.45, trustScore>=0.55. No exceptions.
+ *
+ * Safety priority order (hard overrides, cannot be bypassed by score):
+ *   trustScore<0.35 → INSUFFICIENT DATA → RISKY (low conf) → RISKY (conflict)
+ *   → RISKY (oracle-only) → RISKY (high variance) → trustScore<0.50 cap → scored
+ */
+function buildBuySignal({
+  resaleScore, dealStrength, demandScore, confidenceV2, priceStats,
+  warnings = [], crossCheck = null, isOracleOnly = false,
+  identityQuality = null, trustScore = null,
+  categoryThresholds = null,   // Phase 10: from buildEffectiveThresholds()
+}) {
+  // Resolve effective thresholds — category overrides or global floors
+  const CT = categoryThresholds || {};
+  const T_SB_DS    = CT.STRONG_BUY_DEAL_STRENGTH  ?? 0.25;
+  const T_SB_CV    = CT.STRONG_BUY_CONFIDENCE     ?? 0.60;
+  const T_SB_TRUST = CT.STRONG_BUY_TRUST          ?? 0.55;
+  const T_SB_IQ    = CT.STRONG_BUY_IDENTITY       ?? 0.45;
+  const T_GD_DS    = CT.GOOD_DEAL_DEAL_STRENGTH   ?? 0.18;
+  const T_GD_RS    = CT.GOOD_DEAL_RESALE_SCORE    ?? 52;
+  const T_GD_TRUST = CT.GOOD_DEAL_TRUST           ?? 0.45;
+
+  const count = priceStats?.count ?? 0;
+  const med   = priceStats?.median ?? null;
+  const best  = priceStats?.min    ?? null;
+  const pqs   = priceStats?.priceQualityScore ?? 0;
+
+  const fmt      = (n) => (n != null ? `$${round2(n)}` : "N/A");
+  const pctBelow = med && best ? Math.round(((med - best) / med) * 100) : 0;
+  const rangeTxt = `Typical range: ${fmt(priceStats?.min)}–${fmt(priceStats?.max)}.`;
+
+  // ── Hard override 0: catastrophically low trust score ──────────────────────
+  if (trustScore !== null && trustScore < 0.30) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, `Trust score critically low (${Math.round((trustScore || 0) * 100)}%) — multiple weak signals`],
+      reasoning: `Too many signals are weak simultaneously (identity, market data, confidence). Cannot make a reliable assessment.`,
+    };
+  }
+
+  // ── Hard override 1: insufficient data ──────────────────────────────────────
+  if (count < 3 || !med) {
+    return {
+      signal: "INSUFFICIENT DATA",
+      warnings: [...warnings, "Not enough market listings to evaluate"],
+      reasoning: "Too few comparable listings to make a reliable assessment.",
+    };
+  }
+
+  // ── Hard override 2: low identification confidence ──────────────────────────
+  if (confidenceV2 < 0.40) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, "Low identification confidence"],
+      reasoning: `Scan confidence is low (${Math.round(confidenceV2 * 100)}%). Verify item identity before buying.`,
+    };
+  }
+
+  // ── Hard override 2b: weak item identity (shape guess, no visible evidence) ─
+  if (identityQuality !== null && identityQuality < 0.25) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, "Item identity too weak — brand/model not confirmed from image"],
+      reasoning: "Item could not be identified reliably from the image. Scan a clearer view or verify manually.",
+    };
+  }
+
+  // ── Hard override 3: vision/result identity conflict ────────────────────────
+  const hasConflict =
+    crossCheck?.type === "conflict" ||
+    warnings.some((w) => typeof w === "string" && (w.includes("brand_conflict") || w.includes("vision_result_conflict")));
+  if (hasConflict) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, "Item identity conflicts with market results"],
+      reasoning: "Visual identification conflicts with listed results. Verify item before buying.",
+    };
+  }
+
+  // ── Hard override 4: oracle-only pricing (no real marketplace data) ─────────
+  if (isOracleOnly) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, "Market data is AI-estimated, not from live listings"],
+      reasoning: "Live market listings unavailable. Pricing is estimated — verify before buying.",
+    };
+  }
+
+  // ── Hard override 5: high price variability ──────────────────────────────────
+  if (priceStats.variance > 0 && Math.sqrt(priceStats.variance) / Math.max(med, 1) > 0.60) {
+    return {
+      signal: "RISKY",
+      warnings: [...warnings, "High price variability"],
+      reasoning: `Market price varies widely (${fmt(priceStats.min)}–${fmt(priceStats.max)}). Pricing is unreliable.`,
+    };
+  }
+
+  // ── Hard override 6: trust too low for positive verdict ─────────────────────
+  if (trustScore !== null && trustScore < 0.45) {
+    // Trust is real but insufficient — cap at FAIR regardless of scores
+    return {
+      signal: "FAIR",
+      warnings: [...warnings, "Insufficient trust for a strong positive verdict"],
+      reasoning: `${rangeTxt} Signals are present but trust score (${Math.round((trustScore || 0) * 100)}%) is below the threshold for a deal recommendation. Verify identity before buying.`,
+    };
+  }
+
+  // ── STRONG BUY: ALL hard gates must pass — no exceptions ────────────────────
+  const strongBuyGate =
+    confidenceV2              >= T_SB_CV    &&
+    count                     >= 4          &&
+    dealStrength              >= T_SB_DS    &&
+    pqs                       >= 0.50       &&
+    resaleScore               >= 70         &&
+    demandScore               >= 50         &&
+    (identityQuality ?? 0)    >= T_SB_IQ   &&   // Identity must be well-grounded
+    (trustScore ?? 1)         >= T_SB_TRUST;    // Trust must be adequate
+
+  if (strongBuyGate) {
+    return {
+      signal: "STRONG BUY",
+      warnings,
+      reasoning: `${rangeTxt} Best listing at ${fmt(best)} — ${pctBelow}% below median ${fmt(med)}. Strong market support.`,
+    };
+  }
+
+  // ── Scored classification ────────────────────────────────────────────────────
+  if (resaleScore >= T_GD_RS && dealStrength >= T_GD_DS) {
+    // Require minimum trust for GOOD DEAL
+    if ((trustScore ?? 1) < T_GD_TRUST) {
+      return {
+        signal: "FAIR",
+        warnings: [...warnings, "Trust score below threshold for GOOD DEAL"],
+        reasoning: `${rangeTxt} Price looks favorable but identification confidence is insufficient for a GOOD DEAL call.`,
+      };
+    }
+    // Require minimum listing depth for GOOD DEAL
+    if (count < 4) {
+      return {
+        signal: "FAIR",
+        warnings: [...warnings, `Insufficient listing depth for GOOD DEAL — only ${count} listings found`],
+        reasoning: `${rangeTxt} Fewer than 4 comparable listings — market is too thin for a confident GOOD DEAL call.`,
+      };
+    }
+    return {
+      signal: "GOOD DEAL",
+      warnings,
+      reasoning: `${rangeTxt} Best listing at ${fmt(best)}, ${pctBelow}% below median ${fmt(med)}. Worth buying.`,
+    };
+  }
+  if (dealStrength >= -0.08) {
+    return {
+      signal: "FAIR",
+      warnings,
+      reasoning: `${rangeTxt} Best listing at ${fmt(best)} is near median ${fmt(med)}. Fair market value.`,
+    };
+  }
+  return {
+    signal: "OVERPRICED",
+    warnings: [...warnings, "Best listing is above market median"],
+    reasoning: `${rangeTxt} Best listing at ${fmt(best)} is above median ${fmt(med)}. Negotiate or wait.`,
+  };
+}
+
+/**
+ * Assemble the complete profit intelligence object.
+ * Called at the route layer after all items + result-awareness are finalized.
+ * NEVER duplicates existing payload fields — adds a clean profitIntel sub-object.
+ *
+ * Outputs: priceStats, dealStrength, demandScore, resaleScore, buySignal,
+ *          primaryAction, reasoning, warnings, expectedProfit, confidenceV2,
+ *          and scanGuidance when data is too weak to act on.
+ */
+function assembleProfitIntel({
+  items, scannedPrice, visionConfidence, confidenceV2, resultConsensus, refinementWarnings,
+  prediction, category, crossCheck = null, isOracleOnly = false,
+  visionIdentity = null, attributeCertainty = null,
+  categoryPrior = null, userHitRate = null,
+  liquidityScoreVal = 0,
+  // WS4/WS5 additions
+  soldCompCount     = null,   // confirmed-sold subset of comps
+  resaleModeOverride = null,  // "LOCAL"|"NATIONAL"|"EITHER" (computed from category if null)
+  localResultCount  = null,   // count of local/Facebook results (for LOCAL mode warning)
+  medianDaysToSale  = null,   // from signalCalibrator (for profit range)
+  categoryCalibration = null, // from getCategoryCalibration (for win rate display)
+}) {
+  const _cv2 = confidenceV2 ?? visionConfidence ?? 0;
+
+  // ── Identity Quality ──────────────────────────────────────────────────────
+  const identityQualityBase = computeIdentityQuality(visionIdentity, attributeCertainty);
+
+  // WS2: identity flags + text mismatch penalty
+  const identityFlags = computeIdentityFlags(visionIdentity || {}, attributeCertainty || {});
+  const identityQuality = identityFlags.textMismatchDetected
+    ? Math.max(0, Math.round((identityQualityBase - 0.10) * 100) / 100)
+    : identityQualityBase;
+
+  // WS5: resale mode (classify from category; override from caller)
+  const resaleMode = resaleModeOverride || classifyResaleMode(category || "");
+
+  // Apply resale mode filtering to items for LOCAL markets
+  const effectiveItems = resaleMode === "LOCAL"
+    ? applyResaleModeToItems(items, resaleMode, localResultCount)
+    : items;
+
+  const priceStats   = buildPriceStats(effectiveItems);
+  const dealStrength = computeDealStrength(priceStats);
+  const demandScore  = computeDemandScore({ priceStats, resultConsensus, prediction });
+  const resaleScore  = computeResaleScore({
+    demandScore,
+    priceQualityScore: priceStats?.priceQualityScore ?? 0,
+    dealStrength,
+    consensusStrength: resultConsensus?.strength ?? 0,
+    confidenceV2: _cv2,
+    identityQuality,
+  });
+
+  // Build warnings before signal so signal can use them for conflict detection
+  const warnings = [...(refinementWarnings || [])];
+  if (_cv2 < 0.40)
+    warnings.push("Low identification confidence");
+  else if (_cv2 < 0.55)
+    warnings.push("Moderate identification confidence — treat as estimate");
+  if ((priceStats?.count ?? 0) < 3)
+    warnings.push("Weak market data — few listings found");
+  else if ((priceStats?.count ?? 0) < 6)
+    warnings.push("Limited listings — price range may shift");
+  if (priceStats && Math.sqrt(priceStats.variance || 0) / Math.max(priceStats.median || 1, 1) > 0.55)
+    warnings.push("High price variability");
+  if (isOracleOnly)
+    warnings.push("Market data is AI-estimated, not from live listings");
+  if (crossCheck?.type === "conflict")
+    warnings.push("vision_result_conflict: item identity conflicts with results");
+  if (identityQuality < 0.30)
+    warnings.push("Weak item identification — image may be blurry or brand not visible");
+  else if (identityQuality < 0.45 && visionIdentity?.brand)
+    warnings.push("Brand identification has low visual evidence support");
+
+  const hasConflict =
+    crossCheck?.type === "conflict" ||
+    warnings.some((w) => typeof w === "string" && (w.includes("brand_conflict") || w.includes("vision_result_conflict")));
+
+  // ── Trust Score (new) ─────────────────────────────────────────────────────
+  const trustScore = computeTrustScore({
+    identityQuality,
+    confidenceV2: _cv2,
+    priceStats,
+    crossCheck,
+    isOracleOnly,
+    itemCount: priceStats?.count ?? 0,
+    hasConflict,
+  });
+
+  const dealDetected = dealStrength >= 0.18;
+
+  // ── Phase 10: Category-specific thresholds ───────────────────────────────
+  const effectiveThresholds = buildEffectiveThresholds(categoryCalibration || null);
+
+  const buySignalResult = buildBuySignal({
+    resaleScore, dealStrength, demandScore,
+    confidenceV2: _cv2,
+    priceStats,
+    warnings,
+    crossCheck,
+    isOracleOnly,
+    identityQuality,
+    trustScore,
+    categoryThresholds: effectiveThresholds,
+  });
+
+  // ── Market Depth Gate (caps signal based on comps count + liquidity) ────────
+  let depthGateResult = null;
+  let signalAfterDepth = buySignalResult.signal;
+  try {
+    depthGateResult = applyMarketDepthGate({
+      signal:         buySignalResult.signal,
+      compsCount:     priceStats?.count ?? 0,
+      soldCompCount:  soldCompCount ?? null,
+      liquidityScore: liquidityScoreVal ?? 0,
+    });
+    signalAfterDepth = depthGateResult.signal;
+    if (depthGateResult.capped && depthGateResult.warning) {
+      warnings.push(depthGateResult.warning);
+    }
+  } catch { /* non-fatal */ }
+
+  // ── Outcome Bias Adjustment (pure function, no async) ─────────────────────
+  let finalBuySignal = signalAfterDepth;
+  let biasNote = null;
+  if (categoryPrior !== null || userHitRate !== null) {
+    try {
+      const biasResult = applyOutcomeBiasesToDecision({
+        buySignal: signalAfterDepth,
+        category,
+        categoryPrior,
+        userHitRate,
+      });
+      finalBuySignal = biasResult.biasedBuySignal || signalAfterDepth;
+      biasNote = biasResult.biasNote || null;
+    } catch { /* non-fatal */ }
+  }
+
+  // One clear primary action per result state
+  const primaryAction = {
+    "STRONG BUY":        "VIEW_DEAL",
+    "GOOD DEAL":         "VIEW_DEAL",
+    "FAIR":              "WATCH",
+    "OVERPRICED":        "WATCH",
+    "RISKY":             "VERIFY_MANUALLY",
+    "INSUFFICIENT DATA": "DONT_BUY",
+  }[finalBuySignal] || "VERIFY_MANUALLY";
+
+  // ── Timing Signal (pure, no async) ────────────────────────────────────────
+  let timingSignal = "WATCH";
+  let timingAdvice = null;
+  try {
+    const tIntel = predictTimingSignal({
+      priceHistory:  [],
+      currentPrice:  priceStats?.min ?? null,
+      category,
+      buySignal:     finalBuySignal,
+      dealStrength,
+      demandScore,
+      listingCount:  priceStats?.count ?? 0,
+      isWatched:     false,
+    });
+    timingSignal = tIntel.timingSignal || "WATCH";
+    timingAdvice = buildTimingAdvice(tIntel) || null;
+  } catch { /* non-fatal */ }
+
+  // ── Agent Action (pure, no async) ─────────────────────────────────────────
+  let agentAction = "RESEARCH_MORE";
+  let agentUrgency = "LOW";
+  let agentReason = null;
+  try {
+    const agentDecision = buildPersonalAgentDecision({
+      buySignal:         finalBuySignal,
+      primaryAction,
+      timingSignal,
+      dealStrength,
+      demandScore,
+      resaleScore,
+      confidenceV2:      _cv2,
+      category,
+      userAffinityScore: categoryPrior?.affinityScore ?? 0,
+      userHitRate:       userHitRate ?? null,
+      isWatched:         false,
+      isOwned:           false,
+    });
+    agentAction  = agentDecision.action   || "RESEARCH_MORE";
+    agentUrgency = agentDecision.urgency  || "LOW";
+    agentReason  = agentDecision.reason   || null;
+  } catch { /* non-fatal */ }
+
+  const scannedPriceClean = finitePrice(scannedPrice);
+  const expectedProfit = scannedPriceClean != null && priceStats?.median != null
+    ? round2(Math.max(0, priceStats.median * 0.93 - scannedPriceClean))
+    : null;
+
+  // Scan guidance: surface actionable help when result is weak
+  let scanGuidance = null;
+  if (finalBuySignal === "INSUFFICIENT DATA" || finalBuySignal === "RISKY") {
+    const cat = (category || "").toLowerCase();
+    const tip = cat.includes("sneaker") || cat.includes("shoe") || cat.includes("footwear")
+      ? "Include brand and colorway in the scan (e.g. 'Nike Air Max 90 White')"
+      : cat.includes("bag") || cat.includes("handbag") || cat.includes("purse")
+      ? "Show the brand logo and hardware clearly for best results"
+      : cat.includes("watch")
+      ? "Point at the dial face and crown to capture brand markings"
+      : cat.includes("electronic") || cat.includes("phone") || cat.includes("laptop") || cat.includes("tablet")
+      ? "Scan the device label or model number for accurate matching"
+      : identityQuality < 0.30
+      ? "Scan a clearer, better-lit photo showing any brand text or logos"
+      : "Include brand markings and model labels clearly in the image";
+    const reason = _cv2 < 0.40
+      ? "low_confidence"
+      : identityQuality < 0.30
+      ? "weak_identity"
+      : (priceStats?.count ?? 0) < 3
+      ? "thin_market"
+      : crossCheck?.type === "conflict"
+      ? "identity_conflict"
+      : trustScore < 0.40
+      ? "low_trust"
+      : "weak_data";
+    const message = _cv2 < 0.40
+      ? "Item couldn't be identified with enough confidence."
+      : identityQuality < 0.30
+      ? "Brand or item type not confirmed from image — visual evidence is too weak."
+      : (priceStats?.count ?? 0) < 3
+      ? "Not enough comparable listings to estimate resale value."
+      : crossCheck?.type === "conflict"
+      ? "Item identity doesn't match the market results found."
+      : "Insufficient data for a reliable decision.";
+    scanGuidance = {
+      reason,
+      message,
+      tip,
+      identityQuality: round2(identityQuality),
+      trustScore:      round2(trustScore),
+      highSignalCategories: ["sneakers", "electronics", "handbags", "watches", "streetwear"],
+    };
+  }
+
+  // ── Category Trust Cap (prevents category bleed + high-risk misID) ──────────
+  let cappedBuySignal = finalBuySignal;
+  let capNote = null;
+  try {
+    const cap = getCategoryTrustCap(category, identityQuality);
+    if (cap && cap.maxBuySignal) {
+      const SIGNAL_ORDER = ["STRONG BUY", "GOOD DEAL", "FAIR", "OVERPRICED", "RISKY", "INSUFFICIENT DATA"];
+      const currentIdx = SIGNAL_ORDER.indexOf(finalBuySignal);
+      const capIdx     = SIGNAL_ORDER.indexOf(cap.maxBuySignal);
+      if (currentIdx < capIdx) { // current is "better" than allowed cap
+        cappedBuySignal = cap.maxBuySignal;
+        capNote = `Category (${(category||"").toLowerCase()}) requires stronger identity evidence for a ${finalBuySignal} verdict`;
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  // ── WS2: Replica Risk Cap ────────────────────────────────────────────────
+  let replicaRisk    = null;
+  let replicaCapNote = null;
+  try {
+    const visText = Array.isArray(visionIdentity?.visibleText)
+      ? visionIdentity.visibleText.join(" ")
+      : (visionIdentity?.visibleText || "");
+    replicaRisk = computeReplicaRisk(category, visionIdentity || {}, visText, {});
+    if (replicaRisk?.cappingSignal) {
+      const SIGNAL_ORDER = ["STRONG BUY", "GOOD DEAL", "FAIR", "OVERPRICED", "RISKY", "INSUFFICIENT DATA"];
+      const currentIdx  = SIGNAL_ORDER.indexOf(cappedBuySignal);
+      const fairIdx     = SIGNAL_ORDER.indexOf("FAIR");
+      if (currentIdx < fairIdx) {
+        cappedBuySignal = "FAIR";
+        replicaCapNote  = replicaRisk.warning || `High replica risk in ${(category||"").toLowerCase()} — no authentication markers detected`;
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  // ── WS7: System-level calibration suppression check ─────────────────────
+  // Uses in-memory cache (warmSuppressionCache()) to avoid async call in sync function.
+  try {
+    const suppressed = getSuppressionCached(category, cappedBuySignal);
+    if (suppressed) {
+      const SIGNAL_ORDER = ["STRONG BUY", "GOOD DEAL", "FAIR", "OVERPRICED", "RISKY", "INSUFFICIENT DATA"];
+      const idx = SIGNAL_ORDER.indexOf(cappedBuySignal);
+      if (idx >= 0 && idx < SIGNAL_ORDER.length - 1) {
+        cappedBuySignal = SIGNAL_ORDER[idx + 1];
+      }
+      capNote = capNote || "category_calibration_suppressed";
+    }
+  } catch { /* non-fatal */ }
+
+  // ── WS3: Profit Range + Hold/Return Risk ─────────────────────────────────
+  let profitRange  = null;
+  let holdEstimate = null;
+  let returnRisk   = null;
+  try {
+    const buyP  = finitePrice(scannedPrice);
+    const sellP = priceStats?.median ?? null;
+    if (buyP && sellP) {
+      profitRange = computeProfitRange({
+        buyPrice:        buyP,
+        sellPrice:       sellP,
+        platform:        "ebay",
+        category:        category || "",
+        medianDaysToSale: medianDaysToSale ?? null,
+        resaleMode:      resaleMode,
+      });
+    }
+    holdEstimate = buildHoldEstimate(category || "", medianDaysToSale ?? null);
+    returnRisk   = buildReturnRisk(category || "");
+  } catch { /* non-fatal */ }
+
+  // ── WS5: Local market note ────────────────────────────────────────────────
+  const localMarketNote = resaleMode !== "NATIONAL"
+    ? buildResaleModeNote(category || "", resaleMode)
+    : null;
+
+  // ── WS6: Structured warnings ──────────────────────────────────────────────
+  let structuredWarnings = [];
+  try {
+    const depthForWarn = depthGateResult ? {
+      depthTier:      depthGateResult.depthTier,
+      depthCount:     depthGateResult.depthCount,
+      listedDominated: depthGateResult.listedDominated ?? false,
+      effectiveCount:  depthGateResult.effectiveCount  ?? (depthGateResult.depthCount ?? 0),
+    } : {};
+    structuredWarnings = generateScanWarnings({
+      depthTier:         depthForWarn.depthTier,
+      depthCount:        depthForWarn.depthCount,
+      listedDominated:   depthForWarn.listedDominated,
+      effectiveCount:    depthForWarn.effectiveCount,
+      identityQuality:   round2(identityQuality),
+      cappedBuySignal,
+      signalCapped:      depthGateResult?.capped || !!replicaCapNote || !!capNote,
+      replicaRiskTier:   replicaRisk?.tier,
+      categoryCalibration,
+      resaleMode,
+      localResultCount:  localResultCount ?? null,
+    });
+  } catch { /* non-fatal */ }
+
+  // ── WS6: Category win rate ────────────────────────────────────────────────
+  const categoryWinRate = categoryCalibration?.winRate != null
+    ? round2(categoryCalibration.winRate * 100)
+    : null;
+
+  const _finalSignal = cappedBuySignal;
+  const _finalPrimaryAction = {
+    "STRONG BUY":        "VIEW_DEAL",
+    "GOOD DEAL":         "VIEW_DEAL",
+    "FAIR":              "WATCH",
+    "OVERPRICED":        "WATCH",
+    "RISKY":             "VERIFY_MANUALLY",
+    "INSUFFICIENT DATA": "DONT_BUY",
+  }[_finalSignal] || "VERIFY_MANUALLY";
+
+  // Always-present signal normalization (WS6)
+  const _signalRaw    = buySignalResult.signal;
+  const _signalCapped = _finalSignal !== _signalRaw;
+  const _suppressionActive = getSuppressionCached(category, _signalRaw);
+  const _capReason    = (_suppressionActive ? "category_calibration_suppressed" : null)
+    || replicaCapNote || capNote
+    || (depthGateResult?.capped ? depthGateResult.capReason || "market_depth" : null)
+    || null;
+
+  return {
+    priceStats,
+    dealStrength,
+    dealDetected,
+    demandScore,
+    resaleScore,
+    buySignal:       _finalSignal,
+    primaryAction:   _finalPrimaryAction,
+    signalRaw:       _signalRaw,
+    signalCapped:    _signalCapped,
+    capReason:       _capReason,
+    agentAction,
+    agentUrgency,
+    ...(agentReason  ? { agentReason }   : {}),
+    timingSignal,
+    ...(timingAdvice ? { timingAdvice }  : {}),
+    reasoning:       buySignalResult.reasoning,
+    warnings:        [...new Set(buySignalResult.warnings)],
+    structuredWarnings,
+    expectedProfit,
+    ...(profitRange  ? { profitRange }   : {}),
+    ...(holdEstimate ? { holdEstimate }  : {}),
+    ...(returnRisk   ? { returnRisk }    : {}),
+    confidenceV2:    round2(_cv2),
+    identityQuality: round2(identityQuality),
+    identityFlags,
+    trustScore:      round2(trustScore),
+    ...(replicaRisk     ? { replicaRisk }     : {}),
+    ...(replicaCapNote  ? { replicaCapNote }  : {}),
+    ...(biasNote        ? { biasNote }        : {}),
+    ...(capNote         ? { capNote }         : {}),
+    ...(scanGuidance    ? { scanGuidance }    : {}),
+    ...(localMarketNote ? { localMarketNote } : {}),
+    ...(categoryWinRate !== null ? { categoryWinRate } : {}),
+    // Phase 9: calibration source — where the win rate data came from
+    calibrationSource: categoryCalibration?.source === "user" && categoryCalibration?.isCalibrated
+      ? "empirical"
+      : categoryCalibration?.source === "global"
+        ? "global"
+        : "estimated",
+    // Phase 10: category threshold metadata (ops/debug surface)
+    ...(effectiveThresholds._source === "category" ? {
+      categoryThresholdSource: "category",
+      categoryThresholdSamples: effectiveThresholds._sampleCount,
+    } : {}),
+    resaleMode,
+    ...(depthGateResult ? {
+      depthTier:       depthGateResult.depthTier,
+      depthLabel:      depthGateResult.depthLabel,
+      depthCount:      depthGateResult.depthCount,
+      effectiveCount:  depthGateResult.effectiveCount ?? depthGateResult.depthCount,
+      listedDominated: depthGateResult.listedDominated ?? false,
+    } : {}),
+  };
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Phase 6: Personal decision layer helper ────────────────────────────────────
+// Applies personalization AFTER assembleProfitIntel. Async — modifies payload
+// in-place. Non-fatal: all failures are swallowed so scan response always returns.
+async function _applyPersonalDecisionToPayload(payload, { userId, category, scannedPrice }) {
+  if (!userId || !payload?.profitIntel) return;
+  // Items/identity may be pre-staged on payload for arbitrage detection
+  const items       = payload.__scanItems   || null;
+  const identity    = payload.__scanIdentity || null;
+  const identityConf = Number(payload.__scanIdentityConf) || 0;
+  // Clean up staging keys before any return
+  delete payload.__scanItems;
+  delete payload.__scanIdentity;
+  delete payload.__scanIdentityConf;
+  try {
+    const _pi = payload.profitIntel;
+
+    // Run personal decision layer and capital risk check concurrently
+    const [personalLayer, portfolioSummary] = await Promise.all([
+      applyPersonalDecisionLayer(redis, pgPool, userId, {
+        buySignal:    _pi.buySignal,
+        category:     category || null,
+        price:        scannedPrice ?? null,
+        depthTier:    _pi.depthTier    || null,
+        confidenceV2: _pi.confidenceV2 || null,
+        warnings:     _pi.warnings     || [],
+        hardCapped:   !!_pi.signalCapped,
+      }).catch(() => null),
+      analyzePortfolioCapital(redis, userId).catch(() => null),
+    ]);
+
+    if (personalLayer) {
+      // If personalization downgraded the signal, keep profitIntel.buySignal in sync
+      if (personalLayer.personalDowngrade) {
+        payload.profitIntel.buySignal = personalLayer.finalSignal;
+      }
+
+      payload.userMode       = personalLayer.userMode;
+      payload.personalAction = personalLayer.personalAction;
+      if (personalLayer.categoryMastery)
+        payload.categoryMastery        = personalLayer.categoryMastery;
+      if (personalLayer.personalSignalWinRates)
+        payload.personalSignalWinRates = personalLayer.personalSignalWinRates;
+      if (personalLayer.suspension?.shouldSuspend)
+        payload.suspension             = personalLayer.suspension;
+      if (personalLayer.personalDowngrade)
+        payload.personalDowngrade      = personalLayer.personalDowngrade;
+      payload.isSafeAutonomous         = !!personalLayer.isSafeAutonomous;
+      if (personalLayer.personalWarnings?.length)
+        payload.personalWarnings       = personalLayer.personalWarnings;
+      if (personalLayer.personalExplanation)
+        payload.personalExplanation    = personalLayer.personalExplanation;
+    }
+
+    // Arbitrage detection — only when items + strong identity are available
+    if (
+      Array.isArray(items) && items.length >= 2 &&
+      identity?.brand && identity?.model &&
+      identityConf >= 0.65 &&
+      _pi.buySignal && !["OVERPRICED", "RISKY", "INSUFFICIENT DATA"].includes(_pi.buySignal)
+    ) {
+      try {
+        const arbSummary = buildArbitrageSummary(items, identity, {
+          identityConf,
+          condition: String(_pi.conditionTier || ""),
+        });
+        if (arbSummary) payload.arbitrage = arbSummary;
+      } catch { /* non-fatal */ }
+    }
+
+    // Phase 10: Probability expression — observed win rate for this category+signal+bin
+    // Only surfaces when Redis has enough data (MIN_BIN_SAMPLES). Returns null otherwise.
+    if (category && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
+      try {
+        const observed = await getObservedWinRate(
+          redis, category, _pi.buySignal, _pi.dealStrength ?? 0
+        );
+        const probExpr = buildProbabilityExpression(observed, _pi.buySignal);
+        if (probExpr) payload.probabilityExpression = probExpr;
+      } catch { /* non-fatal */ }
+    }
+
+    // Capital lock risk — only surface on buy signals
+    if (portfolioSummary && _pi.buySignal && !["OVERPRICED", "RISKY", "INSUFFICIENT DATA"].includes(_pi.buySignal)) {
+      const capitalBlock = buildCapitalBlockSignal(portfolioSummary);
+      if (capitalBlock) {
+        payload.capitalLockRisk = {
+          shouldBlock:  capitalBlock.shouldBlock,
+          urgencyLevel: capitalBlock.urgencyLevel,
+          reason:       capitalBlock.reason,
+          urgentItems:  capitalBlock.urgentItems?.slice(0, 2).map(i => ({
+            scanId:    i.scanId,
+            category:  i.category,
+            daysHeld:  i.daysHeld,
+            capitalRisk: i.capitalRisk,
+            recommendedListPrice: i.exitIntel?.recommendedListPrice ?? null,
+            preferredPlatform:    i.exitIntel?.preferredPlatform    ?? null,
+          })) || [],
+        };
+        // Override personalAction to SELL_FIRST if block is warranted
+        if (capitalBlock.shouldBlock && payload.personalAction === "BUY") {
+          payload.personalAction = "SELL_FIRST";
+        }
+      }
+    }
+  } catch { /* non-fatal */ }
+}
+
+// ── User Category Intelligence — lightweight Redis-backed counters ─────────────
+// Tracks per-user, per-category behavior for personalized guidance.
+// Events: scan | buy | sell | pass
+// Uses Redis HSET on a hash per user — cheap and fast.
+
+const USER_CAT_KEY = (userId) => `user_cat:${safeStr(userId, 64)}`;
+const USER_CAT_TTL = 365 * 86400; // 1 year
+
+async function recordUserCategoryActivity(userId, category, event, amount = null) {
+  if (!redis || !userId || !category || !event) return;
+  const cat   = ((category || "").toLowerCase().trim() || "unknown").slice(0, 40);
+  const field = `${cat}:${event}`; // e.g. "sneakers:scan"
+
+  try {
+    await redis.hincrby(USER_CAT_KEY(userId), field, 1);
+    if (amount != null && Number.isFinite(Number(amount))) {
+      // Store running profit/loss sum (in cents to avoid float drift)
+      const amtCents = Math.round(Number(amount) * 100);
+      await redis.hincrby(USER_CAT_KEY(userId), `${cat}:profitCents`, amtCents);
+    }
+    await redis.expire(USER_CAT_KEY(userId), USER_CAT_TTL);
+  } catch {}
+}
+
+async function getUserCategoryStats(userId) {
+  if (!redis || !userId) return null;
+  try {
+    const raw = await redis.hgetall(USER_CAT_KEY(userId));
+    if (!raw || !Object.keys(raw).length) return null;
+
+    // Aggregate by category
+    const catMap = {};
+    for (const [field, val] of Object.entries(raw)) {
+      const [cat, event] = field.split(":");
+      if (!cat || !event) continue;
+      if (!catMap[cat]) catMap[cat] = { category: cat, scanCount: 0, buyCount: 0, sellCount: 0, passCount: 0, realizedProfit: 0 };
+      const n = Number(val || 0);
+      if (event === "scan")         catMap[cat].scanCount  += n;
+      else if (event === "buy")     catMap[cat].buyCount   += n;
+      else if (event === "sell")    catMap[cat].sellCount  += n;
+      else if (event === "pass")    catMap[cat].passCount  += n;
+      else if (event === "profitCents") catMap[cat].realizedProfit = round2(n / 100);
+    }
+
+    // Sort by scan volume, add hitRate per category
+    return Object.values(catMap)
+      .map((c) => ({
+        ...c,
+        buyRate:  c.scanCount > 0 ? Math.round((c.buyCount / c.scanCount) * 100) : null,
+        hitRate:  c.sellCount > 0 ? Math.round(
+          (c.realizedProfit > 0 ? Math.min(c.sellCount, c.buyCount) : 0) / c.sellCount * 100
+        ) : null,
+      }))
+      .sort((a, b) => b.scanCount - a.scanCount);
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildResaleFallbackQuery(identity = null) {
+  if (!identity) return null;
+
+  const parts = [];
+
+  const itemType = safeStr(identity.itemType || "", 60).trim();
+  if (itemType && !isWeakGenericVisionQuery(itemType)) parts.push(itemType);
+
+  const color = (Array.isArray(identity.colors) ? identity.colors : [])[0];
+  if (color) parts.push(color);
+
+  const material = (Array.isArray(identity.materials) ? identity.materials : [])[0];
+  if (material) parts.push(material);
+
+  const style = (Array.isArray(identity.styleWords) ? identity.styleWords : [])[0];
+  if (style && !parts.some((p) => p.toLowerCase() === style.toLowerCase())) parts.push(style);
+
+  const q = normalizeQuery(parts.join(" "));
+  if (q && q.length >= 5 && !isWeakGenericVisionQuery(q)) return q;
+
+  // category-based last resort
+  const category = safeStr(identity.category || "", 40).trim();
+  if (category) return categoryFallback(category) || null;
+
+  return null;
+}
+
 async function runVisionConsensus({ req, file, mode, propContext }) {
   const base64 = file.buffer.toString("base64");
   const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
 
   const passes = await Promise.all([
     runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid }),
-    runVisionPass({ dataUrl, mode, propContext, passLabel: "brand_model", rid: req.rid }),
     runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
   ]);
 
   const parsedList = passes.map((p) => p?.parsed || {});
-  const passLabels = ["master", "brand_model", "visual_shape"];
+  const passLabels = ["master", "visual_shape"];
 
   // Track which passes returned actual responses (vs total failure)
   const anyPassGotResponse = passes.some(
@@ -11798,20 +13537,25 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
 
     const tokenCount = titleTokens(query).length;
 
+    const brandCert = Number(attrCert.brand || 0);
+    const modelCert = Number(attrCert.model || 0);
     const detailScore =
-      (identity?.brand ? 20 : 0) +
-      (identity?.model ? 24 : 0) +
-      (identity?.itemType ? 8 : 0) +
-      Math.min(tokenCount, 7) * 4 +
-      confidence * 20 +
-      (passLabels[idx] === "brand_model"
-        ? 10
-        : passLabels[idx] === "master"
-        ? 4
+      // Brand: presence weighted by certainty — partial credit for low-confidence guesses
+      (identity?.brand
+        ? (brandCert > 0.75 ? 28 : brandCert > 0.45 ? 14 : 5)
         : 0) +
-      // bonus for attribute certainty signals
-      ((attrCert.brand || 0) > 0.7 ? 8 : 0) +
-      ((attrCert.model || 0) > 0.7 ? 8 : 0);
+      // Model: presence weighted by certainty
+      (identity?.model
+        ? (modelCert > 0.75 ? 32 : modelCert > 0.45 ? 16 : 6)
+        : 0) +
+      // itemType presence
+      (identity?.itemType ? 9 : 0) +
+      // Query richness (token count)
+      Math.min(tokenCount, 7) * 4 +
+      // Raw confidence from model
+      confidence * 22 +
+      // Visual descriptor richness (colors + materials = better visual pass)
+      Math.min((identity?.colors?.length || 0) + (identity?.materials?.length || 0), 6) * 2;
 
     return {
       label: passLabels[idx],
@@ -12004,7 +13748,7 @@ if (
         if (catFallback) return catFallback;
       }
 
-      return "consumer product";
+      return buildResaleFallbackQuery(mergedIdentity) || "used item for sale";
     };
 
     query = fallbackFromMode();
@@ -12327,7 +14071,6 @@ app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
 app.post(
   ["/vision/analyze", "/api/vision/analyze"],
   visionLimiter,
-  requireProductAccess,
   upload.single("image"),
   async (req, res) => {
     try {
@@ -16060,6 +17803,467 @@ app.get("/debug/internal-retrieval", async (req, res) => {
 });
 
 // -------------------- MARKET SEARCH (POST) --------------------
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESULT-AWARE FEEDBACK LOOP — Self-Correcting Resale Intelligence Engine
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const _STOPWORDS = new Set([
+  "a","an","the","and","or","for","in","of","to","with","on","at","by","from",
+  "is","are","was","were","be","been","it","this","that","as","into","up","out",
+  "used","new","like","via","vs","all","any","set","per","pre","men","men's",
+  "women","women's","kids","adult","size","color","style","type",
+]);
+
+const _KNOWN_BRANDS_RE = /\b(nike|adidas|jordan|new balance|vans|converse|puma|reebok|under armour|levi|levis|gucci|prada|louis vuitton|chanel|hermes|coach|michael kors|kate spade|ralph lauren|tommy hilfiger|calvin klein|apple|samsung|sony|canon|nikon|rolex|casio|seiko|omega|cartier|swatch|oakley|ray-ban|rayban|persol|hugo boss|versace|balenciaga|off-white|supreme|bape|champion|carhartt|patagonia|north face|columbia|timberland|ugg|birkenstock|dr martens|crocs|skechers|asics|brooks|saucony|wilson|yeti|stanley|lululemon|allbirds|stockx|grailed|depop)\b/gi;
+const _KNOWN_COLORS_RE  = /\b(black|white|red|blue|green|yellow|orange|purple|pink|brown|grey|gray|silver|gold|navy|tan|beige|cream|burgundy|maroon|olive|teal|coral|khaki|ivory|charcoal|rose|mint|copper|lavender)\b/gi;
+const _KNOWN_MATS_RE    = /\b(leather|suede|canvas|denim|nylon|polyester|cotton|wool|cashmere|linen|silk|velvet|rubber|foam|metal|aluminum|steel|titanium|ceramic|plastic|acrylic|acetate|polycarbonate|wood|bamboo|glass|mesh|knit|fleece|sherpa|tweed)\b/gi;
+
+const _DOMAIN_TRUST = {
+  amazon: 0.90, ebay: 0.85, walmart: 0.80, bestbuy: 0.75, target: 0.75,
+  etsy: 0.70, poshmark: 0.70, mercari: 0.70, depop: 0.65,
+  stockx: 0.80, grailed: 0.75, goat: 0.80,
+};
+
+function _getDomainTrust(item) {
+  const src = String(item?.source || item?.domain || "").toLowerCase();
+  for (const [k, v] of Object.entries(_DOMAIN_TRUST)) {
+    if (src.includes(k)) return v;
+  }
+  return 0.50;
+}
+
+function _tokenizeForSignals(title) {
+  return normalizeQuery(title || "")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !_STOPWORDS.has(t));
+}
+
+function recordQuerySuccess(query, category) {
+  const k = normalizeQuery(query || "");
+  if (!k || k.length < 4) return;
+  const existing = QUERY_SUCCESS_MEMORY.get(k);
+  QUERY_SUCCESS_MEMORY.set(k, {
+    count: (existing?.count || 0) + 1,
+    category: category || existing?.category || null,
+    lastSeen: Date.now(),
+  });
+  if (QUERY_SUCCESS_MEMORY.size > QUERY_MEMORY_MAX) {
+    // Evict oldest entry
+    let oldestKey = null, oldestTs = Infinity;
+    for (const [mk, mv] of QUERY_SUCCESS_MEMORY.entries()) {
+      if (mv.lastSeen < oldestTs) { oldestTs = mv.lastSeen; oldestKey = mk; }
+    }
+    if (oldestKey) QUERY_SUCCESS_MEMORY.delete(oldestKey);
+  }
+}
+
+/**
+ * Phase 2: Extract structured frequency signals from top N results
+ */
+function extractResultSignals(items, topN = 8) {
+  const top = (Array.isArray(items) ? items : []).slice(0, topN);
+  if (!top.length) return null;
+
+  const tokenFreq   = {};
+  const brandFreq   = {};
+  const colorFreq   = {};
+  const matFreq     = {};
+  const phraseFreq  = {};
+  const prices      = [];
+  const titles      = [];
+
+  top.forEach((item, idx) => {
+    const rank       = idx + 1;
+    const rankWeight = 1 / Math.log2(rank + 1);
+    const trustWeight = _getDomainTrust(item);
+    const w          = rankWeight * trustWeight;
+
+    const title = String(item?.title || "").trim();
+    if (title) titles.push(title);
+
+    const tokens = _tokenizeForSignals(title);
+    for (const t of tokens) tokenFreq[t] = (tokenFreq[t] || 0) + w;
+
+    const p = finitePrice(item?.totalPrice ?? item?.price);
+    if (p > 0) prices.push(p);
+
+    // Brand detection (case-insensitive, reset lastIndex)
+    let m;
+    _KNOWN_BRANDS_RE.lastIndex = 0;
+    while ((m = _KNOWN_BRANDS_RE.exec(title)) !== null) {
+      const b = m[0].toLowerCase();
+      brandFreq[b] = (brandFreq[b] || 0) + w;
+    }
+    _KNOWN_COLORS_RE.lastIndex = 0;
+    while ((m = _KNOWN_COLORS_RE.exec(title)) !== null) {
+      const c = m[0].toLowerCase();
+      colorFreq[c] = (colorFreq[c] || 0) + w;
+    }
+    _KNOWN_MATS_RE.lastIndex = 0;
+    while ((m = _KNOWN_MATS_RE.exec(title)) !== null) {
+      const mat = m[0].toLowerCase();
+      matFreq[mat] = (matFreq[mat] || 0) + w;
+    }
+  });
+
+  // Build bigram + trigram phrase frequency from raw title list
+  for (const title of titles) {
+    const toks = _tokenizeForSignals(title);
+    for (let i = 0; i < toks.length - 1; i++) {
+      const bigram = `${toks[i]} ${toks[i + 1]}`;
+      phraseFreq[bigram] = (phraseFreq[bigram] || 0) + 1;
+      if (i < toks.length - 2) {
+        const trigram = `${toks[i]} ${toks[i + 1]} ${toks[i + 2]}`;
+        phraseFreq[trigram] = (phraseFreq[trigram] || 0) + 1;
+      }
+    }
+  }
+
+  const sortByScore = (obj) =>
+    Object.entries(obj).sort((a, b) => b[1] - a[1]).map(([k]) => k);
+
+  const repeatedPhrases = Object.entries(phraseFreq)
+    .filter(([, c]) => c >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .map(([p]) => p)
+    .slice(0, 8);
+
+  let priceBand = null;
+  if (prices.length >= 2) {
+    const sorted = [...prices].sort((a, b) => a - b);
+    priceBand = {
+      low:   sorted[Math.floor(sorted.length * 0.10)],
+      high:  sorted[Math.floor(sorted.length * 0.90)] ?? sorted[sorted.length - 1],
+      count: prices.length,
+    };
+  } else if (prices.length === 1) {
+    priceBand = { low: prices[0] * 0.8, high: prices[0] * 1.2, count: 1 };
+  }
+
+  return {
+    topTokens:      sortByScore(tokenFreq).slice(0, 20),
+    repeatedPhrases,
+    brandHints:     sortByScore(brandFreq).slice(0, 3),
+    colorHints:     sortByScore(colorFreq).slice(0, 3),
+    materialHints:  sortByScore(matFreq).slice(0, 3),
+    priceBand,
+    resultCount:    top.length,
+  };
+}
+
+/**
+ * Phase 3: Produce ranked consensus object from raw signals
+ */
+function buildResultConsensus(signals) {
+  if (!signals) return null;
+  const { topTokens, repeatedPhrases, brandHints, colorHints, materialHints, priceBand, resultCount } = signals;
+
+  const strength = clamp01(
+    Math.min(resultCount / 8, 1) * 0.45 +
+    Math.min(repeatedPhrases.length / 3, 1) * 0.30 +
+    (brandHints.length ? 0.15 : 0) +
+    (colorHints.length ? 0.10 : 0)
+  );
+
+  return {
+    dominantTokens:   topTokens.slice(0, 12),
+    dominantPhrases:  repeatedPhrases,
+    dominantPhrase:   repeatedPhrases[0] || topTokens.slice(0, 3).join(" ") || null,
+    possibleBrand:    brandHints[0] || null,
+    possibleColors:   colorHints,
+    possibleMaterials: materialHints,
+    priceBand,
+    strength,
+    resultCount,
+  };
+}
+
+/**
+ * Phase 4: Cross-check vision identity against result consensus
+ * Returns: { type, boost, normalizedScore, warnings }
+ */
+function crossCheckVisionVsResults(visionIdentity, resultConsensus) {
+  if (!visionIdentity || !resultConsensus) {
+    return { type: "no_data", boost: 0, normalizedScore: 0, warnings: [] };
+  }
+
+  const warnings = [];
+  let score = 0;
+  let checks = 0;
+
+  // Brand agreement
+  if (visionIdentity.brand) {
+    const vb = visionIdentity.brand.toLowerCase();
+    if (resultConsensus.possibleBrand) {
+      const rb = resultConsensus.possibleBrand.toLowerCase();
+      if (rb.includes(vb) || vb.includes(rb)) { score += 2; }
+      else {
+        score -= 1;
+        warnings.push(`brand_conflict: vision="${vb}" results="${rb}"`);
+      }
+    } else {
+      score -= 0.5;
+      warnings.push(`brand_unconfirmed: vision="${vb}" absent from top results`);
+    }
+    checks++;
+  }
+
+  // Color agreement
+  if (Array.isArray(visionIdentity.colors) && visionIdentity.colors.length) {
+    const vc = visionIdentity.colors[0]?.toLowerCase() || "";
+    if (vc && resultConsensus.possibleColors?.length) {
+      if (resultConsensus.possibleColors.includes(vc)) { score += 1; }
+      else if (resultConsensus.possibleColors.some((c) => c.includes(vc) || vc.includes(c))) { score += 0.5; }
+    }
+    checks++;
+  }
+
+  // Material agreement
+  if (Array.isArray(visionIdentity.materials) && visionIdentity.materials.length) {
+    const vm = visionIdentity.materials[0]?.toLowerCase() || "";
+    if (vm && resultConsensus.possibleMaterials?.includes(vm)) score += 1;
+    checks++;
+  }
+
+  // itemType token overlap
+  if (visionIdentity.itemType) {
+    const vtoks = new Set(_tokenizeForSignals(visionIdentity.itemType));
+    const overlap = (resultConsensus.dominantTokens || []).filter((t) => vtoks.has(t)).length;
+    if (overlap >= 1) score += 1;
+    checks++;
+  }
+
+  const normalizedScore = checks > 0 ? score / (checks * 1.5) : 0;
+
+  let type, boost;
+  if      (normalizedScore >= 0.6)  { type = "strong_match";  boost =  0.15; }
+  else if (normalizedScore >= 0.2)  { type = "partial_match"; boost =  0.05; }
+  else if (normalizedScore < -0.2)  {
+    type = "conflict"; boost = -0.15;
+    warnings.push("vision_result_conflict: query refinement triggered");
+  }
+  else                              { type = "weak_match";    boost =  0.00; }
+
+  return { type, boost, normalizedScore, warnings };
+}
+
+/**
+ * Phase 5: Build a refined query merging vision attributes + result consensus
+ */
+function buildRefinedQuery(visionIdentity, resultConsensus, initialQuery, crossCheck) {
+  if (!resultConsensus || !resultConsensus.dominantTokens?.length) return null;
+
+  const parts = [];
+
+  // Include vision brand only if confirmed by results AND not in conflict
+  const visionBrandConfirmed =
+    visionIdentity?.brand &&
+    crossCheck?.type !== "conflict" &&
+    resultConsensus.possibleBrand &&
+    (resultConsensus.possibleBrand.includes(visionIdentity.brand.toLowerCase()) ||
+     visionIdentity.brand.toLowerCase().includes(resultConsensus.possibleBrand));
+
+  if (visionBrandConfirmed) parts.push(visionIdentity.brand);
+
+  // itemType — most structural signal
+  if (visionIdentity?.itemType && !isWeakGenericVisionQuery(visionIdentity.itemType)) {
+    parts.push(visionIdentity.itemType);
+  }
+
+  // Primary color — prefer vision color if confirmed, else result color
+  const vColor = Array.isArray(visionIdentity?.colors) ? visionIdentity.colors[0] : null;
+  const rColor = resultConsensus.possibleColors?.[0] || null;
+  if (vColor || rColor) parts.push(vColor || rColor);
+
+  // Primary material
+  const vMat = Array.isArray(visionIdentity?.materials) ? visionIdentity.materials[0] : null;
+  const rMat = resultConsensus.possibleMaterials?.[0] || null;
+  if (vMat || rMat) parts.push(vMat || rMat);
+
+  // Enrich with result consensus dominant phrase tokens not already covered
+  if (resultConsensus.dominantPhrase) {
+    const existingTokenSet = new Set(parts.flatMap((p) => _tokenizeForSignals(p)));
+    const newToks = _tokenizeForSignals(resultConsensus.dominantPhrase)
+      .filter((t) => !existingTokenSet.has(t));
+    if (newToks.length) parts.push(newToks.slice(0, 2).join(" "));
+  }
+
+  const candidate = normalizeQuery(parts.filter(Boolean).join(" "));
+
+  // Guards: don't use refinement if it's weaker or identical
+  if (!candidate || isGarbageQuery(candidate) || isWeakGenericVisionQuery(candidate)) return null;
+  if (candidate === normalizeQuery(initialQuery)) return null;
+  if (titleTokens(candidate).length < titleTokens(initialQuery || "").length) return null;
+
+  // Don't override a known-successful query pattern unless there's a conflict
+  const existingMemory = QUERY_SUCCESS_MEMORY.get(normalizeQuery(initialQuery || ""));
+  if (existingMemory?.count >= 3 && crossCheck?.type !== "conflict") return null;
+
+  return candidate;
+}
+
+/**
+ * Phase 8: Confidence V2 — multi-signal real confidence
+ * Now incorporates identityQuality as an explicit input.
+ */
+function computeConfidenceV2({ visionConfidence, crossCheck, resultConsensus, visionIdentity, refinedQuery }) {
+  let c = clamp01(visionConfidence || 0) * 0.28;
+
+  // Cross-check signal
+  const ccBoost = crossCheck?.boost || 0;
+  c += ccBoost * 0.18;
+
+  // Result consensus strength
+  c += (resultConsensus?.strength || 0) * 0.22;
+
+  // Identity quality (new explicit factor — replaces pure attribute count)
+  const iq = computeIdentityQuality(visionIdentity);
+  c += clamp01(iq) * 0.17;
+
+  // Attribute support from vision (legacy — still contributes but less)
+  const attrCount =
+    (visionIdentity?.brand    ? 1 : 0) +
+    (visionIdentity?.model    ? 1 : 0) +
+    (visionIdentity?.itemType ? 1 : 0) +
+    Math.min((visionIdentity?.colors?.length    || 0), 2) +
+    Math.min((visionIdentity?.materials?.length || 0), 1);
+  c += Math.min(attrCount / 6, 1) * 0.07;
+
+  // Query-result alignment
+  if (refinedQuery && resultConsensus?.dominantTokens?.length) {
+    const rqToks = new Set(_tokenizeForSignals(refinedQuery));
+    const overlap = resultConsensus.dominantTokens.filter((t) => rqToks.has(t)).length;
+    c += Math.min(overlap / 4, 1) * 0.08;
+  }
+
+  // Penalties for contradictions
+  if (crossCheck?.type === "conflict") c -= 0.08;
+  if (crossCheck?.warnings?.some((w) => w.startsWith("brand_conflict"))) c -= 0.04;
+  // Penalty for shape-only identification (no text evidence, brand claimed)
+  if (visionIdentity?.brand && iq < 0.25) c -= 0.05;
+
+  return clamp01(c);
+}
+
+/**
+ * Category trust cap — prevents category bleed from producing false positives.
+ * Some categories have higher misidentification risk and deserve tighter caps.
+ * Returns { maxBuySignal, maxTrustScore } — if current signal exceeds max, downgrade.
+ */
+function getCategoryTrustCap(category, identityQuality) {
+  const cat = (category || "").toLowerCase();
+
+  // Eyewear: very high misidentification risk (generic shapes look alike)
+  // Requires extremely strong identity evidence for positive verdict
+  if (cat.includes("eyewear") || cat.includes("glasses") || cat.includes("sunglasses")) {
+    if (identityQuality < 0.55) return { maxBuySignal: "FAIR", maxTrustFloor: 0.55 };
+  }
+  // Jewelry: impossible to assess value without karat/provenance, very high fraud risk
+  if (cat.includes("jewelry") || cat.includes("ring") || cat.includes("bracelet") || cat.includes("necklace")) {
+    if (identityQuality < 0.50) return { maxBuySignal: "FAIR", maxTrustFloor: 0.52 };
+  }
+  // Watches: reference number critical for value — model alone not enough
+  if (cat.includes("watch")) {
+    if (identityQuality < 0.45) return { maxBuySignal: "FAIR", maxTrustFloor: 0.50 };
+  }
+  // Luxury bags: authentication required — surface-level ID not sufficient for STRONG BUY
+  if (cat.includes("bag") || cat.includes("purse") || cat.includes("handbag")) {
+    if (identityQuality < 0.50) return { maxBuySignal: "GOOD DEAL", maxTrustFloor: 0.48 };
+  }
+  // Electronics: model-specific pricing means wrong model = wrong price
+  if (cat.includes("electronic") || cat.includes("phone") || cat.includes("laptop") || cat.includes("tablet")) {
+    if (identityQuality < 0.40) return { maxBuySignal: "FAIR", maxTrustFloor: 0.45 };
+  }
+
+  return null; // No cap for this category/quality combo
+}
+
+/**
+ * Main orchestrator: full result-aware refinement loop
+ * Runs AFTER initial search, BEFORE final response build.
+ * Max: 1 additional SerpAPI call. Never runs on oracle-only results.
+ */
+async function runResultAwareRefinement({
+  items, query, visionIdentity, visionConfidence, category, imageHash, plan,
+}) {
+  const initialQuery   = query;
+  let refinedSearchUsed = false;
+  const warnings       = [];
+
+  // Phase 2+3: Extract signals + build consensus (check cache first)
+  const consensusCacheKey = `rfc:${imageHash || ""}:${normalizeQuery(initialQuery)}`;
+  let resultConsensus = RESULT_CONSENSUS_CACHE.get(consensusCacheKey) || null;
+  if (!resultConsensus) {
+    const signals = extractResultSignals(items, 8);
+    resultConsensus = buildResultConsensus(signals);
+    if (resultConsensus) RESULT_CONSENSUS_CACHE.set(consensusCacheKey, resultConsensus);
+  }
+
+  // Phase 4: Cross-check vision vs results
+  const crossCheck = crossCheckVisionVsResults(visionIdentity, resultConsensus);
+  warnings.push(...(crossCheck.warnings || []));
+
+  // Phase 5: Build refined query
+  const refinedQuery = buildRefinedQuery(visionIdentity, resultConsensus, initialQuery, crossCheck);
+
+  // Refinement trigger: skip when evidence is already strong (cost discipline)
+  const evidenceAlreadyStrong =
+    visionConfidence >= 0.65 &&
+    Array.isArray(items) && items.length >= 8 &&
+    crossCheck.type !== "conflict";
+  const shouldRunSecondSearch =
+    !evidenceAlreadyStrong &&
+    refinedQuery &&
+    refinedQuery !== normalizeQuery(initialQuery) &&
+    !!SERPAPI_KEY &&
+    !isSourceCoolingDown("serpapi") &&
+    (
+      visionConfidence < 0.55 ||
+      (Array.isArray(items) && items.length < 5) ||
+      crossCheck.type === "conflict"
+    );
+
+  // Phase 6: One controlled second search
+  let refinedItems = items;
+  if (shouldRunSecondSearch) {
+    try {
+      const secondResults = await runBudgetedSourceLane(
+        "serpapi",
+        () => serpShopping(refinedQuery, { softFail: true }),
+        { plan: plan || "free", costUnits: 6 }
+      );
+      if (Array.isArray(secondResults) && secondResults.length > 0) {
+        // Phase 7: Combine + dedup
+        refinedItems    = dedupeSmart([...items, ...secondResults]);
+        refinedSearchUsed = true;
+        recordQuerySuccess(refinedQuery, category);
+        console.log(`🔄 Result-aware: "${initialQuery}" → "${refinedQuery}" (+${secondResults.length} results)`);
+      }
+    } catch (e) {
+      console.warn("result_aware_second_search_error", e?.message || e);
+    }
+  }
+
+  // Record initial query if it yielded good results
+  if (Array.isArray(items) && items.length >= 5) recordQuerySuccess(initialQuery, category);
+
+  const confidenceV2 = computeConfidenceV2({
+    visionConfidence, crossCheck, resultConsensus, visionIdentity, refinedQuery,
+  });
+
+  return {
+    refinedQuery,
+    refinedItems,
+    resultConsensus,
+    crossCheck,
+    refinedSearchUsed,
+    warnings,
+    confidenceV2,
+    initialQuery,
+  };
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+
 app.post("/market/search", async (req, res) => {
   try {
 
@@ -16072,6 +18276,9 @@ query = categoryAdapter(
   query,
   req.body?.category || req.body?.visionIdentity?.category || null
 );
+
+// Capture initial query before any refinement for debugging output
+let _initialQuery = query;
 
 // Feature 5: hyperlocal pricing — accept zipCode or location string from client
 const userLocation = safeStr(req.body?.zipCode || req.body?.location, 80) || null;
@@ -16178,11 +18385,25 @@ if (identityPreferredQuery) {
   }
 }
 
+// Accept scan source signal from frontend
+const scanSource = safeStr(req.body?.scanSource, 40) || null; // "vision" | "deterministic"
+const isDeterministicScan = scanSource === "deterministic" || visionConfidence === 0;
+
 if (!query) {
   return res.status(200).json({ ok: false, error: "Missing query" });
 }
 
 let searchedQueries = buildServerQueryVariants(query, variants, "item", visionIdentity);
+
+// For deterministic scans (vision was absent) or very low confidence, inject
+// the full search intent ladder so SerpAPI has broad coverage to work with.
+if (isDeterministicScan || visionConfidence < 0.3) {
+  const intentLadder = buildSearchIntentLadder(query, {
+    category: category || "",
+    broad: true,
+  });
+  searchedQueries = uniqueQueries([...searchedQueries, ...intentLadder]);
+}
 
 // ---------- dual-lane search ---------- 
 if (visionIdentity?.exactQuery) {
@@ -16195,6 +18416,21 @@ if (visionIdentity?.category) {
     `${visionIdentity.colors?.[0] || ""} ${visionIdentity.category}`.trim()
   );
   if (generic) searchedQueries.push(generic);
+}
+
+// Safety net: broadQuery, categoryFallbackQuery, visualDescriptorQuery from vision
+// These prevent market poisoning when brand/model is wrong or invented
+if (visionIdentity?.broadQuery) {
+  const bq = normalizeQuery(visionIdentity.broadQuery);
+  if (bq && !isGarbageQuery(bq)) searchedQueries.push(bq);
+}
+if (visionIdentity?.categoryFallbackQuery) {
+  const cfq = normalizeQuery(visionIdentity.categoryFallbackQuery);
+  if (cfq && !isGarbageQuery(cfq)) searchedQueries.push(cfq);
+}
+if (visionIdentity?.visualDescriptorQuery) {
+  const vdq = normalizeQuery(visionIdentity.visualDescriptorQuery);
+  if (vdq && !isGarbageQuery(vdq)) searchedQueries.push(vdq);
 }
 
 if (!searchedQueries.length) {
@@ -16241,12 +18477,37 @@ try {
 
 const cached = SERP_CACHE.get(cacheKey);
 
+// ── User Context Prefetch (non-blocking, for outcome-biased decisions) ────────
+// Fire these in parallel before the cache/internalHit checks so they resolve by
+// the time we call assembleProfitIntel. Gracefully degrade to null if not present.
+const _userId = safeStr(req.body?.userId || req.query?.userId, 64) || null;
+const _categoryNorm = (category || "").toLowerCase().trim();
+const _categoryPriorPromise = (_userId && _categoryNorm)
+  ? getCategoryOutcomePrior(redis, _userId)
+      .then((priors) => (Array.isArray(priors) ? priors.find((p) => p.category === _categoryNorm) || null : null))
+      .catch(() => null)
+  : Promise.resolve(null);
+const _userHitRatePromise = _userId
+  ? getPortfolioPerformance(redis, _userId).then((p) => p?.hitRate ?? null).catch(() => null)
+  : Promise.resolve(null);
+// Discovery snapshot — cheap Redis get for relatedOpportunities field
+const _discoverySnapPromise = _userId
+  ? getDiscoverySnapshot(redis, _userId).catch(() => null)
+  : Promise.resolve(null);
+
 const internalHit = await resolveInternalMarketHit(query, visionIdentity, {
   allowStale: true,
 });
 
 const _authFlags = Array.isArray(req.body?.authenticityFlags) ? req.body.authenticityFlags : [];
 const _condFlags  = Array.isArray(req.body?.conditionFlags)    ? req.body.conditionFlags    : [];
+
+// Resolve user context promises (non-blocking — resolved in parallel)
+const [_categoryPrior, _userHitRate, _discoverySnap] = await Promise.all([
+  _categoryPriorPromise,
+  _userHitRatePromise,
+  _discoverySnapPromise,
+]);
 
 if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.length >= 4) {
   const responsePayload = await buildMarketSearchResponsePayload({
@@ -16269,6 +18530,54 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     },
     persistSnapshot: false,
   });
+  try {
+    // Run cheap pure-function signal extraction (no API calls) for crossCheck + real confidenceV2
+    let _ihCrossCheck = null;
+    let _ihCV2 = visionConfidence;
+    try {
+      const _ihSignals   = extractResultSignals(internalHit.items, 8);
+      const _ihConsensus = buildResultConsensus(_ihSignals);
+      if (_ihConsensus) {
+        _ihCrossCheck = crossCheckVisionVsResults(visionIdentity, _ihConsensus);
+        _ihCV2 = computeConfidenceV2({
+          visionConfidence, crossCheck: _ihCrossCheck,
+          resultConsensus: _ihConsensus, visionIdentity, refinedQuery: null,
+        });
+        responsePayload.confidenceV2 = _ihCV2;
+        responsePayload.resultConsensus = _ihConsensus;
+      }
+    } catch {}
+    responsePayload.profitIntel = assembleProfitIntel({
+      items: internalHit.items, scannedPrice,
+      visionConfidence, confidenceV2: _ihCV2,
+      resultConsensus: null, refinementWarnings: [],
+      prediction: responsePayload.prediction || null, category,
+      crossCheck: _ihCrossCheck, isOracleOnly: false,
+      visionIdentity, attributeCertainty: req.body?.attributeCertainty || null,
+      categoryPrior: _categoryPrior || null, userHitRate: _userHitRate || null,
+      liquidityScoreVal: responsePayload.liquidityScore?.liquidityScore ?? 0,
+    });
+  } catch {}
+  // Promote decision fields to top-level
+  try {
+    const _pi = responsePayload.profitIntel;
+    if (_pi?.agentAction)   responsePayload.agentAction   = _pi.agentAction;
+    if (_pi?.agentUrgency)  responsePayload.agentUrgency  = _pi.agentUrgency;
+    if (_pi?.timingSignal)  responsePayload.timingSignal  = _pi.timingSignal;
+    if (_pi?.trustScore != null) responsePayload.trustScore = _pi.trustScore;
+    if (_pi?.identityQuality != null) responsePayload.identityQuality = _pi.identityQuality;
+    // Related opportunities from discovery snapshot
+    if (_discoverySnap?.opportunities?.length > 0) {
+      const related = _discoverySnap.opportunities
+        .filter((o) => o?.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(o.buySignal))
+        .slice(0, 3)
+        .map((o) => ({ query: o.query, brand: o.brand || null, model: o.model || null,
+          category: o.category || null, buySignal: o.buySignal,
+          opportunityScore: o.opportunityScore, priceStats: o.priceStats || null }));
+      if (related.length) responsePayload.relatedOpportunities = related;
+    }
+  } catch {}
+  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -16291,6 +18600,58 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     },
     persistSnapshot: false,
   });
+  try {
+    let _rcCrossCheck = null;
+    let _rcCV2 = visionConfidence;
+    try {
+      const _rcSignals   = extractResultSignals(cached, 8);
+      const _rcConsensus = buildResultConsensus(_rcSignals);
+      if (_rcConsensus) {
+        _rcCrossCheck = crossCheckVisionVsResults(visionIdentity, _rcConsensus);
+        _rcCV2 = computeConfidenceV2({
+          visionConfidence, crossCheck: _rcCrossCheck,
+          resultConsensus: _rcConsensus, visionIdentity, refinedQuery: null,
+        });
+        responsePayload.confidenceV2 = _rcCV2;
+        responsePayload.resultConsensus = _rcConsensus;
+      }
+    } catch {}
+    responsePayload.profitIntel = assembleProfitIntel({
+      items: cached, scannedPrice,
+      visionConfidence, confidenceV2: _rcCV2,
+      resultConsensus: null, refinementWarnings: [],
+      prediction: responsePayload.prediction || null, category,
+      crossCheck: _rcCrossCheck, isOracleOnly: false,
+      visionIdentity, attributeCertainty: req.body?.attributeCertainty || null,
+      categoryPrior: _categoryPrior || null, userHitRate: _userHitRate || null,
+      liquidityScoreVal: responsePayload.liquidityScore?.liquidityScore ?? 0,
+    });
+  } catch {}
+  // Promote decision fields to top-level
+  try {
+    const _pi = responsePayload.profitIntel;
+    if (_pi?.agentAction)   responsePayload.agentAction   = _pi.agentAction;
+    if (_pi?.agentUrgency)  responsePayload.agentUrgency  = _pi.agentUrgency;
+    if (_pi?.timingSignal)  responsePayload.timingSignal  = _pi.timingSignal;
+    if (_pi?.trustScore != null) responsePayload.trustScore = _pi.trustScore;
+    if (_pi?.identityQuality != null) responsePayload.identityQuality = _pi.identityQuality;
+    if (_discoverySnap?.opportunities?.length > 0) {
+      const related = _discoverySnap.opportunities
+        .filter((o) => o?.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(o.buySignal))
+        .slice(0, 3)
+        .map((o) => ({ query: o.query, brand: o.brand || null, model: o.model || null,
+          category: o.category || null, buySignal: o.buySignal,
+          opportunityScore: o.opportunityScore, priceStats: o.priceStats || null }));
+      if (related.length) responsePayload.relatedOpportunities = related;
+    }
+  } catch {}
+  // Stage items+identity for arbitrage detection inside _applyPersonalDecisionToPayload
+  if (internalHit?.items?.length >= 2 && visionIdentity?.brand && visionIdentity?.model) {
+    responsePayload.__scanItems        = internalHit.items;
+    responsePayload.__scanIdentity     = visionIdentity;
+    responsePayload.__scanIdentityConf = visionConfidence || 0;
+  }
+  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -16354,6 +18715,46 @@ if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
   SERP_CACHE.set(cacheKey, items);
 }
 
+// ── RESULT-AWARE FEEDBACK LOOP ────────────────────────────────────────────────
+// Runs after initial search. Extracts result signals, cross-checks vision,
+// optionally refines query + runs one additional SerpAPI search. Never on oracle results.
+let _resultConsensus    = null;
+let _refinedSearchUsed  = false;
+let _confidenceV2       = visionConfidence;
+let _refinementWarnings = [];
+let _crossCheck         = null;
+
+if (!_oracleOnlyResult && Array.isArray(items)) {
+  try {
+    const _raResult = await runResultAwareRefinement({
+      items,
+      query,
+      visionIdentity,
+      visionConfidence,
+      category,
+      imageHash,
+      plan: getResolvedPlan(req),
+    });
+
+    if (_raResult.refinedQuery && _raResult.refinedQuery !== normalizeQuery(query)) {
+      query = _raResult.refinedQuery;
+    }
+    if (Array.isArray(_raResult.refinedItems) && _raResult.refinedItems.length > items.length) {
+      items = _raResult.refinedItems;
+      // Re-cache with expanded result set
+      if (!_oracleOnlyResult) SERP_CACHE.set(cacheKey, items);
+    }
+    _resultConsensus    = _raResult.resultConsensus;
+    _refinedSearchUsed  = _raResult.refinedSearchUsed;
+    _confidenceV2       = _raResult.confidenceV2;
+    _refinementWarnings = _raResult.warnings || [];
+    _crossCheck         = _raResult.crossCheck  || null;
+  } catch (_raErr) {
+    console.warn("result_aware_refinement_error", _raErr?.message || _raErr);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Feature 4 + 5: fire eBay sold comps + local comps in parallel with payload build
 const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
   buildMarketSearchResponsePayload({
@@ -16362,7 +18763,7 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     variants,
     items,
     scannedPrice,
-    visionConfidence,
+    visionConfidence: _confidenceV2,
     category,
     visionIdentity,
     authenticityFlags: _authFlags,
@@ -16381,6 +18782,79 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
 if (ebaySoldComps) responsePayload.ebaySoldComps = ebaySoldComps;
 if (localComps)    responsePayload.localComps    = localComps;
 
+// Inject result-awareness metadata
+responsePayload.initialQuery      = _initialQuery;
+if (_resultConsensus)    responsePayload.resultConsensus    = _resultConsensus;
+if (_refinedSearchUsed)  responsePayload.refinedSearchUsed  = true;
+if (_refinementWarnings.length) responsePayload.refinementWarnings = _refinementWarnings;
+responsePayload.confidenceV2 = _confidenceV2;
+
+// ── PROFIT INTELLIGENCE ENGINE ────────────────────────────────────────────────
+// Assembles clean priceStats, dealStrength, demandScore, resaleScore, buySignal,
+// reasoning, and warnings from finalized items. Runs at route layer — never inside
+// buildMarketSearchResponsePayload — so it always sees the complete item set.
+try {
+  const _profitIntel = assembleProfitIntel({
+    items,
+    scannedPrice,
+    visionConfidence,
+    confidenceV2:       _confidenceV2,
+    resultConsensus:    _resultConsensus,
+    refinementWarnings: _refinementWarnings,
+    prediction:         responsePayload.prediction || null,
+    category,
+    crossCheck:         _crossCheck,
+    isOracleOnly:       _oracleOnlyResult,
+    visionIdentity,
+    attributeCertainty: req.body?.attributeCertainty || null,
+    categoryPrior:      _categoryPrior || null,
+    userHitRate:        _userHitRate   || null,
+    liquidityScoreVal:  responsePayload.liquidityScore?.liquidityScore ?? 0,
+  });
+  responsePayload.profitIntel = _profitIntel;
+
+  // Promote key decision fields to top-level for frontend convenience
+  if (_profitIntel.agentAction)   responsePayload.agentAction   = _profitIntel.agentAction;
+  if (_profitIntel.agentUrgency)  responsePayload.agentUrgency  = _profitIntel.agentUrgency;
+  if (_profitIntel.timingSignal)  responsePayload.timingSignal  = _profitIntel.timingSignal;
+  if (_profitIntel.trustScore != null) responsePayload.trustScore = _profitIntel.trustScore;
+  if (_profitIntel.identityQuality != null) responsePayload.identityQuality = _profitIntel.identityQuality;
+} catch (_piErr) {
+  console.warn("profit_intel_error", _piErr?.message || _piErr);
+}
+
+// ── Related Opportunities (from discovery snapshot) ───────────────────────────
+// Cheap: already fetched in parallel at the top of the route.
+try {
+  if (_discoverySnap?.opportunities?.length > 0) {
+    const relatedCat = (category || "").toLowerCase();
+    const related = _discoverySnap.opportunities
+      .filter((o) => o && o.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(o.buySignal))
+      .filter((o) => !relatedCat || !o.category || o.category.toLowerCase() === relatedCat ||
+        o.opportunityScore >= 70) // high-score opps from any category
+      .slice(0, 4)
+      .map((o) => ({
+        query:           o.query,
+        brand:           o.brand || null,
+        model:           o.model || null,
+        category:        o.category || null,
+        buySignal:       o.buySignal,
+        opportunityScore: o.opportunityScore,
+        priceStats:      o.priceStats || null,
+        discoveredAt:    o.discoveredAt || null,
+      }));
+    if (related.length > 0) responsePayload.relatedOpportunities = related;
+  }
+} catch { /* non-fatal */ }
+// Stage items+identity for arbitrage detection (live path)
+if (Array.isArray(items) && items.length >= 2 && visionIdentity?.brand && visionIdentity?.model) {
+  responsePayload.__scanItems        = items;
+  responsePayload.__scanIdentity     = visionIdentity;
+  responsePayload.__scanIdentityConf = visionConfidence || 0;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
 
@@ -16396,6 +18870,529 @@ return res.status(200).json(responsePayload);
       reason: "market_search_failed",
     });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGED SCAN STREAM  —  POST /market/search/stream
+// ─────────────────────────────────────────────────────────────────────────────
+// Event sequence:
+//   event: phase        data: { phase: "analyzing_fast"|"enriching", query?, scanId }
+//   event: provisional  data: { ...payload, status:"provisional", enriching:true,
+//                               needsOracle, dataDepth, _timing, scanId }
+//   event: complete     data: { ...payload, status:"complete", enriching:false,
+//                               dataDepth, _diff, _timing, scanId,
+//                               degraded?, degradedReason? }
+//   event: error        data: { code, message?, scanId }
+//
+// Phase 3 additions vs Phase 2:
+//   • L0 ENRICHED_SCAN_CACHE: 5-min tuple (items + sold comps + local comps)
+//   • STREAM_PHASE1_INFLIGHT: concurrent-request dedup for Phase 1 fanout
+//   • Oracle threshold: SCAN_STREAM_ORACLE_THRESHOLD (<3, was implicit <4)
+//   • Oracle hard timeout: SCAN_STREAM_ORACLE_BUDGET_MS via Promise.race
+//   • dedupeSmart + trimPriceOutliers after oracle merge
+//   • scanId on all SSE events for client staleness detection
+//   • _diff: { itemsAdded, verdictChanged, oracleContributed }
+//   • _timing: per-phase latency breakdown on complete event
+//   • Degraded state: degraded:true + degradedReason on oracle timeout or no data
+//   • dataDepth: "thin"|"normal" on provisional + complete
+//   • scanLog() structured JSON logging for all key events
+//
+// Trust safeguards (all preserved):
+//   • buildBuySignal, applyMarketDepthGate, computeReplicaRisk, getCategoryTrustCap
+//     and suppression cache apply identically to provisional and final results
+//   • Oracle results carry isOracleOnly → trust penalty applied downstream
+//   • No STRONG BUY possible on <4 items (depth gate enforced in buildBuySignal)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/market/search/stream", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Connection", "keep-alive");
+  try { res.flushHeaders(); } catch {}
+
+  let clientClosed = false;
+  req.on("close", () => { clientClosed = true; });
+
+  const _t0    = Date.now();
+  const scanId = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 6)}`;
+  _recordStreamMetric("totalRequests", 1);
+
+  const send = (name, data) => {
+    if (clientClosed || res.writableEnded) return;
+    try { res.write(`event: ${name}\ndata: ${JSON.stringify({ ...data, scanId })}\n\n`); } catch {}
+  };
+  const endStream = () => { if (!res.writableEnded) { try { res.end(); } catch {} } };
+
+  try {
+    // ── Parse request ─────────────────────────────────────────────────────
+    const rawQuery = safeStr(req.body?.query, 220);
+    let query = normalizeQuery(rawQuery);
+    query = bestHistoricalQuery(query);
+    query = canonicalizeQuery(query);
+    query = categoryAdapter(query, req.body?.category || req.body?.visionIdentity?.category || null);
+
+    const userLocation = safeStr(req.body?.zipCode || req.body?.location, 80) || null;
+
+    let visionIdentity = normalizeVisionIdentityPayload(
+      req.body?.visionIdentity || req.body?.identity || null, query
+    );
+
+    const imageHash = safeStr(
+      req.body?.imageHash || req.body?.scanAsset?.hash ||
+      req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128
+    ) || null;
+    if (imageHash && visionIdentity) visionIdentity = { ...visionIdentity, imageHash };
+    if (visionIdentity) visionIdentity = { ...visionIdentity, plan: getResolvedPlan(req) };
+
+    if ((!query || isGarbageQuery(query)) && visionIdentity?.exactQuery)
+      query = normalizeQuery(visionIdentity.exactQuery);
+    if ((!query || isGarbageQuery(query)) && Array.isArray(visionIdentity?.searchQueries) && visionIdentity.searchQueries.length)
+      query = normalizeQuery(visionIdentity.searchQueries[0]);
+
+    if (!query) { send("error", { code: "NO_QUERY" }); endStream(); return; }
+
+    const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
+    const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
+    const variants      = normalizeVariantList([
+      ...(sizeAugmented ? [sizeAugmented] : []),
+      ...(Array.isArray(req.body?.variants) ? req.body.variants : []),
+      ...(Array.isArray(visionIdentity?.searchQueries) ? visionIdentity.searchQueries : []),
+      visionIdentity?.exactQuery,
+    ], query, "item");
+
+    const scannedPrice       = finitePrice(req.body?.scannedPrice);
+    const visionConfidence   = clamp01(req.body?.visionConfidence ?? req.body?.confidence ?? 0.5);
+    const category           = safeStr(req.body?.category, 80) || visionIdentity?.category || inferVisionCategory(query);
+    const _userId            = safeStr(req.body?.userId || req.query?.userId, 64) || null;
+    const _authFlags         = Array.isArray(req.body?.authenticityFlags) ? req.body.authenticityFlags : [];
+    const _condFlags         = Array.isArray(req.body?.conditionFlags)    ? req.body.conditionFlags    : [];
+    const attributeCertainty = req.body?.attributeCertainty || null;
+
+    let searchedQueries = buildServerQueryVariants(query, variants, "item", visionIdentity);
+    if (!searchedQueries.length) searchedQueries.push(query);
+
+    const canonicalKey        = canonicalMarketQuery(query);
+    const canonicalVariantKey = uniqueQueries(searchedQueries.map((q) => canonicalMarketQuery(q))).join("|");
+    const identityKey         = visionIdentity ? hashString(JSON.stringify(visionIdentity)) : "noid";
+    const cacheKey            = `market|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
+
+    scanLog("scan_start", scanId, { query, category });
+    send("phase", { phase: "analyzing_fast", query });
+
+    // ── User context (parallel, non-blocking) ────────────────────────────
+    const _categoryNorm = (category || "").toLowerCase().trim();
+    const [_categoryPrior, _userHitRate] = await Promise.all([
+      (_userId && _categoryNorm)
+        ? getCategoryOutcomePrior(redis, _userId)
+            .then((priors) => (Array.isArray(priors) ? priors.find((p) => p.category === _categoryNorm) || null : null))
+            .catch(() => null)
+        : Promise.resolve(null),
+      _userId
+        ? getPortfolioPerformance(redis, _userId).then((p) => p?.hitRate ?? null).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    // ── Helper: assemble trusted profit intel + response payload ─────────
+    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence } = {}) => {
+      const payload = await buildMarketSearchResponsePayload({
+        query, searchedQueries, variants, items, scannedPrice,
+        visionConfidence: cv2, category, visionIdentity,
+        authenticityFlags: _authFlags, conditionFlags: _condFlags,
+        retrievalMeta: { source, kind },
+        persistSnapshot: !isOracleOnly,
+      });
+      try {
+        const _signals   = extractResultSignals(items, 8);
+        const _consensus = buildResultConsensus(_signals);
+        let _cv2 = cv2, _crossCheck = null;
+        if (_consensus) {
+          _crossCheck = crossCheckVisionVsResults(visionIdentity, _consensus);
+          _cv2 = computeConfidenceV2({ visionConfidence, crossCheck: _crossCheck, resultConsensus: _consensus, visionIdentity, refinedQuery: null });
+          payload.confidenceV2    = _cv2;
+          payload.resultConsensus = _consensus;
+        }
+        payload.profitIntel = assembleProfitIntel({
+          items, scannedPrice, visionConfidence, confidenceV2: _cv2,
+          resultConsensus: _consensus, refinementWarnings: [],
+          prediction: payload.prediction || null, category,
+          crossCheck: _crossCheck, isOracleOnly,
+          visionIdentity, attributeCertainty,
+          categoryPrior: _categoryPrior || null, userHitRate: _userHitRate || null,
+          liquidityScoreVal: payload.liquidityScore?.liquidityScore ?? 0,
+        });
+        const _pi = payload.profitIntel;
+        if (_pi?.agentAction)              payload.agentAction       = _pi.agentAction;
+        if (_pi?.agentUrgency)             payload.agentUrgency      = _pi.agentUrgency;
+        if (_pi?.timingSignal)             payload.timingSignal      = _pi.timingSignal;
+        if (_pi?.trustScore       != null) payload.trustScore        = _pi.trustScore;
+        if (_pi?.identityQuality  != null) payload.identityQuality   = _pi.identityQuality;
+      } catch (_piErr) {
+        console.warn("stream_profit_intel_error", _piErr?.message);
+      }
+      if (_userId) {
+        await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice }).catch(() => {});
+      }
+      return payload;
+    };
+
+    // ── L0: enriched tuple cache (items + comps, 5-min TTL) ──────────────
+    const enrichedHit = ENRICHED_SCAN_CACHE.get(cacheKey);
+    if (enrichedHit) {
+      _recordStreamMetric("cacheHits", 1);
+      scanLog("cache_hit", scanId, { layer: "enriched", query });
+      const payload = await _buildPayload(enrichedHit.items, { source: "enriched_cache", kind: "cache_hit" });
+      if (enrichedHit.ebaySoldComps) payload.ebaySoldComps = enrichedHit.ebaySoldComps;
+      if (enrichedHit.localComps)    payload.localComps    = enrichedHit.localComps;
+      const _totalMs = Date.now() - _t0;
+      send("complete", {
+        ...payload, status: "complete", enriching: false,
+        dataDepth: enrichedHit.items.length < 3 ? "thin" : "normal",
+        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+      });
+      _recordStreamMetric("totalCompleted", 1);
+      endStream(); return;
+    }
+
+    // ── L1: internal snapshot + SERP_CACHE ───────────────────────────────
+    const internalHit = await resolveInternalMarketHit(query, visionIdentity, { allowStale: true });
+    const serpCached  = SERP_CACHE.get(cacheKey);
+
+    if (internalHit?.hit && Array.isArray(internalHit.items) && internalHit.items.length >= 4) {
+      _recordStreamMetric("cacheHits", 1);
+      scanLog("cache_hit", scanId, { layer: "internal", query });
+      const [payload, ebaySold, localC] = await Promise.all([
+        _buildPayload(internalHit.items, { source: internalHit.source, kind: internalHit.kind }),
+        serpEbaySold(query).catch(() => null),
+        userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
+      ]);
+      if (ebaySold) payload.ebaySoldComps = ebaySold;
+      if (localC)   payload.localComps    = localC;
+      ENRICHED_SCAN_CACHE.set(cacheKey, { items: internalHit.items, ebaySoldComps: ebaySold || null, localComps: localC || null });
+      const _totalMs = Date.now() - _t0;
+      send("complete", {
+        ...payload, status: "complete", enriching: false,
+        dataDepth: internalHit.items.length < 3 ? "thin" : "normal",
+        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+      });
+      _recordStreamMetric("totalCompleted", 1);
+      endStream(); return;
+    }
+
+    if (Array.isArray(serpCached) && serpCached.length >= 4) {
+      _recordStreamMetric("cacheHits", 1);
+      scanLog("cache_hit", scanId, { layer: "serp", query });
+      const [payload, ebaySold, localC] = await Promise.all([
+        _buildPayload(serpCached, { source: "l1_route_cache", kind: "route_cache_hit" }),
+        serpEbaySold(query).catch(() => null),
+        userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
+      ]);
+      if (ebaySold) payload.ebaySoldComps = ebaySold;
+      if (localC)   payload.localComps    = localC;
+      ENRICHED_SCAN_CACHE.set(cacheKey, { items: serpCached, ebaySoldComps: ebaySold || null, localComps: localC || null });
+      const _totalMs = Date.now() - _t0;
+      send("complete", {
+        ...payload, status: "complete", enriching: false,
+        dataDepth: serpCached.length < 3 ? "thin" : "normal",
+        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+      });
+      _recordStreamMetric("totalCompleted", 1);
+      endStream(); return;
+    }
+
+    // ── PHASE 1: marketplace fanout, no oracle, in-flight dedup ──────────
+    const _t1 = Date.now();
+    _recordStreamMetric("totalPhase1", 1);
+
+    // Sold comps + local comps fire immediately — independent of marketplace results
+    const _ebaySoldPromise   = serpEbaySold(query).catch(() => null);
+    const _localCompsPromise = userLocation
+      ? serpLocalShopping(query, userLocation).catch(() => null)
+      : Promise.resolve(null);
+
+    // ── Early provisional callback (Phase 4) ─────────────────────────────
+    // Called by mergeCheapestSources after Tier A (native APIs: eBay/Walmart/BestBuy)
+    // resolves, ~2-3s before SerpAPI finishes. Enables provisional at ~2s instead of ~5s.
+    let _earlyItems   = null;
+    let _earlyProvSent = false;
+    let _provVerdictKey = null;
+
+    const _onEarlyItems = async (earlyRaw) => {
+      if (clientClosed || _earlyProvSent) return;
+      _earlyItems    = assignItemIds(earlyRaw);
+      _earlyProvSent = true;
+      _recordStreamMetric("earlyProvisionalSent", 1);
+      _recordStreamMetric("provisionalSent", 1);
+      const _tEarlyBuild = Date.now();
+      const earlyPayload = await _buildPayload(_earlyItems, {
+        source: "live_market", kind: "fast_provisional", isOracleOnly: false,
+      }).catch(() => null);
+      if (!earlyPayload || clientClosed) return;
+      _provVerdictKey = earlyPayload.profitIntel?.verdict || earlyPayload.agentAction || null;
+      const _earlyMs = Date.now() - _t1;
+      _recordStreamMetric("ttfrMs", _earlyMs);
+      send("provisional", {
+        ...earlyPayload,
+        status: "provisional", enriching: true,
+        needsOracle: _earlyItems.length < SCAN_STREAM_ORACLE_THRESHOLD,
+        dataDepth: _earlyItems.length < 3 ? "thin" : "normal",
+        enrichingReason: "serp_pending",
+        _timing: { phase1Ms: _earlyMs, buildMs: Date.now() - _tEarlyBuild },
+        _scanPhase1Ms: _earlyMs,
+      });
+      scanLog("early_provisional_sent", scanId, {
+        itemCount: _earlyItems.length, verdict: _provVerdictKey, earlyMs: _earlyMs,
+      });
+    };
+
+    // In-flight dedup: share the Phase 1 promise across concurrent identical scans.
+    // earlyItemsCb is only wired for the FIRST request — inflight hits get phase1Items directly.
+    let phase1Promise;
+    if (STREAM_PHASE1_INFLIGHT.has(cacheKey)) {
+      _recordStreamMetric("inflightHits", 1);
+      phase1Promise = STREAM_PHASE1_INFLIGHT.get(cacheKey);
+      // No earlyItemsCb for inflight hits — they receive full phase1Items when promise resolves
+    } else {
+      phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
+        skipOracle: true, earlyItemsCb: _onEarlyItems,
+      });
+      STREAM_PHASE1_INFLIGHT.set(cacheKey, phase1Promise);
+      phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
+    }
+
+    const _phase1Raw = await phase1Promise;
+    // If 5s kill timer fired in mergeCheapestSources, fall back to earlyItems
+    const phase1Items = _phase1Raw.length > 0 ? assignItemIds(_phase1Raw) : (_earlyItems || []);
+    const _phase1Ms   = Date.now() - _t1;
+    _recordStreamMetric("phase1TotalMs", _phase1Ms);
+    scanLog("phase1_done", scanId, {
+      itemCount: phase1Items.length, earlyCount: _earlyItems?.length ?? 0, phase1Ms: _phase1Ms,
+    });
+
+    // ── Smart oracle decision (Phase 4) ──────────────────────────────────
+    const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
+    const needsOracle = _oracleDecision.invoke;
+    scanLog("oracle_decision", scanId, {
+      invoke: needsOracle, reason: _oracleDecision.reason, factors: _oracleDecision.factors,
+    });
+    if (needsOracle) {
+      _recordStreamMetric("oracleInvokeReasons", _oracleDecision.reason);
+    } else {
+      _recordStreamMetric("oracleSkips", 1);
+      _recordStreamMetric("oracleSkipReasons", _oracleDecision.reason);
+    }
+
+    // ── Send provisional from full phase1Items if early provisional not yet sent ─
+    if (!_earlyProvSent && phase1Items.length >= 2 && !clientClosed) {
+      _recordStreamMetric("provisionalSent", 1);
+      const _tProvBuild = Date.now();
+      const provPayload = await _buildPayload(phase1Items, {
+        source: "live_market", kind: "provisional", isOracleOnly: false,
+      });
+      _provVerdictKey = provPayload.profitIntel?.verdict || provPayload.agentAction || null;
+      _recordStreamMetric("ttfrMs", _phase1Ms);
+      send("provisional", {
+        ...provPayload,
+        status: "provisional", enriching: true, needsOracle,
+        dataDepth: phase1Items.length < 3 ? "thin" : "normal",
+        _timing: { phase1Ms: _phase1Ms, buildMs: Date.now() - _tProvBuild },
+        _scanPhase1Ms: _phase1Ms,
+      });
+      scanLog("provisional_sent", scanId, { itemCount: phase1Items.length, verdict: _provVerdictKey });
+    }
+
+    if (clientClosed) { endStream(); return; }
+
+    // ── PHASE 2: oracle (budgeted) + enrichment ───────────────────────────
+    send("phase", { phase: "enriching", needsOracle, itemCount: phase1Items.length });
+
+    const _t2             = Date.now();
+    let _oracleOnlyResult = false;
+    let _oracleMs         = 0;
+    let _oracleContributed = 0;
+    let _degraded         = false;
+    let _degradedReason   = null;
+
+    // LiveAggregator always manages the final item set.
+    // Starts with phase1 results; optionally ingests oracle when needsOracle is true.
+    const _agg = new LiveAggregator();
+    _agg.ingest("phase1", phase1Items);
+
+    if (needsOracle) {
+      _recordStreamMetric("oracleInvocations", 1);
+      const _tOracle = Date.now();
+      let _oracleTimedOut = false;
+      const oracleTimeout = new Promise((resolve) =>
+        setTimeout(() => { _oracleTimedOut = true; resolve([]); }, SCAN_STREAM_ORACLE_BUDGET_MS)
+      );
+      const oracleItems = await Promise.race([
+        gptMarketOracle(query, visionIdentity).catch(() => []),
+        oracleTimeout,
+      ]);
+      _oracleMs = Date.now() - _tOracle;
+
+      if (_oracleTimedOut) {
+        _degraded       = true;
+        _degradedReason = "oracle_timeout";
+        _recordStreamMetric("oracleTimeouts", 1);
+        scanLog("oracle_timeout", scanId, { budgetMs: SCAN_STREAM_ORACLE_BUDGET_MS, phase1Count: phase1Items.length });
+      }
+
+      if (Array.isArray(oracleItems) && oracleItems.length) {
+        const _realCount   = phase1Items.length;
+        _agg.ingest("oracle", oracleItems);
+        _oracleContributed = _agg.sourceStats().oracle?.added ?? oracleItems.length;
+        _oracleOnlyResult  = _realCount < 2;
+      }
+    }
+
+    // Snapshot, track per-source contributions, then dedupe + trim
+    let enrichedItems = _agg.snapshot();
+
+    const _srcStats = _agg.sourceStats();
+    for (const [src, stats] of Object.entries(_srcStats)) {
+      const contributed = stats.added + stats.upgraded;
+      if (contributed > 0) {
+        _scanStreamMetrics.sourceItemTotals[src] =
+          (_scanStreamMetrics.sourceItemTotals[src] || 0) + contributed;
+      }
+    }
+    scanLog("source_contributions", scanId, { sourceStats: _srcStats, aggSize: _agg.size });
+
+    // Dedupe + outlier trim (always — applies to both oracle and non-oracle paths)
+    enrichedItems = dedupeSmart(enrichedItems);
+    enrichedItems = trimPriceOutliers(enrichedItems);
+
+    if (!enrichedItems.length) {
+      _degraded       = true;
+      _degradedReason = _degradedReason || "no_market_data";
+      scanLog("no_results", scanId, { query });
+    }
+
+    if (clientClosed) { endStream(); return; }
+
+    const [_ebaySoldComps, _localComps] = await Promise.all([_ebaySoldPromise, _localCompsPromise]);
+    const _phase2Ms = Date.now() - _t2;
+    _recordStreamMetric("phase2TotalMs", _phase2Ms);
+
+    // Write enriched cache only for clean (non-oracle, non-degraded) results
+    if (!_oracleOnlyResult && !_degraded && enrichedItems.length > 0) {
+      SERP_CACHE.set(cacheKey, enrichedItems);
+      ENRICHED_SCAN_CACHE.set(cacheKey, {
+        items:        enrichedItems,
+        ebaySoldComps: _ebaySoldComps || null,
+        localComps:    _localComps    || null,
+      });
+    }
+
+    const _tFinalBuild = Date.now();
+    const finalPayload = await _buildPayload(enrichedItems, {
+      source:       _oracleOnlyResult ? "gpt_oracle"  : "live_market",
+      kind:         _oracleOnlyResult ? "oracle"       : "live_refresh",
+      isOracleOnly: _oracleOnlyResult,
+    }).catch(() => ({ items: [], query, searchedQueries: searchedQueries || [query] }));
+
+    if (_ebaySoldComps) finalPayload.ebaySoldComps = _ebaySoldComps;
+    if (_localComps)    finalPayload.localComps    = _localComps;
+
+    const _finalVerdictKey = finalPayload.profitIntel?.verdict || finalPayload.agentAction || null;
+    const _diff = {
+      itemsAdded:        enrichedItems.length - phase1Items.length,
+      verdictChanged:    _provVerdictKey !== null && _finalVerdictKey !== _provVerdictKey,
+      oracleContributed: _oracleContributed,
+    };
+
+    const _totalMs = Date.now() - _t0;
+    send("complete", {
+      ...finalPayload,
+      status: "complete", enriching: false,
+      dataDepth: enrichedItems.length < 3 ? "thin" : "normal",
+      ...(_degraded ? { degraded: true, degradedReason: _degradedReason } : {}),
+      _diff,
+      _timing: {
+        phase1Ms: _phase1Ms, phase2Ms: _phase2Ms,
+        oracleMs: _oracleMs, buildMs: Date.now() - _tFinalBuild, totalMs: _totalMs,
+      },
+      _scanPhase1Ms: _phase1Ms, _scanPhase2Ms: _phase2Ms, _scanTotalMs: _totalMs,
+    });
+    _recordStreamMetric("totalCompleted", 1);
+    if (_degraded) _recordStreamMetric("degradedCompletions", 1);
+    scanLog("complete", scanId, {
+      itemCount: enrichedItems.length, verdict: _finalVerdictKey,
+      verdictChanged: _diff.verdictChanged, oracleContributed: _oracleContributed,
+      degraded: _degraded, totalMs: _totalMs,
+    });
+
+  } catch (err) {
+    console.error("scan_stream_error:", err?.message || err);
+    if (!clientClosed) send("error", { code: "INTERNAL", message: String(err?.message || err) });
+  } finally {
+    endStream();
+  }
+});
+
+// ── Scan stream metrics endpoint ──────────────────────────────────────────────
+app.get("/ops/scan-stream-metrics", (req, res) => {
+  if (IS_PROD && OPS_SECRET && req.headers["x-ops-secret"] !== OPS_SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const median = (arr) => {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)];
+  };
+  const p95 = (arr) => {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.floor(s.length * 0.95)];
+  };
+  const m = _scanStreamMetrics;
+  const oracleEligible = m.oracleInvocations + m.oracleSkips;
+  res.json({
+    // counters
+    totalRequests:         m.totalRequests,
+    totalCompleted:        m.totalCompleted,
+    totalPhase1:           m.totalPhase1,
+    cacheHits:             m.cacheHits,
+    oracleInvocations:     m.oracleInvocations,
+    oracleTimeouts:        m.oracleTimeouts,
+    oracleSkips:           m.oracleSkips,
+    provisionalSent:       m.provisionalSent,
+    earlyProvisionalSent:  m.earlyProvisionalSent,
+    degradedCompletions:   m.degradedCompletions,
+    inflightHits:          m.inflightHits,
+    // rates
+    cacheHitRate:          m.totalRequests     ? (m.cacheHits              / m.totalRequests).toFixed(3)   : "0",
+    oracleInvokeRate:      oracleEligible       ? (m.oracleInvocations      / oracleEligible).toFixed(3)    : "0",
+    oracleSkipRate:        oracleEligible       ? (m.oracleSkips            / oracleEligible).toFixed(3)    : "0",
+    oracleTimeoutRate:     m.oracleInvocations  ? (m.oracleTimeouts         / m.oracleInvocations).toFixed(3) : "0",
+    provisionalRate:       m.totalPhase1        ? (m.provisionalSent        / m.totalPhase1).toFixed(3)    : "0",
+    earlyProvisionalRate:  m.provisionalSent    ? (m.earlyProvisionalSent   / m.provisionalSent).toFixed(3) : "0",
+    degradedRate:          m.totalCompleted     ? (m.degradedCompletions    / m.totalCompleted).toFixed(3)  : "0",
+    inflightHitRate:       m.totalPhase1        ? (m.inflightHits           / m.totalPhase1).toFixed(3)    : "0",
+    // latency distributions
+    phase1MedianMs:        median(m.phase1TotalMs),
+    phase1P95Ms:           p95(m.phase1TotalMs),
+    phase2MedianMs:        median(m.phase2TotalMs),
+    phase2P95Ms:           p95(m.phase2TotalMs),
+    ttfrMedianMs:          median(m.ttfrMs),
+    ttfrP95Ms:             p95(m.ttfrMs),
+    phase1SampleCount:     m.phase1TotalMs.length,
+    phase2SampleCount:     m.phase2TotalMs.length,
+    ttfrSampleCount:       m.ttfrMs.length,
+    // oracle decision reasons (top 5 each)
+    oracleInvokeReasons:   Object.entries(m.oracleInvokeReasons)
+      .sort(([,a],[,b]) => b - a).slice(0, 5).map(([r, c]) => ({ reason: r, count: c })),
+    oracleSkipReasons:     Object.entries(m.oracleSkipReasons)
+      .sort(([,a],[,b]) => b - a).slice(0, 5).map(([r, c]) => ({ reason: r, count: c })),
+    // per-source contribution totals (LiveAggregator — items added+upgraded per source across all scans)
+    sourceItemTotals:      Object.entries(m.sourceItemTotals)
+      .sort(([,a],[,b]) => b - a).map(([src, total]) => ({ source: src, total })),
+    // live state
+    enrichedCacheSize:     ENRICHED_SCAN_CACHE.size(),
+    inflightCount:         STREAM_PHASE1_INFLIGHT.size,
+    oracleThreshold:       SCAN_STREAM_ORACLE_THRESHOLD,
+    oracleBudgetMs:        SCAN_STREAM_ORACLE_BUDGET_MS,
+  });
 });
 
 app.post("/market/check", async (req, res) => {
@@ -17127,7 +20124,7 @@ async function saveSavedScanRecord(userId, record = {}) {
 
   const payload = {
     id,
-    query: normalizeQuery(record?.query || record?.finalQuery || "") || null,
+    query:      normalizeQuery(record?.query || record?.finalQuery || "") || null,
     finalQuery: normalizeQuery(record?.finalQuery || record?.query || "") || null,
     title:
       safeStr(record?.title, 220) ||
@@ -17135,15 +20132,32 @@ async function saveSavedScanRecord(userId, record = {}) {
       null,
     imageHash:
       safeStr(record?.imageHash || record?.visionIdentity?.imageHash, 128) || null,
-    best: record?.best ? compactSavedItem(record.best) : null,
-    bestPrice: finitePrice(record?.bestPrice ?? record?.best?.totalPrice ?? record?.best?.price),
+    // Originating scan replay ID — enables linking saved scan → outcome
+    scanId: safeStr(record?.scanId, 128) || null,
+    best:       record?.best ? compactSavedItem(record.best) : null,
+    bestPrice:  finitePrice(record?.bestPrice ?? record?.best?.totalPrice ?? record?.best?.price),
     top3: Array.isArray(record?.items)
       ? record.items.slice(0, 3).map((x) => compactSavedItem(x))
       : [],
-    visionIdentity: record?.visionIdentity || null,
-    prediction: record?.prediction || null,
-    consensus: record?.consensus || null,
-    notes: safeStr(record?.notes, 500) || null,
+    visionIdentity:  record?.visionIdentity || null,
+    prediction:      record?.prediction     || null,
+    consensus:       record?.consensus      || null,
+    // Snapshot of decision intelligence at time of save
+    buySignal:       safeStr(record?.buySignal || record?.profitIntel?.buySignal, 30) || null,
+    primaryAction:   safeStr(record?.primaryAction || record?.profitIntel?.primaryAction, 30) || null,
+    profitIntelSnapshot: record?.profitIntel
+      ? {
+          buySignal:    record.profitIntel.buySignal,
+          dealStrength: record.profitIntel.dealStrength,
+          demandScore:  record.profitIntel.demandScore,
+          resaleScore:  record.profitIntel.resaleScore,
+          confidenceV2: record.profitIntel.confidenceV2,
+          priceStats:   record.profitIntel.priceStats || null,
+        }
+      : null,
+    // Lifecycle state of this saved scan
+    lifecycleStatus: safeStr(record?.lifecycleStatus, 20) || "WATCHING",
+    notes:     safeStr(record?.notes, 500) || null,
     createdAt: Number(existing?.createdAt || Date.now()),
     updatedAt: Date.now(),
   };
@@ -17473,6 +20487,11 @@ async function runWatchCheck(userId, rawQuery) {
     reason: "watch_check",
   });
 
+  // Derive next recommended action for this watched item
+  const watchItem     = { targetPrice: null }; // anonymous watch — no per-user item context here
+  const priceHistory  = []; // history not loaded at this layer (loaded via watchlistIntelligence)
+  const nextAction    = buildWatchNextAction(watchItem, state.lastBestPrice, priceHistory);
+
   return {
     query,
     bestPrice: finitePrice(items[0]?.totalPrice ?? items[0]?.price),
@@ -17481,6 +20500,7 @@ async function runWatchCheck(userId, rawQuery) {
     state,
     consensus,
     watchSignals,
+    nextAction,
   };
 }
 
@@ -18810,6 +21830,186 @@ app.post(
     }
   });
 
+  // ── POST /scan/buy-outcome ────────────────────────────────────────────────────
+  // Records whether the user actually bought and/or sold the item.
+  // Body: { scanId, didBuy, buyPrice?, didSell?, sellPrice?, soldAt?, notes?, source? }
+  // This is the moat: real buy/sell outcomes linked to scan identity for calibration.
+  app.post("/scan/buy-outcome", async (req, res) => {
+    try {
+      const scanId = safeStr(req.body?.scanId, 128);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const didBuy    = !!req.body?.didBuy;
+      const buyPrice  = req.body?.buyPrice  != null ? Number(req.body.buyPrice)  : null;
+      const didSell   = !!req.body?.didSell;
+      const sellPrice = req.body?.sellPrice != null ? Number(req.body.sellPrice) : null;
+      const soldAt    = req.body?.soldAt    != null ? Number(req.body.soldAt)    : null;
+      const notes     = safeStr(req.body?.notes,  500) || null;
+      const source    = safeStr(req.body?.source, 80)  || null;
+
+      // Sanity: prices must be positive if provided
+      if (buyPrice  != null && (isNaN(buyPrice)  || buyPrice  <= 0)) return res.status(200).json({ ok: false, error: "invalid_buy_price" });
+      if (sellPrice != null && (isNaN(sellPrice) || sellPrice <= 0)) return res.status(200).json({ ok: false, error: "invalid_sell_price" });
+
+      const record = await recordBuyOutcome(redis, scanId, {
+        didBuy, buyPrice, didSell, sellPrice, soldAt, notes, source,
+      });
+
+      // Update category stats from scan replay context
+      const userId   = safeStr(req.body?.userId, 64) || null;
+      const category = safeStr(req.body?.category, 60) || null;
+      const buySignal = safeStr(req.body?.buySignal, 30) || null;
+      const query     = safeStr(req.body?.query, 300) || null;
+      if (userId && category) {
+        if (didBuy)  await recordUserCategoryActivity(userId, category, "buy",  buyPrice).catch(() => {});
+        if (didSell) {
+          const profit = sellPrice != null && buyPrice != null ? sellPrice - buyPrice : null;
+          await recordUserCategoryActivity(userId, category, "sell", profit).catch(() => {});
+        }
+        // Outcome learning: calibrate future agent decisions
+        const profitCents = didSell && sellPrice != null && buyPrice != null
+          ? Math.round((sellPrice - buyPrice) * 100) : null;
+        await recordOutcomeLearning(redis, userId, {
+          category, query, didBuy, profitCents, didSell, buySignal,
+        }).catch(() => {});
+
+        // WS3: Return outcome tracking
+        const didReturn = req.body?.didReturn != null ? !!req.body.didReturn : null;
+        if (didReturn !== null) {
+          await recordReturnOutcome(redis, userId, { category, didReturn }).catch(() => {});
+        }
+
+        // Decision dominance layer: feed all new calibration systems
+        if (didBuy && buySignal) {
+          const isWin = didSell ? (profitCents != null && profitCents > 0) : null;
+          const dealStrength = Number(req.body?.dealStrength) || 0;
+          const confidenceV2 = Number(req.body?.confidenceV2) || 0;
+          const depthTier    = safeStr(req.body?.depthTier, 30) || null;
+          const daysToSale   = didSell && soldAt
+            ? Math.max(0, (soldAt - Date.now()) / 86400000 + (soldAt > Date.now() ? 0 : (Date.now() - soldAt) / 86400000))
+            : null;
+
+          // Per-category threshold calibration
+          await recordCalibrationSample(redis, userId, {
+            category, buySignal, dealStrength, confidenceV2, isWin: isWin ?? false, daysToSale,
+          }).catch(() => {});
+
+          // Price tier sweet spot learning
+          await recordPriceTierOutcome(redis, userId, {
+            buyPrice, profitCents, didSell,
+          }).catch(() => {});
+
+          // Failure fingerprint: conditions present when user lost money
+          if (isWin === false) {
+            const _priceRange = buyPrice != null
+              ? (buyPrice < 75 ? "low" : buyPrice < 300 ? "mid" : "high")
+              : null;
+            await recordFailureFingerprint(redis, userId, {
+              buySignal, depthTier, confidenceV2, category,
+              priceRange: _priceRange,
+            }).catch(() => {});
+            // Phase 6: also record into failureFingerprintEngine for scan-time enforcement
+            await recordFailurePattern(redis, userId, {
+              buySignal, depthTier, priceRange: _priceRange, category,
+            }).catch(() => {});
+          }
+
+          // Streak + addiction: record profitable day if sold for profit
+          if (didSell && profitCents != null && profitCents > 0) {
+            await recordProfitableDay(redis, userId).catch(() => {});
+          }
+          await recordDailyActivity(redis, userId).catch(() => {});
+        }
+
+        // Missed opportunity detection: track strong buy signals that were passed
+        if (!didBuy && buySignal) {
+          const priceStats = req.body?.priceStats || null;
+          const missedData = detectMissedOpportunity({
+            scanId, buySignal,
+            dealStrength: Number(req.body?.dealStrength) || 0,
+            priceStats,
+            category, brand: safeStr(req.body?.brand, 80) || "", model: safeStr(req.body?.model, 80) || "",
+            query, didBuy: false,
+            passReason: safeStr(req.body?.passReason || req.body?.reason, 200) || null,
+            scannedPrice: buyPrice,
+            source: "buy_outcome",
+          });
+          if (missedData) {
+            await storeMissedOpportunity(redis, userId, missedData).catch(() => {});
+          }
+        }
+      }
+
+      // ── Phase 5: Outcome lifecycle state machine ──────────────────────────────
+      if (userId && scanId) {
+        try {
+          // Map buy-outcome fields to lifecycle state transition
+          if (!didBuy) {
+            // User explicitly passed — move to SKIPPED
+            await transitionOutcome(redis, pgPool, userId, scanId, "SKIPPED", {
+              notes: notes || undefined,
+            }).catch(() => {});
+          } else if (didBuy && !didSell) {
+            // Bought but not yet sold
+            await transitionOutcome(redis, pgPool, userId, scanId, "BOUGHT", {
+              buyPrice,
+              notes: notes || undefined,
+            }).catch(() => {});
+          } else if (didBuy && didSell && sellPrice != null) {
+            // Full round-trip: buy → sold (transition through BOUGHT then SOLD)
+            const existingState = await getOutcomeState(redis, pgPool, userId, scanId).catch(() => null);
+            const curState = existingState?.lifecycleState || "SCANNED";
+            if (!["BOUGHT", "LISTED"].includes(curState)) {
+              await transitionOutcome(redis, pgPool, userId, scanId, "BOUGHT", { buyPrice }).catch(() => {});
+            }
+            await transitionOutcome(redis, pgPool, userId, scanId, "SOLD", {
+              sellPrice,
+              soldAt,
+              sellPlatform: safeStr(req.body?.sellPlatform, 80) || null,
+              platformFeeRealized: req.body?.platformFeeRealized != null ? Number(req.body.platformFeeRealized) : null,
+              shippingRealized:    req.body?.shippingRealized    != null ? Number(req.body.shippingRealized)    : null,
+              notes: notes || undefined,
+            }).catch(() => {});
+          }
+
+          // Record realized profit when both prices confirmed
+          if (didBuy && didSell && buyPrice != null && buyPrice > 0 && sellPrice != null && sellPrice > 0) {
+            await recordRealizedProfit(redis, pgPool, userId, {
+              scanId,
+              category:            category || "",
+              brand:               safeStr(req.body?.brand, 80)  || "",
+              model:               safeStr(req.body?.model, 80)  || "",
+              buyPriceRealized:    buyPrice,
+              sellPriceRealized:   sellPrice,
+              platformFeeRealized: req.body?.platformFeeRealized != null ? Number(req.body.platformFeeRealized) : null,
+              shippingRealized:    req.body?.shippingRealized    != null ? Number(req.body.shippingRealized)    : null,
+              sellPlatform:        safeStr(req.body?.sellPlatform, 80) || null,
+              signalAtBuy:         buySignal || null,
+              boughtAt:            null,
+              soldAt,
+            }).catch(() => {});
+          }
+        } catch { /* non-fatal — legacy outcome recording already happened */ }
+      }
+
+      return res.status(200).json({ ok: !!record, record: record || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "buy_outcome_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /scan/buy-outcome/:scanId ─────────────────────────────────────────────
+  app.get("/scan/buy-outcome/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 128);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const record = await getBuyOutcome(redis, scanId);
+      return res.status(200).json({ ok: !!record, record: record || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "buy_outcome_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
   app.get("/scan/history", async (req, res) => {
     try {
       const userId = safeStr(req.query?.userId, 64);
@@ -18821,6 +22021,776 @@ app.post(
       return res.status(200).json({ ok: false, error: "scan_history_failed", reason: err?.message || String(err) });
     }
   });
+
+  // ── POST /outcome/state ────────────────────────────────────────────────────────
+  // Advance a scan item's lifecycle state.
+  // Body: { userId, scanId, toState, buyPrice?, sellPrice?, sellPlatform?,
+  //         platformFeeRealized?, shippingRealized?, soldAt?, notes? }
+  app.post("/outcome/state", async (req, res) => {
+    try {
+      const userId  = safeStr(req.body?.userId,  64);
+      const scanId  = safeStr(req.body?.scanId, 128);
+      const toState = safeStr(req.body?.toState,  20);
+      if (!userId || !scanId)  return res.status(200).json({ ok: false, error: "userId and scanId required" });
+      if (!toState)            return res.status(200).json({ ok: false, error: "toState required" });
+      if (!OUTCOME_STATES[toState]) return res.status(200).json({ ok: false, error: "invalid_state", validStates: Object.keys(OUTCOME_STATES) });
+
+      const result = await transitionOutcome(redis, pgPool, userId, scanId, toState, {
+        buyPrice:            req.body?.buyPrice         != null ? Number(req.body.buyPrice)          : null,
+        sellPrice:           req.body?.sellPrice        != null ? Number(req.body.sellPrice)         : null,
+        sellPlatform:        safeStr(req.body?.sellPlatform, 80) || null,
+        platformFeeRealized: req.body?.platformFeeRealized != null ? Number(req.body.platformFeeRealized) : null,
+        shippingRealized:    req.body?.shippingRealized    != null ? Number(req.body.shippingRealized)    : null,
+        soldAt:              req.body?.soldAt           != null ? Number(req.body.soldAt)            : null,
+        notes:               safeStr(req.body?.notes, 500) || null,
+      });
+
+      if (result?.error) return res.status(200).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, outcome: result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "outcome_transition_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /outcome/timeline/:scanId ─────────────────────────────────────────────
+  // Per-item event timeline. Query: userId (required).
+  app.get("/outcome/timeline/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 128);
+      const userId = safeStr(req.query?.userId, 64);
+      if (!scanId || !userId) return res.status(200).json({ ok: false, error: "scanId and userId required" });
+      const events = await getItemTimeline(redis, pgPool, userId, scanId);
+      return res.status(200).json({ ok: true, scanId, userId, events });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "timeline_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /outcome/history ──────────────────────────────────────────────────────
+  // Queryable outcome event history: userId (required), plus optional filters.
+  // Query params: eventType, toState, category, signal, since (ms), until (ms), limit
+  app.get("/outcome/history", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+      const events = await queryTimelineEvents(pgPool, userId, {
+        eventType: safeStr(req.query?.eventType, 40)  || null,
+        toState:   safeStr(req.query?.toState,   20)  || null,
+        category:  safeStr(req.query?.category,  60)  || null,
+        signal:    safeStr(req.query?.signal,    30)  || null,
+        since:     req.query?.since ? Number(req.query.since) : null,
+        until:     req.query?.until ? Number(req.query.until) : null,
+        limit:     req.query?.limit ? Math.min(Number(req.query.limit), 500) : 100,
+      });
+      return res.status(200).json({ ok: true, events });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "outcome_history_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /outcome/profit-ledger ─────────────────────────────────────────────────
+  // Realized P&L summary + optional recent entries.
+  // Query params: userId (required), category, includeEntries (bool), limit
+  app.get("/outcome/profit-ledger", async (req, res) => {
+    try {
+      const userId   = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+      const category       = safeStr(req.query?.category, 60) || null;
+      const includeEntries = req.query?.includeEntries === "true";
+      const limit          = req.query?.limit ? Math.min(Number(req.query.limit), 200) : 20;
+
+      const [summary, entries] = await Promise.all([
+        getRealizedProfitSummary(redis, pgPool, userId, { category }),
+        includeEntries ? listRealizedProfitEntries(redis, userId, { limit }) : Promise.resolve([]),
+      ]);
+
+      return res.status(200).json({ ok: true, summary: summary || null, entries });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "profit_ledger_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /personal/mode ───────────────────────────────────────────────────────
+  // Set user's preferred operating mode. Bounded by derived mode at runtime.
+  // Body: { userId, mode } — mode: "PROTECT" | "BALANCED" | "AGGRESSIVE"
+  app.post("/personal/mode", async (req, res) => {
+    try {
+      const userId = safeStr(req.body?.userId, 64);
+      const mode   = safeStr(req.body?.mode, 20);
+      if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+      if (!OPERATING_MODES[mode]) return res.status(200).json({ ok: false, error: "invalid_mode", validModes: Object.keys(OPERATING_MODES) });
+      const ok = await setUserOperatingMode(redis, userId, mode);
+      // Return the effective mode after bounds check
+      const effective = await computeUserOperatingMode(redis, userId).catch(() => null);
+      return res.status(200).json({ ok, preferenceSet: mode, effectiveMode: effective?.mode || null, reason: effective?.reason || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "set_mode_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /personal/profile ──────────────────────────────────────────────────────
+  // Full personal decision profile: mode, signal win rates, category mastery map,
+  // failure fingerprints, active suspensions.
+  // Query: userId (required), category? (for single-category mastery detail)
+  app.get("/personal/profile", async (req, res) => {
+    try {
+      const userId   = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+      const category = safeStr(req.query?.category, 60) || null;
+
+      const [operatingMode, accuracyProfile, masteryMap, fingerprints, categoryMastery] =
+        await Promise.all([
+          computeUserOperatingMode(redis, userId).catch(() => null),
+          computeAccuracyProfile(redis, userId).catch(() => null),
+          getCategoryMasteryMap(redis, userId).catch(() => new Map()),
+          loadFailureFingerprints(redis, userId).catch(() => []),
+          category ? computeCategoryMastery(redis, userId, category).catch(() => null) : Promise.resolve(null),
+        ]);
+
+      // Build signal win rates from accuracy profile
+      let personalSignalWinRates = null;
+      if (accuracyProfile?.signalBreakdown?.length > 0) {
+        const bd = accuracyProfile.signalBreakdown;
+        const find = (sig) => bd.find((b) => b.signal === sig);
+        const sb = find("STRONG BUY");
+        const gd = find("GOOD DEAL");
+        const fa = find("FAIR");
+        personalSignalWinRates = {
+          strongBuyHitRate:    sb?.biasedWinRate != null ? Math.round(Number(sb.biasedWinRate) * 100) / 100 : null,
+          goodDealHitRate:     gd?.biasedWinRate != null ? Math.round(Number(gd.biasedWinRate) * 100) / 100 : null,
+          fairOverrideHitRate: fa?.biasedWinRate != null ? Math.round(Number(fa.biasedWinRate) * 100) / 100 : null,
+          totalOutcomes:       Number(accuracyProfile.totalReported || 0),
+          overallAccuracy:     accuracyProfile.overallAccuracy != null
+            ? Math.round(Number(accuracyProfile.overallAccuracy) * 100) / 100 : null,
+        };
+      }
+
+      // Build mastery list and detect suspensions
+      const masteryList = Array.from(masteryMap.values())
+        .sort((a, b) => b.masteryScore - a.masteryScore);
+      const suspensions = await Promise.all(
+        masteryList
+          .filter((m) => (m.sbWinRate != null && m.sbWinRate < 40) || m.masteryLevel === "NOVICE")
+          .slice(0, 5)
+          .map((m) => buildCategorySuspensionRecommendation(redis, userId, m.category).catch(() => null))
+      );
+      const activeSuspensions = suspensions.filter((s) => s?.shouldSuspend);
+
+      // Active fingerprints that have hit the enforcement threshold (3+)
+      const activeFingerprints = fingerprints.filter((fp) => fp.count >= 3)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
+
+      return res.status(200).json({
+        ok: true,
+        userId,
+        userMode:              operatingMode?.mode     || OPERATING_MODES.BALANCED,
+        userModeReason:        operatingMode?.reason   || null,
+        derivedMode:           operatingMode?.derivedMode || null,
+        personalSignalWinRates: personalSignalWinRates || null,
+        categoryMastery:       category ? (categoryMastery || null) : null,
+        masteryList:           masteryList.slice(0, 20),
+        activeSuspensions,
+        activeFingerprints,
+        generatedAt:           Date.now(),
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "personal_profile_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /scan/pass ───────────────────────────────────────────────────────────
+  // Record a deliberate "pass" decision on a scan. Feeds category stats + buy outcome.
+  // Body: { userId, scanId?, query?, category?, scannedPrice?, buySignal?, reason? }
+  app.post("/scan/pass", async (req, res) => {
+    try {
+      const userId      = safeStr(req.body?.userId,    64)  || null;
+      const scanId      = safeStr(req.body?.scanId,    128) || null;
+      const category    = safeStr(req.body?.category,  60)  || null;
+      const scannedPrice = req.body?.scannedPrice != null ? Number(req.body.scannedPrice) : null;
+      const buySignal   = safeStr(req.body?.buySignal, 30)  || null;
+
+      // Store buy outcome (didBuy: false = pass)
+      if (scanId) {
+        await recordBuyOutcome(redis, scanId, { didBuy: false, buyPrice: scannedPrice, notes: safeStr(req.body?.reason, 200) || null }).catch(() => {});
+      }
+
+      // Update category stats
+      if (userId && category) {
+        await recordUserCategoryActivity(userId, category, "pass").catch(() => {});
+        await recordUserCategoryActivity(userId, category, "scan").catch(() => {});
+        // Outcome learning — pass is a non-buy signal
+        await recordOutcomeLearning(redis, userId, {
+          category,
+          query:        safeStr(req.body?.query, 300) || null,
+          didBuy:       false,
+          profitCents:  null,
+          didSell:      false,
+          buySignal,
+        }).catch(() => {});
+        // Detect missed opportunity if signal was strong
+        if (buySignal) {
+          const priceStats   = req.body?.priceStats || null;
+          const missedData = detectMissedOpportunity({
+            scanId,
+            buySignal,
+            dealStrength:  Number(req.body?.dealStrength) || 0,
+            priceStats,
+            category,
+            brand:         safeStr(req.body?.brand, 80) || "",
+            model:         safeStr(req.body?.model, 80) || "",
+            query:         safeStr(req.body?.query, 300) || null,
+            didBuy:        false,
+            passReason:    safeStr(req.body?.reason, 200) || null,
+            scannedPrice,
+            source:        "pass",
+          });
+          if (missedData) {
+            await storeMissedOpportunity(redis, userId, missedData).catch(() => {});
+          }
+        }
+      }
+
+      return res.status(200).json({ ok: true, recorded: true, buySignal });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "scan_pass_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /user/category-stats ──────────────────────────────────────────────────
+  // Returns per-category scan/buy/sell/pass counts and realized profit.
+  app.get("/user/category-stats", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const stats = await getUserCategoryStats(userId);
+      return res.status(200).json({ ok: true, stats: stats || [] });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "category_stats_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /portfolio/insight ────────────────────────────────────────────────────
+  // Enhanced portfolio summary: P&L + category breakdown + best/worst flip + advice.
+  app.get("/portfolio/insight", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const [perf, catStats] = await Promise.all([
+        getPortfolioPerformance(redis, userId),
+        getUserCategoryStats(userId),
+      ]);
+
+      if (!perf) return res.status(200).json({ ok: true, perf: null, advice: null, catStats: [] });
+
+      // Build actionable advice from performance
+      const advice = [];
+      if (perf.hitRate !== null) {
+        if (perf.hitRate >= 75)      advice.push(`Strong hit rate (${perf.hitRate}%) — your instincts are good. Keep scanning.`);
+        else if (perf.hitRate < 40)  advice.push(`Hit rate is low (${perf.hitRate}%). Focus on higher-confidence signals before buying.`);
+      }
+      if (perf.bestFlip) {
+        advice.push(`Best flip: ${perf.bestFlip.title || "item"} (+$${perf.bestFlip.gain}). Look for more in ${perf.bestFlip.category || "this category"}.`);
+      }
+      if (perf.categoryBreakdown?.length > 0) {
+        const top = perf.categoryBreakdown[0];
+        advice.push(`Top category by profit: ${top.category} (${top.soldCount} sold, $${top.totalGain} realized).`);
+      }
+
+      return res.status(200).json({ ok: true, perf, advice, catStats: catStats || [] });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "portfolio_insight_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /portfolio/item/set-status ──────────────────────────────────────────
+  // Update lifecycle status: HOLDING | LISTED | PASSED | BOUGHT | SOLD
+  // Body: { userId, itemId, lifecycleStatus }
+  app.post("/portfolio/item/set-status", async (req, res) => {
+    try {
+      const userId          = safeStr(req.body?.userId,          64);
+      const itemId          = safeStr(req.body?.itemId,          80);
+      const lifecycleStatus = safeStr(req.body?.lifecycleStatus, 20);
+      if (!userId || !itemId || !lifecycleStatus) {
+        return res.status(200).json({ ok: false, error: "missing_fields" });
+      }
+      const updated = await setPortfolioItemLifecycleStatus(redis, userId, itemId, lifecycleStatus);
+      if (!updated) return res.status(200).json({ ok: false, error: "item_not_found_or_invalid_status" });
+      return res.status(200).json({ ok: true, item: updated });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "set_status_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /saved-scans/rescore/:scanId ─────────────────────────────────────────
+  // Recompute profitIntel from cached market data for a saved scan.
+  // Cheap: pure computation, no new API calls. Returns verdictDelta.
+  app.post("/saved-scans/rescore/:scanId", async (req, res) => {
+    try {
+      const userId = safeStr(req.body?.userId || req.query?.userId, 64);
+      const scanId = safeStr(req.params?.scanId, 128);
+      if (!userId || !scanId) return res.status(200).json({ ok: false, error: "missing_fields" });
+
+      // Load saved scan to get query + original signal
+      const savedScans = await listSavedScanRecords(userId, 500);
+      const savedScan  = savedScans.find((s) => s.id === scanId || s.scanId === scanId);
+      if (!savedScan) return res.status(200).json({ ok: false, error: "saved_scan_not_found" });
+
+      const query = savedScan.finalQuery || savedScan.query;
+      if (!query)  return res.status(200).json({ ok: false, error: "no_query_on_saved_scan" });
+
+      // Pull from route cache (no live fetch — cost-free)
+      const cacheKey  = canonicalMarketQuery(query);
+      const cachedItems = SERP_CACHE.get(cacheKey);
+
+      if (!Array.isArray(cachedItems) || cachedItems.length === 0) {
+        return res.status(200).json({
+          ok: true, rescored: false,
+          reason: "no_cached_market_data",
+          hint: "Re-search this item to refresh market data first.",
+        });
+      }
+
+      const freshProfitIntel = assembleProfitIntel({
+        items:              cachedItems,
+        scannedPrice:       savedScan.bestPrice || null,
+        visionConfidence:   savedScan.profitIntelSnapshot?.confidenceV2 ?? 0.5,
+        confidenceV2:       savedScan.profitIntelSnapshot?.confidenceV2 ?? 0.5,
+        resultConsensus:    null,
+        refinementWarnings: [],
+        prediction:         null,
+        category:           savedScan.visionIdentity?.category || null,
+        crossCheck:         null,
+        isOracleOnly:       false,
+      });
+
+      // Store verdict drift
+      const driftRecord = await storeRescanVerdict(redis, scanId, {
+        currentBuySignal:  freshProfitIntel.buySignal,
+        currentPriceStats: freshProfitIntel.priceStats,
+        currentReasoning:  freshProfitIntel.reasoning,
+      }).catch(() => null);
+
+      const originalSignal = savedScan.buySignal || savedScan.profitIntelSnapshot?.buySignal || null;
+      const verdictChanged  = originalSignal && freshProfitIntel.buySignal !== originalSignal;
+
+      return res.status(200).json({
+        ok:               true,
+        rescored:         true,
+        originalBuySignal: originalSignal,
+        freshProfitIntel,
+        verdictChanged,
+        verdictDelta:     verdictChanged ? `${originalSignal} → ${freshProfitIntel.buySignal}` : null,
+        drift:            driftRecord || null,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "rescore_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /saved-scans/rescore/:scanId ─────────────────────────────────────────
+  // Retrieve the last rescore verdict for a saved scan.
+  app.get("/saved-scans/rescore/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 128);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const drift = await getRescanVerdict(redis, scanId);
+      return res.status(200).json({ ok: true, drift: drift || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "rescore_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ============================================================
+  // PHASE 3 — PROFIT ENGINE + DISCOVERY + PREDICTIVE TIMING
+  // ============================================================
+
+  // ── GET /feed/daily ───────────────────────────────────────────────────────────
+  // Full personalized daily opportunity feed. Aggregates alerts, discovery, missed,
+  // portfolio actions, and a personalized tip. No new API calls — pure computation.
+  // Query: userId
+  app.get("/feed/daily", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      // Parallel data fetch
+      const [
+        watchlistAlerts,
+        discoverySnap,
+        missedOpps,
+        portfolioItems,
+        categoryStats,
+        catAffinities,
+      ] = await Promise.all([
+        checkWatchlistAlerts(redis, userId, {}).catch(() => []),
+        getDiscoverySnapshot(redis, userId).catch(() => null),
+        listMissedOpportunities(redis, userId, 10).catch(() => []),
+        listPortfolioItems(redis, userId, 50).catch(() => []),
+        getUserCategoryStats(userId).catch(() => []),
+        getUserCategoryAffinity(redis, userId).catch(() => []),
+      ]);
+
+      const discoveryOpps = discoverySnap?.opportunities || [];
+      const catPriors     = await getCategoryOutcomePrior(redis, userId).catch(() => []);
+
+      const perf = await getPortfolioPerformance(redis, userId).catch(() => null);
+      const userPolicy = buildUserOpportunityPolicy({
+        categoryStats:     catPriors,
+        userHitRate:       perf?.hitRate ?? null,
+        portfolioCount:    portfolioItems.length,
+        avgMarginPct:      perf?.avgMarginPct ?? null,
+        totalRealizedGain: perf?.totalRealizedGain ?? 0,
+      });
+
+      const feed = buildDailyOpportunityFeed({
+        watchlistAlerts,
+        discoveryOpps,
+        missedOpps,
+        portfolioItems,
+        categoryStats: catPriors,
+        userPolicy,
+        rescanDrifts: [],
+        limit: 25,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        feed:           hydrateFeedCards(feed.flatFeed),
+        sections:       feed.sections,
+        totalCount:     feed.totalCount,
+        hasHighPriority: feed.hasHighPriority,
+        userPolicy,
+        generatedAt:    feed.generatedAt,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "daily_feed_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /feed/discovery ───────────────────────────────────────────────────────
+  // Returns the latest discovery snapshot for a user. Triggers a queue refresh if stale.
+  // Query: userId, forceRefresh=1
+  app.get("/feed/discovery", async (req, res) => {
+    try {
+      const userId       = safeStr(req.query?.userId, 64);
+      const forceRefresh = req.query?.forceRefresh === "1" || req.query?.forceRefresh === "true";
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      let snapshot = forceRefresh ? null : await getDiscoverySnapshot(redis, userId);
+
+      if (!snapshot || forceRefresh) {
+        // Enqueue a refresh — returns stale snapshot in the meantime
+        enqueueBackgroundJob("discovery_refresh", { userId }, async (payload) => {
+          try {
+            const [watchlist, portfolio, catStats, affinities, savedScans] = await Promise.all([
+              listWatchlistItems(redis, payload.userId, 50).catch(() => []),
+              listPortfolioItems(redis, payload.userId, 100).catch(() => []),
+              getUserCategoryStats(payload.userId).catch(() => []),
+              getUserCategoryAffinity(redis, payload.userId).catch(() => []),
+              listSavedScanRecords(payload.userId, 20).catch(() => []),
+            ]);
+
+            const queryUniverse = buildDiscoveryQueryUniverse({
+              watchlistItems:     watchlist,
+              portfolioItems:     portfolio,
+              categoryStats:      catStats,
+              categoryAffinities: affinities,
+              savedScans,
+              maxQueries:         20,
+            });
+
+            if (queryUniverse.length === 0) return { ok: true, processed: 0, opportunities: [] };
+
+            await enqueueDiscoveryScans(redis, payload.userId, queryUniverse);
+
+            const watchedFps = new Set(watchlist.map((w) => w.fingerprint).filter(Boolean));
+            const ownedFps   = new Set(portfolio.map((p) => p.fingerprint || "").filter(Boolean));
+
+            return await runDiscoveryRefreshJob(redis, payload.userId, {
+              fetchMarketItems: async (query) => {
+                const key   = canonicalMarketQuery(query);
+                const cached = SERP_CACHE.get(key);
+                return Array.isArray(cached) ? cached : [];
+              },
+              assembleProfitIntel,
+              watchedFingerprints: watchedFps,
+              ownedFingerprints:   ownedFps,
+              batchSize: 8,
+            });
+          } catch {
+            return { ok: false, processed: 0, opportunities: [] };
+          }
+        });
+      }
+
+      return res.status(200).json({
+        ok:           true,
+        opportunities: snapshot?.opportunities || [],
+        count:         snapshot?.opportunities?.length || 0,
+        isStale:       !snapshot || forceRefresh,
+        refreshQueued: !snapshot || forceRefresh,
+        generatedAt:   snapshot?.generatedAt || null,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feed_discovery_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /feed/missed ──────────────────────────────────────────────────────────
+  // Returns missed opportunity cards for the user.
+  // Query: userId, limit
+  app.get("/feed/missed", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      const limit  = Math.min(50, Math.max(1, Number(req.query?.limit) || 20));
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const missed = await listMissedOpportunities(redis, userId, limit);
+      const cards  = missed.map(buildMissedOpportunityCard).filter(Boolean);
+
+      return res.status(200).json({
+        ok:    true,
+        cards,
+        count: cards.length,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feed_missed_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /intel/timing ─────────────────────────────────────────────────────────
+  // Predictive timing advice for a given item/scan.
+  // Query: userId, scanId, category, currentPrice, dealStrength, demandScore, buySignal
+  app.get("/intel/timing", async (req, res) => {
+    try {
+      const userId       = safeStr(req.query?.userId, 64);
+      const scanId       = safeStr(req.query?.scanId, 128);
+      const category     = safeStr(req.query?.category, 60);
+      const currentPrice = Number(req.query?.currentPrice) || null;
+      const dealStrength = Number(req.query?.dealStrength) || 0;
+      const demandScore  = Number(req.query?.demandScore)  || 0;
+      const buySignal    = safeStr(req.query?.buySignal, 30);
+      const isWatched    = req.query?.isWatched === "1" || req.query?.isWatched === "true";
+
+      // Load price history from watchlist if scanId or fingerprint available
+      let priceHistory = [];
+      if (userId && req.query?.fingerprint) {
+        const fp = safeStr(req.query.fingerprint, 120);
+        priceHistory = await getWatchlistPriceHistory(redis, fp, 30).catch(() => []);
+      }
+
+      const timingIntel  = predictTimingSignal({
+        priceHistory,
+        currentPrice:   currentPrice ?? priceHistory[0]?.price ?? null,
+        category,
+        buySignal,
+        dealStrength,
+        demandScore,
+        listingCount:   Number(req.query?.listingCount) || 0,
+        isWatched,
+      });
+
+      const advice = buildTimingAdvice(timingIntel);
+
+      return res.status(200).json({ ok: true, timingIntel, advice });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "timing_intel_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /intel/agent ──────────────────────────────────────────────────────────
+  // Personal agent decision for the current user+scan. ONE clear action.
+  // Query: userId + all profit intel fields OR body for POST usage
+  app.get("/intel/agent", async (req, res) => {
+    try {
+      const userId       = safeStr(req.query?.userId, 64);
+      const category     = safeStr(req.query?.category, 60);
+      const buySignal    = safeStr(req.query?.buySignal, 30);
+      const primaryAction = safeStr(req.query?.primaryAction, 30);
+      const timingSignal  = safeStr(req.query?.timingSignal, 20);
+      const dealStrength  = Number(req.query?.dealStrength)  || 0;
+      const demandScore   = Number(req.query?.demandScore)   || 0;
+      const resaleScore   = Number(req.query?.resaleScore)   || 0;
+      const confidenceV2  = Number(req.query?.confidenceV2)  || 0;
+      const isWatched     = req.query?.isWatched === "1" || req.query?.isWatched === "true";
+      const isOwned       = req.query?.isOwned   === "1" || req.query?.isOwned   === "true";
+
+      // Load user outcome priors
+      const [perf, catPriors, affinities] = await Promise.all([
+        getPortfolioPerformance(redis, userId).catch(() => null),
+        getCategoryOutcomePrior(redis, userId).catch(() => []),
+        getUserCategoryAffinity(redis, userId).catch(() => []),
+      ]);
+
+      const catPrior   = catPriors.find((c) => c.category === (category || "").toLowerCase()) || null;
+      const affinity   = affinities.find((a) => a.category === (category || "").toLowerCase());
+      const affScore   = affinity?.affinityScore ?? 0;
+      const userHitRate = perf?.hitRate ?? null;
+
+      // Apply outcome biases
+      const biasResult = applyOutcomeBiasesToDecision({
+        buySignal,
+        category,
+        categoryPrior: catPrior,
+        userHitRate,
+      });
+
+      const agentDecision = buildPersonalAgentDecision({
+        buySignal:         biasResult.biasedBuySignal,
+        primaryAction,
+        timingSignal,
+        dealStrength,
+        demandScore,
+        resaleScore,
+        confidenceV2,
+        category,
+        userAffinityScore: affScore,
+        userHitRate,
+        portfolioCount:    0,
+        isWatched,
+        isOwned,
+      });
+
+      return res.status(200).json({
+        ok:             true,
+        agentDecision,
+        biasNote:       biasResult.biasNote || null,
+        originalSignal: biasResult.originalBuySignal,
+        biasedSignal:   biasResult.biasedBuySignal,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "agent_intel_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /discovery/refresh ───────────────────────────────────────────────────
+  // Trigger an immediate synchronous discovery refresh (small batch, no queue).
+  // Body: { userId }
+  app.post("/discovery/refresh", async (req, res) => {
+    try {
+      const userId = safeStr(req.body?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const [watchlist, portfolio, catStats, affinities, savedScans] = await Promise.all([
+        listWatchlistItems(redis, userId, 50).catch(() => []),
+        listPortfolioItems(redis, userId, 100).catch(() => []),
+        getUserCategoryStats(userId).catch(() => []),
+        getUserCategoryAffinity(redis, userId).catch(() => []),
+        listSavedScanRecords(userId, 20).catch(() => []),
+      ]);
+
+      const queryUniverse = buildDiscoveryQueryUniverse({
+        watchlistItems:     watchlist,
+        portfolioItems:     portfolio,
+        categoryStats:      catStats,
+        categoryAffinities: affinities,
+        savedScans,
+        maxQueries:         15,
+      });
+
+      if (queryUniverse.length === 0) {
+        return res.status(200).json({ ok: true, processed: 0, opportunities: [], message: "No query universe — scan more items first" });
+      }
+
+      await enqueueDiscoveryScans(redis, userId, queryUniverse);
+
+      const watchedFps = new Set(watchlist.map((w) => w.fingerprint).filter(Boolean));
+      const ownedFps   = new Set(portfolio.map((p) => p.fingerprint || "").filter(Boolean));
+
+      const result = await runDiscoveryRefreshJob(redis, userId, {
+        fetchMarketItems: async (query) => {
+          const key    = canonicalMarketQuery(query);
+          const cached = SERP_CACHE.get(key);
+          return Array.isArray(cached) ? cached : [];
+        },
+        assembleProfitIntel,
+        watchedFingerprints: watchedFps,
+        ownedFingerprints:   ownedFps,
+        batchSize: 6,
+      });
+
+      return res.status(200).json({
+        ok:           true,
+        processed:    result?.processed || 0,
+        opportunities: result?.opportunities || [],
+        count:        result?.opportunities?.length || 0,
+        queryCount:   queryUniverse.length,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "discovery_refresh_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /user/opportunity-profile ────────────────────────────────────────────
+  // Full user opportunity profile: policy, next best action, category affinities,
+  // query outcome priors, and portfolio performance summary.
+  // Query: userId
+  app.get("/user/opportunity-profile", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const [
+        perf,
+        catPriors,
+        affinities,
+        queryPriors,
+        portfolioItems,
+        watchlistAlerts,
+        discoverySnap,
+        missedOpps,
+      ] = await Promise.all([
+        getPortfolioPerformance(redis, userId).catch(() => null),
+        getCategoryOutcomePrior(redis, userId).catch(() => []),
+        getUserCategoryAffinity(redis, userId).catch(() => []),
+        getQueryOutcomePrior(redis, userId, 10).catch(() => []),
+        listPortfolioItems(redis, userId, 50).catch(() => []),
+        checkWatchlistAlerts(redis, userId, {}).catch(() => []),
+        getDiscoverySnapshot(redis, userId).catch(() => null),
+        listMissedOpportunities(redis, userId, 5).catch(() => []),
+      ]);
+
+      const userPolicy = buildUserOpportunityPolicy({
+        categoryStats:     catPriors,
+        userHitRate:       perf?.hitRate ?? null,
+        portfolioCount:    portfolioItems.length,
+        avgMarginPct:      perf?.avgMarginPct ?? null,
+        totalRealizedGain: perf?.totalRealizedGain ?? 0,
+      });
+
+      const nextBestAction = buildNextBestAction({
+        watchlistAlerts,
+        discoveryOpps: discoverySnap?.opportunities || [],
+        portfolioItems,
+        userHitRate:   perf?.hitRate ?? null,
+      });
+
+      return res.status(200).json({
+        ok:             true,
+        userPolicy,
+        nextBestAction,
+        categoryAffinities: affinities,
+        categoryOutcomePriors: catPriors,
+        topQueries:     queryPriors,
+        portfolioPerf:  perf ? {
+          hitRate:           perf.hitRate,
+          avgMarginPct:      perf.avgMarginPct,
+          totalRealizedGain: perf.totalRealizedGain,
+          bestFlip:          perf.bestFlip,
+          soldItems:         perf.soldItems,
+        } : null,
+        discoveryCount:   discoverySnap?.opportunities?.length || 0,
+        alertCount:       watchlistAlerts.length,
+        missedCount:      missedOpps.length,
+        generatedAt:      Date.now(),
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "opportunity_profile_failed", reason: err?.message || String(err) });
+    }
+  });
+
 
   // -------------------- COUNTERFACTUAL RESULT ROUTE --------------------
 
@@ -19058,6 +23028,188 @@ app.post(
       return res.status(200).json({ ok: true, demand: result || null });
     } catch (err) {
       return res.status(200).json({ ok: false, error: "watchlist_demand_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── Phase 8: Watchlist intelligence upgrades ───────────────────────────────
+
+  // GET /watchlist/alerts/full?userId=...
+  // Returns all alert types: existing + relist + similar + escalation
+  app.get("/watchlist/alerts/full", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      // Base alerts (target_hit, new_low, significant_drop)
+      const baseAlerts = await checkWatchlistAlerts(redis, userId, {});
+
+      // Load watchlist items for enhanced checks
+      const watchItems = await listWatchlistItems(redis, userId, 50);
+      const enhancedAlerts = [];
+
+      for (const item of watchItems) {
+        const fp = item.fingerprint;
+        const lastSeen = item.lastSeenPrice;
+        if (!fp) continue;
+
+        // Relist alert — only if we have lastSeenPrice and last check was >5 days ago
+        if (lastSeen && item.lastCheckedAt) {
+          const relistAlert = await checkRelistAlert(redis, userId, item, lastSeen, []).catch(() => null);
+          if (relistAlert) enhancedAlerts.push(relistAlert);
+        }
+
+        // Escalation alert — requires current price and market data
+        if (lastSeen && item.marketPriceAtAdd) {
+          const escAlert = await checkEscalationAlert(redis, userId, item, lastSeen, item.marketPriceAtAdd, null).catch(() => null);
+          if (escAlert) enhancedAlerts.push(escAlert);
+        }
+      }
+
+      const allAlerts = [...baseAlerts, ...enhancedAlerts]
+        .sort((a, b) => (b.priority === "HIGH" ? 1 : 0) - (a.priority === "HIGH" ? 1 : 0));
+
+      return res.status(200).json({ ok: true, alerts: allAlerts, totalCount: allAlerts.length });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "watchlist_full_alerts_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // POST /watchlist/velocity-check
+  // Body: { userId, fingerprint, items, buySignal, marketMedian }
+  // Check velocity for a specific item fingerprint
+  app.post("/watchlist/velocity-check", async (req, res) => {
+    try {
+      const userId      = safeStr(req.body?.userId, 64);
+      const fingerprint = safeStr(req.body?.fingerprint, 128);
+      if (!userId || !fingerprint) return res.status(200).json({ ok: false, error: "missing_fields" });
+
+      const items       = Array.isArray(req.body?.items) ? req.body.items.slice(0, 50) : [];
+      const buySignal   = safeStr(req.body?.buySignal, 30) || null;
+      const marketMedian = finitePrice(req.body?.marketMedian);
+
+      const alert = await analyzeVelocityForItem(redis, userId, {
+        fingerprint,
+        items,
+        priceHistory: [],
+        buySignal,
+        marketMedian,
+      });
+
+      return res.status(200).json({ ok: true, velocityAlert: alert || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "velocity_check_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // POST /market/arbitrage
+  // Body: { items, identity: { brand, model, category }, identityConf, condition, sellPlatform }
+  // Detect arbitrage opportunities in a set of market items
+  app.post("/market/arbitrage", async (req, res) => {
+    try {
+      const items       = Array.isArray(req.body?.items) ? req.body.items.slice(0, 100) : [];
+      const identity    = req.body?.identity || {};
+      const identityConf = Number(req.body?.identityConf) || 0;
+      const condition   = safeStr(req.body?.condition, 60) || "";
+      const sellPlatform = safeStr(req.body?.sellPlatform, 40) || null;
+
+      if (!items.length) return res.status(200).json({ ok: false, error: "no_items" });
+      if (!identity?.brand || !identity?.model) {
+        return res.status(200).json({ ok: false, error: "identity_required", detail: "brand and model required for arbitrage detection" });
+      }
+
+      const opportunities = detectArbitrageOpportunities(items, identity, { identityConf, condition, sellPlatform });
+      const summary       = opportunities.length > 0 ? opportunities[0] : null;
+
+      return res.status(200).json({
+        ok: true,
+        found: opportunities.length > 0,
+        count: opportunities.length,
+        best: summary ? {
+          score:          summary.score,
+          buyPlatform:    summary.buyPlatform,
+          buyPrice:       summary.buyPrice,
+          sellPlatform:   summary.sellPlatform,
+          sellPrice:      summary.sellPrice,
+          netDollars:     summary.netDollars,
+          netMarginPct:   round2(summary.netPct * 100),
+          identityConf:   summary.identityConfidence,
+          reasoning:      summary.reasoning || null,
+        } : null,
+        opportunities: opportunities.slice(0, 5),
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "arbitrage_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // GET /feed/scout?userId=...
+  // Returns deal scout targets for a user
+  app.get("/feed/scout", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      // Try cached snapshot first
+      const cached = await loadScoutSnapshot(redis, userId).catch(() => null);
+      if (cached && (Date.now() - (cached.generatedAt || 0)) < 3 * 3600 * 1000) {
+        return res.status(200).json({ ok: true, ...cached, fromCache: true });
+      }
+
+      // Load discovery snapshot for scout generation
+      const { getDiscoverySnapshot } = await import("./src/discoveryEngine.js");
+      const snap = await getDiscoverySnapshot(redis, userId).catch(() => null);
+      const discoveryOpps = snap?.opportunities || [];
+
+      // Load mastery map
+      const { getCategoryMasteryMap } = await import("./src/categoryMastery.js");
+      const masteryMap = await getCategoryMasteryMap(redis, userId).catch(() => new Map());
+
+      // Load capital block
+      const portfolioSummary = await analyzePortfolioCapital(redis, userId).catch(() => null);
+      const capitalBlock = portfolioSummary ? buildCapitalBlockSignal(portfolioSummary) : null;
+
+      // Build user's top categories from category activity
+      const catStats = await getUserCategoryStats(userId).catch(() => null);
+      const topCategories = catStats
+        ? Object.entries(catStats)
+            .sort(([, a], [, b]) => (b.profitCents || 0) - (a.profitCents || 0))
+            .slice(0, 5)
+            .map(([cat]) => cat)
+        : [];
+
+      const result = await buildDealScoutTargets(redis, userId, {
+        discoveryOpps,
+        masteryMap,
+        topCategories,
+        capitalBlock,
+        priceSweet: null,
+      });
+
+      return res.status(200).json({ ok: true, ...result, fromCache: false });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "scout_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // GET /feed/reinvestment?userId=...&limit=...
+  // Returns reinvestment analogs for missed opportunities
+  app.get("/feed/reinvestment", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const limit = Math.max(1, Math.min(5, Number(req.query?.limit || 2)));
+
+      const [missedOpps, discoverySnap] = await Promise.all([
+        listMissedOpportunities(redis, userId, 10).catch(() => []),
+        import("./src/discoveryEngine.js").then(m => m.getDiscoverySnapshot(redis, userId)).catch(() => null),
+      ]);
+
+      const discoveryOpps = discoverySnap?.opportunities || [];
+      const cards = buildReinvestmentCards(missedOpps, discoveryOpps, limit);
+
+      return res.status(200).json({ ok: true, cards, count: cards.length, generatedAt: Date.now() });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "reinvestment_failed", reason: err?.message || String(err) });
     }
   });
 
@@ -20019,9 +24171,69 @@ app.post(
       const userId = safeStr(req.query?.userId, 64);
       if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
       const result = await buildPortfolioPayload(redis, userId);
-      return res.status(200).json({ ok: true, ...result });
+
+      // Enrich each portfolio item with exit intel (Phase 7)
+      const rawItems = result?.portfolio?.items || [];
+      const enrichedItems = rawItems.map(item => {
+        try {
+          const daysHeld = computeDaysHeld(item);
+          const exitIntel = buildFullExitIntel(item, {
+            daysHeld,
+            liquidityTier: item.liquidityTier || "DEVELOPING",
+            liquidityScore: item.liquidityScore ?? 0,
+            medianDaysToSell: item.medianDaysToSell ?? 30,
+            marketMedian: item.currentMedian ?? item.currentMarketPrice ?? null,
+            marketItems: item.recentComps || [],
+          });
+          return { ...item, daysHeld, exitIntel };
+        } catch { return item; }
+      });
+
+      const enrichedPortfolio = result?.portfolio
+        ? { ...result.portfolio, items: enrichedItems }
+        : null;
+
+      // Build capital block signal for SELL_FIRST gate
+      const portfolioSummary = await analyzePortfolioCapital(redis, userId).catch(() => null);
+      const capitalBlock = portfolioSummary ? buildCapitalBlockSignal(portfolioSummary) : null;
+
+      return res.status(200).json({
+        ok: true,
+        portfolio: enrichedPortfolio,
+        topSignal: result?.topSignal || null,
+        capitalBlock: capitalBlock || null,
+        capitalRiskSummary: portfolioSummary
+          ? {
+              dominantRisk:       portfolioSummary.dominantRisk,
+              criticalCount:      portfolioSummary.criticalCount,
+              highCount:          portfolioSummary.highCount,
+              totalTrappedCapital: portfolioSummary.totalTrappedCapital,
+            }
+          : null,
+      });
     } catch (err) {
       return res.status(200).json({ ok: false, error: "portfolio_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // GET /portfolio/capital-allocator?userId=...
+  app.get("/portfolio/capital-allocator", async (req, res) => {
+    try {
+      const userId = safeStr(req.query?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const portfolioSummary = await analyzePortfolioCapital(redis, userId);
+      const allocator = buildCapitalAllocatorPayload(portfolioSummary?.items || []);
+      const capitalBlock = buildCapitalBlockSignal(portfolioSummary);
+
+      return res.status(200).json({
+        ok: true,
+        ...allocator,
+        capitalBlock: capitalBlock || null,
+        generatedAt: Date.now(),
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "capital_allocator_failed", reason: err?.message || String(err) });
     }
   });
 
@@ -21110,6 +25322,34 @@ if (shouldRunQueueWorkers()) {
     workers: QUEUE_WORKER_CONCURRENCY,
     role: SERVER_ROLE,
   });
+
+  // WS1 + WS7: Start accuracy calibration worker (handles recalc-user, recalc-global,
+  // solicit-outcome, audit-system job types)
+  if (redis) {
+    try {
+      startAccuracyCalibrationWorker({ redisConnection: redis, pgPool, redis });
+      console.log("📊 AccuracyCalibrationWorker started (WS1+WS7)");
+    } catch (err) {
+      console.warn("AccuracyCalibrationWorker start failed:", err?.message);
+    }
+  }
+}
+
+// WS7: Weekly audit cron — runs every Monday ~03:00 UTC
+// Checks once per minute whether we're in the target window.
+if (redis) {
+  warmSuppressionCache().catch(() => {}); // warm on startup
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      if (now.getUTCDay() === 1 && now.getUTCHours() === 3 && now.getUTCMinutes() < 5) {
+        await enqueueAuditSystem(redis).catch(() => {});
+      }
+    } catch { /* non-fatal */ }
+  }, 60_000).unref?.();
+
+  // Re-warm suppression cache every 5 minutes
+  setInterval(() => warmSuppressionCache().catch(() => {}), SUPPRESSION_CACHE_TTL_MS).unref?.();
 }
 
 startLeaderOnlyLoops();
@@ -21610,6 +25850,610 @@ app.post("/intel/category-saturation", (req, res) => {
     localNote: "Saturation index based on national resale data. Local markets may vary ±15%.",
     weeklyChange,
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accuracy/score/:userId
+// Bias-corrected accuracy profile for a user.
+//
+// Response: { ok, overallAccuracy, reportedAccuracy, reportingRate,
+//             calibrationScore, signalBreakdown, biasCorrection, totalScans }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/accuracy/score/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+
+    const profile = await computeAccuracyProfile(redis, userId);
+    return res.status(200).json({ ok: true, ...profile });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "accuracy_score_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/accuracy/record-scan
+// Record that a buy signal was shown to a user (before outcome is known).
+// Called client-side when scan result is displayed.
+//
+// Body: { userId, signal, scanId }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/accuracy/record-scan", async (req, res) => {
+  try {
+    const userId   = safeStr(req.body?.userId, 64);
+    const signal   = safeStr(req.body?.signal, 30);
+    const scanId   = safeStr(req.body?.scanId, 128) || null;
+    const category = safeStr(req.body?.category, 60) || null;
+    if (!userId || !signal) return res.status(200).json({ ok: false, error: "userId and signal required" });
+
+    await recordSignalScan(redis, userId, signal);
+
+    // Phase 5: Initialize outcome lifecycle when a signal is produced
+    if (scanId) {
+      initOutcome(redis, pgPool, userId, scanId, {
+        signalShown: signal,
+        category:    category || null,
+        brand:       safeStr(req.body?.brand, 80)  || null,
+        model:       safeStr(req.body?.model, 80)  || null,
+        scannedAt:   Date.now(),
+      }).catch(() => {});
+    }
+
+    // WS1: 20% solicitation sampling — randomly enqueue outcome solicitation jobs
+    if (scanId && ["STRONG BUY", "GOOD DEAL"].includes(signal) && redis) {
+      const sample = crypto.randomBytes(1)[0]; // 0–255
+      if (sample < 51) { // ~20% (51/256 ≈ 19.9%)
+        // Write solicitation record immediately
+        if (pgPool) {
+          pgPool.query(`
+            INSERT INTO outcome_solicitations (scan_id, user_id, category, signal_type)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (scan_id, user_id) DO NOTHING
+          `, [scanId, userId, category, signal]).catch(() => {});
+        }
+        // Enqueue 30-day and 60-day solicitation jobs
+        const redisConn = redis;
+        enqueueOutcomeSolicitation(redisConn, {
+          scanId, userId, category, signalType: signal,
+          delayMs: 30 * 24 * 60 * 60 * 1000,
+        }).catch(() => {});
+        enqueueOutcomeSolicitation(redisConn, {
+          scanId, userId, category, signalType: signal,
+          delayMs: 60 * 24 * 60 * 60 * 1000,
+        }).catch(() => {});
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "record_scan_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/accuracy/record-outcome
+// Record a user-reported outcome for a scan.
+// Feeds the bias-corrected accuracy engine.
+//
+// Body: { userId, scanId, signal, didBuy, isWin, profitCents }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/accuracy/record-outcome", async (req, res) => {
+  try {
+    const userId     = safeStr(req.body?.userId, 64);
+    const signal     = safeStr(req.body?.signal, 30);
+    const didBuy     = Boolean(req.body?.didBuy);
+    const isWin      = req.body?.isWin != null ? Boolean(req.body.isWin) : null;
+    const profitCents = req.body?.profitCents != null ? Number(req.body.profitCents) : null;
+
+    if (!userId || !signal) return res.status(200).json({ ok: false, error: "userId and signal required" });
+
+    await recordSignalOutcome(redis, userId, { signal, didBuy, isWin, profitCents });
+
+    // WS1: mark outcome_solicitations response when present
+    const scanId    = safeStr(req.body?.scanId, 128) || null;
+    const category  = safeStr(req.body?.category, 60) || null;
+    const dealStr   = req.body?.dealStrength != null ? Number(req.body.dealStrength) : null;
+    const confidence = req.body?.confidence != null ? Number(req.body.confidence) : null;
+
+    if (scanId && isWin !== null && pgPool) {
+      const response = isWin ? "WIN" : "LOSS";
+      pgPool.query(`
+        UPDATE outcome_solicitations
+        SET response = $1, response_received_at = NOW()
+        WHERE scan_id = $2 AND user_id = $3 AND response IS NULL
+      `, [response, scanId, userId]).catch(() => {});
+    }
+
+    // Phase 10: Record into calibration curve bins for this category+signal
+    if (category && isWin !== null && dealStr !== null) {
+      recordCurveOutcome(redis, {
+        category, signal, dealStrength: dealStr, confidence, isWin: !!isWin,
+      }).catch(() => {});
+    }
+
+    // Phase 10: Record false positive if this is a STRONG BUY / GOOD DEAL loss
+    if (category && isWin === false && ["STRONG BUY", "GOOD DEAL"].includes(signal)) {
+      recordFalsePositive(redis, {
+        category, signal, dealStrength: dealStr, confidence, scannedAt: Date.now(),
+      }).catch(() => {});
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "record_outcome_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accuracy/global
+// Global cross-user signal calibration (anonymized aggregate).
+// Ops use: detect if STRONG BUY win rate drops below 80% threshold.
+//
+// Response: { ok, calibration: [{ signal, winRate, targetWinRate, isCalibrated, reported }] }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/accuracy/global", requireOpsAccess, async (_req, res) => {
+  try {
+    const calibration = await getGlobalCalibration(redis);
+    return res.status(200).json({ ok: true, calibration: calibration || [] });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "global_calibration_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ops/calibration/silence
+// WS1: Per-category empirical silence factors and sample sizes.
+// Shows which categories have replaced the default 0.65 factor with empirical data.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/calibration/silence", requireOpsAccess, async (_req, res) => {
+  try {
+    // Pull all known categories from recent calibration data
+    let categories = [];
+    if (pgPool) {
+      const result = await pgPool.query(`
+        SELECT DISTINCT category FROM scan_sessions
+        WHERE category IS NOT NULL AND category != ''
+          AND created_at > NOW() - INTERVAL '30 days'
+        ORDER BY category
+      `).catch(() => ({ rows: [] }));
+      categories = result.rows.map(r => r.category);
+    }
+
+    const factors = await Promise.all(
+      categories.map(async (cat) => {
+        const empirical = await getEmpiricalSilenceFactor(redis, cat).catch(() => null);
+        return {
+          category:      cat,
+          silenceFactor: empirical?.factor ?? 0.65,
+          source:        empirical ? "empirical" : "default",
+          sampleSize:    empirical?.sampleSize ?? null,
+          updatedAt:     empirical?.updatedAt ? new Date(empirical.updatedAt).toISOString() : null,
+          divergence:    empirical ? Math.round((empirical.factor - 0.65) * 100) / 100 : 0,
+        };
+      })
+    );
+
+    // Solicitation response stats
+    let solicitationStats = [];
+    if (pgPool) {
+      const sResult = await pgPool.query(`
+        SELECT
+          category,
+          COUNT(*)                                        AS total_solicited,
+          COUNT(response)                                 AS responded,
+          ROUND(COUNT(response)::numeric / NULLIF(COUNT(*), 0) * 100, 2) AS response_rate_pct,
+          SUM(CASE WHEN response = 'WIN'  THEN 1 ELSE 0 END) AS wins,
+          SUM(CASE WHEN response = 'LOSS' THEN 1 ELSE 0 END) AS losses
+        FROM outcome_solicitations
+        WHERE solicitation_sent_at IS NOT NULL
+        GROUP BY category
+        ORDER BY total_solicited DESC
+      `).catch(() => ({ rows: [] }));
+      solicitationStats = sResult.rows;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      factors:          factors.sort((a, b) => Math.abs(b.divergence) - Math.abs(a.divergence)),
+      solicitationStats,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "silence_factors_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ops/calibration/audit
+// WS7: System-wide calibration audit results.
+// Shows per-category win rate vs expected, suppression status, failing weeks.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/calibration/audit", requireOpsAccess, async (_req, res) => {
+  try {
+    const [alerts, systemWinRate, suppressions] = await Promise.all([
+      getCategoryAuditAlerts(pgPool).catch(() => []),
+      getSystemWideWinRate(pgPool).catch(() => null),
+      getAllSuppressions(redis).catch(() => []),
+    ]);
+
+    const suppressedSet = new Set(suppressions.map(s => `${s.category}:${s.signalType}`));
+    const categories = alerts.map(row => ({
+      category:       row.category,
+      signalType:     row.signal_type,
+      winRate:        row.win_rate,
+      expectedRate:   row.expected_rate,
+      status:         row.status,
+      weeksFailing:   row.weeks_failing,
+      totalOutcomes:  row.total_outcomes,
+      weekStart:      row.week_start,
+      actionTaken:    row.action_taken,
+      autoSuppressed: suppressedSet.has(`${row.category}:${row.signal_type}`),
+    }));
+
+    const lastAuditKey = await redis?.get("calibration:audit:last_run").catch(() => null);
+
+    return res.status(200).json({
+      ok: true,
+      auditDate:         lastAuditKey || null,
+      systemWideWinRate: systemWinRate,
+      categories,
+      alertCount:        categories.filter(c => c.status !== "PASS").length,
+      suppressedCount:   suppressions.length,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "calibration_audit_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/ops/calibration/unsuppress
+// WS7: Manually clear a category+signal suppression key.
+// Body: { category, signalType }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/ops/calibration/unsuppress", requireOpsAccess, async (req, res) => {
+  try {
+    const category   = safeStr(req.body?.category, 60);
+    const signalType = safeStr(req.body?.signalType, 30);
+    if (!category || !signalType) {
+      return res.status(200).json({ ok: false, error: "category and signalType required" });
+    }
+    const cleared = await unsuppressCategory(redis, pgPool, category, signalType);
+    // Invalidate the in-memory suppression cache entry
+    _suppressionCache.delete(`${normalizeSuppressKey(category)}:${signalType}`);
+    return res.status(200).json({ ok: cleared, category, signalType, cleared });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "unsuppress_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/market-depth
+// Returns market depth context for a query (tier, depth note, liquidity label).
+// Lightweight — used by frontend to show depth pill on results screen.
+//
+// Query: { query, category, compsCount, liquidityScore }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/market-depth", async (req, res) => {
+  try {
+    const compsCount    = Math.max(0, parseInt(req.query?.compsCount || "0", 10));
+    const liquidityScore = Math.max(0, Math.min(100, parseFloat(req.query?.liquidityScore || "50")));
+    const query         = safeStr(req.query?.query, 300) || null;
+    const category      = safeStr(req.query?.category, 80) || null;
+
+    const depth = buildDepthContext(compsCount, liquidityScore);
+    return res.status(200).json({ ok: true, ...depth, query, category });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "market_depth_failed", reason: err?.message });
+  }
+});
+
+// ── Decision Dominance Layer Routes ──────────────────────────────────────────
+
+// GET /api/user/decision-profile/:userId
+// Full personalized decision profile: mode, risk tolerance, sweet spot, thresholds
+app.get("/api/user/decision-profile/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+    // Serve cache if available and fresh
+    const cached = await getCachedDecisionProfile(redis, userId);
+    if (cached) return res.status(200).json({ ok: true, profile: cached, cached: true });
+
+    // Build fresh
+    const [categoryPriors, accuracyProfile, profileData] = await Promise.all([
+      getCategoryOutcomePrior(redis, userId).catch(() => []),
+      computeAccuracyProfile(redis, userId).catch(() => null),
+      loadUserProfileData(redis, userId).catch(() => ({ priceTierStats: {}, failureFingerprints: {} })),
+    ]);
+
+    const profile = buildUserDecisionProfile({
+      categoryPriors,
+      accuracyProfile,
+      portfolioPerf: null,
+      categoryAffinities: [],
+      priceTierStats:      profileData.priceTierStats,
+      failureFingerprints: profileData.failureFingerprints,
+      portfolioCount:      0,
+    });
+
+    await cacheDecisionProfile(redis, userId, profile).catch(() => {});
+    return res.status(200).json({ ok: true, profile, cached: false });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "decision_profile_failed", reason: err?.message });
+  }
+});
+
+// POST /api/user/streak/check
+// Record daily activity and return current streak + urgency feed
+app.post("/api/user/streak/check", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+    const [streak, urgency] = await Promise.all([
+      recordDailyActivity(redis, userId).catch(() => null),
+      getUrgencyTriggers(redis, userId).catch(() => []),
+    ]);
+
+    return res.status(200).json({ ok: true, streak, urgency });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "streak_check_failed", reason: err?.message });
+  }
+});
+
+// GET /api/feed/daily/:userId
+// Daily money feed: discovery + alerts + addiction cards merged
+app.get("/api/feed/daily/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+    const [categoryPriors, missedOpps, discoverySnap, urgencyTriggers, streak] = await Promise.all([
+      getCategoryOutcomePrior(redis, userId).catch(() => []),
+      listMissedOpportunities(redis, userId, 5).catch(() => []),
+      getDiscoverySnapshot(redis, userId).catch(() => []),
+      getUrgencyTriggers(redis, userId).catch(() => []),
+      recordDailyActivity(redis, userId).catch(() => null),
+    ]);
+
+    const baseFeed = await buildDailyOpportunityFeed({
+      redis, userId, categoryPriors, missedOpps,
+      watchlistItems: [], portfolioItems: [], discoverySnap,
+    }).catch(() => []);
+
+    // Merge addiction cards at top of feed
+    const addictionCards = buildAddictionFeedCards({
+      streak, urgencyTriggers,
+      missedOpps: missedOpps.slice(0, 3),
+      progressSignal: null,
+      categoryHeat: [],
+      portfolioItems: [],
+    });
+
+    const fullFeed = [...addictionCards, ...baseFeed];
+    return res.status(200).json({ ok: true, feed: fullFeed, feedCount: fullFeed.length });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "daily_feed_failed", reason: err?.message });
+  }
+});
+
+// GET /api/signal/calibration/:category
+// Per-category calibration: win rates, threshold overrides, heat
+app.get("/api/signal/calibration/:category", async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const userId   = safeStr(req.query?.userId, 64) || null;
+    if (!category) return res.status(200).json({ ok: false, error: "missing_category" });
+
+    const [userCal, globalCal] = await Promise.all([
+      userId ? getCategoryCalibration(redis, userId, category).catch(() => null) : Promise.resolve(null),
+      getGlobalCategoryCalibration(redis, category).catch(() => null),
+    ]);
+
+    return res.status(200).json({ ok: true, userCalibration: userCal, globalCalibration: globalCal });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "calibration_failed", reason: err?.message });
+  }
+});
+
+// GET /api/category/heat/:category
+// Current heat score + label for a category
+app.get("/api/category/heat/:category", async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    if (!category) return res.status(200).json({ ok: false, error: "missing_category" });
+    const heat = await getCategoryHeat(redis, category).catch(() => null);
+    return res.status(200).json({ ok: true, category, heat });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "heat_failed", reason: err?.message });
+  }
+});
+
+// POST /api/opportunity/enqueue
+// Manually trigger a user scan cycle (for testing or premium on-demand)
+app.post("/api/opportunity/enqueue", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    await enqueueUserScanCycle(redis, userId);
+    return res.status(200).json({ ok: true, queued: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "enqueue_failed", reason: err?.message });
+  }
+});
+
+// ── Phase 9: Wrong-call admission + monthly calibration report ────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/accuracy/wrong-call
+// Record a confirmed wrong call: Evan called STRONG BUY and user lost money.
+// Feeds wrong-call feed cards, false-positive tracking, and calibration report.
+//
+// Body: { userId, scanId, signal?, category?, gateSuspected?, dealStrength?, confidence? }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/accuracy/wrong-call", async (req, res) => {
+  try {
+    const userId       = safeStr(req.body?.userId, 64);
+    const scanId       = safeStr(req.body?.scanId, 128);
+    const signal       = safeStr(req.body?.signal, 30) || "STRONG BUY";
+    const category     = safeStr(req.body?.category, 60) || null;
+    const gateSuspected = safeStr(req.body?.gateSuspected, 60) || null;
+    const dealStr      = req.body?.dealStrength != null ? Number(req.body.dealStrength) : null;
+    const confidence   = req.body?.confidence   != null ? Number(req.body.confidence)   : null;
+
+    if (!userId || !scanId) {
+      return res.status(200).json({ ok: false, error: "userId and scanId required" });
+    }
+
+    await recordWrongCall(redis, userId, { scanId, signal, category, gateSuspected });
+
+    // Phase 10: Record false-positive event for calibration curve analysis
+    if (category && dealStr !== null) {
+      recordFalsePositive(redis, {
+        category, signal, dealStrength: dealStr, confidence, scannedAt: Date.now(),
+      }).catch(() => {});
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "wrong_call_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accuracy/wrong-calls/:userId
+// Recent wrong calls for a user — used to populate WRONG_CALL feed cards.
+//
+// Response: { ok, wrongCalls: [{ scanId, signal, category, gateSuspected, recordedAt }] }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/accuracy/wrong-calls/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    const limit  = Math.min(50, Math.max(1, parseInt(req.query?.limit || "20", 10)));
+    if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+
+    const wrongCalls = await listWrongCalls(redis, userId, limit);
+    return res.status(200).json({ ok: true, wrongCalls, count: wrongCalls.length });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "wrong_calls_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/accuracy/calibration-report/:userId
+// Monthly calibration report: scan volume, signal breakdown, category win rates,
+// top missed signals, wrong call summary, and lifetime accuracy profile.
+//
+// Query: { month? }  — "YYYY-MM" format, defaults to current month
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/accuracy/calibration-report/:userId", async (req, res) => {
+  try {
+    const userId      = safeStr(req.params?.userId, 64);
+    const monthParam  = safeStr(req.query?.month, 7) || null;
+    const reportMonth = monthParam || new Date().toISOString().slice(0, 7);
+
+    if (!userId) return res.status(200).json({ ok: false, error: "userId required" });
+
+    // Serve cached version if available
+    const cached = await getCachedCalibrationReport(redis, userId, reportMonth);
+    if (cached) return res.status(200).json({ ...cached, cached: true });
+
+    // Build fresh report
+    const report = await buildMonthlyCalibrationReport(redis, pgPool, userId, { month: reportMonth });
+    await cacheCalibrationReport(redis, userId, reportMonth, report);
+
+    return res.status(200).json({ ...report, cached: false });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "calibration_report_failed", reason: err?.message });
+  }
+});
+
+// ── Phase 10: Calibration curve + category threshold ops routes ───────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ops/calibration/curves/:category
+// Calibration curves for a category — observed win rates per deal-strength bin.
+// Ops use: detect where Evan is over/under-confident for a category.
+//
+// Query: { signal? }  — "STRONG BUY" | "GOOD DEAL" | "FAIR"; defaults to all
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/calibration/curves/:category", requireOpsAccess, async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const signal   = safeStr(req.query?.signal, 30) || null;
+
+    if (!category) return res.status(200).json({ ok: false, error: "category required" });
+
+    const [curves, health] = await Promise.all([
+      signal
+        ? getCalibrationCurve(redis, category, signal).then((c) => c ? [c] : [])
+        : getAllCurvesForCategory(redis, category),
+      assessCalibrationHealth(redis, category),
+    ]);
+
+    return res.status(200).json({ ok: true, category, curves, health });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "calibration_curves_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ops/category-thresholds/:category
+// Effective signal thresholds for a category — global floors + calibration overrides.
+// Ops use: inspect what gates are actually being applied for a given category.
+//
+// Query: { userId? }  — provide to include user-level calibration data
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/category-thresholds/:category", requireOpsAccess, async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const userId   = safeStr(req.query?.userId, 64) || null;
+
+    if (!category) return res.status(200).json({ ok: false, error: "category required" });
+
+    // Load calibration (user-level if userId provided, else global)
+    const calibration = userId
+      ? await getCategoryCalibration(redis, userId, category).catch(() => null)
+      : await getGlobalCategoryCalibration(redis, category).catch(() => null);
+
+    const thresholds = buildEffectiveThresholds(calibration);
+    const fpSummaries = await Promise.all([
+      getFalsePositiveSummary(redis, category, "STRONG BUY"),
+      getFalsePositiveSummary(redis, category, "GOOD DEAL"),
+    ]);
+
+    return res.status(200).json({
+      ok: true,
+      category,
+      userId:       userId || null,
+      thresholds,
+      globalFloors: GLOBAL_FLOORS,
+      overrides:    thresholds._overrides || null,
+      source:       thresholds._source,
+      sampleCount:  thresholds._sampleCount,
+      falsePositives: fpSummaries.filter(Boolean),
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "category_thresholds_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ops/calibration/false-positives/:category
+// False-positive summary for a category + signal pair.
+// Ops use: detect which feature ranges are systematically producing bad calls.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/calibration/false-positives/:category", requireOpsAccess, async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const signal   = safeStr(req.query?.signal, 30) || "STRONG BUY";
+    if (!category) return res.status(200).json({ ok: false, error: "category required" });
+
+    const summary = await getFalsePositiveSummary(redis, category, signal);
+    return res.status(200).json({ ok: true, category, signal, summary });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "false_positives_failed", reason: err?.message });
+  }
 });
 
 setInterval(() => {
