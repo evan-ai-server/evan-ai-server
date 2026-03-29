@@ -529,6 +529,7 @@ import {
   enqueueGlobalCalibrationSweep,
   enqueueOutcomeSolicitation,
   enqueueAuditSystem,
+  enqueueDriftScan,
   startAccuracyCalibrationWorker,
 } from "./workers/accuracyCalibrationWorker.js";
 import {
@@ -567,6 +568,31 @@ import {
   loadStoredCategoryThresholds,
   GLOBAL_FLOORS,
 } from "./src/categoryThresholdEngine.js";
+import {
+  runDriftScan,
+  loadDriftSnapshot,
+  getLastDriftScanTime,
+  computeCategoryDrift,
+  computeSignalDrift,
+} from "./src/driftEngine.js";
+import {
+  buildAutoTuningProposals,
+  proposeThresholdAdjustment,
+  applyAdjustment,
+  rollbackAdjustment,
+  promoteCanary,
+  listPendingAdjustments,
+  listAllAdjustments,
+  listAdjustmentHistory,
+  loadExplicitThresholdOverrides,
+  buildUserCalibrationReinforcement,
+} from "./src/autoTuningEngine.js";
+import {
+  recordBadCall,
+  detectClusters,
+  loadAllClusterAlerts,
+  loadClusterAlert,
+} from "./src/badCallClusterEngine.js";
 import {
   recordCurveOutcome,
   getObservedWinRate,
@@ -1331,6 +1357,17 @@ async function incrementDistributedWindowCounter(key, windowMs) {
     await redis.pexpire(key, windowMs);
   }
   return count;
+}
+
+// Phase 11: Deterministic 0–1 float from a string key — used for canary cohort routing.
+// Same userId+category always hashes to the same bucket so behavior is consistent per session.
+function deterministicRoll(key) {
+  let hash = 0;
+  for (let i = 0; i < key.length; i++) {
+    hash = ((hash << 5) - hash) + key.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash % 1000) / 1000;
 }
 
 function routeNeedsPhase1AbuseGuard(req) {
@@ -12913,6 +12950,7 @@ function assembleProfitIntel({
   localResultCount  = null,   // count of local/Facebook results (for LOCAL mode warning)
   medianDaysToSale  = null,   // from signalCalibrator (for profit range)
   categoryCalibration = null, // from getCategoryCalibration (for win rate display)
+  explicitThresholdOverrides = {}, // Phase 11: confirmed ops overrides from autoTuningEngine
 }) {
   const _cv2 = confidenceV2 ?? visionConfidence ?? 0;
 
@@ -12983,8 +13021,11 @@ function assembleProfitIntel({
 
   const dealDetected = dealStrength >= 0.18;
 
-  // ── Phase 10: Category-specific thresholds ───────────────────────────────
-  const effectiveThresholds = buildEffectiveThresholds(categoryCalibration || null);
+  // ── Phase 10+11: Category-specific thresholds + explicit ops overrides ──────
+  const effectiveThresholds = buildEffectiveThresholds(
+    categoryCalibration || null,
+    explicitThresholdOverrides || {},
+  );
 
   const buySignalResult = buildBuySignal({
     resaleScore, dealStrength, demandScore,
@@ -13415,6 +13456,54 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
           payload.personalAction = "SELL_FIRST";
         }
       }
+    }
+
+    // Phase 11: Apply explicit ops threshold overrides (post-hoc signal correction).
+    // If an operator-confirmed threshold tighten was applied for this category, and the
+    // current scan's feature values fall below the tighter floor, downgrade the signal.
+    // This is auditable — payload.explicitOverrideApplied records what changed and why.
+    if (category && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
+      try {
+        // Canary roll: deterministic 0-1 from hash(userId + category) so same user
+        // always gets the same canary bucket for the same category.
+        const canaryRoll = deterministicRoll(`${userId}:${category}`);
+        const explicitOverrides = await loadExplicitThresholdOverrides(redis, category, canaryRoll);
+        if (Object.keys(explicitOverrides).length > 0) {
+          const tighterThresholds = buildEffectiveThresholds(null, explicitOverrides);
+          const ds = _pi.dealStrength ?? 0;
+          const cv = _pi.confidenceV2 ?? 0;
+          let downgraded = false;
+          let reason = null;
+
+          if (_pi.buySignal === "STRONG BUY") {
+            if (ds < (tighterThresholds.STRONG_BUY_DEAL_STRENGTH ?? 0.25)) {
+              downgraded = true;
+              reason = `explicit_threshold: STRONG_BUY_DEAL_STRENGTH raised to ${tighterThresholds.STRONG_BUY_DEAL_STRENGTH} (deal_strength=${round2(ds)})`;
+            } else if (cv < (tighterThresholds.STRONG_BUY_CONFIDENCE ?? 0.60)) {
+              downgraded = true;
+              reason = `explicit_threshold: STRONG_BUY_CONFIDENCE raised to ${tighterThresholds.STRONG_BUY_CONFIDENCE} (confidence=${round2(cv)})`;
+            }
+          } else if (_pi.buySignal === "GOOD DEAL") {
+            if (ds < (tighterThresholds.GOOD_DEAL_DEAL_STRENGTH ?? 0.18)) {
+              downgraded = true;
+              reason = `explicit_threshold: GOOD_DEAL_DEAL_STRENGTH raised to ${tighterThresholds.GOOD_DEAL_DEAL_STRENGTH} (deal_strength=${round2(ds)})`;
+            }
+          }
+
+          if (downgraded) {
+            const originalSignal = _pi.buySignal;
+            _pi.buySignal = originalSignal === "STRONG BUY" ? "GOOD DEAL" : "FAIR";
+            payload.profitIntel.buySignal = _pi.buySignal;
+            payload.explicitOverrideApplied = {
+              originalSignal,
+              newSignal: _pi.buySignal,
+              reason,
+              category,
+              appliedAt: Date.now(),
+            };
+          }
+        }
+      } catch { /* non-fatal */ }
     }
   } catch { /* non-fatal */ }
 }
@@ -25336,14 +25425,20 @@ if (shouldRunQueueWorkers()) {
 }
 
 // WS7: Weekly audit cron — runs every Monday ~03:00 UTC
+// Phase 11: Daily drift scan cron — runs every day ~02:00 UTC
 // Checks once per minute whether we're in the target window.
 if (redis) {
   warmSuppressionCache().catch(() => {}); // warm on startup
   setInterval(async () => {
     try {
       const now = new Date();
+      // Weekly audit: Monday 03:00 UTC
       if (now.getUTCDay() === 1 && now.getUTCHours() === 3 && now.getUTCMinutes() < 5) {
         await enqueueAuditSystem(redis).catch(() => {});
+      }
+      // Daily drift scan: every day 02:00 UTC
+      if (now.getUTCHours() === 2 && now.getUTCMinutes() < 5) {
+        await enqueueDriftScan(redis).catch(() => {});
       }
     } catch { /* non-fatal */ }
   }, 60_000).unref?.();
@@ -25978,6 +26073,13 @@ app.post("/api/accuracy/record-outcome", async (req, res) => {
       }).catch(() => {});
     }
 
+    // Phase 11: Record bad call into cluster detector (loss on positive signal)
+    if (category && isWin === false && ["STRONG BUY", "GOOD DEAL"].includes(signal)) {
+      recordBadCall(redis, {
+        category, signal, dealStrength: dealStr, confidence, scannedAt: Date.now(),
+      }).catch(() => {});
+    }
+
     return res.status(200).json({ ok: true });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "record_outcome_failed", reason: err?.message });
@@ -26453,6 +26555,148 @@ app.get("/api/ops/calibration/false-positives/:category", requireOpsAccess, asyn
     return res.status(200).json({ ok: true, category, signal, summary });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "false_positives_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 11 — Self-Improving System: Ops Routes
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/ops/drift/status
+// Current drift snapshot — category + signal drift detections with severity.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/drift/status", requireOpsAccess, async (_req, res) => {
+  try {
+    const [snapshot, lastScan] = await Promise.all([
+      loadDriftSnapshot(redis),
+      getLastDriftScanTime(redis),
+    ]);
+    return res.status(200).json({
+      ok: true,
+      snapshot,
+      lastScanAt: lastScan ? new Date(lastScan).toISOString() : null,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "drift_status_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/drift/adjustments
+// Pending proposals + recent adjustment history.
+// Query: { status? } — "PROPOSED" | "APPLIED" | "CANARY" | "ROLLED_BACK" | "PROMOTED"
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/drift/adjustments", requireOpsAccess, async (req, res) => {
+  try {
+    const statusFilter = safeStr(req.query?.status, 20) || null;
+    const [pending, history] = await Promise.all([
+      listPendingAdjustments(redis),
+      listAdjustmentHistory(redis, { limit: 50 }),
+    ]);
+    const filteredHistory = statusFilter
+      ? history.filter((h) => h.status === statusFilter)
+      : history;
+    return res.status(200).json({ ok: true, pending, history: filteredHistory });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "drift_adjustments_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/drift/adjustments/:id/apply
+// Confirm and apply a proposed threshold adjustment.
+// Body: { confirmedBy, mode?, trafficPct? }
+//   mode: "full" (default) | "canary"
+//   trafficPct: 0–100 (only for canary mode, default 10)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/ops/drift/adjustments/:id/apply", requireOpsAccess, async (req, res) => {
+  try {
+    const adjustmentId = safeStr(req.params?.id, 128);
+    const confirmedBy  = safeStr(req.body?.confirmedBy, 64) || "ops";
+    const mode         = safeStr(req.body?.mode, 20) || "full";
+    const trafficPct   = req.body?.trafficPct != null ? Number(req.body.trafficPct) : 10;
+
+    if (!adjustmentId) return res.status(200).json({ ok: false, error: "adjustment id required" });
+
+    await applyAdjustment(redis, adjustmentId, { mode, trafficPct, confirmedBy });
+    return res.status(200).json({ ok: true, adjustmentId, mode, appliedBy: confirmedBy });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "apply_adjustment_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/drift/adjustments/:id/rollback
+// Roll back an applied adjustment to its previous value.
+// Body: { confirmedBy }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/ops/drift/adjustments/:id/rollback", requireOpsAccess, async (req, res) => {
+  try {
+    const adjustmentId = safeStr(req.params?.id, 128);
+    const confirmedBy  = safeStr(req.body?.confirmedBy, 64) || "ops";
+
+    if (!adjustmentId) return res.status(200).json({ ok: false, error: "adjustment id required" });
+
+    await rollbackAdjustment(redis, adjustmentId, { confirmedBy });
+    return res.status(200).json({ ok: true, adjustmentId, rolledBackBy: confirmedBy });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "rollback_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/drift/adjustments/:id/promote
+// Promote a canary adjustment to full traffic.
+// Body: { confirmedBy }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/ops/drift/adjustments/:id/promote", requireOpsAccess, async (req, res) => {
+  try {
+    const adjustmentId = safeStr(req.params?.id, 128);
+    const confirmedBy  = safeStr(req.body?.confirmedBy, 64) || "ops";
+
+    if (!adjustmentId) return res.status(200).json({ ok: false, error: "adjustment id required" });
+
+    await promoteCanary(redis, adjustmentId, { confirmedBy });
+    return res.status(200).json({ ok: true, adjustmentId, promotedBy: confirmedBy });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "promote_canary_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/drift/clusters
+// Current bad-call cluster alerts (WARN + ALERT severity) across all categories.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/drift/clusters", requireOpsAccess, async (_req, res) => {
+  try {
+    const alerts = await loadAllClusterAlerts(redis);
+    return res.status(200).json({ ok: true, alerts, alertCount: alerts.length });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "cluster_alerts_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/drift/clusters/:category
+// Cluster alert for a specific category + signal.
+// Query: { signal? } — defaults to "STRONG BUY"
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/ops/drift/clusters/:category", requireOpsAccess, async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const signal   = safeStr(req.query?.signal, 30) || "STRONG BUY";
+    if (!category) return res.status(200).json({ ok: false, error: "category required" });
+
+    const alert = await loadClusterAlert(redis, category, signal);
+    return res.status(200).json({ ok: true, category, signal, alert });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "cluster_alert_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/drift/scan
+// Manually trigger a drift + cluster scan (ops use — does not require Redis worker).
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/ops/drift/scan", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await runDriftScan(pgPool, redis);
+    return res.status(200).json({ ok: true, result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "drift_scan_failed", reason: err?.message });
   }
 });
 

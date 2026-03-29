@@ -189,36 +189,54 @@ export function computeCategoryThresholds(calibration) {
 
 /**
  * Build the full effective threshold set for a category.
- * Merges global floors with calibration-derived overrides.
- * Global floors act as hard boundaries — no override can breach them beyond MAX_LOOSEN_DELTA.
+ * Merges global floors → calibration-derived overrides → explicit operator overrides.
+ * Global floors act as absolute hard limits — explicit overrides can only TIGHTEN.
  *
- * This is SYNCHRONOUS — call computeCategoryThresholds() with already-loaded calibration.
+ * Priority (highest wins):
+ *   1. explicit ops overrides (from autoTuningEngine — confirmed, logged, reversible)
+ *   2. calibration-derived overrides (from computeCategoryThresholds)
+ *   3. GLOBAL_FLOORS (unconditional floor)
  *
- * @param {object|null} calibration — from getCategoryCalibration
+ * This is SYNCHRONOUS — pass pre-loaded explicitOverrides from async scan context.
+ *
+ * @param {object|null} calibration       — from getCategoryCalibration
+ * @param {object}      explicitOverrides  — from loadExplicitThresholdOverrides() (Phase 11)
  * @returns {object} merged thresholds + metadata
  */
-export function buildEffectiveThresholds(calibration) {
-  const overrides = calibration ? computeCategoryThresholds(calibration) : {};
+export function buildEffectiveThresholds(calibration, explicitOverrides = {}) {
+  const calOverrides      = calibration ? computeCategoryThresholds(calibration) : {};
+  const hasCalOverride    = Object.keys(calOverrides).length > 0;
+  const hasExplicitOverride = explicitOverrides && Object.keys(explicitOverrides).length > 0;
 
   const merged = {};
   for (const [key, floor] of Object.entries(GLOBAL_FLOORS)) {
-    const override = overrides[key];
-    if (override !== undefined) {
-      // Override cannot drop more than MAX_LOOSEN_DELTA below floor
-      const minAllowed = floor - MAX_LOOSEN_DELTA;
-      merged[key] = round4(Math.max(minAllowed, override));
-    } else {
-      merged[key] = floor;
+    // Start with calibration-derived override or floor
+    let value = calOverrides[key] !== undefined
+      ? round4(Math.max(floor - MAX_LOOSEN_DELTA, calOverrides[key]))
+      : floor;
+
+    // Apply explicit ops override on top (Phase 11: auto-tuning confirmed adjustment)
+    // Explicit overrides can only TIGHTEN (must be >= current value after cal-override)
+    if (hasExplicitOverride && explicitOverrides[key] !== undefined) {
+      const explicit = Number(explicitOverrides[key]);
+      // Hard rule: explicit cannot go below global floor
+      if (Number.isFinite(explicit) && explicit >= floor) {
+        value = round4(Math.max(value, explicit)); // take the tighter of the two
+      }
     }
+
+    merged[key] = value;
   }
 
-  const hasOverride = Object.keys(overrides).length > 0;
+  const source = hasExplicitOverride ? "explicit_ops" : hasCalOverride ? "category" : "global";
+
   return {
     ...merged,
-    _source:       hasOverride ? "category" : "global",
-    _sampleCount:  calibration?.totalSamples || 0,
-    _isCalibrated: calibration?.isCalibrated || false,
-    _overrides:    hasOverride ? overrides : null,
+    _source:          source,
+    _sampleCount:     calibration?.totalSamples || 0,
+    _isCalibrated:    calibration?.isCalibrated || false,
+    _overrides:       hasCalOverride    ? calOverrides      : null,
+    _explicitOverrides: hasExplicitOverride ? explicitOverrides : null,
   };
 }
 
