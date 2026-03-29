@@ -603,6 +603,31 @@ import {
   classifyDealStrengthBin,
 } from "./src/calibrationCurveEngine.js";
 import { recordReturnOutcome } from "./src/outcomeLearning.js";
+// Phase 12: Market Ownership / B2B Foundation
+import {
+  recordPriceIndexSample,
+  getCategoryPriceIndex,
+  computePriceIndex,
+  invalidatePriceIndexCache,
+  assessValuationEligibility,
+} from "./src/priceIndexEngine.js";
+import {
+  valuateItem,
+  valuateBatch,
+  B2B_BATCH_MAX,
+} from "./src/businessValuationApi.js";
+import {
+  createApiKey,
+  lookupApiKey,
+  revokeApiKey,
+  listApiKeys,
+  checkUsageBudget,
+  incrementUsage,
+  getTodayUsage,
+  getUsageHistory,
+  getAggregateUsageStats,
+  B2B_TIERS,
+} from "./src/apiUsageTracker.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -1265,6 +1290,22 @@ function requireOpsAccess(req, res, next) {
   }
 
   return res.status(404).json({ ok: false });
+}
+
+// Phase 12: B2B API key middleware.
+// Validates x-api-key header against the B2B key store.
+// Attaches keyRecord to req.b2b for downstream use.
+async function requireB2BApiKey(req, res, next) {
+  const rawKey = String(req.headers["x-api-key"] || "").trim();
+  if (!rawKey) {
+    return res.status(401).json({ ok: false, error: "api_key_required" });
+  }
+  const keyRecord = await lookupApiKey(redis, rawKey).catch(() => null);
+  if (!keyRecord) {
+    return res.status(403).json({ ok: false, error: "api_key_invalid" });
+  }
+  req.b2b = keyRecord;
+  return next();
 }
 
 const globalApiLimiter = rateLimit({
@@ -13504,6 +13545,12 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
           }
         }
       } catch { /* non-fatal */ }
+    }
+
+    // Phase 12: Feed price index from this scan result (non-blocking).
+    // Only fires when category + a valid priceStats.median are available.
+    if (category && payload.profitIntel?.priceStats?.median > 0) {
+      recordPriceIndexSample(redis, category, payload.profitIntel.priceStats).catch(() => {});
     }
   } catch { /* non-fatal */ }
 }
@@ -26697,6 +26744,268 @@ app.post("/api/ops/drift/scan", requireOpsAccess, async (_req, res) => {
     return res.status(200).json({ ok: true, result });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "drift_scan_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 12 — Market Ownership / B2B Foundation
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// B2B routes are completely isolated from consumer scan flows.
+// All B2B endpoints require a valid x-api-key header issued by ops.
+// Usage is tracked per-key per-day per-endpoint; limits are enforced before response.
+//
+// Consumer truthfulness is never distorted — these routes expose the SAME underlying
+// accuracy and calibration data that drives the consumer product.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper: check budget, respond 429 if over limit, return true if request is blocked.
+async function _b2bCheckAndEnforce(req, res, endpoint) {
+  const budget = await checkUsageBudget(redis, req.b2b, endpoint).catch(() => null);
+  if (!budget || !budget.allowed) {
+    const limit = budget?.limit ?? 0;
+    const used  = budget?.used  ?? 0;
+    res.set("X-B2B-Limit",     String(limit));
+    res.set("X-B2B-Used",      String(used));
+    res.set("X-B2B-Remaining", "0");
+    res.status(429).json({
+      ok:    false,
+      error: "b2b_rate_limit_exceeded",
+      endpoint,
+      used,
+      limit,
+      tier:  req.b2b?.tier || "unknown",
+      resetAt: new Date(new Date().setUTCHours(24, 0, 0, 0)).toISOString(),
+    });
+    return true;  // blocked
+  }
+  res.set("X-B2B-Limit",     String(budget.limit));
+  res.set("X-B2B-Used",      String(budget.used));
+  res.set("X-B2B-Remaining", String(budget.remaining));
+  return false;  // allowed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/b2b/valuate
+// Single-item market valuation.
+//
+// Headers: x-api-key (required)
+// Body:    { query, category, askPrice?, itemRef? }
+// Response schema:
+//   { ok, itemRef, query, category, valuation, confidence, calibration, warnings, failureReason, generatedAt }
+//   valuation: { marketMedian, p25, p75, priceRange, spread, sampleCount, indexGrade, valuationLabel, dealContext? }
+//   calibration: { sbWinRate, gdWinRate, isCalibrated, calSamples, health } | null
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/b2b/valuate", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "valuate")) return;
+  try {
+    const query    = safeStr(req.body?.query,    200);
+    const category = safeStr(req.body?.category, 80);
+    const askPrice = req.body?.askPrice != null ? Number(req.body.askPrice) : null;
+    const itemRef  = safeStr(req.body?.itemRef,  128) || null;
+
+    const result = await valuateItem(redis, { query, category, askPrice, itemRef });
+
+    incrementUsage(redis, req.b2b, "valuate").catch(() => {});
+    return res.status(200).json(result);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "valuation_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/b2b/batch-valuate
+// Batch market valuation — up to 25 items per request.
+//
+// Headers: x-api-key (required)
+// Body:    { items: Array<{ query, category, askPrice?, itemRef? }> }
+// Response schema:
+//   { ok, count, succeeded, failed, results: ValuationResult[], generatedAt }
+//   Each result follows the same schema as /api/b2b/valuate.
+//   Failed items include failureReason and ok: false.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/b2b/batch-valuate", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "batch_valuate")) return;
+  try {
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (rawItems.length === 0) {
+      return res.status(200).json({ ok: false, error: "items_required", results: [] });
+    }
+    if (rawItems.length > B2B_BATCH_MAX) {
+      return res.status(200).json({
+        ok: false,
+        error: "batch_too_large",
+        maxAllowed: B2B_BATCH_MAX,
+        received: rawItems.length,
+      });
+    }
+
+    // Sanitize items before passing downstream
+    const items = rawItems.slice(0, B2B_BATCH_MAX).map((item) => ({
+      query:    safeStr(item?.query,    200),
+      category: safeStr(item?.category, 80),
+      askPrice: item?.askPrice != null ? Number(item.askPrice) : null,
+      itemRef:  safeStr(item?.itemRef,  128) || null,
+    }));
+
+    const result = await valuateBatch(redis, items);
+
+    incrementUsage(redis, req.b2b, "batch_valuate").catch(() => {});
+    return res.status(200).json(result);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "batch_valuation_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/b2b/price-index/:category
+// Category price index — market distribution, calibration grade, and sample depth.
+//
+// Headers: x-api-key (required)
+// Params:  category
+// Response schema:
+//   { ok, category, index: { indexGrade, sampleCount, medianPrice, p25, p75, priceRange,
+//     spread, avgPriceQuality, calibration, lastUpdated }, eligibility: { ready, grade, reason } }
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/b2b/price-index/:category", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "price_index")) return;
+  try {
+    const category = safeStr(req.params?.category, 80);
+    if (!category) {
+      return res.status(200).json({ ok: false, error: "category required" });
+    }
+
+    const index = await getCategoryPriceIndex(redis, category);
+    if (!index) {
+      return res.status(200).json({ ok: false, error: "category_not_indexed", category });
+    }
+
+    const eligibility = assessValuationEligibility(index);
+
+    incrementUsage(redis, req.b2b, "price_index").catch(() => {});
+    return res.status(200).json({ ok: true, category, index, eligibility });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "price_index_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/b2b/usage
+// Usage statistics for the authenticated API key (today + last 30 days).
+//
+// Headers: x-api-key (required)
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/b2b/usage", requireB2BApiKey, async (req, res) => {
+  try {
+    const [today, history] = await Promise.all([
+      getTodayUsage(redis, req.b2b),
+      getUsageHistory(redis, req.b2b.keyId, { days: 30 }),
+    ]);
+    return res.status(200).json({
+      ok:     true,
+      keyId:  req.b2b.keyId,
+      orgId:  req.b2b.orgId,
+      tier:   req.b2b.tier,
+      limits: B2B_TIERS[req.b2b.tier]?.limits || {},
+      today,
+      history,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "usage_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ops-only B2B key management routes (require x-ops-secret header)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/ops/b2b/keys — create a new API key
+// Body: { orgId, orgName?, tier?, notes? }
+app.post("/api/ops/b2b/keys", requireOpsAccess, async (req, res) => {
+  try {
+    const orgId   = safeStr(req.body?.orgId,   128);
+    const orgName = safeStr(req.body?.orgName, 128) || "";
+    const tier    = safeStr(req.body?.tier,     20) || "starter";
+    const notes   = safeStr(req.body?.notes,   256) || "";
+
+    if (!orgId) return res.status(200).json({ ok: false, error: "orgId required" });
+
+    const result = await createApiKey(redis, { orgId, orgName, tier, notes });
+    // rawKey shown once only — ops must record it immediately
+    return res.status(200).json({
+      ok: true,
+      ...result,
+      warning: "Store the rawKey immediately — it will not be shown again.",
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "create_key_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/b2b/keys — list all API keys (metadata only, no raw keys)
+// Query: { includeRevoked? } — default true
+app.get("/api/ops/b2b/keys", requireOpsAccess, async (req, res) => {
+  try {
+    const includeRevoked = req.query?.includeRevoked !== "false";
+    const keys = await listApiKeys(redis, { limit: 200, includeRevoked });
+    return res.status(200).json({ ok: true, count: keys.length, keys });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "list_keys_failed", reason: err?.message });
+  }
+});
+
+// DELETE /api/ops/b2b/keys/:keyId — revoke an API key
+app.delete("/api/ops/b2b/keys/:keyId", requireOpsAccess, async (req, res) => {
+  try {
+    const keyId = safeStr(req.params?.keyId, 64);
+    if (!keyId) return res.status(200).json({ ok: false, error: "keyId required" });
+
+    const result = await revokeApiKey(redis, keyId);
+    return res.status(200).json(result);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "revoke_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/b2b/usage — aggregate usage across all active keys
+app.get("/api/ops/b2b/usage", requireOpsAccess, async (_req, res) => {
+  try {
+    const stats = await getAggregateUsageStats(redis);
+    return res.status(200).json({ ok: true, count: stats.length, stats });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "usage_stats_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/b2b/usage/:keyId — detailed usage history for a specific key
+// Query: { days? } — default 30
+app.get("/api/ops/b2b/usage/:keyId", requireOpsAccess, async (req, res) => {
+  try {
+    const keyId = safeStr(req.params?.keyId, 64);
+    const days  = Math.min(35, Math.max(1, Number(req.query?.days) || 30));
+    if (!keyId) return res.status(200).json({ ok: false, error: "keyId required" });
+
+    const history = await getUsageHistory(redis, keyId, { days });
+    return res.status(200).json({ ok: true, keyId, days, history });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "key_usage_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/b2b/price-index/:category — ops view of a category price index
+// Includes cache-bypass and raw sample count — for debugging index health.
+// Query: { force? } — bypass cache if "true"
+app.get("/api/ops/b2b/price-index/:category", requireOpsAccess, async (req, res) => {
+  try {
+    const category = safeStr(req.params?.category, 80);
+    const force    = req.query?.force === "true";
+    if (!category) return res.status(200).json({ ok: false, error: "category required" });
+
+    const index       = await getCategoryPriceIndex(redis, category, { force });
+    const eligibility = index ? assessValuationEligibility(index) : { ready: false };
+    return res.status(200).json({ ok: true, category, index, eligibility });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "price_index_ops_failed", reason: err?.message });
   }
 });
 
