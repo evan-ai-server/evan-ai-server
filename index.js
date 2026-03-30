@@ -628,6 +628,31 @@ import {
   getAggregateUsageStats,
   B2B_TIERS,
 } from "./src/apiUsageTracker.js";
+// Phase 13: Behavioral Lock-In
+import {
+  getCategoryPerformanceRanking,
+  getBestCategories,
+  getWorstCategories,
+  getPerformanceSummary,
+  invalidatePerformanceCache,
+  checkNewProfitMilestone,
+} from "./src/personalPerformanceEngine.js";
+import {
+  TACTIC_TYPES,
+  inferTacticsFromBuy,
+  recordTacticsFromBuyContext,
+  getTacticSummary,
+  getSignatureTactics,
+} from "./src/tacticWinRateEngine.js";
+import {
+  buildFinancialIdentity,
+  getFinancialIdentity,
+  invalidateIdentityCache,
+  assessIdentityMaturity,
+  buildCategoryStrengthFeedItems,
+  buildCategoryWeaknessFeedItems,
+  buildProfitMilestoneFeedItem,
+} from "./src/financialIdentityEngine.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -13552,6 +13577,31 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
     if (category && payload.profitIntel?.priceStats?.median > 0) {
       recordPriceIndexSample(redis, category, payload.profitIntel.priceStats).catch(() => {});
     }
+
+    // Phase 13: Worst-category personal warning.
+    // If user has a track record of losing money in this category, surface a warning.
+    if (category && userId && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
+      try {
+        const worstCats = await getWorstCategories(pgPool, redis, userId, { minTrades: 3, topN: 5 });
+        const isWorst   = worstCats.some((c) => c.category?.toLowerCase() === category.toLowerCase());
+        if (isWorst) {
+          const catData = worstCats.find((c) => c.category?.toLowerCase() === category.toLowerCase());
+          const worstWarn = `You've historically lost money in ${category}` +
+            (catData?.netProfitRealized != null ? ` (net: $${catData.netProfitRealized.toFixed(2)})` : "") +
+            ". Review your past trades before buying.";
+          if (!Array.isArray(payload.personalWarnings)) payload.personalWarnings = [];
+          if (!payload.personalWarnings.includes(worstWarn)) {
+            payload.personalWarnings.push(worstWarn);
+          }
+          payload.worstCategoryWarning = {
+            category,
+            netProfitRealized: catData?.netProfitRealized ?? null,
+            winRate:           catData?.winRate           ?? null,
+            totalTrades:       catData?.totalTrades       ?? null,
+          };
+        }
+      } catch { /* non-fatal */ }
+    }
   } catch { /* non-fatal */ }
 }
 
@@ -22125,6 +22175,26 @@ app.post(
               soldAt,
             }).catch(() => {});
           }
+
+          // Phase 13: Record tactic events + invalidate performance/identity caches
+          if (userId) {
+            const _isWin    = didSell && sellPrice != null && buyPrice != null ? (sellPrice > buyPrice) : null;
+            const _netProfit = didSell && sellPrice != null && buyPrice != null ? (sellPrice - buyPrice) : null;
+            recordTacticsFromBuyContext(redis, userId, {
+              didBuy,
+              buySignal:      buySignal || null,
+              personalAction: safeStr(req.body?.personalAction, 30) || null,
+              warnings:       Array.isArray(req.body?.warnings) ? req.body.warnings : null,
+              isWin:          _isWin,
+              netProfit:      _netProfit,
+              daysToSell:     req.body?.daysToSell != null ? Number(req.body.daysToSell) : null,
+              category:       category || null,
+            }).catch(() => {});
+            if (didSell) {
+              invalidatePerformanceCache(redis, userId).catch(() => {});
+              invalidateIdentityCache(redis, userId).catch(() => {});
+            }
+          }
         } catch { /* non-fatal — legacy outcome recording already happened */ }
       }
 
@@ -26357,17 +26427,23 @@ app.get("/api/feed/daily/:userId", async (req, res) => {
     const userId = safeStr(req.params?.userId, 64);
     if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
 
-    const [categoryPriors, missedOpps, discoverySnap, urgencyTriggers, streak] = await Promise.all([
+    const [categoryPriors, missedOpps, discoverySnap, urgencyTriggers, streak,
+           categoryStrengthItems, categoryWeaknessItems, profitMilestoneItem] = await Promise.all([
       getCategoryOutcomePrior(redis, userId).catch(() => []),
       listMissedOpportunities(redis, userId, 5).catch(() => []),
       getDiscoverySnapshot(redis, userId).catch(() => []),
       getUrgencyTriggers(redis, userId).catch(() => []),
       recordDailyActivity(redis, userId).catch(() => null),
+      // Phase 13: financial identity feed items
+      buildCategoryStrengthFeedItems(pgPool, redis, userId).catch(() => []),
+      buildCategoryWeaknessFeedItems(pgPool, redis, userId).catch(() => []),
+      buildProfitMilestoneFeedItem(pgPool, redis, userId).catch(() => null),
     ]);
 
     const baseFeed = await buildDailyOpportunityFeed({
       redis, userId, categoryPriors, missedOpps,
       watchlistItems: [], portfolioItems: [], discoverySnap,
+      categoryStrengthItems, categoryWeaknessItems, profitMilestoneItem,
     }).catch(() => []);
 
     // Merge addiction cards at top of feed
@@ -26383,6 +26459,55 @@ app.get("/api/feed/daily/:userId", async (req, res) => {
     return res.status(200).json({ ok: true, feed: fullFeed, feedCount: fullFeed.length });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "daily_feed_failed", reason: err?.message });
+  }
+});
+
+// ── Phase 13: Financial Identity Profile Routes ───────────────────────────────
+
+// GET /api/profile/financial-identity/:userId
+// Full financial identity — maturity tier, realized P&L, best/worst categories,
+// signature tactics, operating mode, category mastery snapshot.
+app.get("/api/profile/financial-identity/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const force    = req.query?.force === "true";
+    const identity = await getFinancialIdentity(pgPool, redis, userId, { force });
+    return res.status(200).json({ ok: !!identity, identity: identity || null });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "financial_identity_failed", reason: err?.message });
+  }
+});
+
+// GET /api/profile/category-performance/:userId
+// Per-category realized P&L ranking — best to worst by net profit.
+// Query: ?minTrades=3
+app.get("/api/profile/category-performance/:userId", async (req, res) => {
+  try {
+    const userId    = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const minTrades = Math.max(1, Number(req.query?.minTrades || 3));
+    const ranking   = await getCategoryPerformanceRanking(pgPool, redis, userId, { minTrades });
+    const summary   = await getPerformanceSummary(pgPool, redis, userId).catch(() => null);
+    return res.status(200).json({ ok: true, ranking, summary: summary || null });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "category_performance_failed", reason: err?.message });
+  }
+});
+
+// GET /api/profile/tactic-summary/:userId
+// Win-rate breakdown by buying tactic — shows which behaviors produce profits.
+app.get("/api/profile/tactic-summary/:userId", async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const [summary, signature] = await Promise.all([
+      getTacticSummary(redis, userId),
+      getSignatureTactics(redis, userId, { minEvents: 3, topN: 5 }),
+    ]);
+    return res.status(200).json({ ok: true, tactics: summary, signatureTactics: signature });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "tactic_summary_failed", reason: err?.message });
   }
 });
 
