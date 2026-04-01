@@ -89,6 +89,11 @@ export async function recordScanEvent(redis, userId, {
   } catch { /* non-fatal */ }
 }
 
+// Issue 4: Minimum interaction duration before a click is counted as high-quality.
+// Clicks under this threshold are recorded as low_quality and excluded from
+// primary aggregate counts (they are still logged for debugging).
+const MIN_CLICK_DURATION_MS = 1500;
+
 /**
  * Record an affiliate click.
  * Called from POST /attribution/click when client taps a listing URL.
@@ -96,36 +101,50 @@ export async function recordScanEvent(redis, userId, {
  * @param {object} redis
  * @param {string} userId
  * @param {object} opts
- *   scanId   {string}
- *   source   {string}  — e.g. "ebay", "amazon"
- *   category {string}
- *   program  {string}  — affiliate program id
+ *   scanId      {string}
+ *   source      {string}   — e.g. "ebay", "amazon"
+ *   category    {string}
+ *   program     {string}   — affiliate program id
+ *   durationMs  {number}   — ms between scan result render and click (from client)
  */
 export async function recordAffiliateClickEvent(redis, userId, {
-  scanId   = null,
-  source   = null,
-  category = null,
-  program  = null,
+  scanId     = null,
+  source     = null,
+  category   = null,
+  program    = null,
+  durationMs = null,
 } = {}) {
   if (!redis || !userId) return;
   try {
+    // Issue 4: classify click quality; low-quality clicks are logged but not
+    // counted in primary aggregate metrics to keep attribution clean.
+    const quality = (durationMs != null && Number(durationMs) < MIN_CLICK_DURATION_MS)
+      ? "low_quality"
+      : "high";
+
     const date     = todayUTC();
     const clickKey = KEY_CLICK(userId, date);
     const aggKey   = KEY_AGG(date);
     const pipe     = redis.pipeline();
 
-    pipe.hincrby(clickKey, "affiliateClicks", 1);
-    if (source)   pipe.hincrby(clickKey, `src_${source}`, 1);
-    if (category) pipe.hincrby(clickKey, `cat_${String(category).toLowerCase().slice(0, 40)}`, 1);
-    if (program)  pipe.hincrby(clickKey, `prog_${program}`, 1);
+    if (quality === "high") {
+      pipe.hincrby(clickKey, "affiliateClicks", 1);
+      if (source)   pipe.hincrby(clickKey, `src_${source}`, 1);
+      if (category) pipe.hincrby(clickKey, `cat_${String(category).toLowerCase().slice(0, 40)}`, 1);
+      if (program)  pipe.hincrby(clickKey, `prog_${program}`, 1);
+      pipe.hincrby(aggKey, "affiliateClicks", 1);
+      if (program) pipe.hincrby(aggKey, `prog_${program}`, 1);
+    } else {
+      // Low-quality: count separately so ops can review without polluting metrics
+      pipe.hincrby(clickKey, "affiliateClicks_lowQuality", 1);
+      pipe.hincrby(aggKey,   "affiliateClicks_lowQuality", 1);
+    }
     pipe.expire(clickKey, EVENT_TTL);
-
-    pipe.hincrby(aggKey, "affiliateClicks", 1);
-    if (program) pipe.hincrby(aggKey, `prog_${program}`, 1);
-    pipe.expire(aggKey, EVENT_TTL);
+    pipe.expire(aggKey,   EVENT_TTL);
 
     const ev = JSON.stringify({
-      t: "click", uid: userId, scanId, source, cat: category, prog: program, at: Date.now(),
+      t: "click", uid: userId, scanId, source, cat: category, prog: program,
+      quality, durationMs, at: Date.now(),
     });
     pipe.lpush(KEY_DAILY(date), ev);
     pipe.ltrim(KEY_DAILY(date), 0, MAX_EVENTS_PER_DAY - 1);

@@ -1745,6 +1745,36 @@ function getScanPlanLimit(plan = "free") {
   return PLAN_SCAN_LIMIT_ANON;
 }
 
+// Issue 5: Per-user per-minute rate limits (scans and clicks).
+// Uses simple INCR+EXPIRE pattern consistent with existing quota infrastructure.
+// Fails OPEN — never blocks on Redis error.
+const RATE_LIMIT_SCAN_FREE_PER_MIN  = 3;
+const RATE_LIMIT_SCAN_PRO_PER_MIN   = 10;
+const RATE_LIMIT_CLICK_PER_MIN      = 10;
+
+async function checkPerMinuteRateLimit(redisClient, key, limit) {
+  try {
+    const count = await redisClient.incr(key);
+    if (count === 1) await redisClient.expire(key, 60);
+    return count <= limit;
+  } catch { return true; } // fail open
+}
+
+function scanRateLimitKey(userId, plan) {
+  const minuteSlot = Math.floor(Date.now() / 60000);
+  return `rl:scan:${plan}:${userId}:${minuteSlot}`;
+}
+
+function clickRateLimitKey(userId) {
+  const minuteSlot = Math.floor(Date.now() / 60000);
+  return `rl:click:${userId}:${minuteSlot}`;
+}
+
+// Issue 3: Minimum trust score required before attaching affiliate links.
+// Prevents affiliate tags on low-confidence or weak-signal results.
+const MIN_TRUST_FOR_AFFILIATE  = 0.45;
+const WEAK_SIGNALS_NO_AFFILIATE = new Set(["RISKY", "INSUFFICIENT DATA", "OVERPRICED"]);
+
 async function attachAuthContext(req, _res, next) {
   req.auth = null;
   req.authError = null;
@@ -18795,9 +18825,21 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     }
   } catch {}
   const _planA = getResolvedPlan(req);
+  // Issue 5: per-minute scan rate limit
+  if (_userId && !isPaidPlan(_planA)) {
+    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_FREE_PER_MIN).catch(() => true);
+    if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
+  } else if (_userId && isPaidPlan(_planA)) {
+    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_PRO_PER_MIN).catch(() => true);
+    if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
+  }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planA }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planA);
-  attachAffiliateLinksToPayload(responsePayload);
+  // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
+  if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+      !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
+    attachAffiliateLinksToPayload(responsePayload);
+  }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -18873,9 +18915,19 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     responsePayload.__scanIdentityConf = visionConfidence || 0;
   }
   const _planB = getResolvedPlan(req);
+  // Issue 5: per-minute scan rate limit
+  if (_userId) {
+    const _rlLimitB = isPaidPlan(_planB) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
+    const _rlOkB = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planB), _rlLimitB).catch(() => true);
+    if (!_rlOkB) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
+  }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planB }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planB);
-  attachAffiliateLinksToPayload(responsePayload);
+  // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
+  if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+      !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
+    attachAffiliateLinksToPayload(responsePayload);
+  }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -19080,9 +19132,19 @@ if (Array.isArray(items) && items.length >= 2 && visionIdentity?.brand && vision
 // ─────────────────────────────────────────────────────────────────────────────
 
 const _planC = getResolvedPlan(req);
+// Issue 5: per-minute scan rate limit
+if (_userId) {
+  const _rlLimitC = isPaidPlan(_planC) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
+  const _rlOkC = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planC), _rlLimitC).catch(() => true);
+  if (!_rlOkC) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
+}
 await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planC }).catch(() => {});
 applyPlanGatingToPayload(responsePayload, _planC);
-attachAffiliateLinksToPayload(responsePayload);
+// Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
+if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+    !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
+  attachAffiliateLinksToPayload(responsePayload);
+}
 recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
@@ -19260,9 +19322,19 @@ app.post("/market/search/stream", async (req, res) => {
       }
       if (_userId) {
         const _planD = getResolvedPlan(req);
+        // Issue 5: per-minute scan rate limit (stream path — check but don't block stream)
+        if (_userId) {
+          checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planD),
+            isPaidPlan(_planD) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN
+          ).catch(() => {});
+        }
         await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice, plan: _planD }).catch(() => {});
         applyPlanGatingToPayload(payload, _planD);
-        attachAffiliateLinksToPayload(payload);
+        // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
+        if ((payload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+            !WEAK_SIGNALS_NO_AFFILIATE.has(payload.profitIntel?.buySignal)) {
+          attachAffiliateLinksToPayload(payload);
+        }
         recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
       return payload;
@@ -26599,18 +26671,24 @@ app.get("/api/plan/status", async (req, res) => {
 
 // POST /attribution/click
 // Record an affiliate link click from the client.
-// Body: { userId, scanId?, source?, category?, program?, url? }
+// Body: { userId, scanId?, source?, category?, program?, url?, durationMs? }
 app.post("/attribution/click", async (req, res) => {
   try {
-    const userId   = safeStr(req.body?.userId,   64) || null;
-    const scanId   = safeStr(req.body?.scanId,  128) || null;
-    const source   = safeStr(req.body?.source,   60) || null;
-    const category = safeStr(req.body?.category, 60) || null;
-    const program  = safeStr(req.body?.program,  60) || null;
-    const url      = safeStr(req.body?.url,     500) || null;
+    const userId     = safeStr(req.body?.userId,   64) || null;
+    const scanId     = safeStr(req.body?.scanId,  128) || null;
+    const source     = safeStr(req.body?.source,   60) || null;
+    const category   = safeStr(req.body?.category, 60) || null;
+    const program    = safeStr(req.body?.program,  60) || null;
+    const url        = safeStr(req.body?.url,     500) || null;
+    // Issue 4: client sends time-to-click in ms; used to filter low-quality clicks
+    const durationMs = req.body?.durationMs != null ? Number(req.body.durationMs) : null;
     if (userId) {
-      recordAffiliateClick(redis, userId, { scanId, source, category, program, url }).catch(() => {});
-      recordAffiliateClickEvent(redis, userId, { scanId, source, category, program }).catch(() => {});
+      // Issue 5: per-minute click rate limit — fail silently, don't block
+      const _clickRlOk = await checkPerMinuteRateLimit(redis, clickRateLimitKey(userId), RATE_LIMIT_CLICK_PER_MIN).catch(() => true);
+      if (_clickRlOk) {
+        recordAffiliateClick(redis, userId, { scanId, source, category, program, url }).catch(() => {});
+        recordAffiliateClickEvent(redis, userId, { scanId, source, category, program, durationMs }).catch(() => {});
+      }
     }
     return res.status(200).json({ ok: true });
   } catch (err) {

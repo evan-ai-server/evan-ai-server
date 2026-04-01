@@ -178,13 +178,19 @@ const PRO_ONLY_FIELDS = [
   ["worstCategoryWarning",     FEATURES.WORST_CAT_WARNING],
 ];
 
+// Issue 1: Signal label softening for free users — prevents overconfidence
+// without changing the underlying signal value.
+const FREE_SIGNAL_LABELS = {
+  "STRONG BUY": "Potential opportunity",
+  "GOOD DEAL":  "Possible deal",
+};
+
 /**
  * Apply plan gating to a scan response payload.
  *
- * - Strips pro-only personalization fields for free users.
- * - Core signal, priceStats, warnings, and suspension are NEVER stripped.
- * - Trims comp list to top 3 for free users.
- * - Adds planGating summary so the UI can render upgrade hints.
+ * Issue 1: Softens signal display labels for free users (underlying value unchanged).
+ * Issue 2: Nulls gated fields + sets <field>Hidden=true instead of deleting.
+ * Issue 6: Adds _gatingContext hook for future dynamic gating.
  *
  * MUST run AFTER all signal computation — never before.
  *
@@ -194,13 +200,19 @@ const PRO_ONLY_FIELDS = [
  */
 export function applyPlanGatingToPayload(payload, plan) {
   if (!payload) return payload;
-  if (isPaidPlan(plan)) return payload; // nothing to strip
+
+  // Issue 6: always attach gating context for future dynamic gating hooks
+  payload._gatingContext = { plan, trustLevel: null };
+
+  if (isPaidPlan(plan)) return payload; // no further changes for paid users
 
   const gatedFeatures = new Set();
 
+  // Issue 2: null + hidden flag instead of delete — preserves payload shape
   for (const [field, feature] of PRO_ONLY_FIELDS) {
     if (payload[field] !== undefined) {
-      delete payload[field];
+      payload[field]                = null;
+      payload[`${field}Hidden`]     = true;
       gatedFeatures.add(feature);
     }
   }
@@ -212,6 +224,13 @@ export function applyPlanGatingToPayload(payload, plan) {
       items: payload.profitIntel.items.slice(0, 3),
     };
     gatedFeatures.add(FEATURES.FULL_COMP_LIST);
+  }
+
+  // Issue 1: Soften signal labels for free users — display label only,
+  // underlying buySignal value preserved in profitIntel.buySignal.
+  const rawSignal = payload.profitIntel?.buySignal;
+  if (rawSignal && FREE_SIGNAL_LABELS[rawSignal]) {
+    payload.buySignalLabel = FREE_SIGNAL_LABELS[rawSignal];
   }
 
   if (gatedFeatures.size > 0) {
