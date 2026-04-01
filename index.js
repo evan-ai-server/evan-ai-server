@@ -677,6 +677,12 @@ import {
   getGlobalAttributionStats,
   getDailyEvents,
 } from "./src/revenueAttribution.js";
+// Phase 15: Category Immortality
+import {
+  applyCategoryIntelligenceToPayload,
+  recordCategoryOutcomeNonBlocking,
+} from "./src/categoryIntelligence.js";
+import { normalizeCategory } from "./src/categoryRegistry.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -18840,6 +18846,16 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
       !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
     attachAffiliateLinksToPayload(responsePayload);
   }
+  // Phase 15: Category Intelligence enrichment (non-blocking)
+  await applyCategoryIntelligenceToPayload(responsePayload, {
+    redis,
+    userId:       _userId,
+    category,
+    itemText:     [responsePayload.visionIdentity?.title, responsePayload.visionIdentity?.description].filter(Boolean).join(" "),
+    scannedPrice,
+    medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
+    plan:         _planA,
+  }).catch(() => {});
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -18928,6 +18944,16 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
       !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
     attachAffiliateLinksToPayload(responsePayload);
   }
+  // Phase 15: Category Intelligence enrichment (non-blocking)
+  await applyCategoryIntelligenceToPayload(responsePayload, {
+    redis,
+    userId:       _userId,
+    category,
+    itemText:     [responsePayload.visionIdentity?.title, responsePayload.visionIdentity?.description].filter(Boolean).join(" "),
+    scannedPrice,
+    medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
+    plan:         _planB,
+  }).catch(() => {});
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -19145,6 +19171,16 @@ if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
     !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
   attachAffiliateLinksToPayload(responsePayload);
 }
+// Phase 15: Category Intelligence enrichment (non-blocking)
+await applyCategoryIntelligenceToPayload(responsePayload, {
+  redis,
+  userId:       _userId,
+  category,
+  itemText:     [responsePayload.visionIdentity?.title, responsePayload.visionIdentity?.description].filter(Boolean).join(" "),
+  scannedPrice,
+  medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
+  plan:         _planC,
+}).catch(() => {});
 recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
@@ -19335,6 +19371,16 @@ app.post("/market/search/stream", async (req, res) => {
             !WEAK_SIGNALS_NO_AFFILIATE.has(payload.profitIntel?.buySignal)) {
           attachAffiliateLinksToPayload(payload);
         }
+        // Phase 15: Category Intelligence enrichment (non-blocking)
+        applyCategoryIntelligenceToPayload(payload, {
+          redis,
+          userId:       _userId,
+          category,
+          itemText:     [payload.visionIdentity?.title, payload.visionIdentity?.description].filter(Boolean).join(" "),
+          scannedPrice,
+          medianMarket: payload.profitIntel?.medianPrice ?? null,
+          plan:         _planD,
+        }).catch(() => {});
         recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
       return payload;
@@ -22312,6 +22358,24 @@ app.post(
             if (didSell) {
               invalidatePerformanceCache(redis, userId).catch(() => {});
               invalidateIdentityCache(redis, userId).catch(() => {});
+              // Phase 15: record outcome into category identity engine
+              recordCategoryOutcomeNonBlocking(redis, userId, category || null, {
+                brand:     safeStr(req.body?.brand, 80)  || null,
+                model:     safeStr(req.body?.model, 80)  || null,
+                colorway:  safeStr(req.body?.colorway, 60) || null,
+                size:      safeStr(req.body?.size, 20)   || null,
+                reference: safeStr(req.body?.reference, 60) || null,
+                material:  safeStr(req.body?.material, 60) || null,
+                hardware:  safeStr(req.body?.hardware, 40) || null,
+                storageGB: req.body?.storageGB != null ? Number(req.body.storageGB) : null,
+                game:      safeStr(req.body?.game, 40)   || null,
+                set:       safeStr(req.body?.set, 80)    || null,
+                grade:     safeStr(req.body?.grade, 30)  || null,
+                isWin:     _isWin === true,
+                netProfit: _netProfit ?? 0,
+                buyPrice:  buyPrice ?? null,
+                sellPrice: sellPrice ?? null,
+              }).catch(() => {});
             }
           }
         } catch { /* non-fatal — legacy outcome recording already happened */ }
@@ -27406,3 +27470,33 @@ setInterval(() => {
     LOCAL_CACHE.prune(0.5);
   }
 }, 30000);
+
+// ── Phase 15: Category Intelligence daily refresh job ─────────────────────────
+// Runs at 04:00 UTC via a 1-minute poll that checks the hour.
+// Lightweight: only stores static calendar events that may have shifted.
+// Per-user identity data does NOT need backfill — it accumulates via outcomes.
+{
+  let _catIntelLastRun = 0;
+  setInterval(() => {
+    const now  = new Date();
+    const utcH = now.getUTCHours();
+    const utcM = now.getUTCMinutes();
+    // Run once per day at 04:00–04:01 UTC
+    if (utcH !== 4 || utcM > 1) return;
+    const todayMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    if (_catIntelLastRun >= todayMidnight) return;
+    _catIntelLastRun = todayMidnight;
+
+    // Pre-cache calendar contexts for high-volume categories
+    const catsToRefresh = ["sneakers", "watches", "electronics", "handbags", "trading_cards"];
+    Promise.all(
+      catsToRefresh.map((cat) =>
+        import("./src/categoryEventCalendar.js")
+          .then(({ getCategoryCalendarContext }) => getCategoryCalendarContext(redis, cat))
+          .catch(() => null)
+      )
+    )
+      .then(() => console.log("[Phase15] Category calendar contexts refreshed"))
+      .catch(() => {});
+  }, 60_000); // check every minute
+}
