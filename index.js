@@ -653,6 +653,30 @@ import {
   buildCategoryWeaknessFeedItems,
   buildProfitMilestoneFeedItem,
 } from "./src/financialIdentityEngine.js";
+// Phase 14: Money Engine
+import {
+  FEATURES,
+  PLANS,
+  canAccessFeature,
+  isPaidPlan,
+  gateRoute,
+  applyPlanGatingToPayload,
+  gateFeedItemsForPlan,
+} from "./src/planGateEngine.js";
+import {
+  AFFILIATE_DISCLOSURE,
+  attachAffiliateLinksToPayload,
+  recordAffiliateClick,
+  getAffiliateStatus,
+} from "./src/affiliateRouter.js";
+import {
+  recordScanEvent,
+  recordAffiliateClickEvent,
+  recordSubscriptionEvent,
+  getUserAttributionStats,
+  getGlobalAttributionStats,
+  getDailyEvents,
+} from "./src/revenueAttribution.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -13422,7 +13446,9 @@ function assembleProfitIntel({
 // ── Phase 6: Personal decision layer helper ────────────────────────────────────
 // Applies personalization AFTER assembleProfitIntel. Async — modifies payload
 // in-place. Non-fatal: all failures are swallowed so scan response always returns.
-async function _applyPersonalDecisionToPayload(payload, { userId, category, scannedPrice }) {
+// Phase 14: accepts `plan` — personalization layer is skipped for free users
+// (Phase 12 price index seeding and Phase 11 signal corrections run for all plans).
+async function _applyPersonalDecisionToPayload(payload, { userId, category, scannedPrice, plan = "free" }) {
   if (!userId || !payload?.profitIntel) return;
   // Items/identity may be pre-staged on payload for arbitrage detection
   const items       = payload.__scanItems   || null;
@@ -13432,9 +13458,15 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
   delete payload.__scanItems;
   delete payload.__scanIdentity;
   delete payload.__scanIdentityConf;
+
+  const _isPro = isPaidPlan(plan);
+
   try {
     const _pi = payload.profitIntel;
 
+    // ── Personalization (Pro only) ─────────────────────────────────────────────
+    // Free users get the honest market signal. Pro adds behavioral calibration.
+    if (_isPro) {
     // Run personal decision layer and capital risk check concurrently
     const [personalLayer, portfolioSummary] = await Promise.all([
       applyPersonalDecisionLayer(redis, pgPool, userId, {
@@ -13524,10 +13556,11 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
       }
     }
 
-    // Phase 11: Apply explicit ops threshold overrides (post-hoc signal correction).
-    // If an operator-confirmed threshold tighten was applied for this category, and the
-    // current scan's feature values fall below the tighter floor, downgrade the signal.
-    // This is auditable — payload.explicitOverrideApplied records what changed and why.
+    } // ── end _isPro personalization block ─────────────────────────────────────
+
+    // Phase 11: Explicit ops threshold override — applies to ALL plans.
+    // Signal accuracy correction based on observed false-positive patterns.
+    // This is not personalization — it's market calibration applied universally.
     if (category && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
       try {
         // Canary roll: deterministic 0-1 from hash(userId + category) so same user
@@ -13572,15 +13605,13 @@ async function _applyPersonalDecisionToPayload(payload, { userId, category, scan
       } catch { /* non-fatal */ }
     }
 
-    // Phase 12: Feed price index from this scan result (non-blocking).
-    // Only fires when category + a valid priceStats.median are available.
+    // Phase 12: Feed price index from this scan result — ALL plans (market data collection).
     if (category && payload.profitIntel?.priceStats?.median > 0) {
       recordPriceIndexSample(redis, category, payload.profitIntel.priceStats).catch(() => {});
     }
 
-    // Phase 13: Worst-category personal warning.
-    // If user has a track record of losing money in this category, surface a warning.
-    if (category && userId && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
+    // Phase 13: Worst-category personal warning — Pro only.
+    if (_isPro && category && userId && _pi.buySignal && ["STRONG BUY", "GOOD DEAL"].includes(_pi.buySignal)) {
       try {
         const worstCats = await getWorstCategories(pgPool, redis, userId, { minTrades: 3, topN: 5 });
         const isWorst   = worstCats.some((c) => c.category?.toLowerCase() === category.toLowerCase());
@@ -18763,7 +18794,11 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
       if (related.length) responsePayload.relatedOpportunities = related;
     }
   } catch {}
-  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
+  const _planA = getResolvedPlan(req);
+  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planA }).catch(() => {});
+  applyPlanGatingToPayload(responsePayload, _planA);
+  attachAffiliateLinksToPayload(responsePayload);
+  recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -18837,7 +18872,11 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     responsePayload.__scanIdentity     = visionIdentity;
     responsePayload.__scanIdentityConf = visionConfidence || 0;
   }
-  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
+  const _planB = getResolvedPlan(req);
+  await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planB }).catch(() => {});
+  applyPlanGatingToPayload(responsePayload, _planB);
+  attachAffiliateLinksToPayload(responsePayload);
+  recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -19040,7 +19079,11 @@ if (Array.isArray(items) && items.length >= 2 && visionIdentity?.brand && vision
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice }).catch(() => {});
+const _planC = getResolvedPlan(req);
+await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planC }).catch(() => {});
+applyPlanGatingToPayload(responsePayload, _planC);
+attachAffiliateLinksToPayload(responsePayload);
+recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
 
@@ -19216,7 +19259,11 @@ app.post("/market/search/stream", async (req, res) => {
         console.warn("stream_profit_intel_error", _piErr?.message);
       }
       if (_userId) {
-        await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice }).catch(() => {});
+        const _planD = getResolvedPlan(req);
+        await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice, plan: _planD }).catch(() => {});
+        applyPlanGatingToPayload(payload, _planD);
+        attachAffiliateLinksToPayload(payload);
+        recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
       return payload;
     };
@@ -26440,10 +26487,18 @@ app.get("/api/feed/daily/:userId", async (req, res) => {
       buildProfitMilestoneFeedItem(pgPool, redis, userId).catch(() => null),
     ]);
 
+    // Phase 14: gate financial identity feed items for free users
+    const _feedPlan = getResolvedPlan(req);
+    const _gatedFeed = gateFeedItemsForPlan(_feedPlan, {
+      categoryStrengthItems, categoryWeaknessItems, profitMilestoneItem,
+    });
+
     const baseFeed = await buildDailyOpportunityFeed({
       redis, userId, categoryPriors, missedOpps,
       watchlistItems: [], portfolioItems: [], discoverySnap,
-      categoryStrengthItems, categoryWeaknessItems, profitMilestoneItem,
+      categoryStrengthItems: _gatedFeed.categoryStrengthItems,
+      categoryWeaknessItems:  _gatedFeed.categoryWeaknessItems,
+      profitMilestoneItem:    _gatedFeed.profitMilestoneItem,
     }).catch(() => []);
 
     // Merge addiction cards at top of feed
@@ -26471,6 +26526,8 @@ app.get("/api/profile/financial-identity/:userId", async (req, res) => {
   try {
     const userId = safeStr(req.params?.userId, 64);
     if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const gate = gateRoute(getResolvedPlan(req), FEATURES.FINANCIAL_IDENTITY);
+    if (!gate.allowed) return res.status(403).json(gate.response);
     const force    = req.query?.force === "true";
     const identity = await getFinancialIdentity(pgPool, redis, userId, { force });
     return res.status(200).json({ ok: !!identity, identity: identity || null });
@@ -26486,6 +26543,8 @@ app.get("/api/profile/category-performance/:userId", async (req, res) => {
   try {
     const userId    = safeStr(req.params?.userId, 64);
     if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const gate = gateRoute(getResolvedPlan(req), FEATURES.CATEGORY_PERFORMANCE);
+    if (!gate.allowed) return res.status(403).json(gate.response);
     const minTrades = Math.max(1, Number(req.query?.minTrades || 3));
     const ranking   = await getCategoryPerformanceRanking(pgPool, redis, userId, { minTrades });
     const summary   = await getPerformanceSummary(pgPool, redis, userId).catch(() => null);
@@ -26501,6 +26560,8 @@ app.get("/api/profile/tactic-summary/:userId", async (req, res) => {
   try {
     const userId = safeStr(req.params?.userId, 64);
     if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const gate = gateRoute(getResolvedPlan(req), FEATURES.TACTIC_SUMMARY);
+    if (!gate.allowed) return res.status(403).json(gate.response);
     const [summary, signature] = await Promise.all([
       getTacticSummary(redis, userId),
       getSignatureTactics(redis, userId, { minEvents: 3, topN: 5 }),
@@ -26508,6 +26569,114 @@ app.get("/api/profile/tactic-summary/:userId", async (req, res) => {
     return res.status(200).json({ ok: true, tactics: summary, signatureTactics: signature });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "tactic_summary_failed", reason: err?.message });
+  }
+});
+
+// ── Phase 14: Money Engine Routes ─────────────────────────────────────────────
+
+// GET /api/plan/status
+// Returns the caller's current plan and feature access flags.
+app.get("/api/plan/status", async (req, res) => {
+  try {
+    const plan = getResolvedPlan(req);
+    return res.status(200).json({
+      ok:   true,
+      plan,
+      isPro: isPaidPlan(plan),
+      features: {
+        personalDecision:   canAccessFeature(plan, FEATURES.PERSONAL_DECISION),
+        financialIdentity:  canAccessFeature(plan, FEATURES.FINANCIAL_IDENTITY),
+        fullCompList:       canAccessFeature(plan, FEATURES.FULL_COMP_LIST),
+        arbitrage:          canAccessFeature(plan, FEATURES.ARBITRAGE_DETECTION),
+        capitalRisk:        canAccessFeature(plan, FEATURES.CAPITAL_LOCK_RISK),
+        fullFeed:           canAccessFeature(plan, FEATURES.FULL_FEED),
+      },
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "plan_status_failed", reason: err?.message });
+  }
+});
+
+// POST /attribution/click
+// Record an affiliate link click from the client.
+// Body: { userId, scanId?, source?, category?, program?, url? }
+app.post("/attribution/click", async (req, res) => {
+  try {
+    const userId   = safeStr(req.body?.userId,   64) || null;
+    const scanId   = safeStr(req.body?.scanId,  128) || null;
+    const source   = safeStr(req.body?.source,   60) || null;
+    const category = safeStr(req.body?.category, 60) || null;
+    const program  = safeStr(req.body?.program,  60) || null;
+    const url      = safeStr(req.body?.url,     500) || null;
+    if (userId) {
+      recordAffiliateClick(redis, userId, { scanId, source, category, program, url }).catch(() => {});
+      recordAffiliateClickEvent(redis, userId, { scanId, source, category, program }).catch(() => {});
+    }
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "attribution_click_failed", reason: err?.message });
+  }
+});
+
+// POST /attribution/subscription
+// Record a subscription lifecycle event (from RevenueCat webhook or client).
+// Body: { userId, event, plan?, source? }
+// event: "activated" | "renewed" | "cancelled" | "restored" | "trial_started"
+app.post("/attribution/subscription", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId, 64);
+    const event  = safeStr(req.body?.event,  30);
+    const plan   = safeStr(req.body?.plan,   20) || "pro";
+    const source = safeStr(req.body?.source, 60) || "client_report";
+    if (!userId || !event) return res.status(200).json({ ok: false, error: "userId and event required" });
+    await recordSubscriptionEvent(redis, userId, { event, plan, source });
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "attribution_subscription_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/revenue/stats
+// Ops: global attribution stats — scan counts, clicks, subscription events.
+// Query: ?days=7 (default 7, max 30)
+app.get("/api/ops/revenue/stats", requireOpsAccess, async (req, res) => {
+  try {
+    const days = Math.min(30, Math.max(1, Number(req.query?.days || 7)));
+    const [global, affStatus] = await Promise.all([
+      getGlobalAttributionStats(redis, { days }),
+      Promise.resolve(getAffiliateStatus()),
+    ]);
+    return res.status(200).json({ ok: true, stats: global, affiliatePrograms: affStatus, days });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "revenue_stats_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/revenue/user/:userId
+// Ops: per-user attribution stats.
+app.get("/api/ops/revenue/user/:userId", requireOpsAccess, async (req, res) => {
+  try {
+    const userId = safeStr(req.params?.userId, 64);
+    if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+    const days  = Math.min(30, Math.max(1, Number(req.query?.days || 30)));
+    const stats = await getUserAttributionStats(redis, userId, { days });
+    return res.status(200).json({ ok: true, userId, stats: stats || null });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "user_revenue_stats_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/revenue/events
+// Ops: raw daily event stream for a date (default today).
+// Query: ?date=YYYY-MM-DD&limit=100
+app.get("/api/ops/revenue/events", requireOpsAccess, async (req, res) => {
+  try {
+    const date   = safeStr(req.query?.date, 10) || null;
+    const limit  = Math.min(500, Math.max(1, Number(req.query?.limit || 100)));
+    const events = await getDailyEvents(redis, { date, limit });
+    return res.status(200).json({ ok: true, events, count: events.length });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "revenue_events_failed", reason: err?.message });
   }
 });
 
