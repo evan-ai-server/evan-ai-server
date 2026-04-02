@@ -696,6 +696,7 @@ import {
   checkIncidentControl, checkAllControlsForTarget, getActiveControls, getIncidentLog,
 } from "./src/incidentControls.js";
 import { guardPayloadSafe, auditB2BPayload } from "./src/consistencyGuard.js";
+import { applyTruthGuardSafe }               from "./src/truthGuard.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 
@@ -13209,6 +13210,13 @@ function assembleProfitIntel({
       });
       finalBuySignal = biasResult.biasedBuySignal || signalAfterDepth;
       biasNote = biasResult.biasNote || null;
+      // Phase 17: bias cannot raise a signal above what trustScore allows.
+      // applyOutcomeBiasesToDecision may raise FAIR→GOOD DEAL for experienced
+      // users, but the trust floor must still be respected.
+      if (finalBuySignal === "GOOD DEAL" && trustScore !== null && trustScore < 0.45) {
+        finalBuySignal = signalAfterDepth;  // revert the raise
+        biasNote = null;
+      }
     } catch { /* non-fatal */ }
   }
 
@@ -13265,7 +13273,10 @@ function assembleProfitIntel({
   } catch { /* non-fatal */ }
 
   const scannedPriceClean = finitePrice(scannedPrice);
-  const expectedProfit = scannedPriceClean != null && priceStats?.median != null
+  // Phase 17: expectedProfit must be null on unsafe signals — showing profit on RISKY
+  // or OVERPRICED scans misleads users into purchases the signal explicitly discourages.
+  const _unsafeSignals = new Set(["RISKY", "INSUFFICIENT DATA", "OVERPRICED"]);
+  const expectedProfit = (!_unsafeSignals.has(finalBuySignal) && scannedPriceClean != null && priceStats?.median != null)
     ? round2(Math.max(0, priceStats.median * 0.93 - scannedPriceClean))
     : null;
 
@@ -13351,6 +13362,8 @@ function assembleProfitIntel({
 
   // ── WS7: System-level calibration suppression check ─────────────────────
   // Uses in-memory cache (warmSuppressionCache()) to avoid async call in sync function.
+  // Track whether suppression actually fired so capReason reflects reality.
+  let _suppressionFired = false;
   try {
     const suppressed = getSuppressionCached(category, cappedBuySignal);
     if (suppressed) {
@@ -13358,6 +13371,7 @@ function assembleProfitIntel({
       const idx = SIGNAL_ORDER.indexOf(cappedBuySignal);
       if (idx >= 0 && idx < SIGNAL_ORDER.length - 1) {
         cappedBuySignal = SIGNAL_ORDER[idx + 1];
+        _suppressionFired = true;
       }
       capNote = capNote || "category_calibration_suppressed";
     }
@@ -13389,35 +13403,7 @@ function assembleProfitIntel({
     ? buildResaleModeNote(category || "", resaleMode)
     : null;
 
-  // ── WS6: Structured warnings ──────────────────────────────────────────────
-  let structuredWarnings = [];
-  try {
-    const depthForWarn = depthGateResult ? {
-      depthTier:      depthGateResult.depthTier,
-      depthCount:     depthGateResult.depthCount,
-      listedDominated: depthGateResult.listedDominated ?? false,
-      effectiveCount:  depthGateResult.effectiveCount  ?? (depthGateResult.depthCount ?? 0),
-    } : {};
-    structuredWarnings = generateScanWarnings({
-      depthTier:         depthForWarn.depthTier,
-      depthCount:        depthForWarn.depthCount,
-      listedDominated:   depthForWarn.listedDominated,
-      effectiveCount:    depthForWarn.effectiveCount,
-      identityQuality:   round2(identityQuality),
-      cappedBuySignal,
-      signalCapped:      depthGateResult?.capped || !!replicaCapNote || !!capNote,
-      replicaRiskTier:   replicaRisk?.tier,
-      categoryCalibration,
-      resaleMode,
-      localResultCount:  localResultCount ?? null,
-    });
-  } catch { /* non-fatal */ }
-
-  // ── WS6: Category win rate ────────────────────────────────────────────────
-  const categoryWinRate = categoryCalibration?.winRate != null
-    ? round2(categoryCalibration.winRate * 100)
-    : null;
-
+  // ── Signal normalization — assemble before structuredWarnings so they get correct context ──
   const _finalSignal = cappedBuySignal;
   const _finalPrimaryAction = {
     "STRONG BUY":        "VIEW_DEAL",
@@ -13428,14 +13414,49 @@ function assembleProfitIntel({
     "INSUFFICIENT DATA": "DONT_BUY",
   }[_finalSignal] || "VERIFY_MANUALLY";
 
-  // Always-present signal normalization (WS6)
   const _signalRaw    = buySignalResult.signal;
   const _signalCapped = _finalSignal !== _signalRaw;
-  const _suppressionActive = getSuppressionCached(category, _signalRaw);
-  const _capReason    = (_suppressionActive ? "category_calibration_suppressed" : null)
+  // Phase 17 fix: use tracked _suppressionFired (which checked cappedBuySignal)
+  // instead of re-checking against _signalRaw (which could mismatch after depth-gate cap).
+  const _capReason    = (_suppressionFired ? "category_calibration_suppressed" : null)
     || replicaCapNote || capNote
     || (depthGateResult?.capped ? depthGateResult.capReason || "market_depth" : null)
     || null;
+
+  // ── WS6: Category win rate ────────────────────────────────────────────────
+  // Phase 17 fix: calibration object uses sbWinRate, not winRate.
+  const categoryWinRate = categoryCalibration?.sbWinRate != null
+    ? round2(categoryCalibration.sbWinRate * 100)
+    : null;
+
+  // ── WS6: Structured warnings — built AFTER _capReason/_signalRaw are assembled ──
+  let structuredWarnings = [];
+  try {
+    const depthForWarn = depthGateResult ? {
+      depthTier:        depthGateResult.depthTier,
+      depthCount:       depthGateResult.depthCount,
+      listedDominated:  depthGateResult.listedDominated ?? false,
+      effectiveCount:   depthGateResult.effectiveCount  ?? (depthGateResult.depthCount ?? 0),
+    } : {};
+    structuredWarnings = generateScanWarnings({
+      depthTier:           depthForWarn.depthTier,
+      depthCount:          depthForWarn.depthCount,
+      listedDominated:     depthForWarn.listedDominated,
+      effectiveCount:      depthForWarn.effectiveCount,
+      identityQuality:     round2(identityQuality),
+      // Phase 17 fix: pass signalRaw + capReason so SIGNAL_CAPPED warning fires correctly.
+      signalCapped:        _signalCapped,
+      signalRaw:           _signalRaw,
+      capReason:           _capReason,
+      // Phase 17 fix: pass full replicaRisk object so REPLICA_RISK warning fires correctly.
+      replicaRisk:         replicaRisk,
+      // Phase 17 fix: pass sbWinRate and totalSamples so UNCALIBRATED warning fires correctly.
+      categoryWinRate:     categoryWinRate,
+      calibrationSamples:  categoryCalibration?.totalSamples ?? 0,
+      resaleMode,
+      localResultCount:    localResultCount ?? null,
+    });
+  } catch { /* non-fatal */ }
 
   return {
     priceStats,
@@ -18857,7 +18878,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planA }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planA);
   // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-  if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+  if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
       !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
     attachAffiliateLinksToPayload(responsePayload);
   }
@@ -18876,6 +18897,12 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   if (_cViolationsA.length) {
     console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsA.length, violations: _cViolationsA.map((v) => v.code) });
     redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+  }
+  // Phase 17: truth guard — final payload corrections (mutates in-place)
+  const _tgA = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+  if (_tgA.violations.length) {
+    console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgA.corrections });
+    redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
   }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
@@ -18961,7 +18988,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planB }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planB);
   // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-  if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+  if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
       !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
     attachAffiliateLinksToPayload(responsePayload);
   }
@@ -18980,6 +19007,12 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   if (_cViolationsB.length) {
     console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsB.length, violations: _cViolationsB.map((v) => v.code) });
     redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+  }
+  // Phase 17: truth guard — final payload corrections (mutates in-place)
+  const _tgB = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+  if (_tgB.violations.length) {
+    console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgB.corrections });
+    redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
   }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
@@ -19194,7 +19227,7 @@ if (_userId) {
 await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planC }).catch(() => {});
 applyPlanGatingToPayload(responsePayload, _planC);
 // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-if ((responsePayload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
     !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
   attachAffiliateLinksToPayload(responsePayload);
 }
@@ -19213,6 +19246,12 @@ const _cViolationsC = guardPayloadSafe(responsePayload, _planC);
 if (_cViolationsC.length) {
   console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsC.length, violations: _cViolationsC.map((v) => v.code) });
   redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+}
+// Phase 17: truth guard — final payload corrections (mutates in-place)
+const _tgC = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+if (_tgC.violations.length) {
+  console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgC.corrections });
+  redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
 }
 recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
@@ -19400,7 +19439,7 @@ app.post("/market/search/stream", async (req, res) => {
         await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice, plan: _planD }).catch(() => {});
         applyPlanGatingToPayload(payload, _planD);
         // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-        if ((payload.trustScore ?? 1) >= MIN_TRUST_FOR_AFFILIATE &&
+        if ((payload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
             !WEAK_SIGNALS_NO_AFFILIATE.has(payload.profitIntel?.buySignal)) {
           attachAffiliateLinksToPayload(payload);
         }
@@ -19419,6 +19458,12 @@ app.post("/market/search/stream", async (req, res) => {
         if (_cViolationsD.length) {
           console.warn("consistency_violation", { scanId: payload.scanId, count: _cViolationsD.length, violations: _cViolationsD.map((v) => v.code) });
           redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+        }
+        // Phase 17: truth guard — final payload corrections (mutates in-place)
+        const _tgD = applyTruthGuardSafe(payload, { soldCompCount: payload.profitIntel?.soldCompCount ?? null });
+        if (_tgD.violations.length) {
+          console.warn("truth_violation", { scanId: payload.scanId, corrections: _tgD.corrections });
+          redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
         }
         recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
@@ -27280,6 +27325,19 @@ app.post("/api/b2b/valuate", requireB2BApiKey, async (req, res) => {
     const itemRef  = safeStr(req.body?.itemRef,  128) || null;
 
     const result = await valuateItem(redis, { query, category, askPrice, itemRef });
+
+    // Phase 17: B2B consistency audit — detect overconfidence vs price index
+    try {
+      const priceIdx = await getCategoryPriceIndex(redis, category).catch(() => null);
+      if (priceIdx) {
+        const audit = auditB2BPayload(result, priceIdx);
+        if (!audit.consistent) {
+          result.consistencyViolations = audit.violations;
+          console.warn("b2b_overconfidence", { category, violations: audit.violations.map((v) => v.code) });
+          redis?.hincrby("metrics:b2b_overconfidence_count", "total", 1).catch(() => {});
+        }
+      }
+    } catch { /* non-fatal — audit must not block valuation response */ }
 
     incrementUsage(redis, req.b2b, "valuate").catch(() => {});
     return res.status(200).json(result);
