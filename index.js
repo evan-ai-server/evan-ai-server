@@ -683,6 +683,21 @@ import {
   recordCategoryOutcomeNonBlocking,
 } from "./src/categoryIntelligence.js";
 import { normalizeCategory } from "./src/categoryRegistry.js";
+// Phase 16: No-Decay System
+import { runRegressionHarness }            from "./src/regressionHarness.js";
+import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
+import { replayWrongCalls }                from "./src/badCallReplay.js";
+import { runAnomalyDetection, getActiveAnomalies, getAnomalyHistory } from "./src/anomalyEngine.js";
+import {
+  CONTROL_TYPES,
+  suppressCategory, suppressSignalTier, forceDowngrade,
+  disableOracle, disableAffiliate, disableB2B, markObserveOnly,
+  clearControl, clearAllControls,
+  checkIncidentControl, checkAllControlsForTarget, getActiveControls, getIncidentLog,
+} from "./src/incidentControls.js";
+import { guardPayloadSafe, auditB2BPayload } from "./src/consistencyGuard.js";
+import { runReleaseGate }                  from "./src/releaseGate.js";
+import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -18856,6 +18871,12 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
     plan:         _planA,
   }).catch(() => {});
+  // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
+  const _cViolationsA = guardPayloadSafe(responsePayload, _planA);
+  if (_cViolationsA.length) {
+    console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsA.length, violations: _cViolationsA.map((v) => v.code) });
+    redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+  }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -18954,6 +18975,12 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
     plan:         _planB,
   }).catch(() => {});
+  // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
+  const _cViolationsB = guardPayloadSafe(responsePayload, _planB);
+  if (_cViolationsB.length) {
+    console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsB.length, violations: _cViolationsB.map((v) => v.code) });
+    redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+  }
   recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
@@ -19181,6 +19208,12 @@ await applyCategoryIntelligenceToPayload(responsePayload, {
   medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
   plan:         _planC,
 }).catch(() => {});
+// Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
+const _cViolationsC = guardPayloadSafe(responsePayload, _planC);
+if (_cViolationsC.length) {
+  console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsC.length, violations: _cViolationsC.map((v) => v.code) });
+  redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+}
 recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
@@ -19381,6 +19414,12 @@ app.post("/market/search/stream", async (req, res) => {
           medianMarket: payload.profitIntel?.medianPrice ?? null,
           plan:         _planD,
         }).catch(() => {});
+        // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
+        const _cViolationsD = guardPayloadSafe(payload, _planD);
+        if (_cViolationsD.length) {
+          console.warn("consistency_violation", { scanId: payload.scanId, count: _cViolationsD.length, violations: _cViolationsD.map((v) => v.code) });
+          redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+        }
         recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
       return payload;
@@ -27442,6 +27481,231 @@ app.get("/api/ops/b2b/price-index/:category", requireOpsAccess, async (req, res)
     return res.status(200).json({ ok: true, category, index, eligibility });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "price_index_ops_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 16: No-Decay System — Operator Cockpit Routes
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/ops/regression/run — run regression harness
+app.get("/api/ops/regression/run", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await runRegressionHarness(redis);
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "regression_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/golden-cases/run — run golden case suite
+app.get("/api/ops/golden-cases/run", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await runGoldenCases();
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "golden_cases_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/replay/wrong-calls — replay recent wrong calls
+// Query: ?userId=<id>&limit=<n>&category=<cat>
+app.get("/api/ops/replay/wrong-calls", requireOpsAccess, async (req, res) => {
+  try {
+    const userId   = safeStr(req.query?.userId, 128) || null;
+    const limit    = Math.min(parseInt(req.query?.limit) || 20, 100);
+    const category = safeStr(req.query?.category, 80) || null;
+    const result   = await replayWrongCalls(redis, { userId, limit, category });
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "replay_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/anomalies — get active anomalies (cached snapshot)
+app.get("/api/ops/anomalies", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await getActiveAnomalies(redis);
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "anomalies_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/anomalies/scan — trigger a fresh anomaly detection run
+app.post("/api/ops/anomalies/scan", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await runAnomalyDetection(redis);
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "anomaly_scan_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/anomalies/history — get anomaly history
+// Query: ?days=<n>
+app.get("/api/ops/anomalies/history", requireOpsAccess, async (req, res) => {
+  try {
+    const days   = Math.min(parseInt(req.query?.days) || 7, 30);
+    const result = await getAnomalyHistory(redis, { days });
+    return res.status(200).json({ ok: true, days, history: result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "anomaly_history_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/incidents/active — list all active incident controls
+app.get("/api/ops/incidents/active", requireOpsAccess, async (_req, res) => {
+  try {
+    const controls = await getActiveControls(redis);
+    const log      = await getIncidentLog(redis, { limit: 20 });
+    return res.status(200).json({ ok: true, activeCount: controls.length, controls, recentLog: log });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "incidents_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/incidents/category-suppress
+// Body: { category, reason, ttlSeconds? }
+app.post("/api/ops/incidents/category-suppress", requireOpsAccess, async (req, res) => {
+  try {
+    const category  = safeStr(req.body?.category, 80);
+    const reason    = safeStr(req.body?.reason, 200) || "ops-initiated";
+    const ttlSeconds= req.body?.ttlSeconds != null ? Math.min(Number(req.body.ttlSeconds), 7 * 86400) : undefined;
+    if (!category) return res.status(400).json({ ok: false, error: "category required" });
+    const result = await suppressCategory(redis, category, { reason, triggeredBy: "ops_api", ttlSeconds });
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "suppress_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/incidents/signal-suppress
+// Body: { signal, reason, ttlSeconds? }
+app.post("/api/ops/incidents/signal-suppress", requireOpsAccess, async (req, res) => {
+  try {
+    const signal    = safeStr(req.body?.signal, 40);
+    const reason    = safeStr(req.body?.reason, 200) || "ops-initiated";
+    const ttlSeconds= req.body?.ttlSeconds != null ? Math.min(Number(req.body.ttlSeconds), 7 * 86400) : undefined;
+    if (!signal) return res.status(400).json({ ok: false, error: "signal required" });
+    const result = await suppressSignalTier(redis, signal, { reason, triggeredBy: "ops_api", ttlSeconds });
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "signal_suppress_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/incidents/force-downgrade
+// Body: { category, reason, ttlSeconds? }
+app.post("/api/ops/incidents/force-downgrade", requireOpsAccess, async (req, res) => {
+  try {
+    const category  = safeStr(req.body?.category, 80);
+    const reason    = safeStr(req.body?.reason, 200) || "ops-initiated";
+    const ttlSeconds= req.body?.ttlSeconds != null ? Math.min(Number(req.body.ttlSeconds), 7 * 86400) : undefined;
+    if (!category) return res.status(400).json({ ok: false, error: "category required" });
+    const result = await forceDowngrade(redis, category, { reason, triggeredBy: "ops_api", ttlSeconds });
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "force_downgrade_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/incidents/disable-affiliate
+// Body: { category, reason, ttlSeconds? }
+app.post("/api/ops/incidents/disable-affiliate", requireOpsAccess, async (req, res) => {
+  try {
+    const category  = safeStr(req.body?.category, 80);
+    const reason    = safeStr(req.body?.reason, 200) || "ops-initiated";
+    const ttlSeconds= req.body?.ttlSeconds != null ? Math.min(Number(req.body.ttlSeconds), 7 * 86400) : undefined;
+    if (!category) return res.status(400).json({ ok: false, error: "category required" });
+    const result = await disableAffiliate(redis, category, { reason, triggeredBy: "ops_api", ttlSeconds });
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "disable_affiliate_failed", reason: err?.message });
+  }
+});
+
+// POST /api/ops/incidents/clear
+// Body: { type, target, reason } — or { clearAll: true, reason }
+app.post("/api/ops/incidents/clear", requireOpsAccess, async (req, res) => {
+  try {
+    const reason      = safeStr(req.body?.reason, 200) || "ops-initiated";
+    if (req.body?.clearAll === true) {
+      const result = await clearAllControls(redis, { reason, triggeredBy: "ops_api" });
+      return res.status(200).json({ ok: result.ok, ...result });
+    }
+    const type   = safeStr(req.body?.type, 40);
+    const target = safeStr(req.body?.target, 80);
+    if (!type || !target) return res.status(400).json({ ok: false, error: "type and target required (or clearAll: true)" });
+    const result = await clearControl(redis, type, target, { reason, triggeredBy: "ops_api" });
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "clear_control_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/release-gate — run full release gate
+app.get("/api/ops/release-gate", requireOpsAccess, async (_req, res) => {
+  try {
+    const result = await runReleaseGate(redis);
+    return res.status(200).json({ ok: result.pass, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "release_gate_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/latency/summary — P95 latency and recent scan timing
+app.get("/api/ops/latency/summary", requireOpsAccess, async (_req, res) => {
+  try {
+    const p95Raw   = await redis?.get("metrics:latency:scan_p95_ms").catch(() => null);
+    const p50Raw   = await redis?.get("metrics:latency:scan_p50_ms").catch(() => null);
+    const p99Raw   = await redis?.get("metrics:latency:scan_p99_ms").catch(() => null);
+    return res.status(200).json({
+      ok:  true,
+      p50: p50Raw ? parseFloat(p50Raw) : null,
+      p95: p95Raw ? parseFloat(p95Raw) : null,
+      p99: p99Raw ? parseFloat(p99Raw) : null,
+      thresholds: { p95Warn: 14000, p95Critical: 20000 },
+      note: "Values in milliseconds. null = no data recorded yet.",
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "latency_summary_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/trust/contradictions — run consistency guard on a sample payload
+// Body: pass a sample payload for diagnosis (or GET returns last recorded violations)
+app.get("/api/ops/trust/contradictions", requireOpsAccess, async (_req, res) => {
+  try {
+    const violationCount = await redis?.hget("metrics:consistency_violations", "total").catch(() => null);
+    const controls       = await getActiveControls(redis).catch(() => []);
+    return res.status(200).json({
+      ok: true,
+      lifetimeViolations:  violationCount ? parseInt(violationCount) : 0,
+      activeControls:      controls.length,
+      note: "Violations detected by guardPayloadSafe() logged to console + metrics:consistency_violations. Active incident controls may be masking underlying issues.",
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "contradictions_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/repair/jobs — list available repair jobs
+app.get("/api/ops/repair/jobs", requireOpsAccess, (_req, res) => {
+  return res.status(200).json({ ok: true, jobs: listRepairJobs() });
+});
+
+// POST /api/ops/repair/run — run a specific repair job
+// Body: { job, ...opts }
+app.post("/api/ops/repair/run", requireOpsAccess, async (req, res) => {
+  try {
+    const jobName = safeStr(req.body?.job, 80);
+    if (!jobName) return res.status(400).json({ ok: false, error: "job name required" });
+    const opts   = req.body?.opts || {};
+    const result = await runRepairJob(redis, pgPool, jobName, opts);
+    return res.status(200).json({ ok: result.ok, ...result });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "repair_failed", reason: err?.message });
   }
 });
 
