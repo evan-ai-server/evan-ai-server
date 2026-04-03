@@ -683,11 +683,55 @@ import {
   recordCategoryOutcomeNonBlocking,
 } from "./src/categoryIntelligence.js";
 import { normalizeCategory } from "./src/categoryRegistry.js";
+// Phase 2: Category Domination Engine
+import {
+  applyCategoryDomination,
+  getCategoryDominationStats,
+} from "./src/categoryDominationEngine.js";
+import {
+  seedCounterfeitMemory,
+  addCounterfeitPattern as addCounterfeitPatternFn,
+} from "./src/counterfeitMemory.js";
+import {
+  submitExpertCorrection,
+  verifyCorrection,
+  rejectCorrection,
+  getPendingCorrections,
+  getCorrectionsForScan,
+  getCorrectionStats,
+} from "./src/expertCorrections.js";
+// Phase 3: Power User Lock-In System
+import {
+  createInventoryItem,
+  getUserInventory,
+  getInventoryItem,
+  getInventoryCounts,
+  getInventoryMetrics,
+  getTimePeriodMetrics,
+  updateInventoryItem,
+  markInventorySold,
+  markInventoryDead,
+  markInventoryReturned,
+  getInvIdForScan,
+} from "./src/inventoryEngine.js";
+import { evaluateLot } from "./src/lotScanner.js";
+import { generateListing } from "./src/listingAssistEngine.js";
+import {
+  createWatchlistEntry,
+  getUserWatchlist,
+  deleteWatchlistEntry,
+  checkWatchlistForScan,
+  getUserAlerts,
+  clearUserAlerts,
+} from "./src/watchlistEngine.js";
+import { generateUserInsights } from "./src/insightsEngine.js";
+import { buildUserDashboard } from "./src/dashboardEngine.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
 import { replayWrongCalls }                from "./src/badCallReplay.js";
-import { runAnomalyDetection, getActiveAnomalies, getAnomalyHistory } from "./src/anomalyEngine.js";
+import { runAnomalyDetection, getActiveAnomalies, getAnomalyHistory, recordScanMetric } from "./src/anomalyEngine.js";
 import {
   CONTROL_TYPES,
   suppressCategory, suppressSignalTier, forceDowngrade,
@@ -696,9 +740,28 @@ import {
   checkIncidentControl, checkAllControlsForTarget, getActiveControls, getIncidentLog,
 } from "./src/incidentControls.js";
 import { guardPayloadSafe, auditB2BPayload } from "./src/consistencyGuard.js";
-import { applyTruthGuardSafe }               from "./src/truthGuard.js";
+import { applyTruthGuardSafe, getCorrectionRate, getTruthCorrectionHistory } from "./src/truthGuard.js";
+import { logEvent as logStructuredEvent, LOG_TYPES } from "./src/structuredLogger.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
+import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
+import { refreshThresholdCache, getAllAdaptiveOverrides } from "./src/adaptiveThresholds.js";
+import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
+import {
+  storeSignalSnapshot,
+  storeDecision,
+  storeSource,
+  storeOutcome,
+  getDecision,
+  getSource,
+  getOutcome,
+  getUserLoop,
+  getUserMetrics,
+  computeNetProfit,
+  VALID_DECISIONS,
+  VALID_SOURCE_TYPES,
+  VALID_OUTCOME_STATUSES,
+} from "./src/closedLoopEngine.js";
 
 import {
   applyPersonalDecisionLayer,
@@ -18556,6 +18619,7 @@ async function runResultAwareRefinement({
 app.post("/market/search", async (req, res) => {
   try {
 
+const _routeT0 = Date.now();
 const rawQuery = safeStr(req.body?.query, 220);
 let query = normalizeQuery(rawQuery);
 query = bestHistoricalQuery(query);
@@ -18877,11 +18941,6 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planA }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planA);
-  // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-  if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
-      !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
-    attachAffiliateLinksToPayload(responsePayload);
-  }
   // Phase 15: Category Intelligence enrichment (non-blocking)
   await applyCategoryIntelligenceToPayload(responsePayload, {
     redis,
@@ -18892,19 +18951,54 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
     plan:         _planA,
   }).catch(() => {});
+  // Phase 2: Category Domination Engine — deep auth + counterfeit memory + trust modifiers
+  await applyCategoryDomination(redis, responsePayload, {
+    identity:         visionIdentity || {},
+    category,
+    scannedPrice,
+    rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
+    visionConfidence: visionConfidence ?? 0.5,
+  }).catch(() => {});
   // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
   const _cViolationsA = guardPayloadSafe(responsePayload, _planA);
   if (_cViolationsA.length) {
-    console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsA.length, violations: _cViolationsA.map((v) => v.code) });
     redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
   }
-  // Phase 17: truth guard — final payload corrections (mutates in-place)
-  const _tgA = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+  // Phase 17+18: truth guard — final payload corrections (mutates in-place, structured logging)
+  const _tgA = applyTruthGuardSafe(responsePayload, {
+    scanId:       responsePayload.scanId || null,
+    category,
+    soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null,
+    redis,
+  });
   if (_tgA.violations.length) {
-    console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgA.corrections });
     redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
   }
-  recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planA, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
+  // Phase 19: global safety fallback — prevent undefined signal state
+  if (!responsePayload?.profitIntel?.buySignal) {
+    if (!responsePayload.profitIntel) responsePayload.profitIntel = {};
+    responsePayload.profitIntel.buySignal    = "INSUFFICIENT DATA";
+    responsePayload.profitIntel.expectedProfit = null;
+  }
+  // Phase 19: affiliate decision logging — uses FINAL corrected signal and trust
+  const _finalSignalA = responsePayload.profitIntel.buySignal;
+  const _finalTrustA  = responsePayload.trustScore ?? 0;
+  const _scanIdA      = responsePayload.scanId || null;
+  if (_finalTrustA >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalA)) {
+    attachAffiliateLinksToPayload(responsePayload);
+    logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA }, redis);
+  } else {
+    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA, reason: _finalTrustA < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+  }
+  // Phase 18+19: scan metrics (non-blocking) — includes latency and category
+  const _latA = Date.now() - _routeT0;
+  recordScanMetric(redis, { signal: _finalSignalA, trustScore: _finalTrustA || null, corrected: responsePayload._corrected ?? false, latencyMs: _latA, category });
+  storeScanLearning(redis, { scanId: _scanIdA, category, signal: _finalSignalA, trustScore: _finalTrustA || null, expectedProfit: responsePayload.profitIntel?.expectedProfit ?? null, corrected: responsePayload._corrected ?? false, corrections: responsePayload._corrections?.map((c) => c.rule) ?? [], latencyMs: _latA });
+  recordScanEvent(redis, _userId, { scanId: _scanIdA, plan: _planA, category, signal: _finalSignalA }).catch(() => {});
+  // Phase 1 closed-loop: store signal snapshot for override detection
+  storeSignalSnapshot(redis, _scanIdA, { userId: _userId, signal: _finalSignalA, trustScore: _finalTrustA || null, category, itemName: responsePayload.itemName || null });
+  // Phase 3: fire watchlist check non-blocking
+  if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalA, scanId: _scanIdA, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -18987,11 +19081,6 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planB }).catch(() => {});
   applyPlanGatingToPayload(responsePayload, _planB);
-  // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-  if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
-      !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
-    attachAffiliateLinksToPayload(responsePayload);
-  }
   // Phase 15: Category Intelligence enrichment (non-blocking)
   await applyCategoryIntelligenceToPayload(responsePayload, {
     redis,
@@ -19002,19 +19091,54 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
     plan:         _planB,
   }).catch(() => {});
+  // Phase 2: Category Domination Engine
+  await applyCategoryDomination(redis, responsePayload, {
+    identity:         visionIdentity || {},
+    category,
+    scannedPrice,
+    rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
+    visionConfidence: visionConfidence ?? 0.5,
+  }).catch(() => {});
   // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
   const _cViolationsB = guardPayloadSafe(responsePayload, _planB);
   if (_cViolationsB.length) {
-    console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsB.length, violations: _cViolationsB.map((v) => v.code) });
     redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
   }
-  // Phase 17: truth guard — final payload corrections (mutates in-place)
-  const _tgB = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+  // Phase 17+18: truth guard — final payload corrections (mutates in-place, structured logging)
+  const _tgB = applyTruthGuardSafe(responsePayload, {
+    scanId:       responsePayload.scanId || null,
+    category,
+    soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null,
+    redis,
+  });
   if (_tgB.violations.length) {
-    console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgB.corrections });
     redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
   }
-  recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planB, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
+  // Phase 19: global safety fallback
+  if (!responsePayload?.profitIntel?.buySignal) {
+    if (!responsePayload.profitIntel) responsePayload.profitIntel = {};
+    responsePayload.profitIntel.buySignal    = "INSUFFICIENT DATA";
+    responsePayload.profitIntel.expectedProfit = null;
+  }
+  // Phase 19: affiliate decision logging — final corrected signal and trust
+  const _finalSignalB = responsePayload.profitIntel.buySignal;
+  const _finalTrustB  = responsePayload.trustScore ?? 0;
+  const _scanIdB      = responsePayload.scanId || null;
+  if (_finalTrustB >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalB)) {
+    attachAffiliateLinksToPayload(responsePayload);
+    logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB }, redis);
+  } else {
+    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB, reason: _finalTrustB < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+  }
+  // Phase 18+19: scan metrics and learning (non-blocking)
+  const _latB = Date.now() - _routeT0;
+  recordScanMetric(redis, { signal: _finalSignalB, trustScore: _finalTrustB || null, corrected: responsePayload._corrected ?? false, latencyMs: _latB, category });
+  storeScanLearning(redis, { scanId: _scanIdB, category, signal: _finalSignalB, trustScore: _finalTrustB || null, expectedProfit: responsePayload.profitIntel?.expectedProfit ?? null, corrected: responsePayload._corrected ?? false, corrections: responsePayload._corrections?.map((c) => c.rule) ?? [], latencyMs: _latB });
+  recordScanEvent(redis, _userId, { scanId: _scanIdB, plan: _planB, category, signal: _finalSignalB }).catch(() => {});
+  // Phase 1 closed-loop: store signal snapshot for override detection
+  storeSignalSnapshot(redis, _scanIdB, { userId: _userId, signal: _finalSignalB, trustScore: _finalTrustB || null, category, itemName: responsePayload.itemName || null });
+  // Phase 3: fire watchlist check non-blocking
+  if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalB, scanId: _scanIdB, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   return res.status(200).json(responsePayload);
 }
@@ -19226,11 +19350,6 @@ if (_userId) {
 }
 await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planC }).catch(() => {});
 applyPlanGatingToPayload(responsePayload, _planC);
-// Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-if ((responsePayload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
-    !WEAK_SIGNALS_NO_AFFILIATE.has(responsePayload.profitIntel?.buySignal)) {
-  attachAffiliateLinksToPayload(responsePayload);
-}
 // Phase 15: Category Intelligence enrichment (non-blocking)
 await applyCategoryIntelligenceToPayload(responsePayload, {
   redis,
@@ -19241,19 +19360,54 @@ await applyCategoryIntelligenceToPayload(responsePayload, {
   medianMarket: responsePayload.profitIntel?.medianPrice ?? null,
   plan:         _planC,
 }).catch(() => {});
+// Phase 2: Category Domination Engine
+await applyCategoryDomination(redis, responsePayload, {
+  identity:         visionIdentity || {},
+  category,
+  scannedPrice,
+  rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
+  visionConfidence: visionConfidence ?? 0.5,
+}).catch(() => {});
 // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
 const _cViolationsC = guardPayloadSafe(responsePayload, _planC);
 if (_cViolationsC.length) {
-  console.warn("consistency_violation", { scanId: responsePayload.scanId, count: _cViolationsC.length, violations: _cViolationsC.map((v) => v.code) });
   redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
 }
-// Phase 17: truth guard — final payload corrections (mutates in-place)
-const _tgC = applyTruthGuardSafe(responsePayload, { soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null });
+// Phase 17+18: truth guard — final payload corrections (mutates in-place, structured logging)
+const _tgC = applyTruthGuardSafe(responsePayload, {
+  scanId:       responsePayload.scanId || null,
+  category,
+  soldCompCount: responsePayload.profitIntel?.soldCompCount ?? null,
+  redis,
+});
 if (_tgC.violations.length) {
-  console.warn("truth_violation", { scanId: responsePayload.scanId, corrections: _tgC.corrections });
   redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
 }
-recordScanEvent(redis, _userId, { scanId: responsePayload.scanId || null, plan: _planC, category, signal: responsePayload.profitIntel?.buySignal }).catch(() => {});
+// Phase 19: global safety fallback
+if (!responsePayload?.profitIntel?.buySignal) {
+  if (!responsePayload.profitIntel) responsePayload.profitIntel = {};
+  responsePayload.profitIntel.buySignal    = "INSUFFICIENT DATA";
+  responsePayload.profitIntel.expectedProfit = null;
+}
+// Phase 19: affiliate decision logging — final corrected signal and trust
+const _finalSignalC = responsePayload.profitIntel.buySignal;
+const _finalTrustC  = responsePayload.trustScore ?? 0;
+const _scanIdC      = responsePayload.scanId || null;
+if (_finalTrustC >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalC)) {
+  attachAffiliateLinksToPayload(responsePayload);
+  logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC }, redis);
+} else {
+  logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC, reason: _finalTrustC < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+}
+// Phase 18+19: scan metrics and learning (non-blocking)
+const _latC = Date.now() - _routeT0;
+recordScanMetric(redis, { signal: _finalSignalC, trustScore: _finalTrustC || null, corrected: responsePayload._corrected ?? false, latencyMs: _latC, category });
+storeScanLearning(redis, { scanId: _scanIdC, category, signal: _finalSignalC, trustScore: _finalTrustC || null, expectedProfit: responsePayload.profitIntel?.expectedProfit ?? null, corrected: responsePayload._corrected ?? false, corrections: responsePayload._corrections?.map((c) => c.rule) ?? [], latencyMs: _latC });
+recordScanEvent(redis, _userId, { scanId: _scanIdC, plan: _planC, category, signal: _finalSignalC }).catch(() => {});
+// Phase 1 closed-loop: store signal snapshot for override detection
+storeSignalSnapshot(redis, _scanIdC, { userId: _userId, signal: _finalSignalC, trustScore: _finalTrustC || null, category, itemName: responsePayload.itemName || null });
+// Phase 3: fire watchlist check non-blocking
+if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalC, scanId: _scanIdC, itemName: responsePayload.itemName || null }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 return res.status(200).json(responsePayload);
 
@@ -19428,45 +19582,75 @@ app.post("/market/search/stream", async (req, res) => {
       } catch (_piErr) {
         console.warn("stream_profit_intel_error", _piErr?.message);
       }
+      // User-specific gating: rate limit + personal decision + plan gating (needs _userId)
+      const _planD = getResolvedPlan(req);
       if (_userId) {
-        const _planD = getResolvedPlan(req);
         // Issue 5: per-minute scan rate limit (stream path — check but don't block stream)
-        if (_userId) {
-          checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planD),
-            isPaidPlan(_planD) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN
-          ).catch(() => {});
-        }
+        checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planD),
+          isPaidPlan(_planD) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN
+        ).catch(() => {});
         await _applyPersonalDecisionToPayload(payload, { userId: _userId, category, scannedPrice, plan: _planD }).catch(() => {});
         applyPlanGatingToPayload(payload, _planD);
-        // Issue 3: only attach affiliate links when trustScore meets threshold and signal is not weak
-        if ((payload.trustScore ?? 0) >= MIN_TRUST_FOR_AFFILIATE &&
-            !WEAK_SIGNALS_NO_AFFILIATE.has(payload.profitIntel?.buySignal)) {
-          attachAffiliateLinksToPayload(payload);
-        }
-        // Phase 15: Category Intelligence enrichment (non-blocking)
-        applyCategoryIntelligenceToPayload(payload, {
-          redis,
-          userId:       _userId,
-          category,
-          itemText:     [payload.visionIdentity?.title, payload.visionIdentity?.description].filter(Boolean).join(" "),
-          scannedPrice,
-          medianMarket: payload.profitIntel?.medianPrice ?? null,
-          plan:         _planD,
-        }).catch(() => {});
-        // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
-        const _cViolationsD = guardPayloadSafe(payload, _planD);
-        if (_cViolationsD.length) {
-          console.warn("consistency_violation", { scanId: payload.scanId, count: _cViolationsD.length, violations: _cViolationsD.map((v) => v.code) });
-          redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
-        }
-        // Phase 17: truth guard — final payload corrections (mutates in-place)
-        const _tgD = applyTruthGuardSafe(payload, { soldCompCount: payload.profitIntel?.soldCompCount ?? null });
-        if (_tgD.violations.length) {
-          console.warn("truth_violation", { scanId: payload.scanId, corrections: _tgD.corrections });
-          redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
-        }
-        recordScanEvent(redis, _userId, { scanId: payload.scanId || null, plan: _planD, category, signal: payload.profitIntel?.buySignal }).catch(() => {});
       }
+      // Phase 15: Category Intelligence enrichment — AWAITED (not fire-and-forget)
+      // Must complete before truth guard so categoryReplicaFlag is applied before TG-03 runs.
+      await applyCategoryIntelligenceToPayload(payload, {
+        redis,
+        userId:       _userId,
+        category,
+        itemText:     [payload.visionIdentity?.title, payload.visionIdentity?.description].filter(Boolean).join(" "),
+        scannedPrice,
+        medianMarket: payload.profitIntel?.medianPrice ?? null,
+        plan:         _planD,
+      }).catch(() => {});
+      // Phase 2: Category Domination Engine
+      await applyCategoryDomination(redis, payload, {
+        identity:         visionIdentity || {},
+        category,
+        scannedPrice,
+        rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
+        visionConfidence: visionConfidence ?? 0.5,
+      }).catch(() => {});
+      // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
+      const _cViolationsD = guardPayloadSafe(payload, _planD);
+      if (_cViolationsD.length) {
+        redis?.hincrby("metrics:consistency_violations", "total", 1).catch(() => {});
+      }
+      // Phase 17+18: truth guard — final payload corrections (mutates in-place, structured logging)
+      const _tgD = applyTruthGuardSafe(payload, {
+        scanId:       payload.scanId || null,
+        category,
+        soldCompCount: payload.profitIntel?.soldCompCount ?? null,
+        redis,
+      });
+      if (_tgD.violations.length) {
+        redis?.hincrby("metrics:truth_violations", "total", 1).catch(() => {});
+      }
+      // Phase 19: global safety fallback
+      if (!payload?.profitIntel?.buySignal) {
+        if (!payload.profitIntel) payload.profitIntel = {};
+        payload.profitIntel.buySignal    = "INSUFFICIENT DATA";
+        payload.profitIntel.expectedProfit = null;
+      }
+      // Phase 19: affiliate decision logging — final corrected signal and trust
+      const _finalSignalD = payload.profitIntel.buySignal;
+      const _finalTrustD  = payload.trustScore ?? 0;
+      const _scanIdD      = payload.scanId || null;
+      if (_finalTrustD >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalD)) {
+        attachAffiliateLinksToPayload(payload);
+        logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD }, redis);
+      } else {
+        logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD, reason: _finalTrustD < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+      }
+      // Phase 18+19: scan metrics and learning (non-blocking)
+      const _latD = Date.now() - _t0;
+      recordScanMetric(redis, { signal: _finalSignalD, trustScore: _finalTrustD || null, corrected: payload._corrected ?? false, latencyMs: _latD, category });
+      storeScanLearning(redis, { scanId: _scanIdD, category, signal: _finalSignalD, trustScore: _finalTrustD || null, expectedProfit: payload.profitIntel?.expectedProfit ?? null, corrected: payload._corrected ?? false, corrections: payload._corrections?.map((c) => c.rule) ?? [], latencyMs: _latD });
+      recordScanEvent(redis, _userId, { scanId: _scanIdD, plan: _planD, category, signal: _finalSignalD }).catch(() => {});
+      // Phase 1 closed-loop: store signal snapshot for override detection
+      storeSignalSnapshot(redis, _scanIdD, { userId: _userId, signal: _finalSignalD, trustScore: _finalTrustD || null, category, itemName: payload.itemName || null });
+      // Phase 3: fire watchlist check non-blocking
+      if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: payload.identity?.brand || null, model: payload.identity?.model || null, scannedPrice: payload.profitIntel?.marketPriceMedian || null, signal: _finalSignalD, scanId: _scanIdD, itemName: payload.itemName || null }).catch(() => {});
       return payload;
     };
 
@@ -22730,6 +22914,785 @@ app.post(
     }
   });
 
+  // ── Phase 1: Closed-Loop Intelligence Routes ──────────────────────────────────
+  //
+  // These 5 routes form the closed-loop data engine:
+  //   POST /scan/decision  — record BUY/PASS/UNDECIDED + detect override
+  //   POST /scan/source    — record purchase price, ask price, source location
+  //   POST /scan/outcome   — record sale result + compute profit
+  //   GET  /scan/history/:userId — unified closed-loop history
+  //   GET  /metrics/user/:userId — full profit and behavioral metrics
+  //
+  // Storage: Redis keys prefixed with loop:*
+  // None of these routes block or touch the scan pipeline.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── POST /scan/decision ───────────────────────────────────────────────────────
+  // Record a user's decision on a scan result.
+  // Performs server-side override detection using the stored signal snapshot.
+  //
+  // Body: { scanId, userId, decision: "BUY"|"PASS"|"UNDECIDED", decidedAt? }
+  //
+  // wasOverride is computed server-side:
+  //   - signal was STRONG BUY or GOOD DEAL and user chose PASS  → override = true
+  //   - signal was RISKY or INSUFFICIENT DATA and user chose BUY → override = true
+  app.post("/scan/decision", async (req, res) => {
+    try {
+      const scanId    = safeStr(req.body?.scanId,   128);
+      const userId    = safeStr(req.body?.userId,    64);
+      const decision  = safeStr(req.body?.decision,  20);
+      const decidedAt = req.body?.decidedAt != null ? Number(req.body.decidedAt) : null;
+
+      if (!scanId)   return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      if (!userId)   return res.status(200).json({ ok: false, error: "missing_user_id" });
+      if (!decision) return res.status(200).json({ ok: false, error: "missing_decision", valid: [...VALID_DECISIONS] });
+
+      const result = await storeDecision(redis, scanId, { userId, decision, decidedAt });
+      if (!result.ok) return res.status(200).json(result);
+
+      return res.status(200).json({
+        ok:            true,
+        scanId,
+        decision:      result.record.decision,
+        wasOverride:   result.record.wasOverride,
+        originalSignal: result.record.originalSignal,
+        decidedAt:     result.record.decidedAt,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "decision_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /scan/source ─────────────────────────────────────────────────────────
+  // Record where and how an item was purchased.
+  // ONLY valid if the scan has a BUY decision.
+  //
+  // Body:
+  //   scanId        — required
+  //   userId        — required
+  //   purchasePrice — required (positive number, what user paid)
+  //   askPrice      — required for physical sources (THRIFT/ESTATE/GARAGE/CONSIGNMENT/AUCTION)
+  //                   null/omitted allowed for MARKETPLACE/ONLINE_LOCAL/OTHER
+  //   sourceType    — required: THRIFT|ESTATE|GARAGE|MARKETPLACE|CONSIGNMENT|AUCTION|ONLINE_LOCAL|OTHER
+  //   city          — required
+  //   zip           — optional
+  //   metadata      — optional JSON object or string
+  //
+  // askPrice is NEVER defaulted to purchasePrice — they are always separate fields.
+  // askPrice captures the real-world price floor; purchasePrice captures the actual cost basis.
+  app.post("/scan/source", async (req, res) => {
+    try {
+      const scanId        = safeStr(req.body?.scanId,     128);
+      const userId        = safeStr(req.body?.userId,      64);
+      const sourceType    = safeStr(req.body?.sourceType,  20);
+      const city          = safeStr(req.body?.city,       100);
+      const zip           = safeStr(req.body?.zip,         20) || null;
+      const purchasePrice = req.body?.purchasePrice != null ? Number(req.body.purchasePrice) : null;
+      const askPrice      = req.body?.askPrice      != null ? Number(req.body.askPrice)      : null;
+      const capturedAt    = req.body?.capturedAt    != null ? Number(req.body.capturedAt)    : null;
+      const metadata      = req.body?.metadata      || null;
+
+      if (!scanId)   return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      if (!userId)   return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await storeSource(redis, scanId, {
+        userId, purchasePrice, askPrice, sourceType, city, zip, metadata, capturedAt,
+      });
+      if (!result.ok) return res.status(200).json(result);
+
+      // Auto-create inventory item (idempotent — safe to call on retry)
+      // Only creates if this scan has a BUY decision and purchasePrice is set
+      if (purchasePrice != null && purchasePrice > 0) {
+        createInventoryItem(redis, {
+          userId, scanId, purchasePrice, askPrice, sourceType, city,
+        }).catch(err => console.error("[scan/source] inventory auto-create failed:", err?.message));
+      }
+
+      return res.status(200).json({
+        ok:           true,
+        scanId,
+        purchasePrice: result.record.purchasePrice,
+        askPrice:      result.record.askPrice,
+        sourceType:    result.record.sourceType,
+        city:          result.record.city,
+        zip:           result.record.zip,
+        capturedAt:    result.record.capturedAt,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "source_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /scan/outcome ────────────────────────────────────────────────────────
+  // Record the outcome of an item (sold/unsold/returned).
+  // Requires a source record to exist first.
+  // Computes netProfit and timeToSale automatically.
+  // Idempotent — updates are allowed.
+  //
+  // Body:
+  //   scanId        — required
+  //   userId        — required
+  //   outcomeStatus — required: SOLD|UNSOLD|RETURNED
+  //   soldPrice     — required for SOLD (positive number)
+  //   platform      — optional string (eBay, Poshmark, StockX, etc.)
+  //   fees          — optional non-negative number
+  //   shippingCost  — optional non-negative number
+  //   updatedAt     — optional ms timestamp (defaults to now)
+  //
+  // Computed fields (returned, not accepted as input):
+  //   netProfit = soldPrice - purchasePrice - fees - shippingCost
+  //   timeToSale = updatedAt - source.capturedAt  (milliseconds)
+  app.post("/scan/outcome", async (req, res) => {
+    try {
+      const scanId       = safeStr(req.body?.scanId,       128);
+      const userId       = safeStr(req.body?.userId,        64);
+      const outcomeStatus = safeStr(req.body?.outcomeStatus, 20);
+      const platform     = safeStr(req.body?.platform,      80) || null;
+      const soldPrice    = req.body?.soldPrice    != null ? Number(req.body.soldPrice)    : null;
+      const fees         = req.body?.fees         != null ? Number(req.body.fees)         : null;
+      const shippingCost = req.body?.shippingCost != null ? Number(req.body.shippingCost) : null;
+      const updatedAt    = req.body?.updatedAt    != null ? Number(req.body.updatedAt)    : null;
+
+      if (!scanId)        return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      if (!userId)        return res.status(200).json({ ok: false, error: "missing_user_id" });
+      if (!outcomeStatus) return res.status(200).json({ ok: false, error: "missing_outcome_status", valid: [...VALID_OUTCOME_STATUSES] });
+
+      // Validate numeric inputs before passing to engine
+      if (soldPrice    != null && (isNaN(soldPrice)    || soldPrice    <= 0)) return res.status(200).json({ ok: false, error: "invalid_sold_price" });
+      if (fees         != null && (isNaN(fees)         || fees         <  0)) return res.status(200).json({ ok: false, error: "invalid_fees" });
+      if (shippingCost != null && (isNaN(shippingCost) || shippingCost <  0)) return res.status(200).json({ ok: false, error: "invalid_shipping_cost" });
+
+      const result = await storeOutcome(redis, scanId, {
+        userId, soldPrice, platform, fees, shippingCost, outcomeStatus, updatedAt,
+      });
+      if (!result.ok) return res.status(200).json(result);
+
+      const r = result.record;
+
+      // Auto-sync outcome to inventory (non-blocking)
+      getInvIdForScan(redis, scanId).then(invId => {
+        if (!invId) return;
+        if (outcomeStatus === "SOLD" && soldPrice != null) {
+          return markInventorySold(redis, invId, {
+            soldPrice, platform, fees, shippingCost,
+            soldAt: updatedAt || Date.now(),
+            linkedOutcomeId: scanId,
+          });
+        }
+        if (outcomeStatus === "RETURNED") return markInventoryReturned(redis, invId, {});
+        if (outcomeStatus === "UNSOLD")   return markInventoryDead(redis, invId, {});
+      }).catch(err => console.error("[scan/outcome] inventory sync failed:", err?.message));
+
+      return res.status(200).json({
+        ok:            true,
+        scanId,
+        outcomeStatus: r.outcomeStatus,
+        soldPrice:     r.soldPrice,
+        fees:          r.fees,
+        shippingCost:  r.shippingCost,
+        netProfit:     r.netProfit,
+        timeToSale:    r.timeToSale,
+        timeToSaleDays: r.timeToSale != null ? Math.round(r.timeToSale / 86400000 * 10) / 10 : null,
+        updatedAt:     r.updatedAt,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "outcome_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /scan/history/:userId ─────────────────────────────────────────────────
+  // Unified closed-loop history for a user.
+  // Returns each scan with its decision, source, outcome, and a profit summary.
+  //
+  // Query params:
+  //   limit   — max records (default 50, max 200)
+  //   offset  — pagination offset (default 0)
+  //   since   — ms timestamp lower bound
+  //   until   — ms timestamp upper bound
+  app.get("/scan/history/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const limit  = Math.max(1, Math.min(200, Number(req.query?.limit  || 50)));
+      const offset = Math.max(0, Number(req.query?.offset || 0));
+      const since  = req.query?.since ? Number(req.query.since) : null;
+      const until  = req.query?.until ? Number(req.query.until) : null;
+
+      const { scans, profitSummary } = await getUserLoop(redis, userId, { limit, offset, since, until });
+      return res.status(200).json({ ok: true, userId, scans, profitSummary, count: scans.length });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "history_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /metrics/user/:userId ─────────────────────────────────────────────────
+  // Full profit and behavioral metrics for a user.
+  //
+  // Returns:
+  //   totalScans, totalDecisions, totalBuys, totalPasses, totalSold
+  //   totalSpent, totalRevenue, totalProfit
+  //   winRate (%), avgROI (%), avgTimeToSaleDays
+  //   overrideRate (% of decisions that were overrides)
+  //   categoryBreakdown — per-category stats sorted by profit
+  //   platformBreakdown — per-platform stats sorted by profit
+  app.get("/metrics/user/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const metrics = await getUserMetrics(redis, userId);
+      return res.status(200).json({ ok: true, userId, metrics });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "metrics_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── END Phase 1: Closed-Loop Intelligence Routes ──────────────────────────────
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Phase 2: Category Domination Engine Routes
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── POST /corrections/submit ──────────────────────────────────────────────────
+  // Submit an expert correction for a scan (flags fake, corrects attributes).
+  // Body: { scanId?, userId, category, brand, model, reportedAttributes?, correctedAttributes?,
+  //         isFake, fakePatterns, notes?, autoApply? }
+  app.post("/corrections/submit", async (req, res) => {
+    try {
+      const userId   = safeStr(req.body?.userId,   64);
+      const category = safeStr(req.body?.category, 40) || "generic";
+      const brand    = safeStr(req.body?.brand,    80) || "";
+      const model    = safeStr(req.body?.model,    120) || null;
+      const isFake   = Boolean(req.body?.isFake);
+      const fakePatterns = Array.isArray(req.body?.fakePatterns)
+        ? req.body.fakePatterns.map(String).slice(0, 20)
+        : [];
+      const correctionId = await submitExpertCorrection(redis, {
+        scanId:              safeStr(req.body?.scanId,  64) || null,
+        userId,
+        category,
+        brand,
+        model,
+        reportedAttributes:  req.body?.reportedAttributes  || {},
+        correctedAttributes: req.body?.correctedAttributes || {},
+        isFake,
+        fakePatterns,
+        notes:               safeStr(req.body?.notes, 500) || null,
+        autoApply:           Boolean(req.body?.autoApply) && isFake,
+      });
+      if (!correctionId) return res.status(200).json({ ok: false, error: "submission_failed" });
+      return res.status(200).json({ ok: true, correctionId, status: "pending" });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "corrections_submit_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /corrections/verify ──────────────────────────────────────────────────
+  // Verify a pending correction and apply to counterfeit memory.
+  // Body: { correctionId, expertId?, overrides? }
+  app.post("/corrections/verify", async (req, res) => {
+    try {
+      const correctionId = safeStr(req.body?.correctionId, 40);
+      if (!correctionId) return res.status(200).json({ ok: false, error: "missing_correction_id" });
+      const ok = await verifyCorrection(redis, correctionId, {
+        expertId:  safeStr(req.body?.expertId, 64) || null,
+        overrides: req.body?.overrides || {},
+      });
+      return res.status(200).json({ ok, status: ok ? "verified" : "failed" });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "corrections_verify_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /corrections/reject ──────────────────────────────────────────────────
+  // Reject a pending correction.
+  // Body: { correctionId, expertId?, reason? }
+  app.post("/corrections/reject", async (req, res) => {
+    try {
+      const correctionId = safeStr(req.body?.correctionId, 40);
+      if (!correctionId) return res.status(200).json({ ok: false, error: "missing_correction_id" });
+      const ok = await rejectCorrection(redis, correctionId, {
+        expertId: safeStr(req.body?.expertId, 64) || null,
+        reason:   safeStr(req.body?.reason, 200) || null,
+      });
+      return res.status(200).json({ ok, status: ok ? "rejected" : "failed" });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "corrections_reject_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /corrections/pending ──────────────────────────────────────────────────
+  // List pending corrections for expert review.
+  // Query: ?limit=20&offset=0
+  app.get("/corrections/pending", async (req, res) => {
+    try {
+      const limit  = Math.min(50, Math.max(1, Number(req.query?.limit)  || 20));
+      const offset = Math.max(0,             Number(req.query?.offset) || 0);
+      const corrections = await getPendingCorrections(redis, { limit, offset });
+      const stats       = await getCorrectionStats(redis).catch(() => ({}));
+      return res.status(200).json({ ok: true, corrections, stats });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "corrections_list_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /corrections/scan/:scanId ─────────────────────────────────────────────
+  // Get corrections submitted for a specific scan.
+  app.get("/corrections/scan/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 64);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const corrections = await getCorrectionsForScan(redis, scanId);
+      return res.status(200).json({ ok: true, scanId, corrections });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "corrections_scan_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /category/ops ─────────────────────────────────────────────────────────
+  // Category Domination Engine ops summary.
+  // Returns: counterfeit memory stats, correction stats, deep category list.
+  app.get("/category/ops", async (req, res) => {
+    try {
+      const stats = await getCategoryDominationStats(redis);
+      return res.status(200).json({ ok: true, stats });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "category_ops_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /counterfeit/pattern/add ────────────────────────────────────────────
+  // Manually add a counterfeit pattern (for ops/seeding).
+  // Body: { category, brand, model, patternType, attributes, fakeSignals, confidence }
+  app.post("/counterfeit/pattern/add", async (req, res) => {
+    try {
+      const category = safeStr(req.body?.category, 40);
+      const brand    = safeStr(req.body?.brand,    80);
+      if (!category || !brand) return res.status(200).json({ ok: false, error: "missing_required_fields" });
+      const patternId = await addCounterfeitPatternFn(redis, {
+        category,
+        brand,
+        model:       safeStr(req.body?.model, 120) || null,
+        patternType: safeStr(req.body?.patternType, 30) || "visual_tell",
+        attributes:  req.body?.attributes  || { brand, model: safeStr(req.body?.model, 120) || null },
+        fakeSignals: Array.isArray(req.body?.fakeSignals) ? req.body.fakeSignals.map(String).slice(0, 20) : [],
+        confidence:  Math.min(1, Math.max(0, Number(req.body?.confidence) || 0.7)),
+        source:      "manual_ops",
+        addedBy:     safeStr(req.body?.addedBy, 64) || "ops",
+      });
+      return res.status(200).json({ ok: true, patternId });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "pattern_add_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── END Phase 2: Category Domination Engine Routes ────────────────────────────
+
+  // ── Phase 3: Power User Lock-In System Routes ─────────────────────────────────
+  //
+  // Inventory management, lot scanning, listing assist, watchlist/alerts,
+  // price movement insights, and dashboard aggregation.
+  //
+  // Routes:
+  //   POST /inventory/create         — log a purchase into persistent inventory
+  //   GET  /inventory/:userId        — list user's inventory (with filters)
+  //   GET  /inventory/item/:invId    — get a single inventory item
+  //   PATCH /inventory/:invId        — update notes/price/name
+  //   POST /inventory/:invId/mark-sold     — mark item sold, compute P&L
+  //   POST /inventory/:invId/mark-dead     — write off as dead inventory
+  //   POST /inventory/:invId/mark-returned — mark item returned
+  //   GET  /metrics/user/:userId/time      — time-period P&L breakdown
+  //   POST /lot/evaluate             — rank a batch of scan IDs as a lot
+  //   POST /listing/generate         — generate listing copy for an inventory item
+  //   POST /watchlist                — create a price/brand watchlist entry
+  //   GET  /watchlist/:userId        — get user's active watchlist
+  //   DELETE /watchlist/:wlId        — delete a watchlist entry
+  //   GET  /watchlist/alerts/:userId — get triggered alerts
+  //   DELETE /watchlist/alerts/:userId — clear all alerts
+  //   GET  /insights/user/:userId    — personalized price movement insights
+  //   GET  /dashboard/:userId        — full business dashboard snapshot
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── POST /inventory/create ────────────────────────────────────────────────────
+  // Log a purchase into persistent inventory.
+  // Idempotent — if a source scanId is provided, duplicate creates are safe.
+  //
+  // Body:
+  //   userId        — required
+  //   scanId        — required (idempotency key; links to scan signal)
+  //   purchasePrice — required (what was paid)
+  //   itemName      — optional (pulled from signal snapshot if omitted)
+  //   category      — optional
+  //   sourceType    — optional (THRIFT|ESTATE|GARAGE|MARKETPLACE|etc.)
+  //   city          — optional
+  //   askPrice      — optional
+  //   notes         — optional
+  app.post("/inventory/create", async (req, res) => {
+    try {
+      const userId        = safeStr(req.body?.userId,       64);
+      const scanId        = safeStr(req.body?.scanId,      128);
+      const purchasePrice = req.body?.purchasePrice != null ? Number(req.body.purchasePrice) : null;
+      const itemName      = safeStr(req.body?.itemName,    200) || null;
+      const category      = safeStr(req.body?.category,    60)  || null;
+      const sourceType    = safeStr(req.body?.sourceType,  30)  || null;
+      const city          = safeStr(req.body?.city,        100) || null;
+      const askPrice      = req.body?.askPrice != null ? Number(req.body.askPrice) : null;
+      const notes         = safeStr(req.body?.notes,       500) || null;
+
+      if (!userId)        return res.status(200).json({ ok: false, error: "missing_user_id" });
+      if (!scanId)        return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      if (purchasePrice == null || isNaN(purchasePrice) || purchasePrice < 0)
+        return res.status(200).json({ ok: false, error: "invalid_purchase_price" });
+
+      const result = await createInventoryItem(redis, {
+        userId, scanId, purchasePrice, itemName, category, sourceType, city, askPrice, notes,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_create_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /inventory/:userId ────────────────────────────────────────────────────
+  // List user's inventory with optional filters.
+  //
+  // Query params:
+  //   status   — ACTIVE|SOLD|DEAD|RETURNED (default: all via ACTIVE index if omitted)
+  //   category — filter by category
+  //   limit    — max records (default 50, max 200)
+  //   offset   — pagination offset
+  //   since    — ms timestamp lower bound
+  //   until    — ms timestamp upper bound
+  app.get("/inventory/:userId", async (req, res) => {
+    try {
+      const userId   = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const status   = safeStr(req.query?.status,   20) || null;
+      const category = safeStr(req.query?.category, 60) || null;
+      const limit    = Math.max(1, Math.min(200, Number(req.query?.limit  || 50)));
+      const offset   = Math.max(0, Number(req.query?.offset || 0));
+      const since    = req.query?.since != null ? Number(req.query.since) : null;
+      const until    = req.query?.until != null ? Number(req.query.until) : null;
+
+      const [inventory, counts] = await Promise.all([
+        getUserInventory(redis, userId, { status, category, limit, offset, since, until }),
+        getInventoryCounts(redis, userId),
+      ]);
+
+      return res.status(200).json({
+        ok:     true,
+        userId,
+        counts,
+        items:  inventory.items || [],
+        total:  inventory.total || 0,
+        limit,
+        offset,
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_list_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /inventory/item/:invId ────────────────────────────────────────────────
+  // Get a single inventory item by invId.
+  app.get("/inventory/item/:invId", async (req, res) => {
+    try {
+      const invId = safeStr(req.params?.invId, 64);
+      if (!invId) return res.status(200).json({ ok: false, error: "missing_inv_id" });
+
+      const item = await getInventoryItem(redis, invId);
+      if (!item)  return res.status(200).json({ ok: false, error: "not_found" });
+
+      return res.status(200).json({ ok: true, item });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── PATCH /inventory/:invId ───────────────────────────────────────────────────
+  // Update mutable fields: notes, purchasePrice, askPrice, itemName.
+  //
+  // Body: { userId, notes?, purchasePrice?, askPrice?, itemName? }
+  app.patch("/inventory/:invId", async (req, res) => {
+    try {
+      const invId  = safeStr(req.params?.invId, 64);
+      const userId = safeStr(req.body?.userId,  64);
+      if (!invId)  return res.status(200).json({ ok: false, error: "missing_inv_id" });
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const patches = {};
+      if (req.body?.notes         != null) patches.notes         = safeStr(req.body.notes, 500);
+      if (req.body?.itemName      != null) patches.itemName      = safeStr(req.body.itemName, 200);
+      if (req.body?.purchasePrice != null) patches.purchasePrice = Number(req.body.purchasePrice);
+      if (req.body?.askPrice      != null) patches.askPrice      = Number(req.body.askPrice);
+
+      const result = await updateInventoryItem(redis, invId, patches, userId);
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_update_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /inventory/:invId/mark-sold ─────────────────────────────────────────
+  // Mark an inventory item as sold and compute net profit.
+  //
+  // Body:
+  //   userId       — required
+  //   soldPrice    — required (positive number)
+  //   platform     — optional (eBay, StockX, Poshmark, etc.)
+  //   fees         — optional (platform fees)
+  //   shippingCost — optional
+  //   soldAt       — optional ms timestamp (defaults to now)
+  app.post("/inventory/:invId/mark-sold", async (req, res) => {
+    try {
+      const invId      = safeStr(req.params?.invId, 64);
+      const userId     = safeStr(req.body?.userId,  64);
+      const soldPrice  = req.body?.soldPrice  != null ? Number(req.body.soldPrice)  : null;
+      const platform   = safeStr(req.body?.platform, 80) || null;
+      const fees       = req.body?.fees       != null ? Number(req.body.fees)       : null;
+      const shippingCost = req.body?.shippingCost != null ? Number(req.body.shippingCost) : null;
+      const soldAt     = req.body?.soldAt     != null ? Number(req.body.soldAt)     : null;
+
+      if (!invId)   return res.status(200).json({ ok: false, error: "missing_inv_id" });
+      if (!userId)  return res.status(200).json({ ok: false, error: "missing_user_id" });
+      if (soldPrice == null || isNaN(soldPrice) || soldPrice <= 0)
+        return res.status(200).json({ ok: false, error: "invalid_sold_price" });
+
+      const result = await markInventorySold(redis, invId, { soldPrice, platform, fees, shippingCost, soldAt });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_sold_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /inventory/:invId/mark-dead ─────────────────────────────────────────
+  // Write off an item as dead (unsellable, lost, etc.).
+  // Body: { userId, notes? }
+  app.post("/inventory/:invId/mark-dead", async (req, res) => {
+    try {
+      const invId  = safeStr(req.params?.invId, 64);
+      const userId = safeStr(req.body?.userId,  64);
+      const notes  = safeStr(req.body?.notes,   500) || null;
+      if (!invId)  return res.status(200).json({ ok: false, error: "missing_inv_id" });
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await markInventoryDead(redis, invId, { notes });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_dead_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /inventory/:invId/mark-returned ─────────────────────────────────────
+  // Mark an item as returned (purchased but returned to seller).
+  // Body: { userId, notes? }
+  app.post("/inventory/:invId/mark-returned", async (req, res) => {
+    try {
+      const invId  = safeStr(req.params?.invId, 64);
+      const userId = safeStr(req.body?.userId,  64);
+      const notes  = safeStr(req.body?.notes,   500) || null;
+      if (!invId)  return res.status(200).json({ ok: false, error: "missing_inv_id" });
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await markInventoryReturned(redis, invId, { notes });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inventory_returned_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /metrics/user/:userId/time ────────────────────────────────────────────
+  // Time-period P&L breakdown: last7d, last30d, last90d, allTime.
+  // Returns parallel period snapshots from inventory data.
+  app.get("/metrics/user/:userId/time", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const periods = await getTimePeriodMetrics(redis, userId);
+      return res.status(200).json({ ok: true, userId, periods });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "time_metrics_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /lot/evaluate ────────────────────────────────────────────────────────
+  // Rank a batch of scan IDs as a lot (e.g., 20 thrift store items).
+  //
+  // Body:
+  //   userId    — required
+  //   scanIds   — required array of scan IDs (up to 50)
+  //   lotBudget — optional total cash available for allocation advice
+  app.post("/lot/evaluate", async (req, res) => {
+    try {
+      const userId    = safeStr(req.body?.userId, 64);
+      const scanIds   = Array.isArray(req.body?.scanIds) ? req.body.scanIds.map(String) : [];
+      const lotBudget = req.body?.lotBudget != null ? Number(req.body.lotBudget) : null;
+
+      if (!userId)          return res.status(200).json({ ok: false, error: "missing_user_id" });
+      if (scanIds.length === 0) return res.status(200).json({ ok: false, error: "missing_scan_ids" });
+
+      const result = await evaluateLot(redis, { userId, scanIds, lotBudget });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "lot_eval_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /listing/generate ────────────────────────────────────────────────────
+  // Generate listing copy for an inventory item.
+  // Uses only stored structured attributes — no hallucination.
+  //
+  // Body:
+  //   invId          — required
+  //   targetPlatform — optional (eBay|Poshmark|StockX|GOAT|TheRealReal|Chrono24|etc.)
+  app.post("/listing/generate", async (req, res) => {
+    try {
+      const invId          = safeStr(req.body?.invId,          64);
+      const targetPlatform = safeStr(req.body?.targetPlatform, 60) || null;
+
+      if (!invId) return res.status(200).json({ ok: false, error: "missing_inv_id" });
+
+      const result = await generateListing(redis, { invId, targetPlatform });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "listing_gen_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /watchlist ───────────────────────────────────────────────────────────
+  // Create a price/brand/model watchlist entry.
+  // Alerts fire when a future scan matches the entry's criteria.
+  //
+  // Body:
+  //   userId         — required
+  //   category       — required (or brand)
+  //   brand          — optional
+  //   model          — optional
+  //   thresholdPrice — optional (only alert when scannedPrice ≤ threshold)
+  //   label          — optional human-readable label
+  app.post("/watchlist", async (req, res) => {
+    try {
+      const userId         = safeStr(req.body?.userId,   64);
+      const category       = safeStr(req.body?.category, 60) || null;
+      const brand          = safeStr(req.body?.brand,    80) || null;
+      const model          = safeStr(req.body?.model,   120) || null;
+      const label          = safeStr(req.body?.label,   120) || null;
+      const thresholdPrice = req.body?.thresholdPrice != null ? Number(req.body.thresholdPrice) : null;
+
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await createWatchlistEntry(redis, {
+        userId, category, brand, model, thresholdPrice, label,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "watchlist_create_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /watchlist/:userId ────────────────────────────────────────────────────
+  // Get a user's active watchlist entries.
+  app.get("/watchlist/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const entries = await getUserWatchlist(redis, userId);
+      return res.status(200).json({ ok: true, userId, count: entries.length, entries });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "watchlist_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── DELETE /watchlist/:wlId ───────────────────────────────────────────────────
+  // Soft-delete a watchlist entry.
+  // Body: { userId }
+  app.delete("/watchlist/:wlId", async (req, res) => {
+    try {
+      const wlId   = safeStr(req.params?.wlId, 64);
+      const userId = safeStr(req.body?.userId, 64);
+      if (!wlId)   return res.status(200).json({ ok: false, error: "missing_wl_id" });
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await deleteWatchlistEntry(redis, userId, wlId);
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "watchlist_delete_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /watchlist/alerts/:userId ─────────────────────────────────────────────
+  // Get triggered watchlist alerts for a user (most recent first).
+  //
+  // Query params:
+  //   limit — max records (default 20, max 100)
+  app.get("/watchlist/alerts/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const limit  = Math.max(1, Math.min(100, Number(req.query?.limit || 20)));
+      const alerts = await getUserAlerts(redis, userId, { limit });
+      return res.status(200).json({ ok: true, userId, count: alerts.length, alerts });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "alerts_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── DELETE /watchlist/alerts/:userId ─────────────────────────────────────────
+  // Clear all alerts for a user.
+  app.delete("/watchlist/alerts/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      await clearUserAlerts(redis, userId);
+      return res.status(200).json({ ok: true, userId });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "alerts_clear_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /insights/user/:userId ────────────────────────────────────────────────
+  // Personalized price movement and behavioral insights.
+  // Surfaces missed opportunities, holding alerts, behavioral patterns, and more.
+  //
+  // Query params:
+  //   (none — derived entirely from user's stored scan + inventory data)
+  app.get("/insights/user/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const result = await generateUserInsights(redis, userId);
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "insights_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /dashboard/:userId ────────────────────────────────────────────────────
+  // Full business dashboard snapshot in a single call.
+  //
+  // Returns: inventory summary, financials, category breakdown, recent activity,
+  //          alerts, top insights, and actionable recommendations.
+  // Optimized: all subsystems read in parallel via Promise.allSettled.
+  app.get("/dashboard/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const dashboard = await buildUserDashboard(redis, userId);
+      return res.status(200).json(dashboard);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "dashboard_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── END Phase 3: Power User Lock-In System Routes ─────────────────────────────
+
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
   app.get("/user/category-stats", async (req, res) => {
@@ -25829,6 +26792,27 @@ if (redis) {
 
   // Re-warm suppression cache every 5 minutes
   setInterval(() => warmSuppressionCache().catch(() => {}), SUPPRESSION_CACHE_TTL_MS).unref?.();
+
+  // Phase 19: warm adaptive threshold cache at startup
+  refreshThresholdCache(redis).catch(() => {});
+
+  // Phase 19: anomaly detection loop — runs every 30 minutes
+  setInterval(() => {
+    runAnomalyDetection(redis).catch(() => {});
+  }, 30 * 60_000).unref?.();
+
+  // Phase 19: self-healing loop — runs every 2 hours
+  setInterval(() => {
+    runSelfHealingCycle(redis, { log: (msg) => console.log(msg) }).catch(() => {});
+  }, 2 * 3600 * 1000).unref?.();
+
+  // Phase 19: refresh adaptive threshold cache every 30 minutes
+  setInterval(() => {
+    refreshThresholdCache(redis).catch(() => {});
+  }, 30 * 60_000).unref?.();
+
+  // Phase 2: Seed counterfeit memory with known fake patterns (idempotent)
+  seedCounterfeitMemory(redis).catch(() => {});
 }
 
 startLeaderOnlyLoops();
@@ -27333,8 +28317,8 @@ app.post("/api/b2b/valuate", requireB2BApiKey, async (req, res) => {
         const audit = auditB2BPayload(result, priceIdx);
         if (!audit.consistent) {
           result.consistencyViolations = audit.violations;
-          console.warn("b2b_overconfidence", { category, violations: audit.violations.map((v) => v.code) });
-          redis?.hincrby("metrics:b2b_overconfidence_count", "total", 1).catch(() => {});
+          // Use same key read by anomaly engine A06 (STRING, not HASH)
+          redis?.incr("anomaly:b2b_overconfidence_count").catch(() => {});
         }
       }
     } catch { /* non-fatal — audit must not block valuation response */ }
@@ -27382,6 +28366,23 @@ app.post("/api/b2b/batch-valuate", requireB2BApiKey, async (req, res) => {
     }));
 
     const result = await valuateBatch(redis, items);
+
+    // Phase 18: B2B consistency audit on batch results
+    if (result.results?.length) {
+      for (const item of result.results) {
+        if (!item.ok || !item.category) continue;
+        try {
+          const priceIdx = await getCategoryPriceIndex(redis, item.category).catch(() => null);
+          if (priceIdx) {
+            const audit = auditB2BPayload(item, priceIdx);
+            if (!audit.consistent) {
+              item.consistencyViolations = audit.violations;
+              redis?.incr("anomaly:b2b_overconfidence_count").catch(() => {});
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+    }
 
     incrementUsage(redis, req.b2b, "batch_valuate").catch(() => {});
     return res.status(200).json(result);
@@ -27545,6 +28546,53 @@ app.get("/api/ops/b2b/price-index/:category", requireOpsAccess, async (req, res)
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 16: No-Decay System — Operator Cockpit Routes
 // ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/ops/metrics/correction-rate — truth guard correction rate
+app.get("/api/ops/metrics/correction-rate", requireOpsAccess, async (_req, res) => {
+  try {
+    const rate    = await getCorrectionRate(redis);
+    const history = await getTruthCorrectionHistory(redis, { limit: 20 });
+    return res.status(200).json({ ok: true, rate, recentCorrections: history });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "correction_rate_failed", reason: err?.message });
+  }
+});
+
+// GET /api/ops/learning/summary — self-learning system overview
+app.get("/api/ops/learning/summary", requireOpsAccess, async (_req, res) => {
+  try {
+    const [
+      topFailing,
+      recentLearned,
+      healingHistory,
+      modelReviewQueue,
+      adaptiveOverrides,
+      correctionRate,
+    ] = await Promise.all([
+      getTopFailingCategories(redis, { limit: 10, minScans: 10 }),
+      getRecentLearningScans(redis, { limit: 20 }),
+      getHealingHistory(redis, { limit: 10 }),
+      getModelReviewQueue(redis, { limit: 20 }),
+      getAllAdaptiveOverrides(redis),
+      getCorrectionRate(redis),
+    ]);
+    return res.status(200).json({
+      ok: true,
+      summary: {
+        topFailingCategories: topFailing,
+        correctionRate,
+        adaptiveOverrides,
+        modelReviewQueue:     modelReviewQueue.slice(0, 10),
+        lastHealingCycle:     healingHistory[0] || null,
+        healingCycleCount:    healingHistory.length,
+      },
+      recentLearningScans: recentLearned,
+      healingHistory,
+    });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "learning_summary_failed", reason: err?.message });
+  }
+});
 
 // GET /api/ops/regression/run — run regression harness
 app.get("/api/ops/regression/run", requireOpsAccess, async (_req, res) => {
