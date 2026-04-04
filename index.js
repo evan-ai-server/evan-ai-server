@@ -791,6 +791,45 @@ import {
   TRUSTMARK_STATUS,
 } from "./src/trustmarkEngine.js";
 
+// ── Phase 6: Marketplace Power + Routing + Data Licensing ────────────────────
+import {
+  computeSellRouting,
+  getQuickNetEstimate,
+  comparePlatforms,
+  ROUTE_VERSION,
+} from "./src/sellRoutingEngine.js";
+import {
+  getCounterpartyRisk,
+  recordCounterpartyEvent,
+  getCounterpartyRecord,
+  getCounterpartyOps,
+} from "./src/counterpartyIntelEngine.js";
+import {
+  recordRouteOutcome,
+  getRouteOutcome,
+  getPlatformLeverageMetrics,
+  getAllLeverageMetrics,
+  getRouteOutcomeOps,
+} from "./src/routeOutcomeMemory.js";
+import {
+  getDataProductReadiness,
+  buildRoutePerformanceIndex,
+  buildB2BValuationResponse,
+  buildB2BVerificationResponse,
+  buildB2BSellerRiskResponse,
+  buildB2BRouteRecommendationResponse,
+  DATA_PRODUCTS,
+  B2B_API_VERSION,
+} from "./src/dataProductEngine.js";
+import {
+  getPlatform,
+  getPlatformList,
+  getMarketplaceRisk,
+  getTrustmarkMarketplacePolicy,
+  getListingPathOptimization,
+  PLATFORMS,
+} from "./src/platformIntelligence.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -24379,6 +24418,369 @@ app.post(
 
   // ── END Phase 5: Evan-Verified + Guarantee + Certification Routes ─────────────
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // Phase 6: Marketplace Power + Routing + Data Licensing
+  // ══════════════════════════════════════════════════════════════════════════════
+
+  // ── POST /sell/route ──────────────────────────────────────────────────────────
+  // Core sell routing: returns ranked platform options with net math, risk
+  // adjustment, time adjustment, trust adjustment, and listing path guidance.
+  //
+  // Body: { price, category, condition?, sellUrgency?, userId?, scanId?,
+  //         platformOverride?, counterpartyPlatform?, counterpartySellerId? }
+  // Response: { ok, sellRouting }
+  app.post("/sell/route", async (req, res) => {
+    try {
+      const price           = req.body?.price != null ? Number(req.body.price) : null;
+      const category        = safeStr(req.body?.category,    80) || "generic";
+      const condition       = safeStr(req.body?.condition,   40) || "good";
+      const sellUrgency     = safeStr(req.body?.sellUrgency, 20) || "medium";
+      const userId          = safeStr(req.body?.userId,      64) || null;
+      const scanId          = safeStr(req.body?.scanId,      64) || null;
+      const platformOverride = Array.isArray(req.body?.platformOverride)
+        ? req.body.platformOverride.map(p => safeStr(p, 40)).filter(Boolean)
+        : null;
+      const cpPlatform      = safeStr(req.body?.counterpartyPlatform,  40) || null;
+      const cpSellerId      = safeStr(req.body?.counterpartySellerId,  80) || null;
+
+      if (!price || price <= 0) {
+        return res.status(200).json({ ok: false, error: "price_required" });
+      }
+
+      // Optionally fetch trust context from redis if scanId provided
+      let evanVerification = null;
+      let certRecord       = null;
+      let authEvidence     = null;
+
+      if (scanId) {
+        try {
+          const [vRaw, cRaw] = await Promise.all([
+            redis.get(`scan:verification:${scanId}`).catch(() => null),
+            userId ? redis.get(`cert:user:${userId}`).catch(() => null) : null,
+          ]);
+          if (vRaw) evanVerification = JSON.parse(vRaw);
+          if (cRaw) certRecord       = JSON.parse(cRaw);
+        } catch { /* non-fatal */ }
+      } else if (userId) {
+        try {
+          const cRaw = await redis.get(`cert:user:${userId}`).catch(() => null);
+          if (cRaw) certRecord = JSON.parse(cRaw);
+        } catch { /* non-fatal */ }
+      }
+
+      // Optionally fetch counterparty risk
+      let counterpartyRisk = 0;
+      if (cpPlatform && cpSellerId) {
+        try {
+          const cpResult = await getCounterpartyRisk(redis, cpPlatform, cpSellerId);
+          counterpartyRisk = cpResult?.counterpartyRisk || 0;
+        } catch { /* non-fatal */ }
+      }
+
+      const sellRouting = computeSellRouting({
+        price,
+        category,
+        condition,
+        sellUrgency,
+        evanVerification,
+        certRecord,
+        authEvidence,
+        counterpartyRisk,
+        platformOverride,
+      });
+
+      return res.status(200).json({ ok: true, sellRouting });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "sell_route_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /platform/intelligence/:platform ──────────────────────────────────────
+  // Full intelligence profile for a platform: fees, velocity, risk, trustmark policy.
+  app.get("/platform/intelligence/:platform", async (req, res) => {
+    try {
+      const platformId = safeStr(req.params?.platform, 40);
+      if (!platformId) return res.status(200).json({ ok: false, error: "platform_required" });
+
+      const platform = getPlatform(platformId);
+      if (!platform) {
+        return res.status(200).json({ ok: false, error: "platform_not_found",
+          available: getPlatformList().map(p => p.id) });
+      }
+
+      const category = safeStr(req.query?.category, 80) || "generic";
+      const riskProfile     = getMarketplaceRisk(platformId);
+      const trustmarkPolicy = getTrustmarkMarketplacePolicy(platformId);
+      const listingPath     = getListingPathOptimization(platformId, category, {});
+
+      return res.status(200).json({
+        ok: true,
+        platformId,
+        platform: {
+          ...platform,
+          // Exclude internal implementation notes, keep public fields
+          riskProfile,
+          trustmarkPolicy,
+          listingPath,
+        },
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "platform_intel_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /platform/risk/:platform ─────────────────────────────────────────────
+  // Risk profile only — lightweight check for risk-sensitive flows.
+  app.get("/platform/risk/:platform", async (req, res) => {
+    try {
+      const platformId = safeStr(req.params?.platform, 40);
+      if (!platformId) return res.status(200).json({ ok: false, error: "platform_required" });
+
+      const riskProfile = getMarketplaceRisk(platformId);
+      if (!riskProfile) {
+        return res.status(200).json({ ok: false, error: "platform_not_found" });
+      }
+
+      return res.status(200).json({ ok: true, platformId, riskProfile });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "platform_risk_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /trustmark/policy/:platform ──────────────────────────────────────────
+  // Trustmark channel policy: what Evan trust language is permitted on this platform.
+  app.get("/trustmark/policy/:platform", async (req, res) => {
+    try {
+      const platformId = safeStr(req.params?.platform, 40);
+      if (!platformId) return res.status(200).json({ ok: false, error: "platform_required" });
+
+      const policy = getTrustmarkMarketplacePolicy(platformId);
+      if (!policy) {
+        return res.status(200).json({ ok: false, error: "platform_not_found",
+          available: getPlatformList().map(p => p.id) });
+      }
+
+      return res.status(200).json({ ok: true, platformId, policy });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trustmark_policy_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /platform/net-estimate ────────────────────────────────────────────────
+  // Quick net estimate for a platform + price (no trust context, no routing).
+  // Query: { platformId, price, category? }
+  app.get("/platform/net-estimate", async (req, res) => {
+    try {
+      const platformId = safeStr(req.query?.platformId, 40);
+      const price      = req.query?.price != null ? Number(req.query.price) : null;
+      const category   = safeStr(req.query?.category, 80) || "generic";
+
+      if (!platformId || !price || price <= 0) {
+        return res.status(200).json({ ok: false, error: "platformId and price required" });
+      }
+
+      const estimate = getQuickNetEstimate(platformId, price, category);
+      if (!estimate) {
+        return res.status(200).json({ ok: false, error: "platform_not_found_or_estimate_failed" });
+      }
+
+      return res.status(200).json({ ok: true, estimate });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "net_estimate_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /platform/compare ─────────────────────────────────────────────────────
+  // Head-to-head platform comparison for a given price.
+  // Query: { platformA, platformB, price, category? }
+  app.get("/platform/compare", async (req, res) => {
+    try {
+      const platformA  = safeStr(req.query?.platformA, 40);
+      const platformB  = safeStr(req.query?.platformB, 40);
+      const price      = req.query?.price != null ? Number(req.query.price) : null;
+      const category   = safeStr(req.query?.category, 80) || "generic";
+
+      if (!platformA || !platformB || !price || price <= 0) {
+        return res.status(200).json({ ok: false, error: "platformA, platformB, and price required" });
+      }
+
+      const comparison = comparePlatforms(platformA, platformB, price, category);
+      if (!comparison) {
+        return res.status(200).json({ ok: false, error: "comparison_failed_check_platform_ids" });
+      }
+
+      return res.status(200).json({ ok: true, comparison });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "compare_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /counterparty/report ─────────────────────────────────────────────────
+  // Report a transaction event for a counterparty (seller/buyer on a platform).
+  // Body: { platformId, sellerId, type, reportedBy?, scanId?, value?, notes? }
+  app.post("/counterparty/report", async (req, res) => {
+    try {
+      const platformId = safeStr(req.body?.platformId, 40);
+      const sellerId   = safeStr(req.body?.sellerId,   80);
+      const type       = safeStr(req.body?.type,       40);
+      const reportedBy = safeStr(req.body?.reportedBy, 40) || "user";
+      const scanId     = safeStr(req.body?.scanId,     64) || null;
+      const value      = req.body?.value != null ? Number(req.body.value) : null;
+      const notes      = safeStr(req.body?.notes,      500) || null;
+
+      if (!platformId || !sellerId || !type) {
+        return res.status(200).json({ ok: false, error: "platformId, sellerId, and type required" });
+      }
+
+      const result = await recordCounterpartyEvent(redis, platformId, sellerId, {
+        type, reportedBy, scanId, value, notes,
+      });
+
+      return res.status(200).json({ ok: result.ok, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "counterparty_report_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /counterparty/risk ────────────────────────────────────────────────────
+  // Get risk score for a counterparty.
+  // Query: { platformId, sellerId }
+  app.get("/counterparty/risk", async (req, res) => {
+    try {
+      const platformId = safeStr(req.query?.platformId, 40);
+      const sellerId   = safeStr(req.query?.sellerId,   80);
+
+      if (!platformId || !sellerId) {
+        return res.status(200).json({ ok: false, error: "platformId and sellerId required" });
+      }
+
+      const result = await getCounterpartyRisk(redis, platformId, sellerId);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "counterparty_risk_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /route/outcome ───────────────────────────────────────────────────────
+  // Record the actual outcome of a sale (feedback loop for routing accuracy).
+  // Body: { scanId, recommendedPlatform?, actualPlatform, expectedNet?, actualNet,
+  //         expectedDays?, actualDays?, category, price?, condition?, notes? }
+  app.post("/route/outcome", async (req, res) => {
+    try {
+      const scanId              = safeStr(req.body?.scanId,              64);
+      const recommendedPlatform = safeStr(req.body?.recommendedPlatform, 40) || null;
+      const actualPlatform      = safeStr(req.body?.actualPlatform,      40);
+      const expectedNet         = req.body?.expectedNet  != null ? Number(req.body.expectedNet)  : null;
+      const actualNet           = req.body?.actualNet    != null ? Number(req.body.actualNet)    : null;
+      const expectedDays        = req.body?.expectedDays != null ? Number(req.body.expectedDays) : null;
+      const actualDays          = req.body?.actualDays   != null ? Number(req.body.actualDays)   : null;
+      const category            = safeStr(req.body?.category,  80) || "generic";
+      const price               = req.body?.price != null ? Number(req.body.price) : null;
+      const condition           = safeStr(req.body?.condition, 40) || null;
+      const notes               = safeStr(req.body?.notes,    500) || null;
+
+      if (!scanId || !actualPlatform) {
+        return res.status(200).json({ ok: false, error: "scanId and actualPlatform required" });
+      }
+
+      const result = await recordRouteOutcome(redis, {
+        scanId, recommendedPlatform, actualPlatform,
+        expectedNet, actualNet, expectedDays, actualDays,
+        category, price, condition, notes, reportedBy: "user",
+      });
+
+      return res.status(200).json({ ok: result.ok, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "route_outcome_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /route/performance ────────────────────────────────────────────────────
+  // Platform leverage metrics + route accuracy summary.
+  // Query: { platformId? } — if omitted, returns all platforms
+  app.get("/route/performance", async (req, res) => {
+    try {
+      const platformId = safeStr(req.query?.platformId, 40) || null;
+
+      if (platformId) {
+        const metrics = await getPlatformLeverageMetrics(redis, platformId);
+        return res.status(200).json({ ok: true, platformId, metrics });
+      }
+
+      const [allMetrics, opsData] = await Promise.all([
+        getAllLeverageMetrics(redis),
+        getRouteOutcomeOps(redis),
+      ]);
+
+      return res.status(200).json({ ok: true, platforms: allMetrics, ops: opsData });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "route_performance_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /data-product/readiness ───────────────────────────────────────────────
+  // Check which data products are ready for external exposure.
+  app.get("/data-product/readiness", async (_req, res) => {
+    try {
+      const [vOps, tmOps] = await Promise.all([
+        redis.hGetAll("ev:ops").catch(() => ({})),
+        redis.hGetAll("tm:ops").catch(() => ({})),
+      ]);
+
+      const verificationOps = { total: Number(vOps["verified"] || 0) + Number(vOps["failed"] || 0) };
+      const trustmarkOps    = { issued: Number(tmOps["issued"] || 0) };
+
+      const readiness = await getDataProductReadiness(redis, { verificationOps, trustmarkOps });
+      return res.status(200).json({ ok: true, ...readiness });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "data_product_readiness_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /data-product/route-performance-index ─────────────────────────────────
+  // Build the Route Performance Index data product.
+  app.get("/data-product/route-performance-index", async (_req, res) => {
+    try {
+      const index = await buildRoutePerformanceIndex(redis);
+      if (!index || index.rowCount === 0) {
+        return res.status(200).json({ ok: false, error: "insufficient_outcome_data",
+          message: "Route Performance Index requires 10+ outcomes per platform" });
+      }
+      return res.status(200).json({ ok: true, ...index });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "route_performance_index_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /ops/phase6 ───────────────────────────────────────────────────────────
+  // Phase 6 governance/ops aggregate.
+  app.get("/ops/phase6", async (_req, res) => {
+    try {
+      const [cpOps, routeOps, leverageMetrics] = await Promise.all([
+        getCounterpartyOps(redis),
+        getRouteOutcomeOps(redis),
+        getAllLeverageMetrics(redis),
+      ]);
+
+      return res.status(200).json({
+        ok: true,
+        phase6Ops: {
+          counterpartyIntel: cpOps,
+          routeOutcomes:     routeOps,
+          platformLeverage:  leverageMetrics,
+          routeVersion:      ROUTE_VERSION,
+          b2bApiVersion:     B2B_API_VERSION,
+          dataProducts:      Object.keys(DATA_PRODUCTS),
+        },
+        generatedAt: Date.now(),
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "phase6_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 6: Marketplace Power + Routing + Data Licensing ────────────────
+
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
   app.get("/user/category-stats", async (req, res) => {
@@ -29226,6 +29628,118 @@ app.get("/api/ops/b2b/price-index/:category", requireOpsAccess, async (req, res)
     return res.status(200).json({ ok: true, category, index, eligibility });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "price_index_ops_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 6: B2B API Extensions — Route, Seller Risk, Trust Verify
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/b2b/route-recommend
+// B2B sell routing: returns ranked platform options (versioned external contract).
+// Body: { query?, price, category, condition?, sellUrgency?, scanId? }
+app.post("/api/b2b/route-recommend", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "route_recommend")) return;
+  try {
+    const price       = req.body?.price != null ? Number(req.body.price) : null;
+    const category    = safeStr(req.body?.category,    80) || "generic";
+    const condition   = safeStr(req.body?.condition,   40) || "good";
+    const sellUrgency = safeStr(req.body?.sellUrgency, 20) || "medium";
+    const scanId      = safeStr(req.body?.scanId,      64) || null;
+    const requestId   = safeStr(req.body?.requestId,  128) || null;
+
+    if (!price || price <= 0) {
+      return res.status(200).json({ ok: false, error: "price_required" });
+    }
+
+    let evanVerification = null;
+    if (scanId) {
+      try {
+        const vRaw = await redis.get(`scan:verification:${scanId}`).catch(() => null);
+        if (vRaw) evanVerification = JSON.parse(vRaw);
+      } catch { /* non-fatal */ }
+    }
+
+    const sellRouting = computeSellRouting({ price, category, condition, sellUrgency, evanVerification });
+    const b2bResponse = buildB2BRouteRecommendationResponse(sellRouting, requestId);
+
+    incrementUsage(redis, req.b2b, "route_recommend").catch(() => {});
+    return res.status(200).json(b2bResponse);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "b2b_route_failed", reason: err?.message });
+  }
+});
+
+// POST /api/b2b/seller-risk
+// B2B seller risk scoring: counterparty risk + certification check.
+// Body: { platformId, sellerId, requestId? }
+app.post("/api/b2b/seller-risk", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "seller_risk")) return;
+  try {
+    const platformId = safeStr(req.body?.platformId, 40);
+    const sellerId   = safeStr(req.body?.sellerId,   80);
+    const requestId  = safeStr(req.body?.requestId, 128) || null;
+
+    if (!platformId || !sellerId) {
+      return res.status(200).json({ ok: false, error: "platformId and sellerId required" });
+    }
+
+    const [cpResult, certRecord] = await Promise.all([
+      getCounterpartyRisk(redis, platformId, sellerId),
+      redis.get(`cert:user:${sellerId}`).then(r => r ? JSON.parse(r) : null).catch(() => null),
+    ]);
+
+    const b2bResponse = buildB2BSellerRiskResponse(cpResult, certRecord, requestId);
+
+    incrementUsage(redis, req.b2b, "seller_risk").catch(() => {});
+    return res.status(200).json(b2bResponse);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "b2b_seller_risk_failed", reason: err?.message });
+  }
+});
+
+// POST /api/b2b/trust-verify
+// B2B verification status: Evan-Verified check + trustmark lookup.
+// Body: { scanId, trustmarkId?, requestId? }
+app.post("/api/b2b/trust-verify", requireB2BApiKey, async (req, res) => {
+  if (await _b2bCheckAndEnforce(req, res, "trust_verify")) return;
+  try {
+    const scanId      = safeStr(req.body?.scanId,      64);
+    const trustmarkId = safeStr(req.body?.trustmarkId, 64) || null;
+    const requestId   = safeStr(req.body?.requestId,  128) || null;
+
+    if (!scanId && !trustmarkId) {
+      return res.status(200).json({ ok: false, error: "scanId or trustmarkId required" });
+    }
+
+    let evanVerification = null;
+    let trustmarkRecord  = null;
+
+    if (scanId) {
+      try {
+        const [vRaw, tmIdRaw] = await Promise.all([
+          redis.get(`scan:verification:${scanId}`).catch(() => null),
+          redis.get(`tm:scan:${scanId}`).catch(() => null),
+        ]);
+        if (vRaw) evanVerification = JSON.parse(vRaw);
+        if (tmIdRaw) {
+          const tmRaw = await redis.get(`tm:record:${tmIdRaw}`).catch(() => null);
+          if (tmRaw) trustmarkRecord = JSON.parse(tmRaw);
+        }
+      } catch { /* non-fatal */ }
+    } else if (trustmarkId) {
+      try {
+        const tmRaw = await redis.get(`tm:record:${trustmarkId}`).catch(() => null);
+        if (tmRaw) trustmarkRecord = JSON.parse(tmRaw);
+      } catch { /* non-fatal */ }
+    }
+
+    const b2bResponse = buildB2BVerificationResponse(evanVerification, trustmarkRecord, requestId);
+
+    incrementUsage(redis, req.b2b, "trust_verify").catch(() => {});
+    return res.status(200).json(b2bResponse);
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: "b2b_trust_verify_failed", reason: err?.message });
   }
 });
 
