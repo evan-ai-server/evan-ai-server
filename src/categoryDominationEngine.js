@@ -41,7 +41,11 @@ import { buildAuthEvidenceModel }                  from "./authEvidenceModel.js"
 import { applyHighStakesDowngradeRules }           from "./highStakesDowngradeRules.js";
 import { buildTrustExplanation }                   from "./trustExplanationEngine.js";
 import { computeTrustState }                       from "./trustStateEngine.js";
-import { storeTrustRecord }                        from "./trustHistoryEngine.js";
+import { storeTrustRecord, getTrustRecord }        from "./trustHistoryEngine.js";
+// Phase 5 imports
+import { computeEvanVerification,
+         storeVerificationRecord }                 from "./evanVerifiedEngine.js";
+import { issueTrustmark }                          from "./trustmarkEngine.js";
 
 // ── Signal downgrade map ──────────────────────────────────────────────────────
 // When a blocking warning fires, these signals are downgraded
@@ -418,6 +422,65 @@ export async function applyCategoryDomination(redis, payload, {
         finalBuySignal: payload?.profitIntel?.buySignal || null,
         scannedPrice,
       }).catch(err => console.error("[categoryDomination] storeTrustRecord error:", err?.message));
+    }
+
+    // ── Phase 5: Evan-Verified item eligibility ────────────────────────────────
+    let evanVerification;
+    try {
+      // Check if expert has reviewed this scan (from trust history)
+      let expertReviewed = false;
+      let expertVerdict  = null;
+      if (activeScanId) {
+        const trustRecord = await getTrustRecord(redis, activeScanId).catch(() => null);
+        expertReviewed = !!(trustRecord?.expertVerdict?.verdict);
+        expertVerdict  = trustRecord?.expertVerdict?.verdict || null;
+      }
+
+      evanVerification = computeEvanVerification({
+        authEvidence,
+        trustState:    finalTrustState,
+        trustScore:    payload?.profitIntel?.trustScore ?? newTrustScore,
+        category,
+        scannedPrice,
+        expertReviewed,
+        expertVerdict,
+      });
+
+      payload.evanVerification = evanVerification;
+
+      // Store verification record (non-blocking)
+      if (activeScanId) {
+        storeVerificationRecord(redis, activeScanId, evanVerification, {
+          userId:   activeUserId,
+          category,
+        }).catch(err => console.error("[categoryDomination] storeVerificationRecord error:", err?.message));
+      }
+
+      // Issue trustmark for VERIFIED items (non-blocking)
+      if (evanVerification.status === "VERIFIED" && activeScanId) {
+        issueTrustmark(redis, {
+          scanId:          activeScanId,
+          evanVerification,
+          authEvidence,
+          category,
+          brand:           extractionResult.extractedAttributes?.brand || null,
+        }).then(tmResult => {
+          if (tmResult.ok && tmResult.trustmarkId) {
+            // Stash trustmarkId back onto the record if possible
+            payload._trustmarkId = tmResult.trustmarkId;
+          }
+        }).catch(err => console.error("[categoryDomination] issueTrustmark error:", err?.message));
+      }
+    } catch (err) {
+      console.error("[categoryDomination] Phase5 verification error:", err?.message);
+      // Safe fallback — don't expose error in payload
+      payload.evanVerification = {
+        status: "NOT_VERIFIED",
+        eligible: false,
+        reasonCodes: ["engine_error"],
+        guaranteeEligible: false,
+        claimText: null,
+      };
     }
 
   } catch (err) {

@@ -742,6 +742,55 @@ import {
 } from "./src/trustHistoryEngine.js";
 import { TRUST_STATES, TRUST_STATE_META } from "./src/trustStateEngine.js";
 
+// Phase 5: Evan-Verified + Guarantee + Certification Engine
+import {
+  computeEvanVerification,
+  getVerificationRecord,
+  checkVerificationValidity,
+  revokeVerificationRecord,
+  getUserVerificationHistory,
+  getVerificationOps,
+  VERIFY_STATUS,
+  buildClaimLanguage,
+} from "./src/evanVerifiedEngine.js";
+import {
+  issueGuaranteePolicy,
+  getGuaranteePolicy,
+  getPolicyForScan,
+  getUserPolicies,
+  revokeGuaranteePolicy,
+  getGuaranteeOps,
+  POLICY_STATUS,
+} from "./src/guaranteeEngine.js";
+import {
+  createClaim,
+  updateClaimStatus,
+  getClaimRecord,
+  getUserClaims,
+  getClaimsForPolicy,
+  getOpenClaims,
+  getClaimOps,
+  CLAIM_STATUS,
+} from "./src/claimDisputeEngine.js";
+import {
+  computeResellerCertification,
+  getCertificationRecord,
+  getCertificationOps,
+  CERT_STATUS,
+  CERT_TIER,
+} from "./src/resellerCertificationEngine.js";
+import {
+  issueTrustmark,
+  getTrustmark,
+  getTrustmarkForScan,
+  checkTrustmarkStatus,
+  revokeTrustmark,
+  revokeTrustmarkForScan,
+  cascadeRevocationForScan,
+  getTrustmarkOps,
+  TRUSTMARK_STATUS,
+} from "./src/trustmarkEngine.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -23885,6 +23934,450 @@ app.post(
   });
 
   // ── END Phase 4: Authentication + Trust Domination Engine Routes ──────────────
+
+  // ── Phase 5: Evan-Verified + Guarantee + Certification Routes ────────────────
+  //
+  //   GET  /verify/item/:scanId              — get verification record
+  //   GET  /verify/validity/:scanId          — check if verification is still valid
+  //   POST /verify/revoke/:scanId            — revoke verification (ops/expert)
+  //   GET  /verify/history/:userId           — user's verification history
+  //   GET  /verify/ops                       — verification ops summary
+  //
+  //   POST /guarantee/policy                 — issue guarantee policy for verified item
+  //   GET  /guarantee/policy/:policyId       — get policy
+  //   GET  /guarantee/scan/:scanId           — get policy for scan
+  //   GET  /guarantee/user/:userId           — user's policies
+  //   POST /guarantee/policy/:policyId/revoke — revoke policy
+  //   GET  /guarantee/ops                    — guarantee ops summary
+  //
+  //   POST /claim                            — file a claim
+  //   GET  /claim/:claimId                   — get claim
+  //   PATCH /claim/:claimId/status           — update claim status (reviewer)
+  //   GET  /claim/policy/:policyId           — claims for a policy
+  //   GET  /claim/user/:userId               — user's claims
+  //   GET  /claim/open                       — open claims queue
+  //   GET  /claim/ops                        — claim ops summary
+  //
+  //   GET  /reseller/certification/:userId   — get certification record
+  //   POST /reseller/certification/:userId/evaluate — trigger evaluation
+  //   GET  /reseller/ops                     — certification ops summary
+  //
+  //   GET  /trustmark/:trustmarkId           — get trustmark
+  //   GET  /trustmark/scan/:scanId           — get trustmark for scan
+  //   GET  /trustmark/status/:trustmarkId    — real-time status check (public)
+  //   POST /trustmark/:trustmarkId/revoke    — revoke trustmark
+  //   POST /trustmark/scan/:scanId/revoke    — revoke trustmark by scanId
+  //   POST /trustmark/cascade/:scanId        — cascade revocation for scan
+  //   GET  /trustmark/ops                    — trustmark ops summary
+
+  // ── Verify: Item Verification ─────────────────────────────────────────────────
+
+  app.get("/verify/item/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 64);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const record = await getVerificationRecord(redis, scanId);
+      if (!record) return res.status(200).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, verification: record });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "verify_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/verify/validity/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 64);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const result = await checkVerificationValidity(redis, scanId);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "validity_check_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/verify/revoke/:scanId", async (req, res) => {
+    try {
+      const scanId   = safeStr(req.params?.scanId, 64);
+      const reason   = safeStr(req.body?.reason, 200) || "ops_revocation";
+      const revokedBy= safeStr(req.body?.revokedBy, 64) || "ops";
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const result = await revokeVerificationRecord(redis, scanId, { reason, revokedBy });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "revoke_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/verify/history/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      const limit  = Math.min(100, Math.max(1, Number(req.query?.limit) || 20));
+      const offset = Math.max(0, Number(req.query?.offset) || 0);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const result = await getUserVerificationHistory(redis, userId, { limit, offset });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "history_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/verify/ops", async (_req, res) => {
+    try {
+      const ops = await getVerificationOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── Guarantee: Policy Engine ───────────────────────────────────────────────────
+
+  app.post("/guarantee/policy", async (req, res) => {
+    try {
+      const { scanId, userId, category, scannedPrice, modelVersion } = req.body || {};
+      const sId = safeStr(scanId, 64);
+      const uId = safeStr(userId, 64);
+      if (!sId || !uId) return res.status(200).json({ ok: false, error: "missing_required" });
+
+      // Fetch verification and auth evidence
+      const verification = await getVerificationRecord(redis, sId);
+      if (!verification) return res.status(200).json({ ok: false, error: "no_verification_record" });
+      if (verification.status !== VERIFY_STATUS.VERIFIED) {
+        return res.status(200).json({ ok: false, error: "item_not_verified", status: verification.status });
+      }
+
+      const result = await issueGuaranteePolicy(redis, {
+        scanId:           sId,
+        userId:           uId,
+        category:         safeStr(category, 32) || verification.category || "generic",
+        evanVerification: verification,
+        authEvidence:     verification._authEvidence || {},
+        scannedPrice:     Number(scannedPrice) || null,
+        modelVersion:     safeStr(modelVersion, 16) || "5.0",
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "policy_issue_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/guarantee/policy/:policyId", async (req, res) => {
+    try {
+      const policyId = safeStr(req.params?.policyId, 64);
+      if (!policyId) return res.status(200).json({ ok: false, error: "missing_policy_id" });
+      const policy = await getGuaranteePolicy(redis, policyId);
+      if (!policy) return res.status(200).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, policy });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "policy_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/guarantee/scan/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 64);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const policyId = await getPolicyForScan(redis, scanId);
+      if (!policyId) return res.status(200).json({ ok: false, error: "no_policy_for_scan" });
+      const policy = await getGuaranteePolicy(redis, policyId);
+      return res.status(200).json({ ok: !!policy, policyId, policy: policy || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "policy_scan_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/guarantee/user/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      const limit  = Math.min(100, Math.max(1, Number(req.query?.limit) || 20));
+      const offset = Math.max(0, Number(req.query?.offset) || 0);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const result = await getUserPolicies(redis, userId, { limit, offset });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "user_policies_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/guarantee/policy/:policyId/revoke", async (req, res) => {
+    try {
+      const policyId = safeStr(req.params?.policyId, 64);
+      const reason   = safeStr(req.body?.reason, 200) || "ops_revocation";
+      const revokedBy= safeStr(req.body?.revokedBy, 64) || "ops";
+      if (!policyId) return res.status(200).json({ ok: false, error: "missing_policy_id" });
+      const result = await revokeGuaranteePolicy(redis, policyId, { reason, revokedBy });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "policy_revoke_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/guarantee/ops", async (_req, res) => {
+    try {
+      const ops = await getGuaranteeOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── Claims: Dispute Foundation ────────────────────────────────────────────────
+
+  app.post("/claim", async (req, res) => {
+    try {
+      const { policyId, userId, reason, claimType, evidenceMetadata, requestedPayout } = req.body || {};
+      const result = await createClaim(redis, {
+        policyId:        safeStr(policyId, 64),
+        userId:          safeStr(userId, 64),
+        reason:          safeStr(reason, 2000),
+        claimType:       safeStr(claimType, 32) || "other",
+        evidenceMetadata:Array.isArray(evidenceMetadata) ? evidenceMetadata.slice(0, 20) : [],
+        requestedPayout: Number(requestedPayout) || null,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "claim_create_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/claim/open", async (req, res) => {
+    try {
+      const limit  = Math.min(100, Math.max(1, Number(req.query?.limit) || 50));
+      const claims = await getOpenClaims(redis, { limit });
+      return res.status(200).json({ ok: true, claims, count: claims.length });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "open_claims_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/claim/ops", async (_req, res) => {
+    try {
+      const ops = await getClaimOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ops_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/claim/policy/:policyId", async (req, res) => {
+    try {
+      const policyId = safeStr(req.params?.policyId, 64);
+      if (!policyId) return res.status(200).json({ ok: false, error: "missing_policy_id" });
+      const claims = await getClaimsForPolicy(redis, policyId);
+      return res.status(200).json({ ok: true, claims });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "policy_claims_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/claim/user/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      const limit  = Math.min(100, Math.max(1, Number(req.query?.limit) || 20));
+      const offset = Math.max(0, Number(req.query?.offset) || 0);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const result = await getUserClaims(redis, userId, { limit, offset });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "user_claims_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/claim/:claimId", async (req, res) => {
+    try {
+      const claimId = safeStr(req.params?.claimId, 64);
+      if (!claimId) return res.status(200).json({ ok: false, error: "missing_claim_id" });
+      const claim = await getClaimRecord(redis, claimId);
+      if (!claim) return res.status(200).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, claim });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "claim_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.patch("/claim/:claimId/status", async (req, res) => {
+    try {
+      const claimId        = safeStr(req.params?.claimId, 64);
+      const status         = safeStr(req.body?.status, 32);
+      const reviewerNotes  = safeStr(req.body?.reviewerNotes, 5000);
+      const resolutionReason = safeStr(req.body?.resolutionReason, 500);
+      const approvedPayout = Number(req.body?.approvedPayout) || null;
+      const reviewer       = safeStr(req.body?.reviewer, 64) || "reviewer";
+      if (!claimId || !status) return res.status(200).json({ ok: false, error: "missing_required" });
+      const result = await updateClaimStatus(redis, claimId, {
+        status, reviewerNotes, resolutionReason, approvedPayout, reviewer,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "status_update_failed", reason: err?.message });
+    }
+  });
+
+  // ── Reseller Certification ─────────────────────────────────────────────────────
+
+  app.get("/reseller/certification/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const record = await getCertificationRecord(redis, userId);
+      if (!record) return res.status(200).json({ ok: true, certification: null, evaluated: false });
+      return res.status(200).json({ ok: true, certification: record });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "cert_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/reseller/certification/:userId/evaluate", async (req, res) => {
+    try {
+      const userId              = safeStr(req.params?.userId, 64);
+      const disputeRate         = Math.min(1, Math.max(0, Number(req.body?.disputeRate) || 0));
+      const counterfeitIncidents= Math.max(0, Number(req.body?.counterfeitIncidents) || 0);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const record = await computeResellerCertification(redis, userId, {
+        forceRefresh: true,
+        disputeRate,
+        counterfeitIncidents,
+      });
+      return res.status(200).json({ ok: true, certification: record });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "cert_eval_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/reseller/ops", async (_req, res) => {
+    try {
+      const ops = await getCertificationOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── Trustmarks ────────────────────────────────────────────────────────────────
+
+  app.get("/trustmark/ops", async (_req, res) => {
+    try {
+      const ops = await getTrustmarkOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ops_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/trustmark/scan/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 64);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const trustmarkId = await getTrustmarkForScan(redis, scanId);
+      if (!trustmarkId) return res.status(200).json({ ok: false, error: "no_trustmark_for_scan" });
+      const trustmark = await getTrustmark(redis, trustmarkId);
+      return res.status(200).json({ ok: !!trustmark, trustmarkId, trustmark: trustmark || null });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trustmark_scan_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/trustmark/status/:trustmarkId", async (req, res) => {
+    try {
+      const trustmarkId = safeStr(req.params?.trustmarkId, 64);
+      if (!trustmarkId) return res.status(200).json({ ok: false, error: "missing_trustmark_id" });
+      const status = await checkTrustmarkStatus(redis, trustmarkId);
+      return res.status(200).json({ ok: true, ...status });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "status_check_failed", reason: err?.message });
+    }
+  });
+
+  app.get("/trustmark/:trustmarkId", async (req, res) => {
+    try {
+      const trustmarkId = safeStr(req.params?.trustmarkId, 64);
+      if (!trustmarkId) return res.status(200).json({ ok: false, error: "missing_trustmark_id" });
+      const trustmark = await getTrustmark(redis, trustmarkId);
+      if (!trustmark) return res.status(200).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, trustmark });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trustmark_fetch_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/trustmark/:trustmarkId/revoke", async (req, res) => {
+    try {
+      const trustmarkId = safeStr(req.params?.trustmarkId, 64);
+      const reason      = safeStr(req.body?.reason, 200) || "ops_action";
+      const revokedBy   = safeStr(req.body?.revokedBy, 64) || "ops";
+      if (!trustmarkId) return res.status(200).json({ ok: false, error: "missing_trustmark_id" });
+      const result = await revokeTrustmark(redis, trustmarkId, { reason, revokedBy });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "revoke_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/trustmark/scan/:scanId/revoke", async (req, res) => {
+    try {
+      const scanId  = safeStr(req.params?.scanId, 64);
+      const reason  = safeStr(req.body?.reason, 200) || "ops_action";
+      const revokedBy= safeStr(req.body?.revokedBy, 64) || "ops";
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      const result = await revokeTrustmarkForScan(redis, scanId, { reason, revokedBy });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "revoke_failed", reason: err?.message });
+    }
+  });
+
+  app.post("/trustmark/cascade/:scanId", async (req, res) => {
+    try {
+      const scanId   = safeStr(req.params?.scanId, 64);
+      const reason   = safeStr(req.body?.reason, 200) || "expert_confirmed_counterfeit";
+      const revokedBy= safeStr(req.body?.revokedBy, 64) || "ops";
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      // Full cascade: revoke trustmark + verification + guarantee policy
+      const [cascadeResult, verifyRevoke] = await Promise.allSettled([
+        cascadeRevocationForScan(redis, scanId, { reason, revokedBy }),
+        revokeVerificationRecord(redis, scanId, { reason, revokedBy }),
+      ]);
+
+      return res.status(200).json({
+        ok:                true,
+        scanId,
+        trustmarkRevoke:   cascadeResult.status === "fulfilled" ? cascadeResult.value : { ok: false },
+        verificationRevoke:verifyRevoke.status  === "fulfilled" ? verifyRevoke.value  : { ok: false },
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "cascade_failed", reason: err?.message });
+    }
+  });
+
+  // ── Phase 5 Ops: Governance / Audit aggregate ─────────────────────────────────
+
+  app.get("/ops/phase5", async (_req, res) => {
+    try {
+      const [verifyOps, guaranteeOps, claimOps, certOps, tmOps] = await Promise.allSettled([
+        getVerificationOps(redis),
+        getGuaranteeOps(redis),
+        getClaimOps(redis),
+        getCertificationOps(redis),
+        getTrustmarkOps(redis),
+      ]);
+
+      return res.status(200).json({
+        ok: true,
+        phase5Ops: {
+          verification: verifyOps.status === "fulfilled"   ? verifyOps.value   : {},
+          guarantee:    guaranteeOps.status === "fulfilled" ? guaranteeOps.value : {},
+          claims:       claimOps.status === "fulfilled"     ? claimOps.value     : {},
+          certification:certOps.status === "fulfilled"      ? certOps.value      : {},
+          trustmarks:   tmOps.status === "fulfilled"        ? tmOps.value        : {},
+        },
+      });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "phase5_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 5: Evan-Verified + Guarantee + Certification Routes ─────────────
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
