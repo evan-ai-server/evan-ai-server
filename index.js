@@ -727,6 +727,21 @@ import {
 import { generateUserInsights } from "./src/insightsEngine.js";
 import { buildUserDashboard } from "./src/dashboardEngine.js";
 
+// Phase 4: Authentication + Trust Domination Engine
+import {
+  storeTrustRecord,
+  getTrustRecord,
+  getUserTrustHistory,
+  getReviewQueue,
+  flagForReview,
+  attachExpertVerdict,
+  getReviewRecord,
+  getTrustOps,
+  getCategoryTrustPressure,
+  REVIEW_VERDICT,
+} from "./src/trustHistoryEngine.js";
+import { TRUST_STATES, TRUST_STATE_META } from "./src/trustStateEngine.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -18958,6 +18973,8 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     scannedPrice,
     rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
     visionConfidence: visionConfidence ?? 0.5,
+    scanId:           _scanIdA,
+    userId:           _userId,
   }).catch(() => {});
   // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
   const _cViolationsA = guardPayloadSafe(responsePayload, _planA);
@@ -19098,6 +19115,8 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     scannedPrice,
     rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
     visionConfidence: visionConfidence ?? 0.5,
+    scanId:           _scanIdB,
+    userId:           _userId,
   }).catch(() => {});
   // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
   const _cViolationsB = guardPayloadSafe(responsePayload, _planB);
@@ -19367,6 +19386,8 @@ await applyCategoryDomination(redis, responsePayload, {
   scannedPrice,
   rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
   visionConfidence: visionConfidence ?? 0.5,
+  scanId:           _scanIdC,
+  userId:           _userId,
 }).catch(() => {});
 // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
 const _cViolationsC = guardPayloadSafe(responsePayload, _planC);
@@ -19610,6 +19631,8 @@ app.post("/market/search/stream", async (req, res) => {
         scannedPrice,
         rawText:          [visionIdentity?.visibleText, visionIdentity?.description].flat().filter(Boolean).join(" "),
         visionConfidence: visionConfidence ?? 0.5,
+        scanId:           _scanIdD,
+        userId:           _userId,
       }).catch(() => {});
       // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
       const _cViolationsD = guardPayloadSafe(payload, _planD);
@@ -23692,6 +23715,176 @@ app.post(
   });
 
   // ── END Phase 3: Power User Lock-In System Routes ─────────────────────────────
+
+  // ── Phase 4: Authentication + Trust Domination Engine Routes ─────────────────
+  //
+  // Trust history, expert review pipeline, and ops/audit visibility.
+  //
+  //   GET  /trust/ops                        — trust system ops summary
+  //   GET  /trust/scan/:scanId               — single scan trust record
+  //   GET  /trust/history/:userId            — user trust audit trail
+  //   POST /trust/flag/:scanId               — flag scan for expert review
+  //   GET  /trust/review/queue               — expert review queue
+  //   POST /trust/review/:scanId/verdict     — attach expert verdict
+  //   GET  /trust/review/:reviewId           — get review record
+  //   GET  /trust/pressure/:category         — category counterfeit pressure
+  //   GET  /trust/states                     — trust state definitions (for UI)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── GET /trust/ops ────────────────────────────────────────────────────────────
+  // Trust system ops summary: verdict distribution, state distribution,
+  // review queue depth, counterfeit flags, high-stakes rule triggers.
+  app.get("/trust/ops", async (req, res) => {
+    try {
+      const ops = await getTrustOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trust_ops_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/scan/:scanId ────────────────────────────────────────────────────
+  // Get the trust/auth record for a specific scan.
+  app.get("/trust/scan/:scanId", async (req, res) => {
+    try {
+      const scanId = safeStr(req.params?.scanId, 128);
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const record = await getTrustRecord(redis, scanId);
+      if (!record) return res.status(200).json({ ok: false, error: "not_found" });
+
+      return res.status(200).json({ ok: true, record });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trust_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/history/:userId ────────────────────────────────────────────────
+  // Get a user's trust audit trail (most recent first).
+  //
+  // Query params: limit (default 20, max 100), offset (default 0)
+  app.get("/trust/history/:userId", async (req, res) => {
+    try {
+      const userId = safeStr(req.params?.userId, 64);
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+
+      const limit  = Math.max(1, Math.min(100, Number(req.query?.limit  || 20)));
+      const offset = Math.max(0, Number(req.query?.offset || 0));
+
+      const result = await getUserTrustHistory(redis, userId, { limit, offset });
+      return res.status(200).json({ ok: true, userId, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "trust_history_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /trust/flag/:scanId ──────────────────────────────────────────────────
+  // Manually flag a scan for expert review.
+  // Body: { urgency?: HIGH|MEDIUM|LOW, reason?: string }
+  app.post("/trust/flag/:scanId", async (req, res) => {
+    try {
+      const scanId  = safeStr(req.params?.scanId, 128);
+      const urgency = safeStr(req.body?.urgency, 10) || "MEDIUM";
+      const reason  = safeStr(req.body?.reason,  300) || null;
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const result = await flagForReview(redis, scanId, { urgency, reason });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "flag_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/review/queue ───────────────────────────────────────────────────
+  // Get the expert review queue — items needing authentication review, priority first.
+  // Query params: limit (default 20, max 50)
+  app.get("/trust/review/queue", async (req, res) => {
+    try {
+      const limit = Math.max(1, Math.min(50, Number(req.query?.limit || 20)));
+      const queue = await getReviewQueue(redis, { limit });
+      return res.status(200).json({ ok: true, count: queue.length, items: queue });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "queue_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── POST /trust/review/:scanId/verdict ───────────────────────────────────────
+  // Attach an expert verdict to a reviewed scan.
+  // Feeds confirmed counterfeits into counterfeit memory automatically.
+  //
+  // Body:
+  //   verdict     — required: AUTHENTIC | COUNTERFEIT | UNRESOLVED
+  //   reviewer    — required: expert identifier
+  //   notes       — optional
+  //   isFake      — optional boolean (if COUNTERFEIT: feed into counterfeit memory)
+  //   fakeSignals — optional string[] (detected tells for counterfeit memory)
+  app.post("/trust/review/:scanId/verdict", async (req, res) => {
+    try {
+      const scanId    = safeStr(req.params?.scanId, 128);
+      const verdict   = safeStr(req.body?.verdict,   20);
+      const reviewer  = safeStr(req.body?.reviewer,  80);
+      const notes     = safeStr(req.body?.notes,     500) || null;
+      const isFake    = Boolean(req.body?.isFake);
+      const fakeSignals = Array.isArray(req.body?.fakeSignals)
+        ? req.body.fakeSignals.map(String).slice(0, 10)
+        : [];
+
+      if (!scanId)   return res.status(200).json({ ok: false, error: "missing_scan_id" });
+      if (!verdict)  return res.status(200).json({ ok: false, error: "missing_verdict", valid: Object.values(REVIEW_VERDICT) });
+      if (!reviewer) return res.status(200).json({ ok: false, error: "missing_reviewer" });
+
+      const result = await attachExpertVerdict(redis, {
+        scanId, verdict, reviewer, notes, isFake, fakeSignals,
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "verdict_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/review/:reviewId ───────────────────────────────────────────────
+  // Get a specific expert review record.
+  app.get("/trust/review/:reviewId", async (req, res) => {
+    try {
+      const reviewId = safeStr(req.params?.reviewId, 64);
+      if (!reviewId) return res.status(200).json({ ok: false, error: "missing_review_id" });
+
+      const review = await getReviewRecord(redis, reviewId);
+      if (!review) return res.status(200).json({ ok: false, error: "not_found" });
+
+      return res.status(200).json({ ok: true, review });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "review_get_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/pressure/:category ─────────────────────────────────────────────
+  // Get counterfeit flagging pressure for a category in the last N days.
+  // Query params: days (default 30)
+  app.get("/trust/pressure/:category", async (req, res) => {
+    try {
+      const category = safeStr(req.params?.category, 60);
+      if (!category) return res.status(200).json({ ok: false, error: "missing_category" });
+
+      const days = Math.max(7, Math.min(90, Number(req.query?.days || 30)));
+      const pressure = await getCategoryTrustPressure(redis, category, { days });
+      return res.status(200).json({ ok: true, ...pressure });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "pressure_failed", reason: err?.message || String(err) });
+    }
+  });
+
+  // ── GET /trust/states ─────────────────────────────────────────────────────────
+  // Return trust state definitions (for UI — labels, colors, guidance).
+  app.get("/trust/states", async (_req, res) => {
+    return res.status(200).json({
+      ok:     true,
+      states: TRUST_STATE_META,
+      order:  Object.keys(TRUST_STATES),
+    });
+  });
+
+  // ── END Phase 4: Authentication + Trust Domination Engine Routes ──────────────
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.

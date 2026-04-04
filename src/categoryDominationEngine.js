@@ -1,21 +1,30 @@
 // src/categoryDominationEngine.js
-// Phase 2 — Category Domination Engine Orchestrator.
+// Phase 2 + Phase 4 — Category Domination Engine Orchestrator.
 //
-// Ties together all Phase 2 subsystems:
+// Phase 2 pipeline (steps 1-8):
 //   1. categoryAttributeExtractor   → extract structured attributes from identity
 //   2. categoryAuthEngine           → authentication risk assessment
 //   3. counterfeitMemory            → match against known fake patterns
 //   4. categoryTrustModifiers       → compute trust score adjustments
 //   5. Apply adjustments to payload  → trust score + buy signal affected
+//   6. Apply signal downgrade for blocking warnings
+//   7. Enrich authenticityIntel in payload
+//   8. Attach full Phase 2 intel to payload
 //
-// Exports a single async function: applyCategoryDomination(redis, payload, opts)
-// Called at each scan route (Routes A-D) right after applyCategoryIntelligenceToPayload.
+// Phase 4 additions (steps 9-13):
+//   9.  categoryAuthRules           → per-category structured YES/NO/UNKNOWN rule evaluation
+//   10. authEvidenceModel           → translate pipeline outputs into structured evidence object
+//   11. highStakesDowngradeRules    → hard safety rules (no STRONG BUY + weak evidence, etc.)
+//   12. trustExplanationEngine      → evidence-backed human-readable explanation
+//   13. trustStateEngine            → user-facing trust state (VERIFIED_CONFIDENT, HIGH_RISK_AUTH, etc.)
+//   14. trustHistoryEngine          → async persist trust record (non-blocking)
 //
-// Side effects on payload:
-//   - payload.categoryDomination   — full Phase 2 intel object
-//   - payload.profitIntel.trustScore  — adjusted by trust delta
-//   - payload.profitIntel.buySignal   — downgraded if blocking warnings active
-//   - payload.authenticityIntel       — enriched with Phase 2 signals
+// Exports: applyCategoryDomination(redis, payload, opts)
+// Side effects on payload (NEW Phase 4 additions):
+//   - payload.authenticationEvidence  — structured evidence model
+//   - payload.trustExplanation        — evidence-backed trust explanation
+//   - payload.trustState              — user-facing trust state
+//   - payload.categoryDomination.authRuleResults — per-category rule outcomes
 //
 // The system degrades gracefully: any subsystem failure is caught and skipped.
 
@@ -26,6 +35,13 @@ import { computeCategoryTrustAdjustments,
          applyCategoryTrustModifiers }             from "./categoryTrustModifiers.js";
 import { hasDeepProfile, getConfidenceFloors }     from "./categoryProfiles.js";
 import { CAT }                                     from "./categoryRegistry.js";
+// Phase 4 imports
+import { runCategoryAuthRules }                    from "./categoryAuthRules.js";
+import { buildAuthEvidenceModel }                  from "./authEvidenceModel.js";
+import { applyHighStakesDowngradeRules }           from "./highStakesDowngradeRules.js";
+import { buildTrustExplanation }                   from "./trustExplanationEngine.js";
+import { computeTrustState }                       from "./trustStateEngine.js";
+import { storeTrustRecord }                        from "./trustHistoryEngine.js";
 
 // ── Signal downgrade map ──────────────────────────────────────────────────────
 // When a blocking warning fires, these signals are downgraded
@@ -52,7 +68,8 @@ const SOFT_DOWNGRADE = {
 // ── Main orchestrator ─────────────────────────────────────────────────────────
 
 /**
- * Run the Category Domination Engine and apply results to the scan payload.
+ * Run the Category Domination Engine (Phase 2) + Authentication Trust Engine (Phase 4).
+ * Applies all results in-place to the scan payload.
  *
  * @param {object} redis
  * @param {object} payload    — the assembled scan response payload (mutated in place)
@@ -62,6 +79,8 @@ const SOFT_DOWNGRADE = {
  *   scannedPrice    {number|null}
  *   rawText         {string}  — raw listing/image text
  *   visionConfidence{number}  — 0-1
+ *   scanId          {string|null} — for trust history storage
+ *   userId          {string|null} — for trust history storage
  */
 export async function applyCategoryDomination(redis, payload, {
   identity          = {},
@@ -69,6 +88,8 @@ export async function applyCategoryDomination(redis, payload, {
   scannedPrice      = null,
   rawText           = "",
   visionConfidence  = 0.5,
+  scanId            = null,
+  userId            = null,
 } = {}) {
   // Only run full Phase 2 for categories with deep profiles
   if (!hasDeepProfile(category)) {
@@ -256,6 +277,148 @@ export async function applyCategoryDomination(redis, payload, {
       finalBuySignal:    finalSignal,
       signalDowngraded:  finalSignal !== currentSignal,
     };
+
+    // ── Phase 4: Category-specific auth rules ──────────────────────────────────
+    let authRuleResults;
+    try {
+      authRuleResults = runCategoryAuthRules({
+        category,
+        extractedAttributes: extractionResult.extractedAttributes,
+        authResult,
+        counterfeitMatches,
+        scannedPrice,
+        rawText,
+      });
+    } catch (err) {
+      console.error("[categoryDomination] categoryAuthRules error:", err?.message);
+      authRuleResults = { ruleResults: [], passCount: 0, failCount: 0, unknownCount: 0, authScore: 0.5 };
+    }
+
+    // ── Phase 4: Authentication evidence model ────────────────────────────────
+    let authEvidence;
+    try {
+      authEvidence = buildAuthEvidenceModel({
+        category,
+        brand: extractionResult.extractedAttributes?.brand || identity?.brand || null,
+        extractionResult,
+        authResult,
+        counterfeitMatches,
+        modifiers,
+        authRuleResults,
+        scannedPrice,
+        visionConfidence,
+      });
+    } catch (err) {
+      console.error("[categoryDomination] buildAuthEvidenceModel error:", err?.message);
+      authEvidence = {
+        verdict: "INSUFFICIENT_EVIDENCE", evidenceStrength: "NONE", authScore: 0.5,
+        positiveSignals: [], negativeSignals: [], missingSignals: [],
+        requiredChecks: [], reviewRecommended: false, reviewUrgency: null,
+        confidence: 0.1, trustImpact: 0, warningCodes: [],
+      };
+    }
+
+    // ── Phase 4: Trust state ───────────────────────────────────────────────────
+    const trustStateVal = computeTrustState({
+      trustScore:        newTrustScore,
+      verdict:           authEvidence.verdict,
+      evidenceStrength:  authEvidence.evidenceStrength,
+      hasBlockingWarning: authEvidence.negativeSignals?.some(s => s.blocking) || false,
+      authScore:         authEvidence.authScore,
+      buySignal:         payload?.profitIntel?.buySignal,
+      category,
+    });
+
+    // ── Phase 4: High-stakes downgrade rules ──────────────────────────────────
+    let highStakesResult;
+    try {
+      highStakesResult = applyHighStakesDowngradeRules({
+        payload,
+        authEvidence,
+        trustState: trustStateVal,
+        category,
+        scannedPrice,
+      });
+    } catch (err) {
+      console.error("[categoryDomination] highStakesDowngradeRules error:", err?.message);
+      highStakesResult = { rulesTriggered: [], warnings: [], flagsAdded: [], trustAdjust: 0 };
+    }
+
+    // Re-compute trust state after high-stakes rules may have adjusted trust/signal
+    const finalTrustState = computeTrustState({
+      trustScore:        payload?.profitIntel?.trustScore ?? newTrustScore,
+      verdict:           authEvidence.verdict,
+      evidenceStrength:  authEvidence.evidenceStrength,
+      hasBlockingWarning: authEvidence.negativeSignals?.some(s => s.blocking) || false,
+      authScore:         authEvidence.authScore,
+      buySignal:         payload?.profitIntel?.buySignal,
+      category,
+    });
+
+    // ── Phase 4: Trust explanation ─────────────────────────────────────────────
+    let trustExplanation;
+    try {
+      trustExplanation = buildTrustExplanation({
+        trustScore:       payload?.profitIntel?.trustScore ?? newTrustScore,
+        authEvidence,
+        authRuleResults,
+        modifiers,
+        highStakesResult,
+        extractionResult,
+        category,
+        scannedPrice,
+        visionConfidence,
+      });
+    } catch (err) {
+      console.error("[categoryDomination] buildTrustExplanation error:", err?.message);
+      trustExplanation = null;
+    }
+
+    // ── Phase 4: Attach new fields to payload ──────────────────────────────────
+    payload.authenticationEvidence = authEvidence;
+    payload.trustState             = finalTrustState;
+    if (trustExplanation) payload.trustExplanation = trustExplanation;
+
+    // Add auth rule results to categoryDomination
+    if (payload.categoryDomination) {
+      payload.categoryDomination.authRuleResults = {
+        passCount:    authRuleResults.passCount,
+        failCount:    authRuleResults.failCount,
+        unknownCount: authRuleResults.unknownCount,
+        authScore:    authRuleResults.authScore,
+        hasBlockingFail: authRuleResults.hasBlockingFail,
+        rules:        authRuleResults.ruleResults,
+      };
+      payload.categoryDomination.highStakesRulesTriggered = highStakesResult.rulesTriggered;
+    }
+
+    // Add high-stakes warnings to structured warnings list
+    if (highStakesResult.warnings.length > 0) {
+      if (!Array.isArray(payload?.profitIntel?.structuredWarnings)) {
+        if (payload?.profitIntel) payload.profitIntel.structuredWarnings = [];
+      }
+      if (payload?.profitIntel?.structuredWarnings) {
+        payload.profitIntel.structuredWarnings.push(...highStakesResult.warnings);
+      }
+    }
+
+    // ── Phase 4: Store trust history (non-blocking) ────────────────────────────
+    const activeScanId = scanId || payload?._scanId || payload?.profitIntel?.scanId || null;
+    const activeUserId = userId || payload?._userId || null;
+    if (activeScanId) {
+      storeTrustRecord(redis, {
+        scanId:   activeScanId,
+        userId:   activeUserId,
+        category,
+        brand:    extractionResult.extractedAttributes?.brand || null,
+        trustScore: payload?.profitIntel?.trustScore ?? newTrustScore,
+        authEvidence,
+        trustState: finalTrustState,
+        highStakesRulesTriggered: highStakesResult.rulesTriggered,
+        finalBuySignal: payload?.profitIntel?.buySignal || null,
+        scannedPrice,
+      }).catch(err => console.error("[categoryDomination] storeTrustRecord error:", err?.message));
+    }
 
   } catch (err) {
     console.error("[categoryDomination] fatal error:", err?.message);

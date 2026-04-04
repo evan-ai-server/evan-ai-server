@@ -15,6 +15,62 @@
 import { getInventoryItem } from "./inventoryEngine.js";
 import { CAT } from "./categoryRegistry.js";
 
+// ── Trust-safe listing helpers ────────────────────────────────────────────────
+
+/**
+ * Build trust-aware brand claim prefix for listing descriptions.
+ * Avoids overclaiming authenticity when evidence is weak or verdict is uncertain.
+ *
+ * @param {string} brand
+ * @param {object|null} authEvidence — payload.authenticationEvidence if stored in snapshot
+ * @returns {{ claimPrefix: string, confidenceNote: string|null, blockStrongClaims: boolean }}
+ */
+function buildTrustSafeListingClaims(brand, authEvidence) {
+  if (!authEvidence) {
+    // No evidence data — use neutral brand attribution
+    return {
+      claimPrefix: brand || "Item",
+      confidenceNote: null,
+      blockStrongClaims: false,
+    };
+  }
+
+  const verdict  = authEvidence.verdict;
+  const strength = authEvidence.evidenceStrength;
+
+  if (verdict === "LIKELY_COUNTERFEIT") {
+    // Should not be listed — but if it is, never claim authentic
+    return {
+      claimPrefix: brand || "Item",
+      confidenceNote: "Authentication concerns noted. Buyer should independently verify authenticity.",
+      blockStrongClaims: true,
+    };
+  }
+
+  if (verdict === "LIKELY_AUTHENTIC" && (strength === "STRONG" || strength === "MEDIUM")) {
+    return {
+      claimPrefix: `Authentic ${brand}`.trim(),
+      confidenceNote: null,
+      blockStrongClaims: false,
+    };
+  }
+
+  if (verdict === "INSUFFICIENT_EVIDENCE" || strength === "NONE") {
+    return {
+      claimPrefix: brand || "Item",
+      confidenceNote: "Authenticity not independently verified. Buyer should authenticate prior to purchase.",
+      blockStrongClaims: true,
+    };
+  }
+
+  // UNCERTAIN or WEAK evidence — hedged language
+  return {
+    claimPrefix: brand || "Item",
+    confidenceNote: "Authentication not confirmed. Independent verification recommended.",
+    blockStrongClaims: false,
+  };
+}
+
 // ── Platform recommendations by category ─────────────────────────────────────
 
 const PLATFORM_RECS = {
@@ -207,6 +263,10 @@ function generateHandbagListing(item, attrs) {
   const accessories = Array.isArray(attrs.accessories) ? attrs.accessories : [];
   const size     = attrs.size     || null;
 
+  // Phase 4: trust-safe authentication claims
+  const authEvidence = item.itemSnapshot?.authenticationEvidence || null;
+  const { claimPrefix, confidenceNote, blockStrongClaims } = buildTrustSafeListingClaims(brand, authEvidence);
+
   // Luxury title format
   const titleParts = [
     brand,
@@ -222,15 +282,23 @@ function generateHandbagListing(item, attrs) {
     ? `Comes with: ${accessories.map(a => a.replace(/_/g, " ")).join(", ")}.`
     : null;
 
+  // Use trust-safe brand claim prefix — never "Authentic" when evidence is weak
+  const brandClaimLine = `${claimPrefix} ${model}${material ? " in " + material : ""}${color ? ", " + color : ""}.`.trim();
+
+  // Authenticity documentation claim — only state if evidence supports it
+  const hasAuthDocs = accessories.includes("receipt") || accessories.includes("authenticity_card");
+  const authDocLine = hasAuthDocs
+    ? "Authenticity documentation included."
+    : (blockStrongClaims ? null : "Authentication verification recommended before purchase.");
+
   const descParts = [
-    `Authentic ${brand} ${model}${material ? " in " + material : ""}${color ? ", " + color : ""}.`,
+    brandClaimLine,
     condition ? `Condition: ${condition}.` : null,
     hardware  ? `${hardware} tone hardware.` : null,
     dateCode  ? `Date code present: ${dateCode}.` : null,
     accessoryStr,
-    accessories.includes("receipt") || accessories.includes("authenticity_card")
-      ? "Authenticity documentation included."
-      : "Authenticate before purchase recommended.",
+    authDocLine,
+    confidenceNote,
     "All sales final. International buyers welcome.",
   ].filter(Boolean);
   const description = descParts.join(" ");
@@ -264,6 +332,11 @@ function generateHandbagListing(item, attrs) {
     keyAttributes,
     conditionSummary: buildConditionSummary(condition, "handbags"),
     suggestedPriceRange,
+    trustSafety: {
+      blockStrongClaims,
+      confidenceNote,
+      authVerdictAtListing: authEvidence?.verdict || null,
+    },
   };
 }
 
