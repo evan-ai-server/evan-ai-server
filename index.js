@@ -1006,6 +1006,10 @@ import {
 } from "./src/distributionInsightsEngine.js";
 import { runAllPhase8Validations } from "./src/phase8Validation.js";
 
+// Institutional Bridge: Signal Fingerprint + Platform Fee engines
+import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
+import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -10151,6 +10155,7 @@ function isBadListing(title = "", query = "") {
   const q = String(query || "").toLowerCase();
 
   const badWords = [
+    // Functional noise
     "for parts",
     "parts only",
     "not working",
@@ -10168,6 +10173,31 @@ function isBadListing(title = "", query = "") {
     "bid",
     "read description",
     "as is",
+    // Phase Bridge: TruthGuard marketplace noise (counterfeit / incomplete items)
+    "replica",
+    "inspired by",
+    "inspired",
+    "1:1",
+    "aaa quality",
+    "box only",
+    "empty box",
+    "display only",
+    "display model",
+    "dupe",
+    "look alike",
+    "lookalike",
+    "super copy",
+    "mirror image",
+    "no tag",
+    "no box",
+    "missing tag",
+    "tag only",
+    "certificate only",
+    "card only",
+    "outer box",
+    "dustbag only",
+    "dustbag only",
+    "authenticity card only",
   ];
 
   if (badWords.some((w) => t.includes(w))) return true;
@@ -11338,9 +11368,24 @@ SCHEMA
     "substituteCandidates": string[],
     "marketSegment": string|null
   },
+  "institutionalIds": {
+    "sku": string|null,
+    "serialNumber": string|null,
+    "modelCode": string|null,
+    "styleCode": string|null,
+    "skuSource": string|null
+  },
   "authenticityFlags": string[],
   "conditionFlags": string[]
 }
+
+institutionalIds extraction rules:
+- sku: style/product code exactly as printed (e.g. "CT8012-100", "GX3537", "1ABTC1")
+- serialNumber: unique serial number from hardware stamp, interior tag, or engraving
+- modelCode: watch reference number, bag model code, electronics model (e.g. "116610LN")
+- styleCode: garment/apparel style number from label (e.g. "A01234", "ST-1890")
+- skuSource: "tag"|"label"|"embossed"|"printed"|"visible_text"|"inferred"|null
+- Use null for any field you cannot read with certainty. Never hallucinate identifiers.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 1 — BRAND VISUAL TELLS (expert recognition)
@@ -12220,12 +12265,34 @@ function buildFlipPrediction({
 }) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
 
-  const prices = list
-    .map((i) => i?.totalPrice ?? i?.price)
-    .filter((n) => typeof n === "number" && Number.isFinite(n) && n > 0)
-    .sort((a, b) => a - b);
+  // Phase Bridge — TruthGuard valuation weighting:
+  // Sold/completed listings carry 85% weight; active listings carry 15%.
+  // Real cash value = what buyers actually paid, not what sellers are asking.
+  const SOLD_WEIGHT   = 0.85;
+  const ACTIVE_WEIGHT = 0.15;
 
-  const medianPrice = median(prices);
+  const _price = (i) => i?.totalPrice ?? i?.price;
+  const _isNum = (n) => typeof n === "number" && Number.isFinite(n) && n > 0;
+
+  const soldItems   = list.filter((i) => i?.sold === true || String(i?.status || "").toLowerCase() === "sold");
+  const activeItems = list.filter((i) => !(i?.sold === true || String(i?.status || "").toLowerCase() === "sold"));
+
+  const soldPrices   = soldItems.map(_price).filter(_isNum).sort((a, b) => a - b);
+  const activePrices = activeItems.map(_price).filter(_isNum).sort((a, b) => a - b);
+
+  const soldMedian   = soldPrices.length   ? median(soldPrices)   : null;
+  const activeMedian = activePrices.length ? median(activePrices) : null;
+
+  // Weighted blend — fall back to whichever pool exists
+  let medianPrice;
+  if (soldMedian !== null && activeMedian !== null) {
+    medianPrice = soldMedian * SOLD_WEIGHT + activeMedian * ACTIVE_WEIGHT;
+  } else {
+    medianPrice = soldMedian ?? activeMedian ?? null;
+  }
+
+  // Combined price list for quartile / distribution stats
+  const prices = list.map(_price).filter(_isNum).sort((a, b) => a - b);
   const q1 = quantile(prices, 0.25);
   const q3 = quantile(prices, 0.75);
   const listingCount = list.length;
@@ -12574,7 +12641,7 @@ function buildVisionConsensusSchema() {
     return {
       type: "object",
       additionalProperties: false,
-      required: ["query", "variants", "confidence", "attributeCertainty", "identity", "authenticityFlags", "conditionFlags"],
+      required: ["query", "variants", "confidence", "attributeCertainty", "identity", "authenticityFlags", "conditionFlags", "institutionalIds"],
       properties: {
         query: {
           anyOf: [{ type: "string" }, { type: "null" }],
@@ -12637,6 +12704,19 @@ function buildVisionConsensusSchema() {
             searchQueries:        { type: "array", items: { type: "string" } },
             substituteCandidates: { type: "array", items: { type: "string" } },
             marketSegment:        { anyOf: [{ type: "string" }, { type: "null" }] },
+          },
+        },
+        // Phase Bridge: Institutional Identifiers extracted directly by vision model
+        institutionalIds: {
+          type: "object",
+          additionalProperties: false,
+          required: ["sku", "serialNumber", "modelCode", "styleCode", "skuSource"],
+          properties: {
+            sku:          { anyOf: [{ type: "string" }, { type: "null" }] },
+            serialNumber: { anyOf: [{ type: "string" }, { type: "null" }] },
+            modelCode:    { anyOf: [{ type: "string" }, { type: "null" }] },
+            styleCode:    { anyOf: [{ type: "string" }, { type: "null" }] },
+            skuSource:    { anyOf: [{ type: "string" }, { type: "null" }] },
           },
         },
         authenticityFlags: {
@@ -12724,7 +12804,7 @@ Output the single best resale search query + 8 ranked variants (specific→broad
 
   return `${header}
 
-PASS: EXPERT RESALE BUYER
+PASS: EXPERT RESALE BUYER + INSTITUTIONAL IDENTIFIER EXTRACTION
 You just photographed this item to resell it. What exact search term finds the most comparable sold listings?
 
 EVIDENCE HIERARCHY (strict — do NOT skip levels):
@@ -12733,6 +12813,16 @@ EVIDENCE HIERARCHY (strict — do NOT skip levels):
 3. Distinctive shape + markings together → cautious inference only
 4. Visual shape alone → no-brand visual descriptor query (never guess brand from shape)
 
+INSTITUTIONAL IDENTIFIER EXTRACTION (always run before building the query):
+Scan ALL visible text, tags, labels, boxes, hangtags, and embossed marks for:
+  • SKU / Style Code: alphanumeric codes like "CT8012-100" (Nike), "GX3537" (Adidas), "1ABTC1" (LV)
+  • Serial Number: unique item serial engraved / printed on hardware, inside band, or interior tag
+  • Model Code: watch references (e.g. "116610LN"), bag model codes, electronics model numbers
+  • Style Code: dress/apparel codes, e.g. "Style: A01234", printed on garment labels
+  • SKU Source: where you found it — "tag" | "label" | "embossed" | "printed" | "visible_text" | "inferred"
+Fill institutionalIds with ONLY what you can actually read. Use null for fields you cannot confirm.
+Never invent or hallucinate identifiers. A confirmed SKU beats brand inference every time.
+
 ANTI-HALLUCINATION RULES:
 - If you cannot READ the brand name, do NOT put it in searchQueries[0]–[2]
 - If you cannot READ the model name/number, do NOT include it
@@ -12740,7 +12830,7 @@ ANTI-HALLUCINATION RULES:
 - searchQueries[6]–[9] MUST always be no-brand visual descriptor fallbacks
 - "searchQueries" must always contain at least 3 entries
 
-Priority: brand + exact model + colorway → brand + model → model alone → [item type] + color + material`;
+Priority: SKU/serial confirmed → brand + exact model + colorway → brand + model → model alone → [item type] + color + material`;
 }
 
 async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
@@ -15246,6 +15336,46 @@ if (!openai) {
           }
           shaped.priceIntelligence = intel;
         }
+
+        // ── Institutional Bridge: Signal Fingerprint Map ─────────────────────────
+        // Generates raw_evidence_hash (Phase 7 anchor), institutionalIds,
+        // autoCropRequired, progressToken, and verificationReady flag.
+        try {
+          const signalMap = buildSignalMap(
+            {
+              ...result,
+              institutionalIds: result?.institutionalIds || null,
+            },
+            {
+              imageHash: originalHash,
+              mode,
+              passCount: 2,
+            }
+          );
+          shaped.signalMap       = signalMap;
+          shaped.rawEvidenceHash = signalMap.rawEvidenceHash || null;
+          shaped.progressToken   = signalMap.progressToken   || "IMAGE_ANALYZED";
+          shaped.autoCropRequired= signalMap.autoCropRequired || false;
+          shaped.autoCropReason  = signalMap.autoCropReason  || null;
+          shaped.verificationReady = signalMap.verificationReady || false;
+          // Lift institutionalIds to top level for Phase 7/8 direct consumption
+          if (signalMap.institutionalIds) {
+            shaped.institutionalIds = signalMap.institutionalIds;
+          }
+        } catch (e) { console.warn("signal_fingerprint_error", e?.message || e); }
+
+        // ── Institutional Bridge: Platform Fee Payload ───────────────────────────
+        // Pre-computes category-specific platform fees for Phase 10 P&L engine.
+        // Uses originalPrice (user's stated price) as the anchor.
+        try {
+          const feePrice = originalPrice || null;
+          if (feePrice) {
+            shaped.platformFeePayload = buildPlatformFeePayload({
+              price:    feePrice,
+              category: shaped.identity?.category || null,
+            });
+          }
+        } catch (e) { console.warn("platform_fee_error", e?.message || e); }
 
         visionCache.set(cacheKey, shaped);
         await cacheSet(cacheKey, shaped, 86400);
@@ -19816,6 +19946,48 @@ app.post("/market/search/stream", async (req, res) => {
 
     scanLog("scan_start", scanId, { query, category });
     send("phase", { phase: "analyzing_fast", query });
+
+    // ── Phase Bridge: Partial progress signals (Phase 8 UI animation layer) ──
+    // Emit granular status events based on what the vision pass already extracted.
+    // The UI can use these to drive high-end "Verifying..." animations before
+    // market data arrives.
+    try {
+      const _instIds      = req.body?.institutionalIds || visionIdentity?.institutionalIds || null;
+      const _progressToken= req.body?.progressToken || null;
+      const _hasSku       = !!((_instIds?.sku) || (_instIds?.serialNumber) || (_instIds?.modelCode));
+      const _brand        = visionIdentity?.brand || null;
+      const _model        = visionIdentity?.model || null;
+      const _vConf        = clamp01(req.body?.visionConfidence ?? req.body?.confidence ?? 0.5);
+
+      if (_hasSku) {
+        send("progress", {
+          status:          "SKU_EXTRACTED",
+          institutionalIds:_instIds,
+          progressToken:   _progressToken || "SKU_EXTRACTED",
+        });
+      } else if (_brand && _model && _vConf >= 0.65) {
+        send("progress", {
+          status:        "BRAND_MODEL_CONFIRMED",
+          brand:         _brand,
+          model:         _model,
+          confidence:    _vConf,
+          progressToken: _progressToken || "BRAND_MODEL_CONFIRMED",
+        });
+      } else if (_brand && _vConf >= 0.50) {
+        send("progress", {
+          status:        "BRAND_IDENTIFIED",
+          brand:         _brand,
+          confidence:    _vConf,
+          progressToken: _progressToken || "BRAND_IDENTIFIED",
+        });
+      } else {
+        send("progress", {
+          status:        "MARKET_SCANNING",
+          query,
+          progressToken: _progressToken || "IMAGE_ANALYZED",
+        });
+      }
+    } catch (_pe) { /* non-blocking */ }
 
     // ── User context (parallel, non-blocking) ────────────────────────────
     const _categoryNorm = (category || "").toLowerCase().trim();
