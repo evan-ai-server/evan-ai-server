@@ -936,6 +936,76 @@ import {
 } from "./src/dataConsentGovernance.js";
 import { runAllValidations as runPhase7Validations } from "./src/phase7Validation.js";
 
+// Phase 8: Activate the Evan Network in the Real World
+import {
+  buildShareableItemLink,
+  buildShareableResellerLink,
+  buildItemOGMeta,
+  buildResellerOGMeta,
+  buildQRCode,
+  buildQREmbedHtml,
+  recordShareEvent,
+  recordLinkClick,
+  recordQRScan,
+  getShareOps,
+} from "./src/shareableLinkEngine.js";
+import {
+  buildListingExportBundle,
+  injectTrustIntoListing,
+  LISTING_EXPORT_VERSION,
+} from "./src/listingExportEngine.js";
+import {
+  recordUsageEvent,
+  USAGE_EVENT_TYPE,
+  trackVerificationViewed,
+  trackLinkShared,
+  trackLinkClicked,
+  trackListingExported,
+  trackTrustmarkCopied,
+  trackProfileViewed,
+  trackQRScanned,
+  trackPartnerApiCalled,
+  getTopEngagedItems,
+  getTopActiveResellers,
+  getCategoryAdoptionScores,
+  getReferenceEngagement,
+  getUsageOps,
+} from "./src/externalUsageTracker.js";
+import {
+  buildItemTrustmarkDisplay,
+  buildResellerTrustmarkDisplay,
+  buildEmbedWidget,
+  registerEmbedDomain,
+  TRUSTMARK_DISPLAY_VERSION,
+} from "./src/trustmarkDisplayEngine.js";
+import {
+  issuePartnerApiKey,
+  validateApiKey,
+  rotatePartnerApiKey,
+  revokePartnerApiKey,
+  buildSandboxResponse,
+  getPartnerKeyUsage,
+  getSandboxOps,
+  SANDBOX_PARTNER_TYPE,
+} from "./src/partnerSandboxEngine.js";
+import {
+  submitFeedbackReport,
+  getReportsForReference,
+  getReferenceFeedbackSummary,
+  markReportReviewed,
+  getRevocationFlags,
+  clearRevocationFlag,
+  getFeedbackOps,
+  FEEDBACK_TYPE,
+} from "./src/externalFeedbackEngine.js";
+import {
+  buildDistributionPlaybook,
+  runTrustmarkSafetyMonitor,
+  getActiveMonitorAlerts,
+  getDistributionOps,
+} from "./src/distributionInsightsEngine.js";
+import { runAllPhase8Validations } from "./src/phase8Validation.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -25355,6 +25425,396 @@ app.post(
   });
 
   // ── END Phase 7: External Trust + Platform Power + Institutional Distribution ─
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  Phase 8: Activate the Evan Network in the Real World
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // ── POST /api/share/item-link ─────────────────────────────────────────────────
+  // Build shareable link with OG meta + QR code for a verified item.
+  app.post("/api/share/item-link", async (req, res) => {
+    try {
+      const { referenceId, itemName, category, brand, userId, referenceRecord } = req.body || {};
+      if (!referenceId) return res.status(200).json({ ok: false, error: "missing_referenceId" });
+      const result = await buildShareableItemLink(redis, {
+        referenceId, itemName, category, brand, userId, referenceRecord,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "share_link_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/share/reseller-link ─────────────────────────────────────────────
+  // Build shareable profile link with OG meta + QR for a certified reseller.
+  app.post("/api/share/reseller-link", async (req, res) => {
+    try {
+      const { userId, referenceId, displayName, certStatus, certTier, dealIQBand, categorySpecialties } = req.body || {};
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_userId" });
+      const result = await buildShareableResellerLink(redis, {
+        userId, referenceId, displayName, certStatus, certTier, dealIQBand, categorySpecialties,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "reseller_link_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/share/qr ────────────────────────────────────────────────────────
+  // Generate a QR code for any URL (items, reseller profiles, verification pages).
+  app.post("/api/share/qr", async (req, res) => {
+    try {
+      const { url, size, label, format } = req.body || {};
+      if (!url) return res.status(200).json({ ok: false, error: "missing_url" });
+      const result = buildQRCode(url, { size, label, format });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "qr_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/share/ops ────────────────────────────────────────────────────────
+  // Sharing system ops summary.
+  app.get("/api/share/ops", async (req, res) => {
+    try {
+      const ops = await getShareOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "share_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/listing/export ──────────────────────────────────────────────────
+  // Generate copy-ready listing bundles for one or more platforms.
+  app.post("/api/listing/export", async (req, res) => {
+    try {
+      const {
+        platform, itemName, category, brand, condition, price,
+        description, evanVerification, trustmarkRecord,
+        referenceId, verificationUrl, shortUrl, certRecord, sellRouting,
+      } = req.body || {};
+      const result = buildListingExportBundle({
+        platform, itemName, category, brand, condition, price,
+        description, evanVerification, trustmarkRecord,
+        referenceId, verificationUrl, shortUrl, certRecord, sellRouting,
+      });
+      if (referenceId) {
+        await trackListingExported(redis, { userId: req.body?.userId, category, platform: Array.isArray(platform) ? platform[0] : platform });
+      }
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "listing_export_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/listing/inject-trust ───────────────────────────────────────────
+  // Inject Evan trust language into an existing listing draft.
+  app.post("/api/listing/inject-trust", async (req, res) => {
+    try {
+      const { existingDescription, platform, isVerified, isCertified, trustUrl, evanVerification } = req.body || {};
+      const result = injectTrustIntoListing({ existingDescription, platform, isVerified, isCertified, trustUrl, evanVerification });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "inject_trust_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/usage/track ─────────────────────────────────────────────────────
+  // Record any external usage event.
+  app.post("/api/usage/track", async (req, res) => {
+    try {
+      const { eventType, referenceId, userId, category, platform, metadata } = req.body || {};
+      const result = await recordUsageEvent(redis, { eventType, referenceId, userId, category, platform, metadata });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "usage_track_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/usage/top-items ──────────────────────────────────────────────────
+  // Network effect signal: top-N most engaged items by external score.
+  app.get("/api/usage/top-items", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query?.limit) || 10, 50);
+      const items = await getTopEngagedItems(redis, limit);
+      return res.status(200).json({ ok: true, items });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "top_items_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/usage/top-resellers ─────────────────────────────────────────────
+  // Network effect signal: top-N most active resellers by external engagement.
+  app.get("/api/usage/top-resellers", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query?.limit) || 10, 50);
+      const resellers = await getTopActiveResellers(redis, limit);
+      return res.status(200).json({ ok: true, resellers });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "top_resellers_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/usage/category-adoption ─────────────────────────────────────────
+  // Category-level adoption scores (trust usage by category).
+  app.get("/api/usage/category-adoption", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query?.limit) || 15, 50);
+      const categories = await getCategoryAdoptionScores(redis, limit);
+      return res.status(200).json({ ok: true, categories });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "category_adoption_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/usage/reference/:referenceId ─────────────────────────────────────
+  // Per-reference engagement stats (clicks, shares, conversions).
+  app.get("/api/usage/reference/:referenceId", async (req, res) => {
+    try {
+      const { referenceId } = req.params;
+      const stats = await getReferenceEngagement(redis, referenceId);
+      return res.status(200).json({ ok: true, stats });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "reference_engagement_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/usage/ops ────────────────────────────────────────────────────────
+  // Full usage ops breakdown.
+  app.get("/api/usage/ops", async (req, res) => {
+    try {
+      const ops = await getUsageOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "usage_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trustmark/item-display ─────────────────────────────────────────
+  // Generate copyable trustmark snippets (html/markdown/plaintext/svg/json) for a verified item.
+  app.post("/api/trustmark/item-display", async (req, res) => {
+    try {
+      const { referenceId, itemName, category, brand, verifyUrl, shortUrl, evanVerification, trustmarkRecord, formats } = req.body || {};
+      const result = await buildItemTrustmarkDisplay(redis, {
+        referenceId, itemName, category, brand, verifyUrl, shortUrl, evanVerification, trustmarkRecord, formats,
+      });
+      if (result.ok && referenceId) await trackTrustmarkCopied(redis, referenceId, { userId: req.body?.userId });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "item_display_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trustmark/reseller-display ─────────────────────────────────────
+  // Generate copyable trustmark snippets for a certified reseller's bio/profile.
+  app.post("/api/trustmark/reseller-display", async (req, res) => {
+    try {
+      const { userId, referenceId, displayName, certStatus, certTier, dealIQBand, categorySpecialties, profileUrl, verifyUrl, formats } = req.body || {};
+      const result = await buildResellerTrustmarkDisplay(redis, {
+        userId, referenceId, displayName, certStatus, certTier, dealIQBand, categorySpecialties, profileUrl, verifyUrl, formats,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "reseller_display_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trustmark/embed-widget ─────────────────────────────────────────
+  // Build an iframe/script embed widget for partner sites.
+  app.post("/api/trustmark/embed-widget", async (req, res) => {
+    try {
+      const { referenceId, embedType, theme, width } = req.body || {};
+      const result = buildEmbedWidget({ referenceId, embedType, theme, width });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "embed_widget_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/partner/sandbox/issue-key ──────────────────────────────────────
+  // Issue a new partner API key (sandbox or live).
+  app.post("/api/partner/sandbox/issue-key", async (req, res) => {
+    try {
+      const { partnerId, partnerType, tier, env, label } = req.body || {};
+      const result = await issuePartnerApiKey(redis, { partnerId, partnerType, tier, env, label });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "key_issue_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/partner/sandbox/rotate-key ─────────────────────────────────────
+  // Rotate a partner API key (revoke + reissue).
+  app.post("/api/partner/sandbox/rotate-key", async (req, res) => {
+    try {
+      const { keyId, partnerId } = req.body || {};
+      const result = await rotatePartnerApiKey(redis, { keyId, partnerId });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "key_rotate_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/partner/sandbox/revoke-key ─────────────────────────────────────
+  // Revoke a partner API key.
+  app.post("/api/partner/sandbox/revoke-key", async (req, res) => {
+    try {
+      const { keyId, partnerId, reason } = req.body || {};
+      const result = await revokePartnerApiKey(redis, { keyId, partnerId, reason });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "key_revoke_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/partner/sandbox/usage/:partnerId ─────────────────────────────────
+  // Get API key usage for a partner.
+  app.get("/api/partner/sandbox/usage/:partnerId", async (req, res) => {
+    try {
+      const { partnerId } = req.params;
+      const usage = await getPartnerKeyUsage(redis, partnerId);
+      return res.status(200).json({ ok: true, usage });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "key_usage_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/partner/sandbox/ops ─────────────────────────────────────────────
+  // Global sandbox ops summary.
+  app.get("/api/partner/sandbox/ops", async (req, res) => {
+    try {
+      const ops = await getSandboxOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "sandbox_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/feedback/submit ─────────────────────────────────────────────────
+  // Submit external feedback about a trust reference (buyers, sellers, partners).
+  app.post("/api/feedback/submit", async (req, res) => {
+    try {
+      const { feedbackType, referenceId, submittedBy, submitterRole, platform, description, evidence, partnerTag } = req.body || {};
+      const result = await submitFeedbackReport(redis, {
+        feedbackType, referenceId, submittedBy, submitterRole, platform, description, evidence, partnerTag,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feedback_submit_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/feedback/reference/:referenceId ──────────────────────────────────
+  // Get all feedback reports for a reference + summary.
+  app.get("/api/feedback/reference/:referenceId", async (req, res) => {
+    try {
+      const { referenceId } = req.params;
+      const [reports, summary] = await Promise.all([
+        getReportsForReference(redis, referenceId),
+        getReferenceFeedbackSummary(redis, referenceId),
+      ]);
+      return res.status(200).json({ ok: true, referenceId, reports, summary });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feedback_reference_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/feedback/review ─────────────────────────────────────────────────
+  // Ops: mark a feedback report reviewed with a resolution.
+  app.post("/api/feedback/review", async (req, res) => {
+    try {
+      const { reportId, resolution, reviewedBy } = req.body || {};
+      const result = await markReportReviewed(redis, reportId, { resolution, reviewedBy });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feedback_review_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/feedback/revocation-flags ───────────────────────────────────────
+  // Get list of references flagged for revocation review.
+  app.get("/api/feedback/revocation-flags", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query?.limit) || 20, 100);
+      const flags = await getRevocationFlags(redis, limit);
+      return res.status(200).json({ ok: true, flags });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "revocation_flags_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/feedback/clear-flag ────────────────────────────────────────────
+  // Ops: clear a revocation flag after review.
+  app.post("/api/feedback/clear-flag", async (req, res) => {
+    try {
+      const { referenceId } = req.body || {};
+      const result = await clearRevocationFlag(redis, referenceId);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "clear_flag_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/feedback/ops ─────────────────────────────────────────────────────
+  // Global feedback ops summary.
+  app.get("/api/feedback/ops", async (req, res) => {
+    try {
+      const ops = await getFeedbackOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "feedback_ops_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/distribution/playbook ──────────────────────────────────────────
+  // Generate channel-by-channel distribution playbook for a reseller or item.
+  app.post("/api/distribution/playbook", async (req, res) => {
+    try {
+      const { userId, certTier, category, subCategory, price, isVerified, isCertified, engagementScore, sellRouting } = req.body || {};
+      const result = await buildDistributionPlaybook(redis, {
+        userId, certTier, category, subCategory, price, isVerified, isCertified, engagementScore, sellRouting,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "playbook_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/distribution/monitor ───────────────────────────────────────────
+  // Run the trustmark safety monitor scan.
+  app.post("/api/distribution/monitor", async (req, res) => {
+    try {
+      const result = await runTrustmarkSafetyMonitor(redis);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "monitor_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/distribution/alerts ─────────────────────────────────────────────
+  // Get current active monitor alerts.
+  app.get("/api/distribution/alerts", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query?.limit) || 20, 100);
+      const alerts = await getActiveMonitorAlerts(redis, limit);
+      return res.status(200).json({ ok: true, alerts });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "alerts_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/validate-phase8 ──────────────────────────────────────────
+  // Internal ops: run Phase 8 validation scenarios (10 scenarios).
+  app.post("/api/trust/validate-phase8", async (req, res) => {
+    try {
+      const results = await runAllPhase8Validations(redis);
+      return res.status(200).json({ ok: true, ...results });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "phase8_validation_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 8: Activate the Evan Network in the Real World ─────────────────
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
