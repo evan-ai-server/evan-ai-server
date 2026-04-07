@@ -830,6 +830,112 @@ import {
   PLATFORMS,
 } from "./src/platformIntelligence.js";
 
+// ── Phase 7: External Trust + Platform Power + Institutional Distribution ─────
+import {
+  createExternalReference,
+  getExternalReference,
+  getReferenceBySource,
+  getPublicVerificationPayload,
+  getPartnerVerificationPayload,
+  revokeExternalReference,
+  buildAuditHash,
+  verifyAuditHash,
+  getExternalReferenceOps,
+  REFERENCE_TYPE,
+  REFERENCE_STATUS,
+  EXTREF_VERSION,
+} from "./src/externalTrustReferenceEngine.js";
+import {
+  getBadgePolicy,
+  getAllBadgePolicies,
+  checkBadgeDisplayAllowed,
+  validateClaimText,
+  BADGE_TYPE,
+  DISPLAY_CHANNEL,
+} from "./src/externalBadgePolicyEngine.js";
+import {
+  governExternalClaim,
+  governClaimBatch,
+  getClaimChannelPermissions,
+  CLAIM_CHANNEL,
+  CLAIM_TYPE,
+} from "./src/externalClaimGovernor.js";
+import {
+  getPartnerAccessPolicy,
+  getAllPartnerPolicies,
+  checkFieldAccess,
+  filterPayloadForPartner,
+  checkEndpointAccess,
+  PARTNER_TYPE,
+} from "./src/partnerAccessEngine.js";
+import {
+  recordTimelineEvent,
+  getEntityTimeline,
+  getPublicTimeline,
+  getPartnerTimeline,
+  getTimelineOps,
+  TIMELINE_EVENT_TYPE,
+  TIMELINE_ENTITY_TYPE,
+  TIMELINE_VISIBILITY,
+} from "./src/trustTimelineEngine.js";
+import {
+  buildResellerIdentityProfile,
+  getResellerIdentityProfile,
+  buildPublicResellerProfile,
+  getIdentityOps,
+  TRUST_LEVEL,
+  DEALIQ_BAND,
+} from "./src/resellerIdentityEngine.js";
+import {
+  buildPortableTrustPacket,
+  getPortableTrustPacket,
+  exportPacketForChannel,
+  buildItemTrustPacket,
+  buildResellerTrustPacket,
+  getTrustPortabilityOps,
+  PACKET_TYPE,
+  EXPORT_CHANNEL,
+} from "./src/trustPortabilityEngine.js";
+import {
+  buildGuaranteeExternalRecord,
+  getApprovedGuaranteeWording,
+  checkGuaranteeClaimSafety,
+  buildGuaranteePublicVerification,
+  getProhibitedGuaranteeClaims,
+} from "./src/guaranteeExternalEngine.js";
+import {
+  buildItemVerificationLookup,
+  buildResellerVerificationLookup,
+  buildGuaranteeVerificationLookup,
+  dispatchVerificationLookup,
+} from "./src/publicVerificationEngine.js";
+import {
+  buildMarketplaceVerificationPayload,
+  buildConsignmentIntakePayload,
+  buildLenderValuationPacket,
+  buildRetailerFraudSignal,
+  buildInsuranceValuationRecord,
+  INSTITUTIONAL_API_VERSION,
+} from "./src/institutionalApiLayer.js";
+import {
+  incrementLeverageMetric,
+  getEcosystemMetrics,
+  getPartnerMetrics,
+  getCategoryMetrics,
+  getPartnerEconomicsPolicy,
+  getAllPartnerEconomicsPolicies,
+  ECO_METRIC,
+} from "./src/ecosystemLeverageEngine.js";
+import {
+  getConsentPolicy,
+  getAllConsentPolicies,
+  checkDataSharePermission,
+  getPublicSafeFields,
+  getPartnerDataAccessSummary,
+  DATA_TYPE,
+} from "./src/dataConsentGovernance.js";
+import { runAllValidations as runPhase7Validations } from "./src/phase7Validation.js";
+
 // Phase 16: No-Decay System
 import { runRegressionHarness }            from "./src/regressionHarness.js";
 import { runGoldenCases }                  from "./src/goldenCaseRunner.js";
@@ -24780,6 +24886,475 @@ app.post(
   });
 
   // ── END Phase 6: Marketplace Power + Routing + Data Licensing ────────────────
+
+  // ── Phase 7: External Trust + Platform Power + Institutional Distribution ─────
+
+  // ── GET /verify/item/:referenceId ─────────────────────────────────────────────
+  // Public verification lookup for Evan-Verified items. No auth required.
+  // Serves only public-safe fields. Tracks ecosystem lookup metric.
+  app.get("/verify/item/:referenceId", async (req, res) => {
+    try {
+      const referenceId = safeStr(req.params?.referenceId, 64);
+      if (!referenceId) return res.status(200).json({ verified: false, error: "missing_reference_id" });
+
+      // Fetch trustmark + verification from Redis for enrichment
+      const extRef = await getExternalReference(redis, referenceId);
+      const sourceId = extRef?.sourceId || null;
+      const [trustmarkRecord, evanVerification] = await Promise.all([
+        sourceId ? redis.get(`tm:record:${sourceId}`).then(r => r ? JSON.parse(r) : null).catch(() => null) : null,
+        sourceId ? redis.get(`scan:verification:${sourceId}`).then(r => r ? JSON.parse(r) : null).catch(() => null) : null,
+      ]);
+
+      const payload = await buildItemVerificationLookup(redis, referenceId, { trustmarkRecord, evanVerification });
+      await incrementLeverageMetric(redis, ECO_METRIC.VERIFICATION_LOOKUPS_PUBLIC, 1, { channel: "public" });
+      await incrementLeverageMetric(redis, ECO_METRIC.TRUSTMARK_LOOKUPS, 1);
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ verified: false, error: "lookup_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /verify/reseller/:referenceId ─────────────────────────────────────────
+  // Public verification lookup for Evan-Certified resellers. No auth required.
+  app.get("/verify/reseller/:referenceId", async (req, res) => {
+    try {
+      const referenceId = safeStr(req.params?.referenceId, 64);
+      if (!referenceId) return res.status(200).json({ verified: false, error: "missing_reference_id" });
+
+      const extRef = await getExternalReference(redis, referenceId);
+      const userId  = extRef?.ownerId || null;
+
+      const payload = await buildResellerVerificationLookup(redis, referenceId, { userId });
+      await incrementLeverageMetric(redis, ECO_METRIC.VERIFICATION_LOOKUPS_PUBLIC, 1, { channel: "public" });
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ verified: false, error: "lookup_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /verify/guarantee/:referenceId ────────────────────────────────────────
+  // Public verification lookup for Evan guarantee policies. No auth required.
+  app.get("/verify/guarantee/:referenceId", async (req, res) => {
+    try {
+      const referenceId = safeStr(req.params?.referenceId, 64);
+      if (!referenceId) return res.status(200).json({ verified: false, error: "missing_reference_id" });
+
+      const extRef = await getExternalReference(redis, referenceId);
+      const policyId = extRef?.sourceId || null;
+      const guaranteePolicy = policyId
+        ? await redis.get(`guar:pol:${policyId}`).then(r => r ? JSON.parse(r) : null).catch(() => null)
+        : null;
+
+      const payload = await buildGuaranteeVerificationLookup(redis, referenceId, { guaranteePolicy });
+      await incrementLeverageMetric(redis, ECO_METRIC.GUARANTEE_LOOKUPS, 1);
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ verified: false, error: "lookup_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/external-reference ────────────────────────────────────────
+  // Create an external trust reference for a verified item or certified reseller.
+  app.post("/api/trust/external-reference", async (req, res) => {
+    try {
+      const { referenceType, sourceId, ownerId, ownerType, status, issuedAt, expiresAt, summary, publicSafeFields, partnerSafeFields } = req.body || {};
+      if (!referenceType || !sourceId) return res.status(200).json({ ok: false, error: "missing_required" });
+      const result = await createExternalReference(redis, {
+        referenceType, sourceId, ownerId, ownerType: ownerType || "user",
+        status: status || REFERENCE_STATUS.ACTIVE,
+        issuedAt: issuedAt || Date.now(), expiresAt: expiresAt || null,
+        summary: safeStr(summary, 200), publicSafeFields: publicSafeFields || {},
+        partnerSafeFields: partnerSafeFields || {},
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "reference_create_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/revoke-reference ─────────────────────────────────────────
+  app.post("/api/trust/revoke-reference", async (req, res) => {
+    try {
+      const { referenceId, reason, revokedBy } = req.body || {};
+      if (!referenceId) return res.status(200).json({ ok: false, error: "missing_reference_id" });
+      const result = await revokeExternalReference(redis, referenceId, {
+        reason:    safeStr(reason, 100)    || "issuer_revoked",
+        revokedBy: safeStr(revokedBy, 64) || "system",
+      });
+      if (result.ok) {
+        await incrementLeverageMetric(redis, ECO_METRIC.TRUSTMARK_REVOCATIONS, 1);
+      }
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "revoke_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/identity-profile ─────────────────────────────────────────
+  // Build or refresh a reseller identity profile.
+  app.post("/api/trust/identity-profile", async (req, res) => {
+    try {
+      const { userId, displayName, categorySpecialties } = req.body || {};
+      if (!userId) return res.status(200).json({ ok: false, error: "missing_user_id" });
+      const certRecord = await getCertificationRecord(redis, userId).catch(() => null);
+      const result = await buildResellerIdentityProfile(redis, userId, {
+        certRecord,
+        displayName:        safeStr(displayName, 80) || null,
+        categorySpecialties: Array.isArray(categorySpecialties) ? categorySpecialties.slice(0, 5) : [],
+      });
+      if (result.ok) {
+        await incrementLeverageMetric(redis, ECO_METRIC.CERTIFIED_RESELLERS_PUBLIC, certRecord?.status === "CERTIFIED" ? 1 : 0);
+      }
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "identity_profile_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/timeline-event ───────────────────────────────────────────
+  // Record a trust timeline event for an entity (item scan or reseller).
+  app.post("/api/trust/timeline-event", async (req, res) => {
+    try {
+      const { entityType, entityId, eventType, eventSummary, changedBy, metadata } = req.body || {};
+      if (!entityType || !entityId || !eventType) {
+        return res.status(200).json({ ok: false, error: "missing_required" });
+      }
+      const result = await recordTimelineEvent(redis, {
+        entityType, entityId, eventType,
+        eventSummary: safeStr(eventSummary, 200) || "",
+        changedBy:    safeStr(changedBy, 50)     || "system",
+        metadata:     (metadata && typeof metadata === "object") ? metadata : {},
+      });
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "timeline_event_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/trust/timeline/:entityType/:entityId ─────────────────────────────
+  // Get trust timeline for an entity (partner-safe view requires auth).
+  app.get("/api/trust/timeline/:entityType/:entityId", async (req, res) => {
+    try {
+      const entityType = safeStr(req.params?.entityType, 20);
+      const entityId   = safeStr(req.params?.entityId, 100);
+      const asPartner  = req.query?.partner === "true";
+      if (!entityType || !entityId) return res.status(200).json({ ok: false, error: "missing_params" });
+      const events = asPartner
+        ? await getPartnerTimeline(redis, entityType, entityId)
+        : await getPublicTimeline(redis, entityType, entityId);
+      return res.status(200).json({ ok: true, entityType, entityId, events });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "timeline_fetch_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/portable-packet ──────────────────────────────────────────
+  // Build a portable trust packet for dispute defense, insurance, or partner use.
+  app.post("/api/trust/portable-packet", async (req, res) => {
+    try {
+      const { packetType, subjectId, subjectType, exportChannel, trustStatus, evidenceSummary } = req.body || {};
+      if (!packetType || !subjectId) return res.status(200).json({ ok: false, error: "missing_required" });
+
+      let result;
+      if (packetType === PACKET_TYPE.ITEM_TRUST) {
+        const tmRecord  = await redis.get(`tm:scan:${subjectId}`).then(id => id ? redis.get(`tm:record:${id}`) : null).then(r => r ? JSON.parse(r) : null).catch(() => null);
+        const verif     = await redis.get(`scan:verification:${subjectId}`).then(r => r ? JSON.parse(r) : null).catch(() => null);
+        const extRef    = await getReferenceBySource(redis, REFERENCE_TYPE.TRUSTMARK, subjectId).catch(() => null)
+                       || await getReferenceBySource(redis, REFERENCE_TYPE.ITEM_VERIFICATION, subjectId).catch(() => null);
+        result = await buildItemTrustPacket(redis, {
+          scanId: subjectId, trustmarkRecord: tmRecord,
+          evanVerification: verif, referenceRecord: extRef,
+          exportChannel: exportChannel || EXPORT_CHANNEL.PARTNER,
+        });
+      } else if (packetType === PACKET_TYPE.RESELLER_TRUST) {
+        const certRecord    = await getCertificationRecord(redis, subjectId).catch(() => null);
+        const identityProf  = await getResellerIdentityProfile(redis, subjectId).catch(() => null);
+        const extRef        = await getReferenceBySource(redis, REFERENCE_TYPE.RESELLER_CERT, subjectId).catch(() => null);
+        result = await buildResellerTrustPacket(redis, {
+          userId: subjectId, certRecord,
+          identityProfile: identityProf, referenceRecord: extRef,
+          exportChannel: exportChannel || EXPORT_CHANNEL.PARTNER,
+        });
+      } else {
+        result = await buildPortableTrustPacket(redis, {
+          packetType, subjectId,
+          subjectType: safeStr(subjectType, 20) || "item",
+          trustStatus: safeStr(trustStatus, 50) || null,
+          evidenceSummary: (evidenceSummary && typeof evidenceSummary === "object") ? evidenceSummary : {},
+          exportChannel: exportChannel || EXPORT_CHANNEL.PARTNER,
+        });
+      }
+
+      if (result.ok) {
+        await incrementLeverageMetric(redis, ECO_METRIC.TRUST_PACKET_EXPORTS, 1, { channel: exportChannel });
+      }
+      return res.status(200).json(result);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "packet_build_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/trust/portable-packet/:packetId ──────────────────────────────────
+  app.get("/api/trust/portable-packet/:packetId", async (req, res) => {
+    try {
+      const packetId = safeStr(req.params?.packetId, 64);
+      if (!packetId) return res.status(200).json({ ok: false, error: "missing_packet_id" });
+      const packet = await getPortableTrustPacket(redis, packetId);
+      if (!packet) return res.status(200).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, packet });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "packet_fetch_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/govern-claim ──────────────────────────────────────────────
+  // Check if a proposed trust claim is allowed for a given external channel.
+  app.post("/api/trust/govern-claim", async (req, res) => {
+    try {
+      const { channel, claimType, rawClaim, referenceId, verificationUrl } = req.body || {};
+      if (!channel || !claimType) return res.status(200).json({ ok: false, error: "missing_required" });
+      const result = governExternalClaim({
+        channel, claimType,
+        rawClaim:       safeStr(rawClaim, 500) || null,
+        referenceId:    safeStr(referenceId, 64) || null,
+        verificationUrl:safeStr(verificationUrl, 200) || null,
+      });
+      if (!result.allowed) {
+        await incrementLeverageMetric(redis, ECO_METRIC.CLAIM_GOVERNOR_BLOCKS, 1, { channel });
+      } else if (result.softening !== "NONE") {
+        await incrementLeverageMetric(redis, ECO_METRIC.CLAIM_GOVERNOR_SOFTENS, 1, { channel });
+      }
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "claim_gov_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/institutional/partner-policy/:partnerType ────────────────────────
+  // Get access policy + economics policy for a partner type.
+  app.get("/api/institutional/partner-policy/:partnerType", async (req, res) => {
+    try {
+      const partnerType = safeStr(req.params?.partnerType, 30);
+      const accessPolicy = getPartnerAccessPolicy(partnerType);
+      const econPolicy   = getPartnerEconomicsPolicy(partnerType);
+      const dataSummary  = getPartnerDataAccessSummary(partnerType);
+      if (!accessPolicy) return res.status(200).json({ ok: false, error: "unknown_partner_type" });
+      return res.status(200).json({ ok: true, partnerType, accessPolicy, econPolicy, dataSummary });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "partner_policy_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/institutional/marketplace-verify ────────────────────────────────
+  // Marketplace partner: get item + seller verification payload.
+  app.post("/api/institutional/marketplace-verify", requireB2BApiKey, async (req, res) => {
+    try {
+      const { scanId, userId, requestId } = req.body || {};
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const [tmId, verif, certRecord] = await Promise.all([
+        redis.get(`tm:scan:${scanId}`).catch(() => null),
+        redis.get(`scan:verification:${scanId}`).then(r => r ? JSON.parse(r) : null).catch(() => null),
+        userId ? getCertificationRecord(redis, userId).catch(() => null) : null,
+      ]);
+      const trustmarkRecord = tmId
+        ? await redis.get(`tm:record:${tmId}`).then(r => r ? JSON.parse(r) : null).catch(() => null)
+        : null;
+      const extRef = await getReferenceBySource(redis, REFERENCE_TYPE.TRUSTMARK, scanId).catch(() => null)
+                  || await getReferenceBySource(redis, REFERENCE_TYPE.ITEM_VERIFICATION, scanId).catch(() => null);
+
+      const payload = buildMarketplaceVerificationPayload({
+        trustmarkRecord, evanVerification: verif, certRecord,
+        referenceRecord: extRef, requestId: safeStr(requestId, 64) || null,
+      });
+      await incrementLeverageMetric(redis, ECO_METRIC.PARTNER_API_CALLS, 1, { partnerType: "MARKETPLACE" });
+      await incrementLeverageMetric(redis, ECO_METRIC.MARKETPLACE_TRUST_USAGE, 1);
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "marketplace_verify_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/institutional/consignment-intake ────────────────────────────────
+  app.post("/api/institutional/consignment-intake", requireB2BApiKey, async (req, res) => {
+    try {
+      const { scanId, userId, requestId } = req.body || {};
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const verif      = await redis.get(`scan:verification:${scanId}`).then(r => r ? JSON.parse(r) : null).catch(() => null);
+      const certRecord = userId ? await getCertificationRecord(redis, userId).catch(() => null) : null;
+      const extRef     = await getReferenceBySource(redis, REFERENCE_TYPE.ITEM_VERIFICATION, scanId).catch(() => null);
+      // Simple valuation stub — real impl pulls from categoryDominationEngine result
+      const valuationResult = null;
+
+      const payload = buildConsignmentIntakePayload({
+        evanVerification: verif, valuationResult, certRecord,
+        referenceRecord: extRef, requestId: safeStr(requestId, 64) || null,
+      });
+      await incrementLeverageMetric(redis, ECO_METRIC.PARTNER_API_CALLS, 1, { partnerType: "CONSIGNMENT" });
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "consignment_intake_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/institutional/lender-valuation ──────────────────────────────────
+  app.post("/api/institutional/lender-valuation", requireB2BApiKey, async (req, res) => {
+    try {
+      const { scanId, userId, platformId, sellerId, requestId } = req.body || {};
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const [verif, certRecord, cpRisk] = await Promise.all([
+        redis.get(`scan:verification:${scanId}`).then(r => r ? JSON.parse(r) : null).catch(() => null),
+        userId ? getCertificationRecord(redis, userId).catch(() => null) : null,
+        (platformId && sellerId) ? getCounterpartyRisk(redis, platformId, sellerId).catch(() => null) : null,
+      ]);
+      const extRef = await getReferenceBySource(redis, REFERENCE_TYPE.ITEM_VERIFICATION, scanId).catch(() => null);
+
+      const payload = buildLenderValuationPacket({
+        evanVerification: verif, valuationResult: null,
+        counterpartyResult: cpRisk, certRecord,
+        referenceRecord: extRef, requestId: safeStr(requestId, 64) || null,
+      });
+      await incrementLeverageMetric(redis, ECO_METRIC.PARTNER_API_CALLS, 1, { partnerType: "LENDER" });
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "lender_valuation_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/institutional/retailer-fraud-signal ────────────────────────────
+  app.post("/api/institutional/retailer-fraud-signal", requireB2BApiKey, async (req, res) => {
+    try {
+      const { scanId, platformId, sellerId, requestId } = req.body || {};
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const [verif, cpRisk] = await Promise.all([
+        redis.get(`scan:verification:${scanId}`).then(r => r ? JSON.parse(r) : null).catch(() => null),
+        (platformId && sellerId) ? getCounterpartyRisk(redis, platformId, sellerId).catch(() => null) : null,
+      ]);
+
+      const payload = buildRetailerFraudSignal({
+        evanVerification: verif, counterpartyResult: cpRisk,
+        requestId: safeStr(requestId, 64) || null,
+      });
+      await incrementLeverageMetric(redis, ECO_METRIC.PARTNER_API_CALLS, 1, { partnerType: "RETAILER" });
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "retailer_signal_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/institutional/insurance-valuation ───────────────────────────────
+  app.post("/api/institutional/insurance-valuation", requireB2BApiKey, async (req, res) => {
+    try {
+      const { scanId, requestId } = req.body || {};
+      if (!scanId) return res.status(200).json({ ok: false, error: "missing_scan_id" });
+
+      const scanGuarId = await redis.get(`guar:scan:${scanId}`).catch(() => null);
+      const [verif, guaranteePolicy] = await Promise.all([
+        redis.get(`scan:verification:${scanId}`).then(r => r ? JSON.parse(r) : null).catch(() => null),
+        scanGuarId ? redis.get(`guar:pol:${scanGuarId}`).then(r => r ? JSON.parse(r) : null).catch(() => null) : null,
+      ]);
+      const extRef = await getReferenceBySource(redis, REFERENCE_TYPE.ITEM_VERIFICATION, scanId).catch(() => null);
+
+      const payload = buildInsuranceValuationRecord({
+        evanVerification: verif, valuationResult: null,
+        guaranteePolicy, referenceRecord: extRef,
+        requestId: safeStr(requestId, 64) || null,
+      });
+      await incrementLeverageMetric(redis, ECO_METRIC.PARTNER_API_CALLS, 1, { partnerType: "INSURANCE" });
+      return res.status(200).json(payload);
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "insurance_valuation_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/ecosystem/metrics ────────────────────────────────────────────────
+  // Internal ops: ecosystem leverage dashboard.
+  app.get("/api/ecosystem/metrics", async (req, res) => {
+    try {
+      const partnerType = safeStr(req.query?.partnerType, 30) || null;
+      const category    = safeStr(req.query?.category, 50) || null;
+      if (partnerType) {
+        const metrics = await getPartnerMetrics(redis, partnerType);
+        return res.status(200).json({ ok: true, metrics });
+      }
+      if (category) {
+        const metrics = await getCategoryMetrics(redis, category);
+        return res.status(200).json({ ok: true, metrics });
+      }
+      const metrics = await getEcosystemMetrics(redis);
+      return res.status(200).json({ ok: true, ...metrics });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "ecosystem_metrics_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/ecosystem/partner-economics ──────────────────────────────────────
+  app.get("/api/ecosystem/partner-economics", async (req, res) => {
+    try {
+      const partnerType = safeStr(req.query?.partnerType, 30) || null;
+      if (partnerType) {
+        const policy = getPartnerEconomicsPolicy(partnerType);
+        return res.status(200).json({ ok: !!policy, policy: policy || null });
+      }
+      return res.status(200).json({ ok: true, policies: getAllPartnerEconomicsPolicies() });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "partner_economics_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/trust/badge-policies ────────────────────────────────────────────
+  app.get("/api/trust/badge-policies", async (req, res) => {
+    try {
+      const badgeType = safeStr(req.query?.badgeType, 40) || null;
+      const channel   = safeStr(req.query?.channel, 40) || null;
+      if (badgeType && channel) {
+        const check = checkBadgeDisplayAllowed(badgeType, channel);
+        return res.status(200).json({ ok: true, badgeType, channel, ...check });
+      }
+      if (badgeType) {
+        const policy = getBadgePolicy(badgeType);
+        return res.status(200).json({ ok: !!policy, policy: policy || null });
+      }
+      return res.status(200).json({ ok: true, policies: getAllBadgePolicies() });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "badge_policy_failed", reason: err?.message });
+    }
+  });
+
+  // ── GET /api/trust/consent-policy ────────────────────────────────────────────
+  app.get("/api/trust/consent-policy", async (req, res) => {
+    try {
+      const dataType    = safeStr(req.query?.dataType, 40) || null;
+      const partnerClass = safeStr(req.query?.partnerClass, 30) || null;
+      if (dataType && partnerClass) {
+        const check = checkDataSharePermission(dataType, partnerClass);
+        return res.status(200).json({ ok: true, dataType, partnerClass, ...check });
+      }
+      if (dataType) {
+        const policy = getConsentPolicy(dataType);
+        return res.status(200).json({ ok: !!policy, policy: policy || null });
+      }
+      return res.status(200).json({ ok: true, policies: getAllConsentPolicies() });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "consent_policy_failed", reason: err?.message });
+    }
+  });
+
+  // ── POST /api/trust/validate-phase7 ──────────────────────────────────────────
+  // Internal ops: run Phase 7 validation scenarios.
+  app.post("/api/trust/validate-phase7", async (req, res) => {
+    try {
+      const results = await runPhase7Validations(redis);
+      return res.status(200).json({ ok: true, ...results });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "validation_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 7: External Trust + Platform Power + Institutional Distribution ─
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
