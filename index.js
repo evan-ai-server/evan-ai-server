@@ -1006,6 +1006,58 @@ import {
 } from "./src/distributionInsightsEngine.js";
 import { runAllPhase8Validations } from "./src/phase8Validation.js";
 
+// Phase 9: Embedded Resale Infrastructure
+import {
+  registerPartner, getPartner, updatePartnerStatus,
+  issuePartnerJWT, verifyPartnerJWT, revokePartnerJWT,
+  checkPartnerRateLimit, filterPayloadByScopes, hasScope,
+  getPartnerAuditLog,
+  PARTNER_TIER, SCOPE,
+} from "./src/partnerAuthTierEngine.js";
+import {
+  guardEmbeddedRequest, guardEmbeddedBatch,
+  getComplianceAuditLog, getComplianceOps,
+  COMPLIANCE_DECISION,
+} from "./src/embeddedComplianceGuard.js";
+import {
+  resolveEmbeddedVerification, resolveEmbeddedBatch, getResolverOps,
+} from "./src/embeddedVerificationResolver.js";
+import {
+  checkSchemaCompatibility, transformToVersion,
+  pinPartnerSchema, getPartnerSchemaPins,
+  getSchemaContract, getAllCurrentSchemas, getSchemaOps,
+  schemaMiddleware,
+} from "./src/partnerSchemaContracts.js";
+import {
+  registerWidgetDomain, isWidgetDomainAllowed, getWidgetDomains,
+  generateWidgetNonce, verifyWidgetNonce,
+  buildEmbedWidget as buildPartnerEmbedWidget, getWidgetOps,
+} from "./src/embedWidgetEngine.js";
+import {
+  trackAnalyticsEvent, getDownstreamTrustRecord,
+  getPartnerAnalyticsEvents, getTopConversions, getAnalyticsOps,
+  ANALYTICS_EVENT,
+} from "./src/embeddedAnalyticsEngine.js";
+import {
+  buildTrustPacket, getTrustPacketOps, PACKET_TYPE as MARKETPLACE_PACKET_TYPE,
+} from "./src/marketplaceTrustPacketEngine.js";
+import {
+  registerWebhook as registerPartnerWebhook,
+  getPartnerWebhooks, deactivateWebhook,
+  dispatchWebhookEvent, deliverWebhook, processDeliveryQueue,
+  getWebhookOps,
+} from "./src/partnerWebhookEngine.js";
+import {
+  checkFailsafe, markRateLimited, getFailsafeOps,
+  FAILSAFE_STATE,
+} from "./src/embeddedFailsafeEngine.js";
+import { buildPartnerDashboard, getDashboardOps } from "./src/partnerDashboardEngine.js";
+import {
+  buildListingPrefill, buildValuationHandoff,
+  buildTrustAwareImport, buildSellPackage, getWorkflowOps,
+} from "./src/workflowIntegrationPrimitives.js";
+import { runPhase9Validations } from "./src/phase9Validation.js";
+
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
 import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
 import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
@@ -25987,6 +26039,346 @@ app.post(
   });
 
   // ── END Phase 8: Activate the Evan Network in the Real World ─────────────────
+
+  //  Phase 9: Turn Evan into Embedded Resale Infrastructure
+
+  // ── POST /api/partner/register ────────────────────────────────────────────────
+  app.post("/api/partner/register", async (req, res) => {
+    try {
+      const { partnerId, partnerName, tier, partnerType, contactEmail, allowedDomains, webhookUrl } = req.body || {};
+      const result = await registerPartner(redis, { partnerId, partnerName, tier, partnerType, contactEmail, allowedDomains, webhookUrl });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/partner/jwt/issue ───────────────────────────────────────────────
+  app.post("/api/partner/jwt/issue", async (req, res) => {
+    try {
+      const { partnerId, tier, additionalScopes } = req.body || {};
+      const result = await issuePartnerJWT(redis, { partnerId, tier, additionalScopes });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/partner/jwt/verify ──────────────────────────────────────────────
+  app.post("/api/partner/jwt/verify", async (req, res) => {
+    try {
+      const { token } = req.body || {};
+      if (!token) return res.status(400).json({ ok: false, error: "token_required" });
+      const result = await verifyPartnerJWT(redis, token);
+      return res.status(200).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/partner/jwt/revoke ──────────────────────────────────────────────
+  app.post("/api/partner/jwt/revoke", async (req, res) => {
+    try {
+      const { token, partnerId } = req.body || {};
+      const result = await revokePartnerJWT(redis, { token, partnerId });
+      return res.status(200).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/partner/:partnerId ───────────────────────────────────────────────
+  app.get("/api/partner/:partnerId", async (req, res) => {
+    try {
+      const partner = await getPartner(redis, req.params.partnerId);
+      if (!partner) return res.status(404).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, partner });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/partner/:partnerId/audit-log ─────────────────────────────────────
+  app.get("/api/partner/:partnerId/audit-log", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const log   = await getPartnerAuditLog(redis, req.params.partnerId, { limit });
+      return res.status(200).json({ ok: true, log, total: log.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/partner/compliance/guard ────────────────────────────────────────
+  app.post("/api/partner/compliance/guard", async (req, res) => {
+    try {
+      const { token, claimType, claimText, embedContext, badgeType, payload, requestMeta } = req.body || {};
+      const result = await guardEmbeddedRequest(redis, { token, claimType, claimText, embedContext, badgeType, payload, requestMeta });
+      return res.status(200).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/partner/:partnerId/compliance/log ────────────────────────────────
+  app.get("/api/partner/:partnerId/compliance/log", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query.limit) || 50, 200);
+      const log   = await getComplianceAuditLog(redis, req.params.partnerId, { limit });
+      return res.status(200).json({ ok: true, log, total: log.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/verify/resolve ──────────────────────────────────────────────────
+  // Resolve a trust reference for embedding (badge/compact/full modes).
+  app.post("/api/verify/resolve", async (req, res) => {
+    try {
+      const { referenceId, mode, token, embedContext, requestMeta } = req.body || {};
+      const result = await resolveEmbeddedVerification(redis, { referenceId, mode, token, embedContext, requestMeta });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/verify/resolve-batch ───────────────────────────────────────────
+  app.post("/api/verify/resolve-batch", async (req, res) => {
+    try {
+      const { referenceIds, mode, token, embedContext } = req.body || {};
+      const result = await resolveEmbeddedBatch(redis, { referenceIds, mode, token, embedContext });
+      return res.status(200).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/widget/domain/register ──────────────────────────────────────────
+  app.post("/api/widget/domain/register", async (req, res) => {
+    try {
+      const { partnerId, domain } = req.body || {};
+      const result = await registerWidgetDomain(redis, partnerId, domain);
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/widget/domain/:partnerId ─────────────────────────────────────────
+  app.get("/api/widget/domain/:partnerId", async (req, res) => {
+    try {
+      const domains = await getWidgetDomains(redis, req.params.partnerId);
+      return res.status(200).json({ ok: true, domains, total: domains.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/widget/nonce ────────────────────────────────────────────────────
+  app.post("/api/widget/nonce", async (req, res) => {
+    try {
+      const { partnerSecret, domain, referenceId, partnerId } = req.body || {};
+      const result = await generateWidgetNonce(redis, { partnerSecret, domain, referenceId, partnerId });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/widget/build ────────────────────────────────────────────────────
+  app.post("/api/widget/build", async (req, res) => {
+    try {
+      const { referenceId, widgetType, token, domain, partnerId, nonce, verificationData } = req.body || {};
+      const result = await buildPartnerEmbedWidget(redis, { referenceId, widgetType, token, domain, partnerId, nonce, verificationData });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/widget/ops ───────────────────────────────────────────────────────
+  app.get("/api/widget/ops", async (req, res) => {
+    try {
+      const ops = await getWidgetOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/analytics/track ─────────────────────────────────────────────────
+  app.post("/api/analytics/track", async (req, res) => {
+    try {
+      const { eventType, referenceId, partnerId, sessionId, conversionValue, itemCategory, meta } = req.body || {};
+      const result = await trackAnalyticsEvent(redis, { eventType, referenceId, partnerId, sessionId, conversionValue, itemCategory, meta });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/analytics/trust/:downstreamTrustId ──────────────────────────────
+  app.get("/api/analytics/trust/:downstreamTrustId", async (req, res) => {
+    try {
+      const record = await getDownstreamTrustRecord(redis, req.params.downstreamTrustId);
+      if (!record) return res.status(404).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, record });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/analytics/partner/:partnerId ────────────────────────────────────
+  app.get("/api/analytics/partner/:partnerId", async (req, res) => {
+    try {
+      const limit  = Math.min(Number(req.query.limit) || 50, 200);
+      const events = await getPartnerAnalyticsEvents(redis, req.params.partnerId, { limit });
+      return res.status(200).json({ ok: true, events, total: events.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/analytics/conversions/top ───────────────────────────────────────
+  app.get("/api/analytics/conversions/top", async (req, res) => {
+    try {
+      const limit = Math.min(Number(req.query.limit) || 20, 100);
+      const conversions = await getTopConversions(redis, { limit });
+      return res.status(200).json({ ok: true, conversions, total: conversions.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/analytics/ops ────────────────────────────────────────────────────
+  app.get("/api/analytics/ops", async (req, res) => {
+    try {
+      const ops = await getAnalyticsOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/trust/packet ────────────────────────────────────────────────────
+  app.post("/api/trust/packet", async (req, res) => {
+    try {
+      const { packetType, referenceId, token, embedContext, sourceData } = req.body || {};
+      const result = await buildTrustPacket(redis, { packetType, referenceId, token, embedContext, sourceData });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/trust/packet/ops ─────────────────────────────────────────────────
+  app.get("/api/trust/packet/ops", async (req, res) => {
+    try {
+      const ops = await getTrustPacketOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/webhook/register ────────────────────────────────────────────────
+  app.post("/api/webhook/register", async (req, res) => {
+    try {
+      const { partnerId, url, secret, events, description } = req.body || {};
+      const result = await registerPartnerWebhook(redis, { partnerId, url, secret, events, description });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/webhook/:partnerId ───────────────────────────────────────────────
+  app.get("/api/webhook/:partnerId", async (req, res) => {
+    try {
+      const webhooks = await getPartnerWebhooks(redis, req.params.partnerId);
+      return res.status(200).json({ ok: true, webhooks, total: webhooks.length });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/webhook/:webhookId/deactivate ───────────────────────────────────
+  app.post("/api/webhook/:webhookId/deactivate", async (req, res) => {
+    try {
+      const { partnerId } = req.body || {};
+      const result = await deactivateWebhook(redis, partnerId, req.params.webhookId);
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/webhook/dispatch ────────────────────────────────────────────────
+  app.post("/api/webhook/dispatch", async (req, res) => {
+    try {
+      const { partnerId, eventType, payload } = req.body || {};
+      const result = await dispatchWebhookEvent(redis, { partnerId, eventType, payload });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/webhook/process-queue ──────────────────────────────────────────
+  app.post("/api/webhook/process-queue", async (req, res) => {
+    try {
+      const maxItems = Math.min(Number(req.body?.maxItems) || 20, 100);
+      const result   = await processDeliveryQueue(redis, { maxItems });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/webhook/ops ──────────────────────────────────────────────────────
+  app.get("/api/webhook/ops", async (req, res) => {
+    try {
+      const ops = await getWebhookOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/schema/current ───────────────────────────────────────────────────
+  app.get("/api/schema/current", async (req, res) => {
+    try {
+      return res.status(200).json({ ok: true, schemas: getAllCurrentSchemas() });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/schema/pin ──────────────────────────────────────────────────────
+  app.post("/api/schema/pin", async (req, res) => {
+    try {
+      const { partnerId, endpoint, minVersion } = req.body || {};
+      const result = await pinPartnerSchema(redis, partnerId, endpoint, minVersion);
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/schema/pins/:partnerId ───────────────────────────────────────────
+  app.get("/api/schema/pins/:partnerId", async (req, res) => {
+    try {
+      const pins = await getPartnerSchemaPins(redis, req.params.partnerId);
+      return res.status(200).json({ ok: true, pins });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/partner/:partnerId/dashboard ─────────────────────────────────────
+  app.get("/api/partner/:partnerId/dashboard", async (req, res) => {
+    try {
+      const forceRefresh = req.query.refresh === "true";
+      const result = await buildPartnerDashboard(redis, req.params.partnerId, { forceRefresh });
+      return res.status(result.ok ? 200 : 404).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/workflow/listing-prefill ────────────────────────────────────────
+  app.post("/api/workflow/listing-prefill", async (req, res) => {
+    try {
+      const { referenceId, token, visionData, trustData, targetPlatform } = req.body || {};
+      const result = await buildListingPrefill(redis, { referenceId, token, visionData, trustData, targetPlatform });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/workflow/valuation-handoff ──────────────────────────────────────
+  app.post("/api/workflow/valuation-handoff", async (req, res) => {
+    try {
+      const { referenceId, token, visionData, trustData, handoffTarget } = req.body || {};
+      const result = await buildValuationHandoff(redis, { referenceId, token, visionData, trustData, handoffTarget });
+      return res.status(200).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/workflow/trust-import ──────────────────────────────────────────
+  app.post("/api/workflow/trust-import", async (req, res) => {
+    try {
+      const { token, partnerItemId, partnerItemData, trustData } = req.body || {};
+      const result = await buildTrustAwareImport(redis, { token, partnerItemId, partnerItemData, trustData });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/workflow/sell-package ───────────────────────────────────────────
+  app.post("/api/workflow/sell-package", async (req, res) => {
+    try {
+      const { referenceId, token, visionData, trustData, platforms } = req.body || {};
+      const result = await buildSellPackage(redis, { referenceId, token, visionData, trustData, platforms });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── GET /api/workflow/ops ─────────────────────────────────────────────────────
+  app.get("/api/workflow/ops", async (req, res) => {
+    try {
+      const ops = await getWorkflowOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(500).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── POST /api/trust/validate-phase9 ──────────────────────────────────────────
+  // Internal ops: run Phase 9 validation scenarios (12 scenarios).
+  app.post("/api/trust/validate-phase9", async (req, res) => {
+    try {
+      const result = await runPhase9Validations();
+      return res.status(200).json({ ok: result.passed === result.total, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "phase9_validation_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 9: Turn Evan into Embedded Resale Infrastructure ───────────────
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.
