@@ -1091,6 +1091,27 @@ import {
 
 import { AFFILIATE_CONFIDENCE_THRESHOLD } from "./src/affiliateRouter.js";
 
+import {
+  distributeLot, getDistributionRecord,
+  getDistributionOps as getLotDistributionOps,
+  DIST_STRATEGY,
+} from "./src/lotDistributionEngine.js";
+
+import {
+  createSwarmJob, getJob, getWorker,
+  drainScoutQueue, drainSpecialistQueue,
+  triggerLotDistribution, reapStaleWorkers, getSwarmOps,
+  WORKER_STATUS, WORKER_ROLE, JOB_STATUS, BUY_SIGNAL,
+} from "./src/swarmOrchestrator.js";
+
+import {
+  detectLedgerDrift, rollbackToLastKnownTruth,
+  isItemFrozen, resolveAuditItem,
+  getSelfHealingAuditLog, drainAuditQueue as drainHealAuditQueue,
+  getSelfHealingOps,
+  HEAL_TYPE, FREEZE_STATUS,
+} from "./src/selfHealingLedger.js";
+
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
 import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
 import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
@@ -26776,6 +26797,191 @@ app.post(
     } catch (err) {
       return res.status(200).json({ ok: false, error: "phase10_validation_failed", reason: err?.message });
     }
+  });
+
+  // ── Phase 10: Lot Distribution Routes ────────────────────────────────────────
+
+  // POST /api/p10/lot/:lotId/distribute
+  // Distribute total cost across child items using chosen strategy.
+  app.post("/api/p10/lot/:lotId/distribute", async (req, res) => {
+    try {
+      const { lotId } = req.params;
+      const { userId, totalPaid, items, strategy, sourceType, acquiredAt, notes, dryRun } = req.body;
+      if (!userId || !items?.length || !totalPaid) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      const result = await distributeLot(redis, { lotId, userId, totalPaid, items, strategy, sourceType, acquiredAt, notes, dryRun });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/lot/:lotId/distribution
+  // Retrieve a persisted distribution record.
+  app.get("/api/p10/lot/:lotId/distribution", async (req, res) => {
+    try {
+      const record = await getDistributionRecord(redis, req.params.lotId);
+      return res.status(200).json({ ok: !!record, record });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Phase 10: Swarm Orchestrator Routes ───────────────────────────────────────
+
+  // POST /api/p10/swarm/job/create
+  // Initialize a new swarm job for a bulk lot.
+  app.post("/api/p10/swarm/job/create", async (req, res) => {
+    try {
+      const { userId, lotId, items, totalPaid, tokenBudget, capitalBudget, timeoutMs, sourceType, notes } = req.body;
+      if (!userId || !lotId || !items?.length || !totalPaid) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      const result = await createSwarmJob(redis, { userId, lotId, items, totalPaid, tokenBudget, capitalBudget, timeoutMs, sourceType, notes });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/swarm/job/:jobId
+  // Retrieve a swarm job record.
+  app.get("/api/p10/swarm/job/:jobId", async (req, res) => {
+    try {
+      const job = await getJob(redis, req.params.jobId);
+      return res.status(200).json({ ok: !!job, job });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/swarm/worker/:workerId
+  // Retrieve a single worker record.
+  app.get("/api/p10/swarm/worker/:workerId", async (req, res) => {
+    try {
+      const worker = await getWorker(redis, req.params.workerId);
+      return res.status(200).json({ ok: !!worker, worker });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/drain/scout
+  // Process a batch from the scout queue.
+  app.post("/api/p10/swarm/drain/scout", async (req, res) => {
+    try {
+      const { batchSize, lotItems, tokenBudget, capitalBudget } = req.body;
+      const result = await drainScoutQueue(redis, { batchSize, lotItems, tokenBudget, capitalBudget });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/drain/specialist
+  // Process a batch from the specialist queue.
+  app.post("/api/p10/swarm/drain/specialist", async (req, res) => {
+    try {
+      const { batchSize, categoryIntel, platformIntel, tokenBudget, capitalBudget } = req.body;
+      const result = await drainSpecialistQueue(redis, { batchSize, categoryIntel, platformIntel, tokenBudget, capitalBudget });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/job/:jobId/distribute
+  // Trigger lot distribution after swarm analysis completes.
+  app.post("/api/p10/swarm/job/:jobId/distribute", async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      const { includeAll, strategy, dryRun } = req.body;
+      const result = await triggerLotDistribution(redis, jobId, { includeAll, strategy, dryRun });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/job/:jobId/reap
+  // Scrub stale/timed-out workers in a job.
+  app.post("/api/p10/swarm/job/:jobId/reap", async (req, res) => {
+    try {
+      const { timeoutMs } = req.body;
+      const result = await reapStaleWorkers(redis, req.params.jobId, timeoutMs);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/swarm/ops
+  // Swarm-level ops counters.
+  app.get("/api/p10/swarm/ops", async (req, res) => {
+    try {
+      const [swarm, dist] = await Promise.all([getSwarmOps(redis), getLotDistributionOps(redis)]);
+      return res.status(200).json({ ok: true, swarm, distribution: dist });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Phase 10: Self-Healing Ledger Routes ─────────────────────────────────────
+
+  // POST /api/p10/heal/drift
+  // Detect and auto-heal drift between agent-claimed total and ledger.
+  app.post("/api/p10/heal/drift", async (req, res) => {
+    try {
+      const { lotId, userId, agentClaimedTotal, lotDistBasis, agentId, agentReasoning } = req.body;
+      if (!lotId || !userId || agentClaimedTotal == null || lotDistBasis == null) {
+        return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      }
+      const result = await detectLedgerDrift(redis, { lotId, userId, agentClaimedTotal, lotDistBasis, agentId, agentReasoning });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/heal/rewind
+  // Price-spike guard — freeze an item if specialist vs market diverges >40%.
+  app.post("/api/p10/heal/rewind", async (req, res) => {
+    try {
+      const { scanId, userId, workerId, specialistValue, marketScanValue, confidence, agentReasoning, lotId } = req.body;
+      if (!scanId || !userId || specialistValue == null || marketScanValue == null) {
+        return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      }
+      const result = await rollbackToLastKnownTruth(redis, { scanId, userId, workerId, specialistValue, marketScanValue, confidence, agentReasoning, lotId });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/heal/frozen/:scanId
+  // Check if an item is currently frozen (blocks capital commitment).
+  app.get("/api/p10/heal/frozen/:scanId", async (req, res) => {
+    try {
+      const status = await isItemFrozen(redis, req.params.scanId);
+      return res.status(200).json({ ok: true, ...status });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/heal/resolve
+  // Audit Agent resolution — unfreeze (RESOLVED) or reject (REJECTED) a frozen item.
+  app.post("/api/p10/heal/resolve", async (req, res) => {
+    try {
+      const { scanId, auditAgentId, resolution, correctedValue, note } = req.body;
+      if (!scanId || !resolution) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      const result = await resolveAuditItem(redis, { scanId, auditAgentId, resolution, correctedValue, note });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/heal/audit
+  // Retrieve the synthetic audit log (newest first).
+  app.get("/api/p10/heal/audit", async (req, res) => {
+    try {
+      const { limit, offset, type } = req.query;
+      const result = await getSelfHealingAuditLog(redis, {
+        limit:  limit  ? Number(limit)  : 50,
+        offset: offset ? Number(offset) : 0,
+        type:   type   || null,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/heal/audit/drain
+  // Dequeue items pending Audit Agent review.
+  app.post("/api/p10/heal/audit/drain", async (req, res) => {
+    try {
+      const { limit } = req.body;
+      const result = await drainHealAuditQueue(redis, limit ? Number(limit) : 10);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/heal/ops
+  // Self-healing ops counters.
+  app.get("/api/p10/heal/ops", async (req, res) => {
+    try {
+      const ops = await getSelfHealingOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
   });
 
   // ── END Phase 10: Economic Finality & Financial Integrity ─────────────────────
