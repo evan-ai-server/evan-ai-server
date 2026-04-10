@@ -18614,6 +18614,168 @@ app.post("/api/receipt/analyze", async (req, res) => {
 // helper used above
 function round2(v) { return Math.round(v * 100) / 100; }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SCAN LIMIT SYSTEM — Server-side daily quota (2 free scans/day)
+//
+// POST /api/scan/check       — Check if actor can scan today
+// POST /api/scan/consume     — Atomically consume a scan slot (with dedup)
+// POST /api/guest/identify   — Issue or recover durable guestId from fingerprint
+// GET  /api/scan/status      — Quota status (GET convenience)
+//
+// Redis keys:
+//   evan:scanlimit:{actorId}:{YYYY-MM-DD}  STRING  count, EX 48h
+//   evan:dedup:{imageHash}                  STRING  actorId, EX 60s
+//   evan:guest:fp:{fingerprint}             STRING  guestId, EX 90d
+//   evan:guest:id:{guestId}                 HASH    metadata, EX 90d
+//   evan:scanabuse:{actorId}               STRING  count, EX 5min
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DAILY_FREE_SCANS  = 2;
+const SCAN_DEDUP_TTL    = 60;          // seconds — same image within 60s = free rescan
+const GUEST_TTL         = 90 * 86400; // 90 days
+const SCAN_ABUSE_TTL    = 300;         // 5-min anomaly window
+
+const _scanDayKey  = (id, day) => `evan:scanlimit:${id}:${day}`;
+const _dedupKey    = (hash)    => `evan:dedup:${hash}`;
+const _guestFpKey  = (fp)      => `evan:guest:fp:${fp}`;
+const _guestIdKey  = (gid)     => `evan:guest:id:${gid}`;
+const _scanDay     = ()        => new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+const _abuseKey    = (id)      => `evan:scanabuse:${id}`;
+
+function _resetAtISO() {
+  const tomorrow = new Date();
+  tomorrow.setUTCHours(24, 0, 0, 0);
+  return tomorrow.toISOString();
+}
+
+function _resolveActor(req) {
+  const uid = String(req.body?.userId  || req.query?.userId  || "").trim().slice(0, 80);
+  if (uid) return { id: `u:${uid}`,  type: "user"  };
+  const gid = String(req.body?.guestId || req.query?.guestId || "").trim().slice(0, 80);
+  if (gid) return { id: `g:${gid}`,  type: "guest" };
+  const ip  = req.ip || req.socket?.remoteAddress || "unknown";
+  return { id: `ip:${ip}`, type: "anon"  };
+}
+
+async function _getScanQuota(actorId, day) {
+  if (!redis) return { used: 0, remaining: DAILY_FREE_SCANS, canScan: true };
+  try {
+    const used = Number((await redis.get(_scanDayKey(actorId, day))) || 0);
+    const remaining = Math.max(0, DAILY_FREE_SCANS - used);
+    return { used, remaining, canScan: remaining > 0 };
+  } catch { return { used: 0, remaining: DAILY_FREE_SCANS, canScan: true }; }
+}
+
+// ── POST /api/scan/check ──────────────────────────────────────────────────────
+app.post("/api/scan/check", async (req, res) => {
+  try {
+    const actor = _resolveActor(req);
+    const quota = await _getScanQuota(actor.id, _scanDay());
+    return res.json({ ok: true, canScan: quota.canScan, scansUsed: quota.used,
+      scansRemaining: quota.remaining, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO(), actorType: actor.type });
+  } catch {
+    return res.json({ ok: true, canScan: true, scansUsed: 0, scansRemaining: DAILY_FREE_SCANS,
+      dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+  }
+});
+
+// ── GET /api/scan/status ──────────────────────────────────────────────────────
+app.get("/api/scan/status", async (req, res) => {
+  try {
+    const actor = _resolveActor({ body: req.query, query: req.query,
+      ip: req.ip, socket: req.socket });
+    const quota = await _getScanQuota(actor.id, _scanDay());
+    return res.json({ ok: true, canScan: quota.canScan, scansUsed: quota.used,
+      scansRemaining: quota.remaining, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO(), actorType: actor.type });
+  } catch {
+    return res.json({ ok: true, canScan: true, scansUsed: 0, scansRemaining: DAILY_FREE_SCANS,
+      dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+  }
+});
+
+// ── POST /api/scan/consume ────────────────────────────────────────────────────
+app.post("/api/scan/consume", async (req, res) => {
+  try {
+    const actor = _resolveActor(req);
+    const day   = _scanDay();
+    const imageHash = String(req.body?.imageHash || "").trim().slice(0, 128);
+
+    // Deduplication: same image within SCAN_DEDUP_TTL seconds = free rescan
+    if (imageHash && redis) {
+      const dKey = _dedupKey(imageHash);
+      const prior = await redis.get(dKey).catch(() => null);
+      if (prior) {
+        const quota = await _getScanQuota(actor.id, day);
+        return res.json({ ok: true, consumed: false, deduped: true, scansUsed: quota.used,
+          scansRemaining: quota.remaining, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+      }
+      redis.set(dKey, actor.id, "EX", SCAN_DEDUP_TTL).catch(() => {});
+    }
+
+    const quotaBefore = await _getScanQuota(actor.id, day);
+    if (!quotaBefore.canScan) {
+      return res.json({ ok: true, consumed: false, deduped: false, limitReached: true,
+        scansUsed: quotaBefore.used, scansRemaining: 0, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+    }
+
+    if (redis) {
+      const key = _scanDayKey(actor.id, day);
+      const newCount = await redis.incr(key);
+      if (newCount === 1) redis.expire(key, 48 * 3600).catch(() => {});
+
+      // Anomaly detection: >10 consume calls in 5 min = flag
+      const aKey = _abuseKey(actor.id);
+      const aCount = await redis.incr(aKey).catch(() => 0);
+      if (aCount === 1) redis.expire(aKey, SCAN_ABUSE_TTL).catch(() => {});
+      if (aCount > 10) console.warn(`⚠️ SCAN_ABUSE actor=${actor.id} aCount=${aCount}`);
+
+      const remaining = Math.max(0, DAILY_FREE_SCANS - newCount);
+      return res.json({ ok: true, consumed: true, deduped: false, limitReached: remaining === 0,
+        scansUsed: newCount, scansRemaining: remaining, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+    }
+
+    return res.json({ ok: true, consumed: true, deduped: false, scansUsed: 1,
+      scansRemaining: DAILY_FREE_SCANS - 1, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+  } catch (e) {
+    console.warn("⚠️ /api/scan/consume error", e?.message);
+    return res.json({ ok: true, consumed: true, deduped: false, scansUsed: 1,
+      scansRemaining: 1, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+  }
+});
+
+// ── POST /api/guest/identify ──────────────────────────────────────────────────
+// Issues or recovers a persistent guestId tied to device fingerprint (installId).
+// Anti-bypass: fingerprint is hashed server-side; new installs on same device
+// recover the same guestId (preventing reinstall abuse).
+app.post("/api/guest/identify", async (req, res) => {
+  try {
+    const fp = String(req.body?.fingerprint || req.body?.installId || "").trim().slice(0, 128);
+    if (!fp) return res.status(400).json({ ok: false, error: "fingerprint_required" });
+
+    if (!redis) {
+      return res.json({ ok: true, guestId: `eph_${fp.slice(0, 8)}_${Date.now().toString(36)}`, recovered: false });
+    }
+
+    const fpKey = _guestFpKey(fp);
+    const existing = await redis.get(fpKey);
+    if (existing) {
+      redis.expire(fpKey,               GUEST_TTL).catch(() => {});
+      redis.expire(_guestIdKey(existing), GUEST_TTL).catch(() => {});
+      return res.json({ ok: true, guestId: existing, recovered: true });
+    }
+
+    const guestId = `g${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-6)}`;
+    await redis.set(fpKey, guestId, "EX", GUEST_TTL);
+    redis.hset(_guestIdKey(guestId), { fingerprint: fp, createdAt: Date.now(), ip: req.ip || "?" }).catch(() => {});
+    redis.expire(_guestIdKey(guestId), GUEST_TTL).catch(() => {});
+
+    return res.json({ ok: true, guestId, recovered: false });
+  } catch (e) {
+    console.warn("⚠️ /api/guest/identify error", e?.message);
+    return res.json({ ok: true, guestId: `gfallback${Date.now().toString(36)}`, recovered: false });
+  }
+});
+
 app.get("/api/price-history", async (req, res) => {
   try {
     const query = normalizeQuery(safeStr(req.query?.q, 220));
