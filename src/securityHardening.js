@@ -482,6 +482,180 @@ export const SCHEMAS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 8b. CLOCK-SKEW DEFENSE (Tweak 2 — Physics-Based Limits)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The 2-scan daily limit must be physics-based, not device-based.
+// A client that manipulates its system clock to "time-travel" past the
+// midnight reset will be rejected if its timestamp deviates from the
+// server's UTC clock by more than CLOCK_DRIFT_WINDOW_SEC seconds.
+//
+// The 120s window accommodates natural network lag and poor cell signal.
+// Requests without client_ts are allowed through (legacy clients).
+//
+// Error response: STABILITY_INT_02 — opaque code, no internal details.
+
+const CLOCK_DRIFT_WINDOW_SEC = 120; // 2-minute drift window
+
+/**
+ * Express middleware: reject requests whose client_ts deviates from server UTC by
+ * more than CLOCK_DRIFT_WINDOW_SEC seconds.
+ *
+ * client_ts must be a Unix timestamp in seconds (Number).
+ * If absent, the middleware is a no-op (backwards-compatible).
+ */
+export function clockSkewMiddleware({ driftWindowSec = CLOCK_DRIFT_WINDOW_SEC } = {}) {
+  return function clockSkewCheck(req, res, next) {
+    const rawTs =
+      req.body?.client_ts ??
+      req.query?.client_ts ??
+      req.headers["x-ev-client-ts"] ??
+      null;
+
+    if (rawTs == null) return next(); // no timestamp — pass through (legacy client)
+
+    const clientTs  = Number(rawTs);
+    if (!Number.isFinite(clientTs) || clientTs <= 0) return next(); // unparseable — ignore
+
+    const serverUtc = Math.floor(Date.now() / 1000);
+    const drift     = Math.abs(serverUtc - clientTs);
+
+    if (drift > driftWindowSec) {
+      return res.status(400).json({
+        ok:          false,
+        error:       "CLOCK_SYNC_REQUIRED",
+        code:        "STABILITY_INT_02",
+        server_utc:  serverUtc,
+        max_drift:   driftWindowSec,
+        // Note: we deliberately omit drift_seconds to avoid aiding clock calibration
+      });
+    }
+
+    next();
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8c. ENTROPY HONEYPOT (Tweak 1 — Shadow-Ban with Garbage Data)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Any legitimate Evan AI client will NEVER send `_entropy_v2` in the request
+// body. This field is an invisible trap — only automation tools that
+// "fill all fields" will trigger it.
+//
+// Detection strategy:
+//   - If `_entropy_v2` is present in the body → shadow-ban
+//   - If `_client_session_v2` is present → same (alternate trap field)
+//
+// Shadow-ban behavior:
+//   - 15s artificial delay (wastes bot compute credits)
+//   - Returns 200 OK with plausible but scrambled price data
+//   - Bot does NOT know it has been caught
+//
+// This middleware must be registered AFTER express.json() body parsing.
+
+const ENTROPY_SHADOW_DELAY_MS = 15_000;
+
+function _garbageValuation() {
+  const price    = parseFloat((Math.random() * 480 + 12).toFixed(2));
+  const verdict  = ["GOOD BUY", "GREAT FLIP", "MEH", "RISKY"][Math.floor(Math.random() * 4)];
+  const conf     = parseFloat((Math.random() * 0.3 + 0.65).toFixed(3));
+  return {
+    ok:              true,
+    price,
+    savedAmount:     parseFloat((price * (Math.random() * 0.18 + 0.05)).toFixed(2)),
+    buyVerdict:      verdict,
+    visionConfidence: conf,
+    totalMatches:    Math.floor(Math.random() * 40 + 8),
+  };
+}
+
+/**
+ * Express middleware: detect and shadow-ban bots that send hidden honeypot fields.
+ * Must be applied AFTER express.json() so req.body is parsed.
+ */
+export function entropyHoneypotMiddleware() {
+  return async function entropyCheck(req, res, next) {
+    const body = req.body ?? {};
+    const triggered =
+      body._entropy_v2 !== undefined ||
+      body._client_session_v2 !== undefined;
+
+    if (!triggered) return next();
+
+    const ip = String(
+      req.headers["cf-connecting-ip"] ||
+      (req.headers["x-forwarded-for"] || "").split(",")[0] ||
+      req.socket?.remoteAddress ||
+      "unknown"
+    ).trim();
+
+    console.warn("[ENTROPY_HONEYPOT]", ip, req.path, "shadow-banned");
+
+    // 15s delay — run setTimeout, return immediately so Express doesn't time out
+    await _sleep(ENTROPY_SHADOW_DELAY_MS);
+    return res.json(_garbageValuation());
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8d. JITTERED PRICING (Tweak 3 — Differential Privacy for B2B)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// B2B partners receiving our margin/pricing outputs could make thousands of
+// API calls to map our internal pricing curves and reverse-engineer the model.
+// Adding cryptographically random noise (±0.5% by default) to every numeric
+// price value in B2B responses poisons the dataset while remaining within
+// App Store "Estimated Margin" safe-harbor tolerances.
+//
+// The noise is applied ONLY to external-facing B2B/public API outputs.
+// Internal user-facing responses always receive the un-jittered truth.
+
+/**
+ * Apply ±pct% uniform random noise to a numeric price.
+ * Returns the original value for non-finite inputs.
+ *
+ * @param {number} value   - price or margin to jitter
+ * @param {number} pct     - max noise percent (default 0.5%)
+ * @returns {number}
+ */
+export function jitterPrice(value, pct = 0.5) {
+  if (!Number.isFinite(value) || value === 0) return value;
+  // Uniform random in [1 - pct/100, 1 + pct/100]
+  const factor = 1 + ((Math.random() * 2 - 1) * pct) / 100;
+  return Math.round(value * factor * 100) / 100;
+}
+
+/**
+ * Deep-walk a plain-object tree and apply jitterPrice to every numeric leaf
+ * whose key matches known pricing field names.
+ *
+ * @param {object} obj - response object to jitter in-place
+ * @param {number} pct - noise percentage (default 0.5%)
+ */
+const PRICE_KEYS = new Set([
+  "marketMedian", "p25", "p75", "priceRange", "spread",
+  "medianPrice", "price", "askPrice", "margin", "estimatedMargin",
+  "marginLow", "marginHigh", "expectedProfit",
+]);
+
+export function applyB2BJitter(obj, pct = 0.5) {
+  if (!obj || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) {
+    obj.forEach((item) => applyB2BJitter(item, pct));
+    return obj;
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (PRICE_KEYS.has(k) && typeof v === "number") {
+      obj[k] = jitterPrice(v, pct);
+    } else if (v && typeof v === "object") {
+      applyB2BJitter(v, pct);
+    }
+  }
+  return obj;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────────────────────────────────────
 

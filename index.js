@@ -1138,6 +1138,9 @@ import {
   SCHEMAS,
   schemaMiddleware as bodySchemaMiddleware,
   sanitizeInput,
+  clockSkewMiddleware,
+  entropyHoneypotMiddleware,
+  applyB2BJitter,
 } from "./src/securityHardening.js";
 
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
@@ -2520,6 +2523,9 @@ app.use(honeytokenMiddleware({ required: false }));
 
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: URLENCODED_BODY_LIMIT }));
+// Entropy honeypot — runs AFTER body parse so req.body is available
+// _entropy_v2 / _client_session_v2 presence → 15s delay + garbage data shadow-ban
+app.use(entropyHoneypotMiddleware());
 app.use((req, res, next) => {
   const oldJson = res.json;
 
@@ -18741,7 +18747,9 @@ app.get("/api/scan/status", async (req, res) => {
 });
 
 // ── POST /api/scan/consume ────────────────────────────────────────────────────
-app.post("/api/scan/consume", bodySchemaMiddleware(SCHEMAS.scanConsume), async (req, res) => {
+// clockSkewMiddleware: rejects if client_ts deviates >120s from server UTC
+// (prevents "time travel" to reset daily scan quota)
+app.post("/api/scan/consume", clockSkewMiddleware(), bodySchemaMiddleware(SCHEMAS.scanConsume), async (req, res) => {
   try {
     const actor = _resolveActor(req);
     const day   = _scanDay();
@@ -32032,7 +32040,9 @@ app.post("/api/b2b/valuate", requireB2BApiKey, async (req, res) => {
     } catch { /* non-fatal — audit must not block valuation response */ }
 
     incrementUsage(redis, req.b2b, "valuate").catch(() => {});
-    return res.status(200).json(result);
+    // Differential privacy: ±0.5% jitter on B2B pricing outputs
+    // prevents competitors from reverse-engineering internal pricing curves
+    return res.status(200).json(applyB2BJitter(result));
   } catch (err) {
     return res.status(200).json({ ok: false, error: "valuation_failed", reason: err?.message });
   }
@@ -32093,7 +32103,8 @@ app.post("/api/b2b/batch-valuate", requireB2BApiKey, async (req, res) => {
     }
 
     incrementUsage(redis, req.b2b, "batch_valuate").catch(() => {});
-    return res.status(200).json(result);
+    // Differential privacy: jitter all pricing fields before external delivery
+    return res.status(200).json(applyB2BJitter(result));
   } catch (err) {
     return res.status(200).json({ ok: false, error: "batch_valuation_failed", reason: err?.message });
   }
