@@ -50,6 +50,14 @@ import {
   VALIDATOR_CONFIDENCE_FLOOR,
 } from "./payloadRegistry.js";
 
+import {
+  enforceInvariants, loadConstraints,
+  acquireItemLock, releaseItemLock, resolveConflict,
+  recordWinStreak, recordAgentOutcome,
+  recordLiquidityCommitment, recordTripleCheck,
+  enforceAuthenticityLaw, checkLedgerSyncSLA,
+} from "./swarmInvariants.js";
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 export const WORKER_STATUS = Object.freeze({
@@ -376,6 +384,8 @@ export async function runScout(redis, workerId, { lotItems = [], tokenBudget = I
         item:         { ...item, tier, lotScore, confidence: guard.confidence },
         parentWorkerId: workerId,
       })).catch(() => {});
+      // Record win-streak signal for emergent market hunting
+      await recordWinStreak(redis, item.category || "generic", workerId, guard.confidence).catch(() => {});
       await redis.hincrby(KEY_OPS(), "handoffs_to_specialist", 1).catch(() => {});
       return { ok: true, workerId, status: WORKER_STATUS.VALUATING, handOff: true, tier, confidence: guard.confidence };
     } else {
@@ -416,6 +426,7 @@ export async function runSpecialist(redis, workerId, {
   platformIntel  = null,
   tokenBudget    = Infinity,
   capitalBudget  = Infinity,
+  totalBankroll  = 0,
 } = {}) {
   if (!redis || !workerId) return { ok: false, error: "missing_args" };
   if (tokenBudget <= 0) {
@@ -555,11 +566,11 @@ export async function runSpecialist(redis, workerId, {
 
     let ledgerEntryId = null;
 
-    // ── ACQUIRING gate — BUY signals require LedgerEntry + capital check ──
+    // ── ACQUIRING gate — BUY signals pass through three laws + item lock ──
     if (signal === BUY_SIGNAL.STRONG_BUY || signal === BUY_SIGNAL.GOOD_DEAL) {
       const recommendedBid = allocatedCost > 0 ? allocatedCost : r2(adjustedValue * 0.55);
 
-      // Capital budget enforcement
+      // Capital budget enforcement (local job limit)
       if (recommendedBid > capitalBudget) {
         await _transitionWorker(redis, workerId, WORKER_STATUS.SCRUBBED, {
           visionConfidence: guard.confidence,
@@ -571,30 +582,100 @@ export async function runSpecialist(redis, workerId, {
         return { ok: true, workerId, status: WORKER_STATUS.SCRUBBED, scrubReason: "capital_budget_exceeded", signal };
       }
 
-      // VALUATING → ACQUIRING
+      // ── Global Invariant Gate (The Three Laws) ──────────────────────────
+      const constraints = loadConstraints();
+      const invariant   = await enforceInvariants(redis, {
+        item,
+        estimatedValue: adjustedValue,
+        allocatedCost:  recommendedBid,
+        userId:         worker.userId,
+        vertical:       payload.id,
+        totalBankroll,
+      });
+
+      if (!invariant.pass) {
+        await _transitionWorker(redis, workerId, WORKER_STATUS.SCRUBBED, {
+          visionConfidence: guard.confidence,
+          scrubReason:      `invariant_violation: ${invariant.violations.join(" | ")}`,
+          specialistResult,
+          telemetrySnapshot,
+          buySignal:        signal,
+          invariantResult:  invariant,
+        });
+        await recordAgentOutcome(redis, workerId, item.category || "generic", false).catch(() => {});
+        return {
+          ok: true, workerId, status: WORKER_STATUS.SCRUBBED,
+          scrubReason: "invariant_violation",
+          violations: invariant.violations,
+          signal,
+        };
+      }
+
+      // ── Item Lock — atomic conflict prevention ────────────────────────
+      const scanId  = item.scanId || null;
+      let lockHeld  = false;
+      if (scanId) {
+        const lockResult = await acquireItemLock(redis, scanId, workerId, constraints);
+        if (!lockResult.locked) {
+          // Another agent holds the lock — resolve by reputation
+          const conflict = await resolveConflict(
+            redis, scanId, workerId, lockResult.holder,
+            item.category || "generic", constraints,
+          );
+          if (conflict.winner !== workerId) {
+            // We lost the conflict — scrub and free resources
+            await _transitionWorker(redis, workerId, WORKER_STATUS.SCRUBBED, {
+              scrubReason:     `conflict_lost_to_${conflict.winner}: ${conflict.basis}`,
+              buySignal:       signal,
+              conflictResult:  conflict,
+            });
+            return {
+              ok: true, workerId, status: WORKER_STATUS.SCRUBBED,
+              scrubReason: "conflict_lost", conflictResult: conflict,
+            };
+          }
+          // We won the reputation contest — lock was transferred to us
+        }
+        lockHeld = true;
+      }
+
+      // ── VALUATING → ACQUIRING ─────────────────────────────────────────
+      const acquisitionTs = Date.now();
       await _transitionWorker(redis, workerId, WORKER_STATUS.ACQUIRING, {
         visionConfidence: guard.confidence,
         specialistResult,
         telemetrySnapshot,
         buySignal: signal,
+        invariantResult: invariant,
       });
 
-      // Record telemetry entry in ledger (ADJUSTMENT — informational, no dollar amount)
+      // Record telemetry entry in ledger — target: within 500ms of ACQUIRING
       const ledgerResult = await recordEntry(redis, worker.userId, {
         type:              TXN_TYPE.ADJUSTMENT,
         amount:            0,
         adjustmentReason:  `Swarm telemetry [${payload.id}] — ${signal} on ${item.itemName || item.scanId} (lot ${worker.lotId})`,
         relatedId:         worker.jobId,
         relatedType:       RELATED_TYPE.OTHER,
-        description:       `Worker ${workerId} | payload: ${payload.id} | signal: ${signal} | confidence: ${guard.confidence}% | adj.value: $${adjustedValue}`,
+        description:       `Worker ${workerId} | payload: ${payload.id} | signal: ${signal} | confidence: ${guard.confidence}% | adj.value: $${adjustedValue} | roi: ${invariant.results.roiFloor?.roiAfterFees}%`,
         recordedBy:        "swarmOrchestrator",
       }).catch(() => null);
 
       ledgerEntryId = ledgerResult?.txnId || null;
 
+      // SLA check: was ledger synced within 500ms?
+      const syncSLA = checkLedgerSyncSLA(Date.now(), acquisitionTs, constraints);
+      if (!syncSLA.inSLA) {
+        await redis.hincrby(KEY_OPS(), "ledger_sync_sla_breaches", 1).catch(() => {});
+      }
+
       // ACQUIRING → LEDGER_SYNC → COMPLETE
-      await _transitionWorker(redis, workerId, WORKER_STATUS.LEDGER_SYNC, { ledgerEntryId });
+      await _transitionWorker(redis, workerId, WORKER_STATUS.LEDGER_SYNC, { ledgerEntryId, syncSLA });
       await _transitionWorker(redis, workerId, WORKER_STATUS.COMPLETE, {});
+
+      // Post-acquisition bookkeeping
+      await recordLiquidityCommitment(redis, worker.userId, payload.id, recommendedBid).catch(() => {});
+      await recordAgentOutcome(redis, workerId, item.category || "generic", true).catch(() => {});
+      if (lockHeld && scanId) await releaseItemLock(redis, scanId, workerId).catch(() => {});
       await redis.hincrby(KEY_OPS(), "buy_signals_emitted", 1).catch(() => {});
 
       return {
@@ -605,6 +686,8 @@ export async function runSpecialist(redis, workerId, {
         recommendedBid,
         confidence:       guard.confidence,
         ledgerEntryId,
+        syncSLA,
+        invariantResult:  invariant,
         telemetrySnapshot,
         specialistResult,
         payloadId:        payload.id,

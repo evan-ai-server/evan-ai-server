@@ -1118,6 +1118,15 @@ import {
   HEAL_TYPE, FREEZE_STATUS,
 } from "./src/selfHealingLedger.js";
 
+import {
+  enforceInvariants, enforceROIFloor, loadConstraints,
+  recordWinStreak, detectHotCategories, getHotCategories,
+  acquireItemLock, releaseItemLock, resolveConflict,
+  getAgentReputation, getAgentReputationProfile, recordAgentOutcome,
+  recordTripleCheck, recordLiquidityCommitment, releaseLiquidityCommitment,
+  getInvariantOps,
+} from "./src/swarmInvariants.js";
+
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
 import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
 import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
@@ -27037,6 +27046,133 @@ app.post(
   app.get("/api/p10/heal/ops", async (req, res) => {
     try {
       const ops = await getSelfHealingOps(redis);
+      return res.status(200).json({ ok: true, ops });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Phase 10: Swarm Invariants — Command & Control Routes ────────────────────
+
+  // GET /api/p10/invariants/constraints
+  // Return the current global_constraints.json (the Laws of the Swarm).
+  app.get("/api/p10/invariants/constraints", async (req, res) => {
+    try {
+      const { forceReload } = req.query;
+      const constraints = loadConstraints(forceReload === "1");
+      return res.status(200).json({ ok: true, constraints });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/check
+  // Run all three invariant laws against a proposed acquisition (dry-run gate).
+  app.post("/api/p10/invariants/check", async (req, res) => {
+    try {
+      const { item, estimatedValue, allocatedCost, userId, vertical, totalBankroll } = req.body;
+      if (estimatedValue == null || allocatedCost == null) {
+        return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      }
+      const result = await enforceInvariants(redis, {
+        item: item || {}, estimatedValue, allocatedCost, userId, vertical, totalBankroll,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/roi-check
+  // Quick ROI floor check (Law 1) without full invariant pass.
+  app.post("/api/p10/invariants/roi-check", async (req, res) => {
+    try {
+      const { estimatedValue, allocatedCost } = req.body;
+      if (estimatedValue == null || allocatedCost == null) {
+        return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      }
+      const constraints = loadConstraints();
+      const result = enforceROIFloor(Number(estimatedValue), Number(allocatedCost), constraints);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/triple-check/:scanId
+  // Record one Specialist triple-check pass for a high-risk item (Law 3).
+  app.post("/api/p10/invariants/triple-check/:scanId", async (req, res) => {
+    try {
+      const { workerId } = req.body;
+      if (!workerId) return res.status(400).json({ ok: false, error: "missing_worker_id" });
+      const constraints = loadConstraints();
+      const result = await recordTripleCheck(redis, req.params.scanId, workerId, constraints);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/invariants/hot-categories
+  // Return categories with active winning streaks (fast cache read).
+  app.get("/api/p10/invariants/hot-categories", async (req, res) => {
+    try {
+      const categories = await getHotCategories(redis);
+      return res.status(200).json({ ok: true, hotCategories: categories });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/detect-streaks
+  // Run winning streak detection across all tracked categories.
+  app.post("/api/p10/invariants/detect-streaks", async (req, res) => {
+    try {
+      const result = await detectHotCategories(redis);
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/invariants/reputation/:workerId
+  // Full reputation profile for an agent across all categories.
+  app.get("/api/p10/invariants/reputation/:workerId", async (req, res) => {
+    try {
+      const { category } = req.query;
+      if (category) {
+        const result = await getAgentReputation(redis, req.params.workerId, category);
+        return res.status(200).json({ ok: true, ...result });
+      }
+      const profile = await getAgentReputationProfile(redis, req.params.workerId);
+      return res.status(200).json({ ok: true, ...profile });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/reputation/:workerId/outcome
+  // Record a win/loss outcome to update agent reputation.
+  app.post("/api/p10/invariants/reputation/:workerId/outcome", async (req, res) => {
+    try {
+      const { category, won } = req.body;
+      if (!category || won == null) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      await recordAgentOutcome(redis, req.params.workerId, category, !!won);
+      return res.status(200).json({ ok: true });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/liquidity/commit
+  // Record capital committed to a vertical (called after acquisition).
+  app.post("/api/p10/invariants/liquidity/commit", async (req, res) => {
+    try {
+      const { userId, vertical, amount } = req.body;
+      if (!userId || !vertical || !amount) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      await recordLiquidityCommitment(redis, userId, vertical, Number(amount));
+      return res.status(200).json({ ok: true });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/invariants/liquidity/release
+  // Release committed capital when an item is sold or scrubbed.
+  app.post("/api/p10/invariants/liquidity/release", async (req, res) => {
+    try {
+      const { userId, vertical, amount } = req.body;
+      if (!userId || !vertical || !amount) return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      await releaseLiquidityCommitment(redis, userId, vertical, Number(amount));
+      return res.status(200).json({ ok: true });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/invariants/ops
+  // Invariant enforcement ops counters.
+  app.get("/api/p10/invariants/ops", async (req, res) => {
+    try {
+      const ops = await getInvariantOps(redis);
       return res.status(200).json({ ok: true, ops });
     } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
   });

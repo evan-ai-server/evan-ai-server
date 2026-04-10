@@ -1,0 +1,48 @@
+{
+  "_comment": "Evan AI — Global Invariants (The Laws of the Swarm). Loaded at runtime by swarmInvariants.js. Changes take effect on next enforceInvariants() call.",
+  "version": "1.0",
+  "updatedAt": "2026-04-09",
+
+  "roiFloor": {
+    "_comment": "Never commit capital unless projected ROI > this after all fees.",
+    "minROIPct": 30,
+    "platformFeePct": 13,
+    "shippingFeePct": 5,
+    "paymentFeePct": 3
+  },
+
+  "liquidityRule": {
+    "_comment": "Never tie up more than maxPctPerVertical% of total bankroll in one payload vertical.",
+    "maxPctPerVertical": 25,
+    "verticals": ["VINTAGE_ELECTRONICS", "DESIGNER_APPAREL", "BULK_LIQUIDATED", "GENERIC"],
+    "cooldownMs": 300000
+  },
+
+  "authenticityLaw": {
+    "_comment": "Items flagged as high-risk must pass tripleCheckMinPasses independent Specialist checks before capital is committed.",
+    "highRiskFlags": ["HIGH_RISK", "COUNTERFEIT_RISK", "AUTH_REQUIRED", "UNVERIFIED_AUTH"],
+    "tripleCheckMinPasses": 3,
+    "tripleCheckTtlMs": 3600000,
+    "scrubOnFailure": true
+  },
+
+  "winningStreak": {
+    "_comment": "If N scouts independently report high margins in the same niche within windowMs, auto-reallocate reallocationPct of idle workers to that category.",
+    "triggerCount": 3,
+    "windowMs": 600000,
+    "reallocationPct": 20,
+    "hotCategoryTtlMs": 1800000
+  },
+
+  "ledgerSync": {
+    "_comment": "Every local agent decision must be synced to the immutable ledger within maxMs.",
+    "maxMs": 500
+  },
+
+  "conflictResolution": {
+    "_comment": "When two agents bid on the same item, resolve by agent reputation (historical accuracy in that category).",
+    "strategy": "REPUTATION",
+    "lockTtlMs": 30000,
+    "minOutcomesForReputation": 3
+  }
+}
