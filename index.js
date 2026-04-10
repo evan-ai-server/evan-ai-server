@@ -1058,6 +1058,39 @@ import {
 } from "./src/workflowIntegrationPrimitives.js";
 import { runPhase9Validations } from "./src/phase9Validation.js";
 
+// ── Phase 10: Economic Finality & Financial Integrity ─────────────────────────
+import {
+  createListing, getListing, activateListing, markListingSold,
+  endListing, expireListing, getUserListings, getListingMetrics, getListingOps,
+  LISTING_STATUS, MARKETPLACE,
+} from "./src/listingRecordModel.js";
+
+import {
+  recordEntry, recordPurchase, recordSale, recordFee,
+  recordShippingCost, recordAdjustment, getEntry,
+  getEntriesForRelated, getUserLedger, getLedgerBalance, getLedgerOps,
+  TXN_TYPE, TXN_DIRECTION, RELATED_TYPE,
+} from "./src/transactionLedger.js";
+
+import {
+  createLot, getLot, addItemsToLot, getUserLots, closeLot, getLotOps,
+  LOT_STATUS, LOT_SOURCE_TYPE,
+} from "./src/lotAssessmentEngine.js";
+
+import { SOURCE_TYPE } from "./src/inventoryEngine.js";
+
+import {
+  setOutcomeFlags, correctOutcomeFinancials,
+} from "./src/outcomeEngine.js";
+
+import {
+  getDailySnapshot, getMonthlySnapshot, getCategorySnapshot,
+  getPlatformSnapshot, getTelemetryExport, buildFullReport, getReportingOps,
+  REPORT_VERSION,
+} from "./src/reportingEngine.js";
+
+import { AFFILIATE_CONFIDENCE_THRESHOLD } from "./src/affiliateRouter.js";
+
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
 import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
 import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
@@ -26379,6 +26412,373 @@ app.post(
   });
 
   // ── END Phase 9: Turn Evan into Embedded Resale Infrastructure ───────────────
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // PHASE 10 — ECONOMIC FINALITY & FINANCIAL INTEGRITY
+  // Transaction Ledger as Mission Control: every inventory move has telemetry,
+  // every financial outcome is audit-proof and reusable for pricing models.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  // ── Listing Records ───────────────────────────────────────────────────────────
+
+  // POST /api/p10/listing/create
+  app.post("/api/p10/listing/create", async (req, res) => {
+    try {
+      const { userId, invId, marketplace, listedPrice, listedAt, listingUrl, notes, startDraft } = req.body || {};
+      const result = await createListing(redis, { userId, invId, marketplace, listedPrice, listedAt, listingUrl, notes, startDraft });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/listing/:listingId/activate
+  app.post("/api/p10/listing/:listingId/activate", async (req, res) => {
+    try {
+      const { listingId } = req.params;
+      const { listingUrl, listedAt } = req.body || {};
+      const result = await activateListing(redis, listingId, { listingUrl, listedAt });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/listing/:listingId/sold
+  app.post("/api/p10/listing/:listingId/sold", async (req, res) => {
+    try {
+      const { listingId } = req.params;
+      const { soldPrice, fees, shippingCost, soldAt } = req.body || {};
+      const result = await markListingSold(redis, listingId, { soldPrice, fees, shippingCost, soldAt });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/listing/:listingId/end
+  app.post("/api/p10/listing/:listingId/end", async (req, res) => {
+    try {
+      const { listingId } = req.params;
+      const { reason } = req.body || {};
+      const result = await endListing(redis, listingId, { reason });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/listing/:listingId/expire
+  app.post("/api/p10/listing/:listingId/expire", async (req, res) => {
+    try {
+      const result = await expireListing(redis, req.params.listingId);
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/listing/:listingId
+  app.get("/api/p10/listing/:listingId", async (req, res) => {
+    try {
+      const listing = await getListing(redis, req.params.listingId);
+      if (!listing) return res.status(404).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, listing });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/listing/user/:userId
+  app.get("/api/p10/listing/user/:userId", async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { status, limit, offset, since, until } = req.query;
+      const result = await getUserListings(redis, userId, {
+        status:  status  || null,
+        limit:   Number(limit)  || 50,
+        offset:  Number(offset) || 0,
+        since:   since  ? Number(since)  : null,
+        until:   until  ? Number(until)  : null,
+      });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/listing/metrics/:userId
+  app.get("/api/p10/listing/metrics/:userId", async (req, res) => {
+    try {
+      const metrics = await getListingMetrics(redis, req.params.userId);
+      return res.status(200).json({ ok: true, metrics });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Transaction Ledger ────────────────────────────────────────────────────────
+
+  // POST /api/p10/ledger/record
+  // Generic single-entry record (for programmatic use)
+  app.post("/api/p10/ledger/record", async (req, res) => {
+    try {
+      const { userId, type, amount, relatedId, relatedType, description, recordedBy } = req.body || {};
+      const result = await recordEntry(redis, userId, { type, amount, relatedId, relatedType, description, recordedBy });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, entry: result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/ledger/purchase
+  app.post("/api/p10/ledger/purchase", async (req, res) => {
+    try {
+      const { userId, amount, invId, description } = req.body || {};
+      const result = await recordPurchase(redis, userId, { amount, invId, description, recordedBy: "/api/p10/ledger/purchase" });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, entry: result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/ledger/sale
+  app.post("/api/p10/ledger/sale", async (req, res) => {
+    try {
+      const { userId, amount, listingId, invId, description } = req.body || {};
+      const result = await recordSale(redis, userId, { amount, listingId, invId, description, recordedBy: "/api/p10/ledger/sale" });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, entry: result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/ledger/fee
+  app.post("/api/p10/ledger/fee", async (req, res) => {
+    try {
+      const { userId, amount, listingId, description } = req.body || {};
+      const result = await recordFee(redis, userId, { amount, listingId, description, recordedBy: "/api/p10/ledger/fee" });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, entry: result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/ledger/adjust
+  // Financial adjustment — requires reason (fail-closed, audit-proof)
+  app.post("/api/p10/ledger/adjust", async (req, res) => {
+    try {
+      const { userId, amount, relatedId, relatedType, adjustmentReason, adjustmentApprovedBy, description } = req.body || {};
+      if (!adjustmentReason) return res.status(400).json({ ok: false, error: "adjustment_requires_reason" });
+      const result = await recordAdjustment(redis, userId, {
+        amount, relatedId, relatedType,
+        adjustmentReason, adjustmentApprovedBy,
+        description, recordedBy: "/api/p10/ledger/adjust",
+      });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, entry: result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/ledger/balance/:userId
+  app.get("/api/p10/ledger/balance/:userId", async (req, res) => {
+    try {
+      const { since } = req.query;
+      const balance = await getLedgerBalance(redis, req.params.userId, {
+        since: since ? Number(since) : null,
+      });
+      return res.status(200).json({ ok: true, ...balance });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/ledger/history/:userId
+  app.get("/api/p10/ledger/history/:userId", async (req, res) => {
+    try {
+      const { limit, since } = req.query;
+      const entries = await getUserLedger(redis, req.params.userId, {
+        limit: Number(limit) || 50,
+        since: since ? Number(since) : null,
+      });
+      return res.status(200).json({ ok: true, entries, count: entries.length });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/ledger/related/:relatedId
+  app.get("/api/p10/ledger/related/:relatedId", async (req, res) => {
+    try {
+      const entries = await getEntriesForRelated(redis, req.params.relatedId);
+      return res.status(200).json({ ok: true, entries, count: entries.length });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Lot Assessment ────────────────────────────────────────────────────────────
+
+  // POST /api/p10/lot/create
+  app.post("/api/p10/lot/create", async (req, res) => {
+    try {
+      const { userId, name, sourceType, location, totalPaid, notes } = req.body || {};
+      const result = await createLot(redis, { userId, name, sourceType, location, totalPaid, notes });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/lot/:lotId/add-items
+  app.post("/api/p10/lot/:lotId/add-items", async (req, res) => {
+    try {
+      const { lotId } = req.params;
+      const { scanIds, lotBudget, userId } = req.body || {};
+      const result = await addItemsToLot(redis, lotId, scanIds, { lotBudget, userId });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/lot/:lotId/close
+  app.post("/api/p10/lot/:lotId/close", async (req, res) => {
+    try {
+      const { notes } = req.body || {};
+      const result = await closeLot(redis, req.params.lotId, { notes });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/lot/:lotId
+  app.get("/api/p10/lot/:lotId", async (req, res) => {
+    try {
+      const lot = await getLot(redis, req.params.lotId);
+      if (!lot) return res.status(404).json({ ok: false, error: "not_found" });
+      return res.status(200).json({ ok: true, lot });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/lot/user/:userId
+  app.get("/api/p10/lot/user/:userId", async (req, res) => {
+    try {
+      const { status, limit } = req.query;
+      const result = await getUserLots(redis, req.params.userId, { status: status || null, limit: Number(limit) || 20 });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Outcome Flags & Corrections ───────────────────────────────────────────────
+
+  // POST /api/p10/outcome/:scanId/flags
+  app.post("/api/p10/outcome/:scanId/flags", async (req, res) => {
+    try {
+      const { scanId } = req.params;
+      const { userId, disputeFlag, counterfeiteFlag, cancellationFlag, notes } = req.body || {};
+      if (!userId) return res.status(400).json({ ok: false, error: "missing_user_id" });
+      const result = await setOutcomeFlags(redis, pgPool, userId, scanId, {
+        disputeFlag, counterfeiteFlag, cancellationFlag, notes,
+      });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/outcome/:scanId/correct
+  // Financial correction with mandatory audit trail
+  app.post("/api/p10/outcome/:scanId/correct", async (req, res) => {
+    try {
+      const { scanId } = req.params;
+      const { userId, corrections, reason, correctedBy } = req.body || {};
+      if (!userId)   return res.status(400).json({ ok: false, error: "missing_user_id" });
+      if (!reason)   return res.status(400).json({ ok: false, error: "correction_requires_reason" });
+      if (!corrections || typeof corrections !== "object") {
+        return res.status(400).json({ ok: false, error: "missing_corrections_object" });
+      }
+      const result = await correctOutcomeFinancials(redis, pgPool, userId, scanId, corrections, {
+        reason, correctedBy: correctedBy || userId,
+      });
+      if (result.error) return res.status(400).json({ ok: false, error: result.error });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Reporting Engine — P&L Mission Control ────────────────────────────────────
+
+  // GET /api/p10/report/daily/:userId
+  app.get("/api/p10/report/daily/:userId", async (req, res) => {
+    try {
+      const { date, forceRefresh } = req.query;
+      const snapshot = await getDailySnapshot(redis, req.params.userId, {
+        dateStr:      date || null,
+        forceRefresh: forceRefresh === "true",
+      });
+      return res.status(snapshot.ok ? 200 : 400).json(snapshot);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/report/monthly/:userId
+  app.get("/api/p10/report/monthly/:userId", async (req, res) => {
+    try {
+      const { month, forceRefresh } = req.query;
+      const snapshot = await getMonthlySnapshot(redis, req.params.userId, {
+        monthStr:     month || null,
+        forceRefresh: forceRefresh === "true",
+      });
+      return res.status(snapshot.ok ? 200 : 400).json(snapshot);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/report/category/:userId
+  app.get("/api/p10/report/category/:userId", async (req, res) => {
+    try {
+      const snapshot = await getCategorySnapshot(redis, pgPool, req.params.userId, {
+        forceRefresh: req.query.forceRefresh === "true",
+      });
+      return res.status(snapshot.ok ? 200 : 400).json(snapshot);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/report/platform/:userId
+  app.get("/api/p10/report/platform/:userId", async (req, res) => {
+    try {
+      const snapshot = await getPlatformSnapshot(redis, req.params.userId, {
+        forceRefresh: req.query.forceRefresh === "true",
+      });
+      return res.status(snapshot.ok ? 200 : 400).json(snapshot);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/report/telemetry/:userId
+  // Pricing model telemetry export — signal accuracy + ledger balance + time-series P&L
+  app.get("/api/p10/report/telemetry/:userId", async (req, res) => {
+    try {
+      const telemetry = await getTelemetryExport(redis, pgPool, req.params.userId, {
+        forceRefresh: req.query.forceRefresh === "true",
+      });
+      return res.status(telemetry.ok ? 200 : 400).json(telemetry);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/report/full/:userId
+  // Full combined report — all sections in one payload
+  app.get("/api/p10/report/full/:userId", async (req, res) => {
+    try {
+      const report = await buildFullReport(redis, pgPool, req.params.userId, {
+        forceRefresh: req.query.forceRefresh === "true",
+      });
+      return res.status(report.ok ? 200 : 400).json(report);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // ── Phase 10 Ops ──────────────────────────────────────────────────────────────
+
+  // GET /api/p10/ops
+  app.get("/api/p10/ops", async (req, res) => {
+    try {
+      const [listing, ledger, lot, reporting] = await Promise.all([
+        getListingOps(redis),
+        getLedgerOps(redis),
+        getLotOps(redis),
+        getReportingOps(redis),
+      ]);
+      return res.status(200).json({
+        ok: true,
+        phase: "10",
+        version: REPORT_VERSION,
+        affiliateConfidenceThreshold: AFFILIATE_CONFIDENCE_THRESHOLD,
+        listing,
+        ledger,
+        lot,
+        reporting,
+      });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/validate
+  // Runs Phase 10 validation scenarios (ops only)
+  app.post("/api/p10/validate", async (req, res) => {
+    try {
+      const { runPhase10Validations } = await import("./src/phase10Validation.js");
+      const result = await runPhase10Validations();
+      return res.status(200).json({ ok: result.passed === result.total, ...result });
+    } catch (err) {
+      return res.status(200).json({ ok: false, error: "phase10_validation_failed", reason: err?.message });
+    }
+  });
+
+  // ── END Phase 10: Economic Finality & Financial Integrity ─────────────────────
 
   // ── GET /user/category-stats ──────────────────────────────────────────────────
   // Returns per-category scan/buy/sell/pass counts and realized profit.

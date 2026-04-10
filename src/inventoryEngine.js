@@ -33,6 +33,19 @@ const MAX_INV_USER = 10_000;            // max items tracked per user
 const VALID_STATUSES = new Set(["ACTIVE", "SOLD", "DEAD", "RETURNED"]);
 const TERMINAL_STATUSES = new Set(["SOLD", "DEAD", "RETURNED"]);
 
+// Phase 10: Canonical source type enum for acquisition tracking.
+// Accepting only these values ensures consistent P&L breakdown by source.
+export const SOURCE_TYPE = Object.freeze({
+  THRIFT:       "THRIFT",
+  ESTATE_SALE:  "ESTATE_SALE",
+  PAWN:         "PAWN",
+  FLEA_MARKET:  "FLEA_MARKET",
+  ONLINE:       "ONLINE",
+  CONSIGNMENT:  "CONSIGNMENT",
+  OTHER:        "OTHER",
+});
+const VALID_SOURCE_TYPES = new Set(Object.values(SOURCE_TYPE));
+
 // ── Redis key helpers ─────────────────────────────────────────────────────────
 
 const KEY_ITEM    = (id)           => `inv:item:${id}`;
@@ -57,24 +70,28 @@ const KEY_CAT     = (userId, cat)  => `inv:user:${userId}:cat:${cat}`;
  *   itemSnapshot    {object|null}        structured attributes from Phase 2 categoryDomination
  *   purchasePrice   {number}             required
  *   askPrice        {number|null}
- *   sourceType      {string}
+ *   sourceType      {string}             SOURCE_TYPE enum value (validated + normalized)
  *   city            {string|null}
  *   signal          {string|null}        Evan's original buy signal
  *   trustScore      {number|null}
+ *   quantity        {number}             Phase 10: number of identical units acquired (default 1)
+ *   conditionNotes  {string|null}        Phase 10: condition description beyond category grading
  * @returns {Promise<{ ok, invId, item, created }>}
  */
 export async function createInventoryItem(redis, {
   userId,
   scanId,
-  category      = null,
-  itemName      = null,
-  itemSnapshot  = null,
+  category       = null,
+  itemName       = null,
+  itemSnapshot   = null,
   purchasePrice,
-  askPrice      = null,
-  sourceType    = "OTHER",
-  city          = null,
-  signal        = null,
-  trustScore    = null,
+  askPrice       = null,
+  sourceType     = SOURCE_TYPE.OTHER,
+  city           = null,
+  signal         = null,
+  trustScore     = null,
+  quantity       = 1,
+  conditionNotes = null,
 } = {}) {
   if (!redis)  return { ok: false, error: "no_redis" };
   if (!userId) return { ok: false, error: "missing_user_id" };
@@ -100,19 +117,31 @@ export async function createInventoryItem(redis, {
     const now       = Date.now();
     const catNorm   = normStr(category) || "generic";
 
+    // Phase 10: validate sourceType against enum; fall back to OTHER
+    const srcRaw  = String(sourceType || "").toUpperCase().trim();
+    const srcNorm = VALID_SOURCE_TYPES.has(srcRaw) ? srcRaw : SOURCE_TYPE.OTHER;
+
+    // Phase 10: quantity must be a positive integer; invalid/negative → default 1
+    const qtyRaw = Math.round(Number(quantity));
+    const qty    = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 1;
+
     const item = {
       invId,
       userId,
       scanId,
-      category:     catNorm,
-      itemName:     normStr(itemName) || null,
-      itemSnapshot: itemSnapshot || null,  // frozen Phase 2 structured attributes
+      category:      catNorm,
+      itemName:      normStr(itemName) || null,
+      itemSnapshot:  itemSnapshot || null,  // frozen Phase 2 structured attributes
       purchasePrice: pp,
       askPrice:      finitePositive(askPrice),
-      sourceType:    normStr(sourceType) || "OTHER",
+      sourceType:    srcNorm,
       city:          normStr(city),
       signal:        normStr(signal),
       trustScore:    finitePositive(trustScore) || null,
+      // Phase 10 fields
+      quantity:      qty,
+      conditionNotes: conditionNotes ? String(conditionNotes).slice(0, 500) : null,
+      // Lifecycle
       status:        "ACTIVE",
       acquiredAt:    now,
       linkedOutcomeId: null,
@@ -253,7 +282,7 @@ export async function updateInventoryItem(redis, invId, patches = {}, editedBy =
     if (!item) return { ok: false, error: "item_not_found" };
 
     const auditEntry = { at: Date.now(), by: editedBy, changes: {} };
-    const allowed    = ["notes", "purchasePrice", "askPrice", "itemName"];
+    const allowed    = ["notes", "purchasePrice", "askPrice", "itemName", "conditionNotes", "quantity"];
 
     for (const field of allowed) {
       if (patches[field] === undefined) continue;
@@ -277,6 +306,16 @@ export async function updateInventoryItem(redis, invId, patches = {}, editedBy =
         const name = patches.itemName ? String(patches.itemName).slice(0, 200) : item.itemName;
         auditEntry.changes.itemName = { from: item.itemName, to: name };
         item.itemName = name;
+      } else if (field === "conditionNotes") {
+        // Phase 10: condition notes (free text, up to 500 chars)
+        const cn = patches.conditionNotes ? String(patches.conditionNotes).slice(0, 500) : null;
+        auditEntry.changes.conditionNotes = { from: item.conditionNotes, to: cn };
+        item.conditionNotes = cn;
+      } else if (field === "quantity") {
+        // Phase 10: quantity correction (must be positive integer)
+        const qty = Math.max(1, Math.round(Math.abs(Number(patches.quantity) || 1)));
+        auditEntry.changes.quantity = { from: item.quantity, to: qty };
+        item.quantity = qty;
       }
     }
 

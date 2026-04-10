@@ -141,15 +141,56 @@ export function attachAffiliateLinksToItems(items) {
   return { items: tagged, hasAffiliateLinks };
 }
 
+// ── Phase 10 Tweak 2: Low-confidence monetization kill-switch ─────────────────
+//
+// If the AI's vision confidence falls below 65%, the affiliate payload is
+// stripped entirely before returning. We only monetize when we are certain.
+// This protects the Evan brand and prevents commission on uncertain identifications.
+//
+// Threshold: AFFILIATE_CONFIDENCE_THRESHOLD = 65 (percent, 0–100 scale)
+// Checked against: payload.visionConfidence, payload.confidenceV2, or
+//                  payload.profitIntel.visionConfidence (first finite value wins)
+//
+// When blocked: payload._affiliateBlocked = true, payload._affiliateBlockReason set.
+// No affiliate links are attached. No disclosure shown.
+
+export const AFFILIATE_CONFIDENCE_THRESHOLD = 65;  // %
+
 /**
  * Apply affiliate routing to a complete scan payload.
  * Runs LAST — after signal computation, plan gating, and all other logic.
+ *
+ * Phase 10 Tweak 2: strips affiliate payload if visionConfidence < 65%.
  *
  * @param {object} payload  — scan response (mutated in place)
  * @returns {object} payload
  */
 export function attachAffiliateLinksToPayload(payload) {
   if (!payload?.profitIntel?.items?.length) return payload;
+
+  // ── Tweak 2: confidence kill-switch ────────────────────────────────────────
+  // Resolve vision confidence from any available field (0–100 scale)
+  const rawConf =
+    payload.visionConfidence            ??    // top-level (set by some scan paths)
+    payload.confidenceV2                ??    // normalized confidence (0–100)
+    payload.profitIntel?.visionConfidence ??  // nested path
+    null;
+
+  // confidenceV2 might be 0–1; normalize to percent
+  let confPct = null;
+  if (rawConf != null && Number.isFinite(Number(rawConf))) {
+    const n = Number(rawConf);
+    confPct = n <= 1 ? n * 100 : n;   // treat ≤1 as 0–1 float, else as percent
+  }
+
+  if (confPct != null && confPct < AFFILIATE_CONFIDENCE_THRESHOLD) {
+    payload._affiliateBlocked      = true;
+    payload._affiliateBlockReason  = "low_vision_confidence";
+    payload._affiliateConfidence   = Math.round(confPct);
+    payload._affiliateThreshold    = AFFILIATE_CONFIDENCE_THRESHOLD;
+    return payload;  // ← exit early, no links attached
+  }
+  // ── End Tweak 2 ─────────────────────────────────────────────────────────────
 
   const { items: taggedItems, hasAffiliateLinks } =
     attachAffiliateLinksToItems(payload.profitIntel.items);
