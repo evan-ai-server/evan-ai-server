@@ -1100,9 +1100,15 @@ import {
 import {
   createSwarmJob, getJob, getWorker,
   drainScoutQueue, drainSpecialistQueue,
+  drainValidatorQueue, runValidator,
   triggerLotDistribution, reapStaleWorkers, getSwarmOps,
   WORKER_STATUS, WORKER_ROLE, JOB_STATUS, BUY_SIGNAL,
 } from "./src/swarmOrchestrator.js";
+
+import {
+  resolvePayload, getCategoryMultiplier, computeAlphaScore,
+  PAYLOAD_ID, ALPHA_ROI_THRESHOLD, VALIDATOR_CONFIDENCE_FLOOR,
+} from "./src/payloadRegistry.js";
 
 import {
   detectLedgerDrift, rollbackToLastKnownTruth,
@@ -26900,6 +26906,57 @@ app.post(
     try {
       const [swarm, dist] = await Promise.all([getSwarmOps(redis), getLotDistributionOps(redis)]);
       return res.status(200).json({ ok: true, swarm, distribution: dist });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/drain/validator
+  // Process pending Alpha candidates through a Validator Specialist.
+  app.post("/api/p10/swarm/drain/validator", async (req, res) => {
+    try {
+      const { batchSize, capitalBudget } = req.body;
+      const result = await drainValidatorQueue(redis, { batchSize, capitalBudget });
+      return res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // GET /api/p10/swarm/payload/:category
+  // Inspect which Expert Logic Module would be loaded for a given category.
+  app.get("/api/p10/swarm/payload/:category", async (req, res) => {
+    try {
+      const { category } = req.params;
+      const { itemName }  = req.query;
+      const payload = resolvePayload(category, itemName || "");
+      return res.status(200).json({
+        ok: true,
+        payloadId:          payload.id,
+        payloadLabel:       payload.label,
+        categoryMultiplier: payload.categoryMultiplier,
+        alphaROIThreshold:  payload.alphaROIThreshold,
+      });
+    } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
+  });
+
+  // POST /api/p10/swarm/alpha-check
+  // Compute Alpha score for an item without running a full swarm job.
+  app.post("/api/p10/swarm/alpha-check", async (req, res) => {
+    try {
+      const { category, itemName, estimatedValue, allocatedCost } = req.body;
+      if (estimatedValue == null || allocatedCost == null) {
+        return res.status(400).json({ ok: false, error: "missing_required_fields" });
+      }
+      const payload    = resolvePayload(category, itemName);
+      const alphaScore = computeAlphaScore(
+        { estimatedValue: Number(estimatedValue) },
+        payload,
+        Number(allocatedCost),
+      );
+      return res.status(200).json({
+        ok: true,
+        payloadId:                payload.id,
+        payloadLabel:             payload.label,
+        ...alphaScore,
+        validatorConfidenceFloor: VALIDATOR_CONFIDENCE_FLOOR,
+      });
     } catch (err) { return res.status(200).json({ ok: false, error: err?.message }); }
   });
 

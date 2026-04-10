@@ -45,6 +45,10 @@ import crypto from "crypto";
 import { evaluateLot }     from "./lotScanner.js";
 import { distributeLot, DIST_STRATEGY } from "./lotDistributionEngine.js";
 import { recordEntry, TXN_TYPE, TXN_DIRECTION, RELATED_TYPE } from "./transactionLedger.js";
+import {
+  resolvePayload, applyPayloadValuation, computeAlphaScore,
+  VALIDATOR_CONFIDENCE_FLOOR,
+} from "./payloadRegistry.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -73,10 +77,12 @@ export const JOB_STATUS = Object.freeze({
 });
 
 export const BUY_SIGNAL = Object.freeze({
-  STRONG_BUY: "STRONG_BUY",
-  GOOD_DEAL:  "GOOD_DEAL",
-  WATCH:      "WATCH",
-  PASS:       "PASS",
+  STRONG_BUY:          "STRONG_BUY",
+  GOOD_DEAL:           "GOOD_DEAL",
+  WATCH:               "WATCH",
+  PASS:                "PASS",
+  ALPHA_CANDIDATE:     "ALPHA_CANDIDATE",     // ROI > 200% — pending validator
+  VALIDATOR_CONFIRMED: "VALIDATOR_CONFIRMED", // Alpha confirmed by second specialist
 });
 
 // TruthGuard floor — matches affiliateRouter.js AFFILIATE_CONFIDENCE_THRESHOLD
@@ -92,6 +98,7 @@ const KEY_WORKER = (id) => `p10:swarm:worker:${id}`;
 const KEY_JOB    = (id) => `p10:swarm:job:${id}`;
 const KEY_Q_SCOUT      = () => `p10:swarm:queue:scout`;
 const KEY_Q_SPECIALIST = () => `p10:swarm:queue:specialist`;
+const KEY_Q_VALIDATOR  = () => `p10:swarm:queue:validator`;
 const KEY_OPS          = () => `p10:swarm:ops`;
 
 // ── Job Management ────────────────────────────────────────────────────────────
@@ -453,8 +460,9 @@ export async function runSpecialist(redis, workerId, {
     // Platform routing (from reportingEngine.getPlatformSnapshot)
     const bestPlatform = platformIntel?.bestByWinRate?.platform || null;
 
-    // Derive buy signal
-    const signal = _deriveBuySignal({
+    // ── Payload hot-swap — equip the specialist with domain expertise ──────
+    const payload        = resolvePayload(item.category, item.itemName);
+    const baseSignal     = _deriveBuySignal({
       tier:          item.tier,
       confidence:    guard.confidence,
       expectedProfit,
@@ -463,42 +471,93 @@ export async function runSpecialist(redis, workerId, {
       catWinRate,
       catAvgProfit,
     });
+    const payloadResult  = applyPayloadValuation(payload, item, baseSignal, allocatedCost);
+    const signal         = payloadResult.adjustedSignal;
+    const adjustedValue  = payloadResult.adjustedValue || estimatedValue;
+
+    // ── Alpha Signal Filter — ROI > 200% requires Validator Specialist ────
+    const alphaScore = computeAlphaScore(
+      { ...item, estimatedValue: adjustedValue },
+      payload,
+      allocatedCost,
+    );
 
     const specialistResult = {
       signal,
-      confidence:    guard.confidence,
+      baseSignal,
+      payloadId:        payload.id,
+      payloadLabel:     payload.label,
+      payloadMultiplier:payloadResult.payloadMultiplier,
+      payloadReasoning: payloadResult.reasoning,
+      confidence:       guard.confidence,
       expectedProfit,
-      estimatedValue,
+      estimatedValue:   adjustedValue,
       allocatedCost,
       catWinRate,
       catAvgProfit,
       bestPlatform,
-      analyzedAt:    Date.now(),
+      alphaScore,
+      analyzedAt:       Date.now(),
     };
 
     // Telemetry snapshot — always captured for specialist outputs
     const telemetrySnapshot = {
       workerId,
-      jobId:        worker.jobId,
-      lotId:        worker.lotId,
-      scanId:       item.scanId || null,
-      itemName:     item.itemName || null,
-      tier:         item.tier || "?",
+      jobId:         worker.jobId,
+      lotId:         worker.lotId,
+      scanId:        item.scanId || null,
+      itemName:      item.itemName || null,
+      tier:          item.tier || "?",
       signal,
-      confidence:   guard.confidence,
+      baseSignal,
+      payloadId:     payload.id,
+      confidence:    guard.confidence,
       expectedProfit,
-      estimatedValue,
+      estimatedValue: adjustedValue,
       allocatedCost,
+      alphaROI:      alphaScore.roi,
+      isAlpha:       alphaScore.isAlpha,
       catWinRate,
       bestPlatform,
-      snapshotAt:   Date.now(),
+      snapshotAt:    Date.now(),
     };
+
+    // ── Alpha gate: high-ROI items must be validated before ledger write ──
+    if (alphaScore.isAlpha && (signal === BUY_SIGNAL.STRONG_BUY || signal === BUY_SIGNAL.GOOD_DEAL)) {
+      await _transitionWorker(redis, workerId, WORKER_STATUS.VALUATING, {
+        visionConfidence: guard.confidence,
+        specialistResult,
+        telemetrySnapshot,
+        buySignal:        BUY_SIGNAL.ALPHA_CANDIDATE,
+      });
+      // Enqueue for Validator Specialist — second opinion required
+      await redis.rpush(KEY_Q_VALIDATOR(), JSON.stringify({
+        jobId:          worker.jobId,
+        lotId:          worker.lotId,
+        userId:         worker.userId,
+        item:           { ...item, estimatedValue: adjustedValue },
+        parentWorkerId: workerId,
+        alphaScore,
+        specialistResult,
+      })).catch(() => {});
+      await redis.hincrby(KEY_OPS(), "alpha_candidates", 1).catch(() => {});
+      return {
+        ok:             true,
+        workerId,
+        status:         WORKER_STATUS.VALUATING,
+        buySignal:      BUY_SIGNAL.ALPHA_CANDIDATE,
+        alphaScore,
+        validatorQueued: true,
+        payloadId:      payload.id,
+        note:           `Alpha candidate (ROI ${alphaScore.roi}%) — routed to Validator Specialist`,
+      };
+    }
 
     let ledgerEntryId = null;
 
     // ── ACQUIRING gate — BUY signals require LedgerEntry + capital check ──
     if (signal === BUY_SIGNAL.STRONG_BUY || signal === BUY_SIGNAL.GOOD_DEAL) {
-      const recommendedBid = allocatedCost > 0 ? allocatedCost : r2(estimatedValue * 0.55);
+      const recommendedBid = allocatedCost > 0 ? allocatedCost : r2(adjustedValue * 0.55);
 
       // Capital budget enforcement
       if (recommendedBid > capitalBudget) {
@@ -524,10 +583,10 @@ export async function runSpecialist(redis, workerId, {
       const ledgerResult = await recordEntry(redis, worker.userId, {
         type:              TXN_TYPE.ADJUSTMENT,
         amount:            0,
-        adjustmentReason:  `Swarm telemetry snapshot — ${signal} on ${item.itemName || item.scanId} (lot ${worker.lotId})`,
+        adjustmentReason:  `Swarm telemetry [${payload.id}] — ${signal} on ${item.itemName || item.scanId} (lot ${worker.lotId})`,
         relatedId:         worker.jobId,
         relatedType:       RELATED_TYPE.OTHER,
-        description:       `Worker ${workerId} signal: ${signal} | confidence: ${guard.confidence}% | est. value: $${estimatedValue}`,
+        description:       `Worker ${workerId} | payload: ${payload.id} | signal: ${signal} | confidence: ${guard.confidence}% | adj.value: $${adjustedValue}`,
         recordedBy:        "swarmOrchestrator",
       }).catch(() => null);
 
@@ -539,15 +598,16 @@ export async function runSpecialist(redis, workerId, {
       await redis.hincrby(KEY_OPS(), "buy_signals_emitted", 1).catch(() => {});
 
       return {
-        ok:             true,
+        ok:               true,
         workerId,
-        status:         WORKER_STATUS.COMPLETE,
-        buySignal:      signal,
+        status:           WORKER_STATUS.COMPLETE,
+        buySignal:        signal,
         recommendedBid,
-        confidence:     guard.confidence,
+        confidence:       guard.confidence,
         ledgerEntryId,
         telemetrySnapshot,
         specialistResult,
+        payloadId:        payload.id,
       };
     }
 
@@ -566,6 +626,7 @@ export async function runSpecialist(redis, workerId, {
       buySignal:    signal,
       confidence:   guard.confidence,
       specialistResult,
+      payloadId:    payload.id,
     };
 
   } catch (err) {
@@ -688,6 +749,185 @@ export async function drainSpecialistQueue(redis, {
 
     stats.processed++;
     remaining--;
+  }
+
+  return { ok: true, ...stats };
+}
+
+// ── Validator Specialist ──────────────────────────────────────────────────────
+
+/**
+ * Run a Validator Specialist — a second-opinion worker for Alpha candidates.
+ *
+ * Requirements are stricter than a standard Specialist:
+ *   - Confidence floor: 75% (vs 65% for standard)
+ *   - Margin threshold: 40% (vs 30%)
+ *   - If confirmed: writes VALIDATOR_CONFIRMED to ledger and completes
+ *   - If rejected: downgrades to WATCH and completes without ledger entry
+ *
+ * @param {object} redis
+ * @param {string} workerId  — must be a SPECIALIST role worker
+ */
+export async function runValidator(redis, workerId, { capitalBudget = Infinity } = {}) {
+  if (!redis || !workerId) return { ok: false, error: "missing_args" };
+
+  const worker = await getWorker(redis, workerId);
+  if (!worker) return { ok: false, error: "worker_not_found" };
+
+  await redis.hincrby(KEY_OPS(), "validator_runs", 1).catch(() => {});
+
+  try {
+    const item         = worker.item;
+    const alphaScore   = worker.alphaScore || {};
+    const parentResult = worker.parentSpecialistResult || {};
+
+    // Stricter confidence check for validator
+    const guard = _truthGuard(item, workerId);
+    const confPct = guard.confidence;
+
+    if (confPct == null || confPct < VALIDATOR_CONFIDENCE_FLOOR) {
+      await _transitionWorker(redis, workerId, WORKER_STATUS.SCRUBBED, {
+        scrubReason: `validator_confidence_below_floor: ${confPct}% < ${VALIDATOR_CONFIDENCE_FLOOR}%`,
+        buySignal:   BUY_SIGNAL.WATCH,
+      });
+      await redis.hincrby(KEY_OPS(), "validator_rejected", 1).catch(() => {});
+      return {
+        ok:       true,
+        workerId,
+        status:   WORKER_STATUS.SCRUBBED,
+        buySignal: BUY_SIGNAL.WATCH,
+        note:     `Validator: confidence ${confPct}% below ${VALIDATOR_CONFIDENCE_FLOOR}% floor — alpha rejected`,
+      };
+    }
+
+    // Re-run payload valuation independently — validator uses same payload
+    const payload       = resolvePayload(item.category, item.itemName);
+    const allocatedCost = Number(item.allocatedCost || 0);
+    const estimatedValue= Number(item.estimatedValue || item.estimatedCost || 0);
+
+    // Stricter margin requirement for validator: 40% minimum
+    const margin = estimatedValue > 0 && allocatedCost > 0
+      ? (estimatedValue - allocatedCost) / estimatedValue
+      : 0;
+
+    if (margin < 0.40) {
+      // Validator rejects — alpha ROI was overstated
+      await _transitionWorker(redis, workerId, WORKER_STATUS.COMPLETE, {
+        buySignal:  BUY_SIGNAL.WATCH,
+        visionConfidence: confPct,
+        validatorNote: `margin ${r2(margin * 100)}% below 40% validator threshold — alpha rejected`,
+      });
+      await redis.hincrby(KEY_OPS(), "validator_rejected", 1).catch(() => {});
+      return {
+        ok:             true,
+        workerId,
+        status:         WORKER_STATUS.COMPLETE,
+        buySignal:      BUY_SIGNAL.WATCH,
+        alphaConfirmed: false,
+        margin:         r2(margin * 100),
+        note:           "Alpha rejected — margin below validator threshold",
+      };
+    }
+
+    // ── Validator confirms — proceed to ACQUIRING with ledger write ────────
+    const recommendedBid = allocatedCost > 0 ? allocatedCost : r2(estimatedValue * 0.55);
+
+    if (recommendedBid > capitalBudget) {
+      await _transitionWorker(redis, workerId, WORKER_STATUS.SCRUBBED, {
+        scrubReason: `capital_budget_exceeded: recommend $${recommendedBid}, remaining $${capitalBudget}`,
+        buySignal:   BUY_SIGNAL.VALIDATOR_CONFIRMED,
+      });
+      return { ok: true, workerId, status: WORKER_STATUS.SCRUBBED, scrubReason: "capital_budget_exceeded" };
+    }
+
+    await _transitionWorker(redis, workerId, WORKER_STATUS.ACQUIRING, {
+      buySignal:        BUY_SIGNAL.VALIDATOR_CONFIRMED,
+      visionConfidence: confPct,
+    });
+
+    const ledgerResult = await recordEntry(redis, worker.userId, {
+      type:              TXN_TYPE.ADJUSTMENT,
+      amount:            0,
+      adjustmentReason:  `VALIDATOR_CONFIRMED: Alpha lot ${worker.lotId} | ROI ${alphaScore.roi}% | payload ${payload.id} | conf ${confPct}%`,
+      relatedId:         worker.jobId,
+      relatedType:       RELATED_TYPE.OTHER,
+      description:       `Validator ${workerId} confirmed alpha candidate — ${item.itemName || item.scanId} | est. value $${estimatedValue} | cost $${allocatedCost}`,
+      recordedBy:        "swarmOrchestrator:validator",
+    }).catch(() => null);
+
+    await _transitionWorker(redis, workerId, WORKER_STATUS.LEDGER_SYNC, { ledgerEntryId: ledgerResult?.txnId || null });
+    await _transitionWorker(redis, workerId, WORKER_STATUS.COMPLETE, {});
+    await redis.hincrby(KEY_OPS(), "alpha_confirmed", 1).catch(() => {});
+    await redis.hincrby(KEY_OPS(), "buy_signals_emitted", 1).catch(() => {});
+
+    return {
+      ok:              true,
+      workerId,
+      status:          WORKER_STATUS.COMPLETE,
+      buySignal:       BUY_SIGNAL.VALIDATOR_CONFIRMED,
+      alphaConfirmed:  true,
+      alphaROI:        alphaScore.roi,
+      recommendedBid,
+      ledgerEntryId:   ledgerResult?.txnId || null,
+      payloadId:       payload.id,
+    };
+
+  } catch (err) {
+    await _transitionWorker(redis, workerId, WORKER_STATUS.FAILED, { scrubReason: err.message || "validator_error" });
+    return { ok: false, error: err.message || "validator_error" };
+  }
+}
+
+/**
+ * Process pending items from the validator queue.
+ *
+ * @param {object} redis
+ * @param {object} opts
+ *   batchSize     {number}  max items per call (default: 3 — validators are expensive)
+ *   capitalBudget {number}
+ */
+export async function drainValidatorQueue(redis, { batchSize = 3, capitalBudget = Infinity } = {}) {
+  if (!redis) return { ok: false, error: "no_redis" };
+
+  const stats = { processed: 0, confirmed: 0, rejected: 0, failed: 0 };
+  let capRemaining = capitalBudget;
+
+  for (let i = 0; i < batchSize; i++) {
+    const raw = await redis.lpop(KEY_Q_VALIDATOR()).catch(() => null);
+    if (!raw) break;
+
+    let entry;
+    try { entry = JSON.parse(raw); } catch { stats.failed++; continue; }
+
+    const workerId = await _spawnWorker(redis, {
+      jobId:          entry.jobId,
+      lotId:          entry.lotId,
+      userId:         entry.userId,
+      role:           WORKER_ROLE.SPECIALIST,   // validators are specialist-role
+      item:           entry.item,
+      parentWorkerId: entry.parentWorkerId || null,
+    });
+
+    // Inject alpha context into the new worker
+    await _transitionWorker(redis, workerId, WORKER_STATUS.IDLE, {
+      alphaScore:              entry.alphaScore,
+      parentSpecialistResult:  entry.specialistResult,
+    });
+
+    await _appendWorkerToJob(redis, entry.jobId, workerId);
+
+    const result = await runValidator(redis, workerId, { capitalBudget: capRemaining });
+
+    if (result.alphaConfirmed) {
+      stats.confirmed++;
+      if (result.recommendedBid) capRemaining = r2(capRemaining - result.recommendedBid);
+    } else if (!result.ok) {
+      stats.failed++;
+    } else {
+      stats.rejected++;
+    }
+
+    stats.processed++;
   }
 
   return { ok: true, ...stats };

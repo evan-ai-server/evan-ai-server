@@ -28,6 +28,7 @@
 import crypto from "crypto";
 import { createInventoryItem, SOURCE_TYPE } from "./inventoryEngine.js";
 import { recordPurchase, RELATED_TYPE }     from "./transactionLedger.js";
+import { getCategoryMultiplier }            from "./payloadRegistry.js";
 
 // ── Distribution strategy constants ───────────────────────────────────────────
 
@@ -68,12 +69,13 @@ export async function distributeLot(redis, {
   lotId,
   userId,
   totalPaid,
-  items        = [],
-  strategy     = DIST_STRATEGY.SIGNAL_WEIGHTED,
-  sourceType   = SOURCE_TYPE.OTHER,
-  acquiredAt   = null,
-  notes        = null,
-  dryRun       = false,
+  items               = [],
+  strategy            = DIST_STRATEGY.SIGNAL_WEIGHTED,
+  sourceType          = SOURCE_TYPE.OTHER,
+  acquiredAt          = null,
+  notes               = null,
+  dryRun              = false,
+  useCategoryMultiplier = false,  // when true, SIGNAL_WEIGHTED applies payload multipliers
 } = {}) {
   if (!redis)      return { ok: false, error: "no_redis" };
   if (!lotId)      return { ok: false, error: "missing_lot_id" };
@@ -87,7 +89,7 @@ export async function distributeLot(redis, {
   const ts = acquiredAt != null ? Number(acquiredAt) : Date.now();
 
   // ── Compute raw weights ───────────────────────────────────────────────────
-  const weights = _computeWeights(items, validStrategy);
+  const weights = _computeWeights(items, validStrategy, useCategoryMultiplier);
   const totalWeight = weights.reduce((s, w) => s + w, 0);
 
   if (totalWeight <= 0) return { ok: false, error: "zero_weight_distribution" };
@@ -234,16 +236,21 @@ export async function getDistributionOps(redis) {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-function _computeWeights(items, strategy) {
+function _computeWeights(items, strategy, useCategoryMultiplier = false) {
   switch (strategy) {
     case DIST_STRATEGY.EQUAL:
       return items.map(() => 1);
 
     case DIST_STRATEGY.SIGNAL_WEIGHTED:
       return items.map(item => {
-        const tierW  = TIER_WEIGHTS[item.tier || "?"] ?? 1.0;
-        const confW  = item.confidence > 0 ? item.confidence : 0.5;
-        return tierW * confW;
+        const tierW = TIER_WEIGHTS[item.tier || "?"] ?? 1.0;
+        const confW = item.confidence > 0 ? item.confidence : 0.5;
+        // Payload category multiplier: high-demand verticals (designer apparel,
+        // vintage electronics) receive heavier cost-basis allocation.
+        const catW  = useCategoryMultiplier
+          ? getCategoryMultiplier(item.category, item.itemName)
+          : 1.0;
+        return tierW * confW * catW;
       });
 
     case DIST_STRATEGY.MARKET_PROPORTIONAL: {
