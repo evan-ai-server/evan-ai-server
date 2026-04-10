@@ -1127,6 +1127,19 @@ import {
   getInvariantOps,
 } from "./src/swarmInvariants.js";
 
+// Security hardening: honeytoken, HMAC signing, outlier squashing, schema validation
+import {
+  squashPriceOutliers,
+  honeytokenMiddleware,
+  abuseTrackerMiddleware,
+  b2bSignatureMiddleware,
+  globalErrorHandler,
+  setHoneytokenRedis,
+  SCHEMAS,
+  schemaMiddleware as bodySchemaMiddleware,
+  sanitizeInput,
+} from "./src/securityHardening.js";
+
 // Institutional Bridge: Signal Fingerprint + Platform Fee engines
 import { buildSignalMap }           from "./src/signalFingerprintEngine.js";
 import { buildPlatformFeePayload }  from "./src/platformFeeEngine.js";
@@ -1467,7 +1480,9 @@ const AUTH_JWT_SECRET = String(process.env.AUTH_JWT_SECRET || "");
 const AUTH_TOKEN_ISSUER = String(process.env.AUTH_TOKEN_ISSUER || "");
 const AUTH_TOKEN_AUDIENCE = String(process.env.AUTH_TOKEN_AUDIENCE || "");
 
+// SECURITY: dev fallback MUST be disabled in production — never allow userId from body in prod
 const AUTH_ALLOW_DEV_BODY_FALLBACK =
+  !IS_PROD &&
   String(process.env.AUTH_ALLOW_DEV_BODY_FALLBACK || "false").toLowerCase() === "true";
 
 const PLAN_SCAN_LIMIT_ANON = Number(process.env.PLAN_SCAN_LIMIT_ANON || 15);
@@ -2203,8 +2218,18 @@ function buildAuthContextFromClaims(claims = {}) {
 }
 
 function hasValidApiKey(req) {
-  const key = String(req.headers["x-api-key"] || "");
-  return !process.env.API_KEY || key === process.env.API_KEY;
+  const configuredKey = String(process.env.API_KEY || "").trim();
+  // Production guard: if API_KEY is not set, deny all API key auth (fail closed)
+  if (!configuredKey) {
+    if (IS_PROD) return false;
+    return false; // always require explicit key — never allow unauthenticated access
+  }
+  const key = String(req.headers["x-api-key"] || "").trim();
+  if (!key) return false;
+  const a = Buffer.from(key,           "utf8");
+  const b = Buffer.from(configuredKey, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 function resolveDevelopmentFallbackUserId(req) {
@@ -2457,9 +2482,20 @@ app.use(
 
 app.use(
   helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc:  ["'none'"],
+        scriptSrc:   ["'self'"],
+        connectSrc:  ["'self'"],
+        imgSrc:      ["'self'", "data:"],
+        frameSrc:    ["'none'"],
+        objectSrc:   ["'none'"],
+        baseUri:     ["'self'"],
+        formAction:  ["'self'"],
+      },
+    },
+    crossOriginEmbedderPolicy:  false, // kept off — CDN images break with COEP
+    crossOriginResourcePolicy:  { policy: "same-origin" }, // re-enabled
   })
 );
 
@@ -2475,6 +2511,12 @@ app.use((req, res, next) => {
 app.use(requireEdgeSecret);
 app.use(globalApiLimiter);
 app.use(writeApiLimiter);
+// Second-layer burst abuse detection (10-scan/10s hard limit per IP on scan routes)
+app.use(abuseTrackerMiddleware({
+  limitPaths: ["/market/search", "/api/vision/analyze", "/upload/presign", "/vision/enrich"],
+}));
+// Honeytoken bot detection — absent/invalid X-Ev-Client-Token → shadow-ban
+app.use(honeytokenMiddleware({ required: false }));
 
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.urlencoded({ extended: true, limit: URLENCODED_BODY_LIMIT }));
@@ -3751,6 +3793,9 @@ const redis =
     : null;
 
 if (redis) {
+  // Wire honeytoken detection to Redis for persistent bot tracking
+  setHoneytokenRedis(redis);
+
   redis.on("connect", () => {
     setMetric("redis_up", 1, { instanceId: INSTANCE_ID });
     logEvent("info", "redis_connect", {});
@@ -12668,27 +12713,29 @@ function requireSelfUserId(req, res, next) {
 }
 
 function requireApiKey(req, res, next) {
-  const configuredKey = safeStr(process.env.API_KEY, 240);
-  const providedKey = safeStr(req.headers["x-api-key"], 240);
+  const configuredKey = String(process.env.API_KEY || "").trim();
+  const providedKey   = String(req.headers["x-api-key"] || "").trim().slice(0, 240);
 
   if (!configuredKey) {
+    // Fail closed in production — never allow unauthenticated ops-key access
     if (IS_PROD) {
-      return res.status(503).json({
-        ok: false,
-        error: "api_key_not_configured",
-      });
+      return res.status(503).json({ ok: false, error: "api_key_not_configured" });
     }
+    return next(); // dev only
+  }
+
+  if (!providedKey) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  // Constant-time comparison to prevent timing attacks
+  const a = Buffer.from(providedKey,   "utf8");
+  const b = Buffer.from(configuredKey, "utf8");
+  if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
     return next();
   }
 
-  if (providedKey === configuredKey) {
-    return next();
-  }
-
-  return res.status(401).json({
-    ok: false,
-    error: "unauthorized",
-  });
+  return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
 function safeJsonParse(value, fallback = {}) {
@@ -18694,7 +18741,7 @@ app.get("/api/scan/status", async (req, res) => {
 });
 
 // ── POST /api/scan/consume ────────────────────────────────────────────────────
-app.post("/api/scan/consume", async (req, res) => {
+app.post("/api/scan/consume", bodySchemaMiddleware(SCHEMAS.scanConsume), async (req, res) => {
   try {
     const actor = _resolveActor(req);
     const day   = _scanDay();
@@ -18747,7 +18794,7 @@ app.post("/api/scan/consume", async (req, res) => {
 // Issues or recovers a persistent guestId tied to device fingerprint (installId).
 // Anti-bypass: fingerprint is hashed server-side; new installs on same device
 // recover the same guestId (preventing reinstall abuse).
-app.post("/api/guest/identify", async (req, res) => {
+app.post("/api/guest/identify", bodySchemaMiddleware(SCHEMAS.guestIdentify), async (req, res) => {
   try {
     const fp = String(req.body?.fingerprint || req.body?.installId || "").trim().slice(0, 128);
     if (!fp) return res.status(400).json({ ok: false, error: "fingerprint_required" });
@@ -19291,6 +19338,10 @@ async function runResultAwareRefinement({
   // Record initial query if it yielded good results
   if (Array.isArray(items) && items.length >= 5) recordQuerySuccess(initialQuery, category);
 
+  // ── SECURITY: 3σ outlier squashing — removes manipulated/fake price listings
+  // before they can inflate estimated value or distort ranking.
+  refinedItems = squashPriceOutliers(refinedItems, 3.0);
+
   const confidenceV2 = computeConfidenceV2({
     visionConfidence, crossCheck, resultConsensus, visionIdentity, refinedQuery,
   });
@@ -19308,7 +19359,7 @@ async function runResultAwareRefinement({
 }
 // ═══════════════════════════════════════════════════════════════════════════════
 
-app.post("/market/search", async (req, res) => {
+app.post("/market/search", bodySchemaMiddleware(SCHEMAS.marketSearch), async (req, res) => {
   try {
 
 const _routeT0 = Date.now();
@@ -30258,6 +30309,10 @@ app.post("/api/profile/flip", async (req, res) => {
 </html>`);
   });
 
+  // ── Global error handler — MUST be last middleware, catches all unhandled errors.
+  // Prevents stack traces and internal details from leaking to clients.
+  app.use(globalErrorHandler);
+
   // -------------------- Start + graceful shutdown --------------------
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
@@ -31936,6 +31991,11 @@ async function _b2bCheckAndEnforce(req, res, endpoint) {
   res.set("X-B2B-Remaining", String(budget.remaining));
   return false;  // allowed
 }
+
+// HMAC-SHA256 replay protection for all B2B API routes (required: false = advisory,
+// lets existing clients keep working while we enforce gradually)
+app.use("/api/b2b", b2bSignatureMiddleware({ required: false }));
+app.use("/api/institutional", b2bSignatureMiddleware({ required: false }));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/b2b/valuate
