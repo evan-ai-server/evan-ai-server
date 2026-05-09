@@ -12,6 +12,7 @@ import {
   verdictColor,
   enforceVerdictOnPayload,
   verdictForPrompt,
+  sanitizePromptContext,
   LEGACY_VERDICT_MAP,
   VERDICTS,
   VerdictLeakError,
@@ -258,4 +259,64 @@ test("verdictForPrompt returns null on unparseable input — never throws", () =
   assert.equal(verdictForPrompt(null,        "ai/test"), null);
   assert.equal(verdictForPrompt({},          "ai/test"), null);
   assert.equal(verdictForPrompt(0,           "ai/test"), null);
+});
+
+// ── sanitizePromptContext — Phase 9 prompt-input gate ───────────────
+
+test("sanitizePromptContext: returns empty object for non-objects", () => {
+  assert.deepEqual(sanitizePromptContext(null),     { ctx: {}, drifted: [] });
+  assert.deepEqual(sanitizePromptContext(undefined), { ctx: {}, drifted: [] });
+  assert.deepEqual(sanitizePromptContext("BUY"),     { ctx: {}, drifted: [] });
+  assert.deepEqual(sanitizePromptContext([1, 2]),    { ctx: {}, drifted: [] });
+});
+
+test("sanitizePromptContext: canonicalizes recoverable legacy verdicts", () => {
+  const { ctx, drifted } = sanitizePromptContext({
+    itemName: "Supreme box logo",
+    verdict:    "STRONG_BUY",
+    buyVerdict: "GREAT_FLIP",
+    buySignal:  "BUY_WITH_CAUTION",
+  });
+  assert.equal(ctx.verdict, "BUY");
+  assert.equal(ctx.buyVerdict, "BUY");
+  assert.equal(ctx.buySignal, "HOLD");
+  assert.equal(ctx.itemName, "Supreme box logo");
+  assert.equal(drifted.length, 3);
+});
+
+test("sanitizePromptContext: nulls out unparseable verdict strings", () => {
+  const { ctx, drifted } = sanitizePromptContext({
+    verdict:    "ZOMBIE_VERDICT",
+    buyVerdict: "??",
+  });
+  assert.equal(ctx.verdict, null);
+  assert.equal(ctx.buyVerdict, null);
+  assert.equal(drifted.length, 2);
+  assert.equal(drifted[0].canonical, null);
+});
+
+test("sanitizePromptContext: leaves canonical fields untouched", () => {
+  const before = { verdict: "BUY", buyVerdict: "PASS" };
+  const { ctx, drifted } = sanitizePromptContext(before);
+  assert.equal(ctx.verdict, "BUY");
+  assert.equal(ctx.buyVerdict, "PASS");
+  assert.equal(drifted.length, 0);
+});
+
+test("sanitizePromptContext: ignores fields that aren't verdict-bearing", () => {
+  const { ctx } = sanitizePromptContext({
+    verdict: "STRONG_BUY",
+    note: "OVERPRICED",          // non-verdict field — must NOT be touched
+    label: "GREAT_FLIP",
+  });
+  assert.equal(ctx.verdict, "BUY");
+  assert.equal(ctx.note, "OVERPRICED");
+  assert.equal(ctx.label, "GREAT_FLIP");
+});
+
+test("sanitizePromptContext: never mutates the input object", () => {
+  const input = { verdict: "STRONG_BUY", x: 1 };
+  const { ctx } = sanitizePromptContext(input);
+  assert.equal(input.verdict, "STRONG_BUY");  // unchanged
+  assert.notEqual(ctx, input);
 });

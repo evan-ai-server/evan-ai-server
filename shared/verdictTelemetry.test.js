@@ -236,3 +236,56 @@ test("buildAnalyticsPayload omits empty legacy", () => {
   const p = buildAnalyticsPayload({ verdict: "BUY", source: "x", legacy: {} });
   assert.equal("legacy" in p, false);
 });
+
+// ── Phase 10 — buildVerdictAnalyticsEvent (strict) ─────────────────
+
+import { buildVerdictAnalyticsEvent } from "./verdictTelemetry.js";
+
+test("buildVerdictAnalyticsEvent: produces canonical shape", () => {
+  const e = buildVerdictAnalyticsEvent({
+    event: "scan_complete",
+    verdict: "BUY",
+    source: "server",
+    extra: { userId: "u_1", scanId: "s_2" },
+  });
+  assert.equal(e.event,   "scan_complete");
+  assert.equal(e.verdict, "BUY");
+  assert.equal(e.source,  "server");
+  assert.equal(e.userId,  "u_1");
+  assert.equal(typeof e.ts, "number");
+});
+
+test("buildVerdictAnalyticsEvent: legacy nests under .legacy", () => {
+  const e = buildVerdictAnalyticsEvent({
+    event:   "x",
+    verdict: "PASS",
+    source:  "cache",
+    legacy:  { buySignal: "OVERPRICED" },
+  });
+  assert.deepEqual(e.legacy, { buySignal: "OVERPRICED" });
+});
+
+test("buildVerdictAnalyticsEvent: rejects legacy verdicts", () => {
+  assert.throws(
+    () => buildVerdictAnalyticsEvent({ event: "x", verdict: "STRONG_BUY", source: "server" }),
+    /non-canonical verdict/
+  );
+});
+
+test("buildVerdictAnalyticsEvent: rejects unknown source", () => {
+  assert.throws(
+    () => buildVerdictAnalyticsEvent({ event: "x", verdict: "BUY", source: "redis" }),
+    /invalid source/
+  );
+  assert.throws(
+    () => buildVerdictAnalyticsEvent({ event: "x", verdict: "BUY", source: undefined }),
+    /invalid source/
+  );
+});
+
+test("buildVerdictAnalyticsEvent: rejects empty event name", () => {
+  assert.throws(
+    () => buildVerdictAnalyticsEvent({ event: "", verdict: "BUY", source: "server" }),
+    /non-empty string/
+  );
+});

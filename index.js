@@ -442,20 +442,49 @@ import { buildBuyOrPassPayload, computeBuyOrPass } from "./src/buyOrPassEngine.j
 import {
   enforceVerdictOnPayload,
   verdictForPrompt,
+  sanitizePromptContext,
   normalizeVerdict,
+  isCanonicalVerdict,
   VerdictLeakError,
 } from "./shared/verdict.js";
 import { assembleLegacyNamespace } from "./shared/legacyNamespace.js";
 import {
   reportLegacyDrift,
   reportPromptDrift,
+  reportServerClientMismatch,
+  reportVerdictDisagreement,
+  buildAnalyticsPayload,
+  buildVerdictAnalyticsEvent,
   setVerdictTelemetrySink,
 } from "./shared/verdictTelemetry.js";
+import {
+  STORED_SCAN_SCHEMA_VERSION,
+  buildFreshStoredScan,
+  hydrateStoredScan,
+  isStoredScanFresh,
+  normalizeStoredScan,
+} from "./shared/storedScan.js";
+import {
+  assertNotificationClean,
+  buildNotification,
+  buildNotificationFromVerdict,
+  REASON_CODES,
+} from "./shared/notification.js";
 
-// Phase 6: server-side telemetry sink. Routes verdict_disagreement_event
-// through console for now; production deployments should replace this
-// with the structured logger / Sentry / analytics pipe.
+// Phase 6 + Phase 11: server-side telemetry sink for verdict drift.
+// Routes verdict_disagreement_event into the structured logger so it
+// flows alongside the rest of our analytics, then mirrors to console.
+// Production deployments can layer Sentry / Snowflake on top of the
+// structured logger without changing this hook.
 setVerdictTelemetrySink((event) => {
+  try {
+    // Use level=warn so drift surfaces in alerting dashboards but
+    // doesn't pollute error budgets. logEvent stamps ts, instanceId, etc.
+    if (typeof logEvent === "function") {
+      logEvent("warn", "verdict_disagreement_event", event);
+      return;
+    }
+  } catch { /* fall through to console */ }
   console.warn("[verdict_disagreement_event]", JSON.stringify(event));
 });
 import { buildBarcodeIntelligencePayload, extractBarcodesFromText, lookupBarcode } from "./src/barcodeIntelligence.js";
@@ -8769,6 +8798,26 @@ function queueAnalyticsEvent(payload = {}) {
 }
 
 function queueNotificationFanout(payload = {}) {
+  // Phase 8 gate: every notification that fans out is asserted clean
+  // (no legacy enum strings in title/body). A regression upstream
+  // surfaces here as a thrown error rather than a contradictory device
+  // experience. Telemetry records the suppression.
+  try {
+    assertNotificationClean({ title: payload?.title, body: payload?.body });
+  } catch (err) {
+    try {
+      reportVerdictDisagreement({
+        trigger:  "ai-prompt-vs-canonical", // closest existing trigger; Phase 11 widens this
+        source:   `notification:${payload?.kind || "unknown"}`,
+        expected: payload?.data?.verdict ?? null,
+        received: payload?.title ?? payload?.body ?? null,
+        meta:     { reason: "notification_legacy_phrase", kind: payload?.kind || null },
+      });
+    } catch { /* telemetry never propagates */ }
+    console.warn("[notification] suppressed:", err?.message || err);
+    return Promise.resolve({ ok: false, kind: payload?.kind || null, suppressed: true });
+  }
+
   return enqueueBackgroundJob(
     "notification_fanout",
     payload,
@@ -17738,6 +17787,31 @@ async function buildMarketSearchResponsePayload({
     }
   } catch { /* telemetry never propagates */ }
 
+  // Phase 10: emit a clean analytics event keyed by canonical verdict.
+  // Legacy values demoted to .legacy; primary key is verdict + source.
+  try {
+    const canonicalVerdict = _responsePayload?.buyOrPass?.verdict ?? null;
+    if (canonicalVerdict) {
+      const evt = buildVerdictAnalyticsEvent({
+        event:   "scan_response",
+        verdict: canonicalVerdict,
+        source:  "server",
+        legacy:  {
+          profitIntelBuySignal: _responsePayload?.legacy?.profitIntelBuySignal ?? null,
+          dealQualityVerdict:   _responsePayload?.legacy?.dealQualityVerdict   ?? null,
+          dealEngineVerdict:    _responsePayload?.legacy?.dealEngineVerdict    ?? null,
+          swarmBuySignal:       _responsePayload?.legacy?.swarmBuySignal       ?? null,
+          smartAlertType:       _responsePayload?.legacy?.smartAlertType       ?? null,
+        },
+        extra: {
+          confidence: _responsePayload?.buyOrPass?.confidence ?? null,
+          reasonCode: _responsePayload?.buyOrPass?.reasonCode ?? null,
+        },
+      });
+      logEvent("info", "verdict_analytics", evt);
+    }
+  } catch { /* analytics must not break a response */ }
+
   return _responsePayload;
 }
 // ── Price history API ──────────────────────────────────────────────────────
@@ -21713,7 +21787,11 @@ function userHistoryKey(userId) {
 async function saveScanHistoryRecord(userId, record = {}) {
   if (!redis || !userId) return null;
 
-  const payload = {
+  // Phase 7: stamp canonical verdict + schema_v3 on write so legacy
+  // strings never become the authoritative state of a stored scan.
+  const verdict = pickCanonicalVerdictForStorage(record);
+
+  const body = {
     id:
       safeStr(record?.id, 80) ||
       `hist_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`,
@@ -21730,8 +21808,16 @@ async function saveScanHistoryRecord(userId, record = {}) {
     prediction: record?.prediction || null,
     consensus: record?.consensus || null,
     coach: record?.coach || null,
+    reasonCode: pickReasonCode(record),
     createdAt: Number(record?.createdAt || Date.now()),
+    // Carry raw legacy strings in so buildFreshStoredScan can archive them.
+    buySignal:     safeStr(record?.buySignal     || record?.profitIntel?.buySignal,    30) || null,
+    primaryAction: safeStr(record?.primaryAction || record?.profitIntel?.primaryAction, 30) || null,
   };
+
+  const payload = verdict
+    ? buildFreshStoredScan(body, verdict)
+    : { ...body, _schemaVersion: STORED_SCAN_SCHEMA_VERSION };
 
   await redis.lpush(userHistoryKey(userId), JSON.stringify(payload));
   await redis.ltrim(userHistoryKey(userId), 0, 199);
@@ -21742,12 +21828,39 @@ async function listScanHistoryRecords(userId, limit = 50) {
   if (!redis || !userId) return [];
 
   const rows = await redis.lrange(userHistoryKey(userId), 0, Math.max(0, limit - 1));
+  // Phase 7: normalize on every load. Drop unrecoverable rows and
+  // queue rewrites for any row whose schema/verdict drifted.
   const out = [];
-
+  let dirty = false;
+  /** @type {string[]} */
+  const newRows = [];
   for (const raw of rows) {
     try {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") out.push(parsed);
+      const { scan, changed, dropped } = normalizeStoredScan(parsed, {
+        source: "scan-history/list",
+      });
+      if (dropped) { dirty = true; continue; }
+      if (changed) dirty = true;
+      out.push(scan);
+      newRows.push(JSON.stringify(scan));
+    } catch {
+      dirty = true;
+    }
+  }
+
+  if (dirty) {
+    // Rewrite the list so legacy / corrupted rows don't survive a hydrate.
+    // newRows is in the same order as `rows`, so lpush in reverse to
+    // preserve recency ordering.
+    try {
+      const pipe = redis.multi();
+      pipe.del(userHistoryKey(userId));
+      for (let i = newRows.length - 1; i >= 0; i--) {
+        pipe.lpush(userHistoryKey(userId), newRows[i]);
+      }
+      pipe.ltrim(userHistoryKey(userId), 0, 199);
+      await pipe.exec();
     } catch {}
   }
 
@@ -21778,7 +21891,14 @@ async function saveSavedScanRecord(userId, record = {}) {
     existing = null;
   }
 
-  const payload = {
+  // Phase 7: resolve canonical verdict at write time (or carry forward
+  // the canonical verdict from an existing v3 record if the writer
+  // didn't supply one). buildFreshStoredScan stamps _schemaVersion: 3.
+  const verdict =
+    pickCanonicalVerdictForStorage(record) ??
+    (isStoredScanFresh(existing) ? existing.verdict : null);
+
+  const body = {
     id,
     query:      normalizeQuery(record?.query || record?.finalQuery || "") || null,
     finalQuery: normalizeQuery(record?.finalQuery || record?.query || "") || null,
@@ -21798,7 +21918,10 @@ async function saveSavedScanRecord(userId, record = {}) {
     visionIdentity:  record?.visionIdentity || null,
     prediction:      record?.prediction     || null,
     consensus:       record?.consensus      || null,
-    // Snapshot of decision intelligence at time of save
+    // Phase 7: canonical reason code, paired with verdict for notifications.
+    reasonCode:      pickReasonCode(record),
+    // Snapshot of decision intelligence at time of save (legacy strings
+    // archived under .legacy by buildFreshStoredScan).
     buySignal:       safeStr(record?.buySignal || record?.profitIntel?.buySignal, 30) || null,
     primaryAction:   safeStr(record?.primaryAction || record?.profitIntel?.primaryAction, 30) || null,
     profitIntelSnapshot: record?.profitIntel
@@ -21818,6 +21941,10 @@ async function saveSavedScanRecord(userId, record = {}) {
     updatedAt: Date.now(),
   };
 
+  const payload = verdict
+    ? buildFreshStoredScan(body, verdict)
+    : { ...body, _schemaVersion: STORED_SCAN_SCHEMA_VERSION };
+
   await redis
     .multi()
     .set(savedScanDocKey(userId, id), JSON.stringify(payload))
@@ -21835,15 +21962,75 @@ async function listSavedScanRecords(userId, limit = 100) {
 
   const raws = await redis.mget(ids.map((id) => savedScanDocKey(userId, id)));
   const out = [];
+  /** @type {Array<[string, string]>} */
+  const rewrites = [];
+  /** @type {string[]} */
+  const dropIds = [];
 
-  for (const raw of raws) {
+  for (let i = 0; i < raws.length; i++) {
+    const raw = raws[i];
+    const id  = ids[i];
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = null; }
+
+    const { scan, changed, dropped } = normalizeStoredScan(parsed, {
+      source: "saved-scans/list",
+    });
+
+    if (dropped) { dropIds.push(id); continue; }
+    if (changed) rewrites.push([id, JSON.stringify(scan)]);
+    out.push(scan);
+  }
+
+  // Phase 7 commitment: rewrite storage immediately whenever a load
+  // surfaced a non-canonical or pre-v3 record, and evict permanently
+  // corrupt rows from the index.
+  if (rewrites.length || dropIds.length) {
     try {
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed === "object") out.push(parsed);
+      const pipe = redis.multi();
+      for (const [id, json] of rewrites) {
+        pipe.set(savedScanDocKey(userId, id), json);
+      }
+      for (const id of dropIds) {
+        pipe.del(savedScanDocKey(userId, id));
+        pipe.zrem(savedScanIndexKey(userId), id);
+      }
+      await pipe.exec();
     } catch {}
   }
 
   return out;
+}
+
+// Phase 7 helper: choose the canonical verdict for a write. Order:
+//   1. record.buyOrPass.verdict     — already canonical from buyOrPassEngine
+//   2. record.verdict               — already canonical from a previous load
+//   3. normalizeVerdict(record.buySignal)         — legacy → canonical
+//   4. normalizeVerdict(record.primaryAction)
+// Returns null if nothing usable was supplied. Callers that get null
+// fall back to writing without a `verdict` field; the next load will
+// drop the doc as unrecoverable.
+function pickCanonicalVerdictForStorage(record = {}) {
+  const direct = record?.buyOrPass?.verdict ?? record?.verdict;
+  if (isCanonicalVerdict(direct)) return direct;
+  return (
+    normalizeVerdict(direct) ??
+    normalizeVerdict(record?.buySignal) ??
+    normalizeVerdict(record?.profitIntel?.buySignal) ??
+    normalizeVerdict(record?.profitIntelSnapshot?.buySignal) ??
+    normalizeVerdict(record?.primaryAction) ??
+    null
+  );
+}
+
+// Phase 7 helper: extract a canonical reason code, falling back through
+// the various places writers might have stashed it.
+function pickReasonCode(record = {}) {
+  return (
+    safeStr(record?.reasonCode, 80) ||
+    safeStr(record?.buyOrPass?.reasonCode, 80) ||
+    null
+  );
 }
 
 async function deleteSavedScanRecord(userId, scanId) {
@@ -22243,6 +22430,14 @@ app.post("/history/save", async (req, res) => {
       prediction: req.body?.prediction || null,
       consensus: req.body?.consensus || null,
       coach: req.body?.coach || null,
+      // Phase 7: thread the canonical verdict through so storage stamps
+      // _schemaVersion: 3 with a real `verdict` field.
+      buyOrPass:     req.body?.buyOrPass     || null,
+      verdict:       req.body?.verdict       || req.body?.buyOrPass?.verdict || null,
+      reasonCode:    req.body?.reasonCode    || req.body?.buyOrPass?.reasonCode || null,
+      buySignal:     req.body?.buySignal     || null,
+      primaryAction: req.body?.primaryAction || null,
+      profitIntel:   req.body?.profitIntel   || null,
     });
 
     return res.status(200).json({
@@ -22302,6 +22497,13 @@ app.post("/saved-scans/save", async (req, res) => {
       prediction: req.body?.prediction || null,
       consensus: req.body?.consensus || null,
       notes: req.body?.notes || null,
+      // Phase 7: thread canonical verdict + reason code through.
+      buyOrPass:     req.body?.buyOrPass     || null,
+      verdict:       req.body?.verdict       || req.body?.buyOrPass?.verdict || null,
+      reasonCode:    req.body?.reasonCode    || req.body?.buyOrPass?.reasonCode || null,
+      buySignal:     req.body?.buySignal     || null,
+      primaryAction: req.body?.primaryAction || null,
+      profitIntel:   req.body?.profitIntel   || null,
     });
 
     return res.status(200).json({
@@ -22900,13 +23102,53 @@ async function sendExpoPushNotification({ token, title, body, data = {} }) {
 /** Queue push + in-app notification for a price drop */
 async function notifyPriceDrop({ userId, query, bestPrice, dropAmount, dropPct, best }) {
   if (!userId) return;
-  const title = "Price Drop Alert 🔔";
-  const body = `${query} dropped to $${bestPrice ?? "?"} (${dropPct != null ? `-${Math.round(dropPct)}%` : `-$${Math.round(dropAmount ?? 0)}`})`;
+
+  // Phase 8: notifications are GENERATED from (canonicalVerdict, reasonCode).
+  // A price-drop alert is, semantically, a BUY signal — the watched price
+  // came down. The builder produces clean copy with no legacy strings.
+  const note = buildNotificationFromVerdict({
+    verdict: "BUY",
+    reasonCode: REASON_CODES.PRICE_DROP_ALERT,
+    source: "price_drop",
+    data: {
+      query,
+      bestPrice,
+      dropAmount,
+      dropPct,
+      itemTitle: best?.title || null,
+      itemSource: best?.source || null,
+    },
+  });
+
+  // Compose the user-visible body around the canonical headline. Keep
+  // the headline (note.body) verbatim from the builder and append
+  // numeric facts only — never legacy enums.
+  const dropFragment =
+    dropPct != null
+      ? `-${Math.round(dropPct)}%`
+      : `-$${Math.round(dropAmount ?? 0)}`;
+  const body = `${query} dropped to $${bestPrice ?? "?"} (${dropFragment}). ${note.body}`.trim();
+  const title = `🔔 ${note.title}`;
+
   const dedupeKey = `price_drop:${query}:${bestPrice}`;
-  const data = { query, bestPrice, dropAmount, dropPct, source: best?.source || null, title: best?.title || null };
+  const data = {
+    ...note.data,
+    verdict: note.verdict,
+    reasonCode: note.reasonCode,
+    source: best?.source || null,
+    title: best?.title || null,
+  };
 
   // In-app notification
-  queueNotificationFanout({ userId, kind: "price_drop", title, body, dedupeKey, data, cooldownMs: 12 * 60 * 60 * 1000 });
+  queueNotificationFanout({
+    userId,
+    kind: "price_drop",
+    title,
+    body,
+    dedupeKey,
+    data,
+    cooldownMs: 12 * 60 * 60 * 1000,
+  });
 
   // Device push notification
   try {
@@ -22914,6 +23156,52 @@ async function notifyPriceDrop({ userId, query, bestPrice, dropAmount, dropPct, 
     if (token) await sendExpoPushNotification({ token, title, body, data });
   } catch { /* non-fatal */ }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 11 — Verdict drift telemetry endpoint.
+//
+// The client (frontend) calls this whenever it observes:
+//   - server verdict ≠ what it actually rendered
+//   - cached scan verdict ≠ normalized verdict
+//   - any verdict-shaped string it can't normalize at all
+//
+// The server normalizes both sides and routes through the same sink
+// the rest of the verdict_disagreement_event pipeline uses, so client
+// drift is observable in the same dashboards as server drift.
+//
+// Body: {
+//   source: "scan_complete" | "history_load" | "notification_open" | ...
+//   trigger: "server-vs-client" | "cache-vs-normalized" | "ai-prompt-vs-canonical"
+//   serverVerdict: <raw>      // optional — what the server claimed
+//   clientVerdict: <raw>      // optional — what the client rendered
+//   scanId, userId, build:    optional metadata for triage
+// }
+// ─────────────────────────────────────────────────────────────────────
+app.post("/telemetry/verdict-disagreement", async (req, res) => {
+  try {
+    const source   = safeStr(req.body?.source, 100)  || "client";
+    const trigger  = safeStr(req.body?.trigger, 50);
+    const validTriggers = ["server-vs-client", "cache-vs-normalized", "ai-prompt-vs-canonical", "legacy-vs-canonical"];
+    const finalTrigger = validTriggers.includes(trigger) ? trigger : "server-vs-client";
+
+    reportVerdictDisagreement({
+      trigger:  finalTrigger,
+      source,
+      expected: req.body?.serverVerdict,
+      received: req.body?.clientVerdict,
+      meta: {
+        scanId:  safeStr(req.body?.scanId,  128) || null,
+        userId:  safeStr(req.body?.userId,  64)  || null,
+        build:   safeStr(req.body?.build,   40)  || null,
+        platform:safeStr(req.body?.platform,32)  || null,
+        screen:  safeStr(req.body?.screen,  64)  || null,
+      },
+    });
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    return res.status(200).json({ ok: false, error: err?.message || "telemetry_failed" });
+  }
+});
 
 // POST /push/register — store Expo push token for user
 app.post("/push/register", async (req, res) => {
@@ -29745,8 +30033,18 @@ app.post(
         return res.status(200).json({ ok: false, error: "invalid_messages" });
       }
 
-      // Build scan context block for system prompt
-      const ctx = scanContext || {};
+      // Build scan context block for system prompt.
+      // Phase 9: sanitize the entire context up front so no verdict-
+      // shaped field survives the LLM boundary in legacy form. drifted[]
+      // feeds Phase 6 telemetry — one event per non-canonical field.
+      const { ctx: rawCtx } = (() => {
+        const sanitized = sanitizePromptContext(scanContext || {});
+        for (const d of sanitized.drifted) {
+          try { reportPromptDrift(`api/ask:${d.field}`, d.canonical, d.raw); } catch {}
+        }
+        return sanitized;
+      })();
+      const ctx = rawCtx;
       const fmtPrice = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : null);
       const fmtPct   = (v) => (Number.isFinite(Number(v)) ? `${Math.round(Number(v))}%` : null);
 
@@ -29757,18 +30055,10 @@ app.post(
         ctx.price != null   ? `Best price found: ${fmtPrice(ctx.price)}`                                 : null,
         ctx.scannedPrice != null ? `Price user is paying: ${fmtPrice(ctx.scannedPrice)}`                  : null,
         ctx.savedAmount > 0 ? `Savings vs scanned price: ${fmtPrice(ctx.savedAmount)} (${fmtPct(ctx.cheaperPct)} less)` : null,
-        // Phase 2 boundary: LLM prompts must receive canonical verdict
-        // strings only. Bad cached payloads silently drop the line —
-        // we'd rather omit it than feed the model "STRONG_BUY" while
-        // the rest of the system says PASS.
-        // Phase 6: fire prompt-drift telemetry when normalization moved
-        // the value (i.e. raw ≠ canonical), so we can hunt down whoever
-        // stuffed a non-canonical verdict into ctx.
-        (() => {
-          const v = verdictForPrompt(ctx.buyVerdict, "api/ask");
-          if (v && v !== ctx.buyVerdict) reportPromptDrift("api/ask", v, ctx.buyVerdict);
-          return v ? `AI deal verdict: ${v} (score ${ctx.buyScore ?? "??"}/10)` : null;
-        })(),
+        // Phase 9: ctx.buyVerdict is now guaranteed canonical or null
+        // (sanitizePromptContext above handled normalization + telemetry).
+        // We pass it straight through — no per-call re-normalization.
+        ctx.buyVerdict ? `AI deal verdict: ${ctx.buyVerdict} (score ${ctx.buyScore ?? "??"}/10)` : null,
         ctx.visionConfidence != null ? `Vision match confidence: ${fmtPct(ctx.visionConfidence * 100)}`  : null,
         ctx.visionQuery     ? `Identified as: "${ctx.visionQuery}"`                                      : null,
         ctx.historicalLow != null && ctx.historicalHigh != null
@@ -29839,7 +30129,12 @@ app.post(
         return res.status(200).json({ ok: false, error: "missing_scan_context" });
       }
 
-      const ctx = scanContext;
+      // Phase 9: sanitize verdict-bearing fields once, then pass clean ctx forward.
+      const { ctx: cleanCtx, drifted: listingDrifted } = sanitizePromptContext(scanContext);
+      for (const d of listingDrifted) {
+        try { reportPromptDrift(`api/listing/generate:${d.field}`, d.canonical, d.raw); } catch {}
+      }
+      const ctx = cleanCtx;
       const fmtPrice = (v) => (Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : null);
 
       // Build context block
@@ -29854,11 +30149,7 @@ app.post(
           ? `Price range: ${fmtPrice(ctx.historicalLow)}–${fmtPrice(ctx.historicalHigh)}`     : null,
         ctx.ebaySoldComps?.median
           ? `eBay median sold: ${fmtPrice(ctx.ebaySoldComps.median)}`                         : null,
-        (() => {
-          const v = verdictForPrompt(ctx.buyVerdict, "api/listing/generate");
-          if (v && v !== ctx.buyVerdict) reportPromptDrift("api/listing/generate", v, ctx.buyVerdict);
-          return v ? `Condition/verdict: ${v}` : null;
-        })(),
+        ctx.buyVerdict ? `Condition/verdict: ${ctx.buyVerdict}` : null,
         ctx.authenticityIntel?.tier ? `Authenticity tier: ${ctx.authenticityIntel.tier}`     : null,
         ctx.trendIntel?.buyAdvice ? `Market trend: ${ctx.trendIntel.buyAdvice}`              : null,
       ].filter(Boolean).join("\n");

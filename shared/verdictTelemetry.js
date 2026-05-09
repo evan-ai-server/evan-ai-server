@@ -245,3 +245,59 @@ export function buildAnalyticsPayload({ verdict, source, legacy, extra }) {
   }
   return payload;
 }
+
+/**
+ * Phase 10 — strict analytics event builder.
+ *
+ * The Phase 10 contract: every analytics event in the verdict universe
+ * carries a top-level canonical `verdict`, an explicit `source` from
+ * the closed set ["server", "client", "cache"], and any legacy values
+ * are demoted to an optional `legacy` sub-field. Legacy enums must
+ * never be the primary key of an analytic.
+ *
+ *   const event = buildVerdictAnalyticsEvent({
+ *     event:   "scan_complete",
+ *     verdict: payload.buyOrPass.verdict,
+ *     source:  "server",
+ *     legacy:  { buySignal: payload.profitIntel?.buySignal ?? null },
+ *     extra:   { userId, scanId, scoreV2 },
+ *   });
+ *
+ * Hard rules:
+ *   - `verdict` must be canonical (BUY/HOLD/PASS) — throws on legacy.
+ *   - `source` must be "server"|"client"|"cache" — throws otherwise.
+ *   - `event` (the logical name) must be a non-empty string.
+ *
+ * Throwing here is the spec — analytics that carry a non-canonical
+ * verdict are themselves the bug we're trying to find.
+ *
+ * @param {object} args
+ * @param {string}  args.event                Logical event name (e.g. "scan_complete").
+ * @param {unknown} args.verdict              Canonical verdict (asserted).
+ * @param {"server"|"client"|"cache"} args.source
+ * @param {Record<string, unknown>} [args.legacy]
+ * @param {Record<string, unknown>} [args.extra]
+ * @returns {{ event: string, verdict: Verdict, source: "server"|"client"|"cache", ts: number, legacy?: Record<string, unknown>, [k: string]: unknown }}
+ */
+export function buildVerdictAnalyticsEvent({ event, verdict, source, legacy, extra }) {
+  if (typeof event !== "string" || event.length === 0) {
+    throw new Error("buildVerdictAnalyticsEvent: `event` must be a non-empty string");
+  }
+  if (source !== "server" && source !== "client" && source !== "cache") {
+    throw new Error(`buildVerdictAnalyticsEvent: invalid source ${JSON.stringify(source)}`);
+  }
+  if (!isCanonicalVerdict(verdict)) {
+    throw new Error(`buildVerdictAnalyticsEvent: non-canonical verdict ${JSON.stringify(verdict)}`);
+  }
+  const payload = {
+    event,
+    verdict,
+    source,
+    ts: Date.now(),
+    ...(extra ?? {}),
+  };
+  if (legacy && Object.keys(legacy).length > 0) {
+    payload.legacy = legacy;
+  }
+  return payload;
+}
