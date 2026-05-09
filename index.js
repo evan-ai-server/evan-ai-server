@@ -10,12 +10,34 @@ import multer from "multer";
 import crypto from "crypto";
 import rateLimit from "express-rate-limit";
 import pLimit from "p-limit";
-import { chromium } from "playwright";
 import fs from "fs/promises";
 import path from "path";
-import sharp from "sharp";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+// Lazy-load heavy native modules — avoids 17s+ blocking startup cost.
+// sharp (libvips) and playwright (browser binaries) are only needed at
+// request time, not at boot. Each loads once and is cached.
+let _sharp = null;
+async function getSharp() {
+  if (!_sharp) _sharp = (await import("sharp")).default;
+  return _sharp;
+}
+let _chromium = null;
+async function getChromium() {
+  if (!_chromium) _chromium = (await import("playwright")).chromium;
+  return _chromium;
+}
+// @aws-sdk cold-imports at ~48s — lazy-load on first S3 call only.
+let _s3sdk = null;
+async function getS3SDK() {
+  if (!_s3sdk) {
+    const [s3, presigner] = await Promise.all([
+      import("@aws-sdk/client-s3"),
+      import("@aws-sdk/s3-request-presigner"),
+    ]);
+    _s3sdk = { ...s3, getSignedUrl: presigner.getSignedUrl };
+  }
+  return _s3sdk;
+}
 import helmet from "helmet";
 import { imageSimilarityScore } from "./intelligence/imageSimilarity.js";
 import { recordPriceObservation, getHistoricalStats } from "./intelligence/priceHistory.js";
@@ -417,6 +439,25 @@ import { buildCounteroferScriptPayload, buildCounteroffer } from "./src/countero
 import { startThriftSession, addSessionScan, getSessionSummary, endThriftSession, getUserSessions } from "./src/thriftScannerMode.js";
 import { buildEvanScoreExplainerPayload, extractSignals, buildExplanation } from "./src/evanScoreExplainer.js";
 import { buildBuyOrPassPayload, computeBuyOrPass } from "./src/buyOrPassEngine.js";
+import {
+  enforceVerdictOnPayload,
+  verdictForPrompt,
+  normalizeVerdict,
+  VerdictLeakError,
+} from "./shared/verdict.js";
+import { assembleLegacyNamespace } from "./shared/legacyNamespace.js";
+import {
+  reportLegacyDrift,
+  reportPromptDrift,
+  setVerdictTelemetrySink,
+} from "./shared/verdictTelemetry.js";
+
+// Phase 6: server-side telemetry sink. Routes verdict_disagreement_event
+// through console for now; production deployments should replace this
+// with the structured logger / Sentry / analytics pipe.
+setVerdictTelemetrySink((event) => {
+  console.warn("[verdict_disagreement_event]", JSON.stringify(event));
+});
 import { buildBarcodeIntelligencePayload, extractBarcodesFromText, lookupBarcode } from "./src/barcodeIntelligence.js";
 import { buildMultiAngleConsensusPayload, buildMultiAngleConsensus, detectPassConflicts } from "./src/multiAngleConsensus.js";
 import { buildBoxTagPayload, extractBoxTagData, buildBoxTagEnhancedQuery } from "./src/boxTagExtractor.js";
@@ -2664,21 +2705,31 @@ const SCAN_THUMB_ROOT = path.join(SCAN_STORAGE_ROOT, "thumb");
 const SCAN_EMBEDDING_ROOT = path.join(SCAN_STORAGE_ROOT, "embeddings");
 const SCAN_MANIFEST_ROOT = path.join(SCAN_STORAGE_ROOT, "manifest");
 
-const s3Client =
-  OBJECT_STORE_PROVIDER === "s3" &&
-  OBJECT_STORE_BUCKET &&
-  OBJECT_STORE_ACCESS_KEY_ID &&
-  OBJECT_STORE_SECRET_ACCESS_KEY
-    ? new S3Client({
-        region: OBJECT_STORE_REGION || "auto",
-        endpoint: OBJECT_STORE_ENDPOINT || undefined,
-        forcePathStyle: OBJECT_STORE_FORCE_PATH_STYLE,
-        credentials: {
-          accessKeyId: OBJECT_STORE_ACCESS_KEY_ID,
-          secretAccessKey: OBJECT_STORE_SECRET_ACCESS_KEY,
-        },
-      })
-    : null;
+// S3 client is created on first use (AWS SDK lazy-loaded above).
+let _s3Client = null;
+async function getS3Client() {
+  if (_s3Client) return _s3Client;
+  if (
+    OBJECT_STORE_PROVIDER !== "s3" ||
+    !OBJECT_STORE_BUCKET ||
+    !OBJECT_STORE_ACCESS_KEY_ID ||
+    !OBJECT_STORE_SECRET_ACCESS_KEY
+  ) return null;
+  const { S3Client } = await getS3SDK();
+  _s3Client = new S3Client({
+    region: OBJECT_STORE_REGION || "auto",
+    endpoint: OBJECT_STORE_ENDPOINT || undefined,
+    forcePathStyle: OBJECT_STORE_FORCE_PATH_STYLE,
+    credentials: {
+      accessKeyId: OBJECT_STORE_ACCESS_KEY_ID,
+      secretAccessKey: OBJECT_STORE_SECRET_ACCESS_KEY,
+    },
+  });
+  return _s3Client;
+}
+// Legacy sync reference kept for canUseS3ObjectStore() truthiness checks — always null at boot.
+// Actual send() calls below use getS3Client() + getS3SDK() instead.
+const s3Client = null;
 
 const PREPROCESS_MAX_EDGE = Number(process.env.PREPROCESS_MAX_EDGE || 768);
 const PREPROCESS_JPEG_QUALITY = Number(
@@ -2770,7 +2821,12 @@ async function ensureScanStorage() {
 const scanStorageReady = ensureScanStorage();
 
 function canUseS3ObjectStore() {
-  return !!s3Client && !!OBJECT_STORE_BUCKET;
+  return (
+    OBJECT_STORE_PROVIDER === "s3" &&
+    !!OBJECT_STORE_BUCKET &&
+    !!OBJECT_STORE_ACCESS_KEY_ID &&
+    !!OBJECT_STORE_SECRET_ACCESS_KEY
+  );
 }
 
 function guessMimeFromKey(key = "") {
@@ -2817,7 +2873,8 @@ async function objectStorePutBuffer(
 ) {
   if (canUseS3ObjectStore()) {
     try {
-      await s3Client.send(
+      const [client, { PutObjectCommand }] = await Promise.all([getS3Client(), getS3SDK()]);
+      await client.send(
         new PutObjectCommand({
           Bucket: OBJECT_STORE_BUCKET,
           Key: key,
@@ -2849,7 +2906,8 @@ async function objectStoreReadBuffer(key) {
 
   try {
     if (canUseS3ObjectStore()) {
-      const out = await s3Client.send(
+      const [client, { GetObjectCommand }] = await Promise.all([getS3Client(), getS3SDK()]);
+      const out = await client.send(
         new GetObjectCommand({
           Bucket: OBJECT_STORE_BUCKET,
           Key: key,
@@ -2868,6 +2926,7 @@ async function objectStoreReadBuffer(key) {
 
 async function analyzeImageQuality(buffer) {
   try {
+    const sharp = await getSharp();
     const base = sharp(buffer, { failOn: "none" }).rotate();
 
     const metadata = await base.metadata().catch(() => ({}));
@@ -2985,6 +3044,7 @@ async function preprocessScanUpload(file) {
   }
 
   try {
+    const sharp = await getSharp();
     const base = sharp(originalBuffer, { failOn: "none" }).rotate();
 
     const transformed = await base
@@ -3240,6 +3300,23 @@ function withHardTimeout(promise, ms, label = "timeout") {
 
 function clamp01(n) {
   return Math.max(0, Math.min(1, n));
+}
+
+// Phase 2 boundary helper: outbound API responses must emit canonical
+// verdicts only. enforceVerdictOnPayload throws on drift (loud, by
+// design); at the user-facing edge we don't want a single bad cached
+// payload to crash the response — we want to drop the verdict, log,
+// and let the rest of the intel ship. Phase 6 wires telemetry here.
+function safeEnforceVerdict(payload, source) {
+  try {
+    return enforceVerdictOnPayload(payload, source);
+  } catch (e) {
+    if (e instanceof VerdictLeakError) {
+      console.warn(`[verdict-leak] ${source}: dropped payload —`, e.message);
+      return null;
+    }
+    throw e;
+  }
 }
 
 function safeStr(s, max = 180) {
@@ -3704,11 +3781,13 @@ function computeMarketIntuition(items, payingPrice = null) {
 }
 
 // -------------------- HUMAN DEAL VERDICT ENGINE --------------------
+// dealEngineVerdict: BUY / PASS / CHECK (spec-aligned two-phase system)
 function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
   if (!intuition || intuition.reason !== "ok") {
     return {
       label: "UNKNOWN",
       emoji: "🤔",
+      dealEngineVerdict: "CHECK",
       confidence: 0.35,
       reason: "Not enough market data yet",
     };
@@ -3726,6 +3805,7 @@ function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
     return {
       label: "RISKY",
       emoji: "⚠️",
+      dealEngineVerdict: "PASS",
       confidence,
       reason: "Price sits outside normal market range",
     };
@@ -3735,6 +3815,7 @@ function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
     return {
       label: "STEAL",
       emoji: "🔥",
+      dealEngineVerdict: "BUY",
       confidence,
       reason: "Far below typical market pricing",
     };
@@ -3744,6 +3825,7 @@ function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
     return {
       label: "GOOD DEAL",
       emoji: "🟢",
+      dealEngineVerdict: "BUY",
       confidence,
       reason: "Below average market value",
     };
@@ -3753,6 +3835,7 @@ function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
     return {
       label: "FAIR",
       emoji: "👌",
+      dealEngineVerdict: "CHECK",
       confidence,
       reason: "Within normal market range",
     };
@@ -3761,6 +3844,7 @@ function buildLocalDealVerdict(intuition, visionConfidence = 0.5) {
   return {
     label: "OVERPRICED",
     emoji: "💸",
+    dealEngineVerdict: "PASS",
     confidence,
     reason: "Above typical market pricing",
   };
@@ -4223,6 +4307,7 @@ async function createDirectUploadSession({
     `${Date.now()}_${crypto.randomBytes(8).toString("hex")}.${ext}`;
 
   if (canUseS3ObjectStore()) {
+    const [client, { PutObjectCommand, getSignedUrl }] = await Promise.all([getS3Client(), getS3SDK()]);
     const command = new PutObjectCommand({
       Bucket: OBJECT_STORE_BUCKET,
       Key: objectKey,
@@ -4233,7 +4318,7 @@ async function createDirectUploadSession({
       }),
     });
 
-    const uploadUrl = await getSignedUrl(s3Client, command, {
+    const uploadUrl = await getSignedUrl(client, command, {
       expiresIn: PRESIGNED_UPLOAD_TTL_SEC,
     });
 
@@ -6613,6 +6698,7 @@ async function fetchHtmlPage(url) {
 let ebayBrowserPromise = null;
 
 async function getEbayBrowser() {
+  const chromium = await getChromium();
   return chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage"]
@@ -11493,9 +11579,12 @@ function smartRank(items, query = "", identity = null) {
 // -------------------- Rate limit --------------------
 const visionLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 60,
+  max: 20,           // 20 vision calls/min per fingerprint (OpenAI cost guard)
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => getClientFingerprint(req),
+  handler: (_req, res) =>
+    res.status(429).json({ ok: false, error: "vision_rate_limited" }),
 });
 
 // -------------------- Vision prompt (maximum accuracy, brand-expert) --------------------
@@ -13007,9 +13096,96 @@ ANTI-HALLUCINATION RULES:
 Priority: SKU/serial confirmed → brand + exact model + colorway → brand + model → model alone → [item type] + color + material`;
 }
 
-async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
-  const timeout = withTimeout(VISION_TIMEOUT_MS);
+// ── Gemini Flash vision fallback ──────────────────────────────────────────────
+// Called when OpenAI vision times out or returns no query.
+// Uses the same prompt/schema as the OpenAI pass so downstream parsing is identical.
+async function _callGeminiVisionPass({ base64, mimeType, mode, propContext, passLabel, rid }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
 
+  const model    = process.env.GEMINI_VISION_MODEL || "gemini-2.0-flash";
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const prompt   = VISION_SYSTEM + "\n\n" + buildVisionPassPrompt(passLabel, mode, propContext);
+
+  const abortCtrl  = new AbortController();
+  const timeoutId  = setTimeout(() => abortCtrl.abort(), 9000);
+
+  try {
+    const res = await fetch(endpoint, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { text: prompt },
+            { inline_data: { mime_type: mimeType || "image/jpeg", data: base64 } },
+          ],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0.1,
+          maxOutputTokens: 600,
+        },
+      }),
+      signal: abortCtrl.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Gemini HTTP ${res.status}: ${errText.slice(0, 160)}`);
+    }
+
+    const json    = await res.json();
+    const rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    const parsedRaw = safeJsonParse(rawText, null) || extractFirstJsonObject(rawText) || null;
+    const salvaged  = salvageVisionFields(rawText);
+
+    const parsed = {
+      query:
+        typeof parsedRaw?.query === "string" && parsedRaw.query.trim()
+          ? parsedRaw.query.trim()
+          : salvaged.query,
+      variants:
+        Array.isArray(parsedRaw?.variants) && parsedRaw.variants.length
+          ? uniqueQueries(parsedRaw.variants)
+          : salvaged.variants,
+      confidence: Number.isFinite(Number(parsedRaw?.confidence))
+        ? clamp01(Number(parsedRaw.confidence))
+        : salvaged.confidence,
+      identity:
+        parsedRaw?.identity && typeof parsedRaw.identity === "object"
+          ? parsedRaw.identity
+          : null,
+      attributeCertainty:
+        parsedRaw?.attributeCertainty && typeof parsedRaw.attributeCertainty === "object"
+          ? parsedRaw.attributeCertainty
+          : null,
+    };
+
+    console.log("🔄 GEMINI VISION PASS", {
+      rid: rid || "",
+      pass: passLabel,
+      parsedQuery: parsed.query,
+      parsedConfidence: parsed.confidence,
+    });
+
+    return { rawText, parsed };
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
+  // OpenAI gets a 3s head start; if it doesn't respond, Gemini fires immediately.
+  const openaiCutoffMs = Number(process.env.VISION_OPENAI_CUTOFF_MS || 3000);
+  const timeout        = withTimeout(openaiCutoffMs);
+  const base64   = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+  const mimeType = dataUrl.startsWith("data:") ? dataUrl.split(";")[0].slice(5) : "image/jpeg";
+
+  let openaiResult = null;
   try {
 
 const response = await withModelServing(
@@ -13054,7 +13230,7 @@ const response = await withModelServing(
         },
         { signal: timeout.signal }
       ),
-      VISION_TIMEOUT_MS + 1500,
+      openaiCutoffMs + 500,
       `vision_pass_timeout:${passLabel}`
     ),
   {
@@ -13112,26 +13288,38 @@ console.log("🧾 VISION PASS RAW", {
   rawPreview: String(rawText || "").slice(0, 280),
 });
 
-return {
-  rawText,
-  parsed,
-};
+    openaiResult = { rawText, parsed, source: "openai" };
+    // Fast path: OpenAI returned a usable query — no need for Gemini
+    if (parsed.query) return openaiResult;
 
 } catch (err) {
   timeout.cancel?.();
 
-  console.warn("❌ VISION PASS FAILED", {
-    rid: rid || "",
-    pass: passLabel,
-    error: err?.message || err,
-  });
-
-  return {
-    rawText: "",
-    parsed: {},
-    error: err?.message || "vision_pass_failed",
-  };
+  if (err?.name !== "AbortError") {
+    console.warn("❌ VISION PASS FAILED (OpenAI)", {
+      rid: rid || "",
+      pass: passLabel,
+      error: err?.message || err,
+    });
+  }
 }
+
+  // Gemini fallback: OpenAI timed out / failed / returned empty query
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      console.log("🔄 VISION PASS → Gemini fallback", { rid: rid || "", pass: passLabel });
+      const gemResult = await _callGeminiVisionPass({ base64, mimeType, mode, propContext, passLabel, rid });
+      if (gemResult?.parsed?.query) return { ...gemResult, source: "gemini" };
+    } catch (e) {
+      console.warn("❌ VISION PASS GEMINI FALLBACK FAILED", {
+        rid: rid || "",
+        pass: passLabel,
+        error: e?.message || e,
+      });
+    }
+  }
+
+  return openaiResult || { rawText: "", parsed: {}, error: "vision_pass_failed", source: "openai" };
 }
 
 async function runVisionRecoveryPass({ req, file, mode, propContext }) {
@@ -14411,6 +14599,9 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
   ]);
 
+  // Track which model served each pass — "gemini" if any pass fell back
+  const visionSource = passes.some((p) => p?.source === "gemini") ? "gemini" : "openai";
+
   const parsedList = passes.map((p) => p?.parsed || {});
   const passLabels = ["master", "visual_shape"];
 
@@ -14704,6 +14895,7 @@ if (
       confidence,
       identity: mergedIdentity,
       attributeCertainty: mergedAttributeCertainty,
+      visionSource,
       debug: {
         passQueries: rawQueries,
       },
@@ -15275,6 +15467,7 @@ if (!openai) {
             : null,
           authenticityFlags: Array.isArray(result?.authenticityFlags) ? result.authenticityFlags : [],
           conditionFlags:    Array.isArray(result?.conditionFlags)    ? result.conditionFlags    : [],
+          visionSource: result?.visionSource || "openai",
           debug: result?.debug || null,
         };
 
@@ -17426,7 +17619,7 @@ async function buildMarketSearchResponsePayload({
       });
   }
 
-  return {
+  const _responsePayload = {
     ok: true,
     query: baseQuery,
     finalQuery: activeQuery,
@@ -17499,7 +17692,7 @@ async function buildMarketSearchResponsePayload({
       authServiceRoute,
       counterofferScript,
       evanExplainer,
-      buyOrPass:    buyOrPassResult?.buyOrPass || null,
+      buyOrPass:    safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
       multiAngle:   null, // populated by route layer from multiAngleResult
 
       // Features 68-77
@@ -17527,6 +17720,25 @@ async function buildMarketSearchResponsePayload({
       kind: Array.isArray(sourceItems) && sourceItems.length ? "live_market" : "empty",
     },
   };
+
+  // Phase 3 boundary: every parallel verdict system this response carries
+  // is mirrored under `legacy: { ... }`. Clients (Phase 4/5) must derive
+  // emotional state from `buyOrPass.verdict` only — `legacy.*` exists for
+  // migration tracing and Phase 6 telemetry, not for rendering.
+  _responsePayload.legacy = assembleLegacyNamespace(_responsePayload);
+
+  // Phase 6: emit a verdict_disagreement_event for each legacy system
+  // whose normalized form contradicts the canonical buyOrPass.verdict.
+  // Silent when everything agrees. The sink (configured at boot) ships
+  // events to whatever analytics surface the host wires up.
+  try {
+    const canonicalVerdict = _responsePayload?.buyOrPass?.verdict ?? null;
+    if (canonicalVerdict) {
+      reportLegacyDrift("scan/main-response", canonicalVerdict, _responsePayload.legacy._trace);
+    }
+  } catch { /* telemetry never propagates */ }
+
+  return _responsePayload;
 }
 // ── Price history API ──────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18683,7 +18895,7 @@ function round2(v) { return Math.round(v * 100) / 100; }
 //   evan:scanabuse:{actorId}               STRING  count, EX 5min
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DAILY_FREE_SCANS  = 2;
+const DAILY_FREE_SCANS  = 3;
 const SCAN_DEDUP_TTL    = 60;          // seconds — same image within 60s = free rescan
 const GUEST_TTL         = 90 * 86400; // 90 days
 const SCAN_ABUSE_TTL    = 300;         // 5-min anomaly window
@@ -20564,6 +20776,29 @@ app.post("/market/search/stream", async (req, res) => {
       });
     };
 
+    // Synthetic placeholder safety net: if no provisional fires within 1.5s, emit
+    // a skeleton event so the client never shows a blank loading screen.
+    // Cleared as soon as a real provisional or early provisional is sent.
+    const _syntheticTimer = setTimeout(() => {
+      if (clientClosed || _earlyProvSent) return;
+      _recordStreamMetric("provisionalSent", 1);
+      send("provisional", {
+        items: [],
+        status: "provisional",
+        enriching: true,
+        needsOracle: true,
+        dataDepth: "thin",
+        synthetic: true,
+        enrichingReason: "marketplace_pending",
+        _timing: { phase1Ms: Date.now() - _t1 },
+      });
+    }, 1500);
+    // Patch _onEarlyItems to cancel the synthetic timer on real data
+    const _onEarlyItemsWrapped = async (earlyRaw) => {
+      clearTimeout(_syntheticTimer);
+      return _onEarlyItems(earlyRaw);
+    };
+
     // In-flight dedup: share the Phase 1 promise across concurrent identical scans.
     // earlyItemsCb is only wired for the FIRST request — inflight hits get phase1Items directly.
     let phase1Promise;
@@ -20573,13 +20808,14 @@ app.post("/market/search/stream", async (req, res) => {
       // No earlyItemsCb for inflight hits — they receive full phase1Items when promise resolves
     } else {
       phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
-        skipOracle: true, earlyItemsCb: _onEarlyItems,
+        skipOracle: true, earlyItemsCb: _onEarlyItemsWrapped,
       });
       STREAM_PHASE1_INFLIGHT.set(cacheKey, phase1Promise);
       phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
     }
 
     const _phase1Raw = await phase1Promise;
+    clearTimeout(_syntheticTimer); // real data arrived — cancel synthetic safety net
     // If 5s kill timer fired in mergeCheapestSources, fall back to earlyItems
     const phase1Items = _phase1Raw.length > 0 ? assignItemIds(_phase1Raw) : (_earlyItems || []);
     const _phase1Ms   = Date.now() - _t1;
@@ -23279,6 +23515,11 @@ app.post(
       const userId   = safeStr(req.body?.userId, 64) || null;
       const category = safeStr(req.body?.category, 60) || null;
       const buySignal = safeStr(req.body?.buySignal, 30) || null;
+      // Phase 2 boundary: ML calibration receives a canonical verdict
+      // alongside the legacy buySignal. The legacy string is preserved
+      // for backwards-compatible interior logic in outcomeLearning.js
+      // (Phase 3 will isolate that under legacy: { ... }).
+      const verdict   = normalizeVerdict(buySignal);
       const query     = safeStr(req.body?.query, 300) || null;
       if (userId && category) {
         if (didBuy)  await recordUserCategoryActivity(userId, category, "buy",  buyPrice).catch(() => {});
@@ -23290,7 +23531,7 @@ app.post(
         const profitCents = didSell && sellPrice != null && buyPrice != null
           ? Math.round((sellPrice - buyPrice) * 100) : null;
         await recordOutcomeLearning(redis, userId, {
-          category, query, didBuy, profitCents, didSell, buySignal,
+          category, query, didBuy, profitCents, didSell, buySignal, verdict,
         }).catch(() => {});
 
         // WS3: Return outcome tracking
@@ -23667,6 +23908,8 @@ app.post(
       const category    = safeStr(req.body?.category,  60)  || null;
       const scannedPrice = req.body?.scannedPrice != null ? Number(req.body.scannedPrice) : null;
       const buySignal   = safeStr(req.body?.buySignal, 30)  || null;
+      // Phase 2 boundary: attach canonical verdict alongside legacy buySignal.
+      const verdict     = normalizeVerdict(buySignal);
 
       // Store buy outcome (didBuy: false = pass)
       if (scanId) {
@@ -23685,6 +23928,7 @@ app.post(
           profitCents:  null,
           didSell:      false,
           buySignal,
+          verdict,
         }).catch(() => {});
         // Detect missed opportunity if signal was strong
         if (buySignal) {
@@ -29008,11 +29252,18 @@ app.post(
 
   // POST /intel/buy-or-pass
   // Body: full scan result bundle (all or subset of intel fields)
-  // Returns: verdict (BUY/PASS/WAIT/STRONG_BUY/CAUTION), confidence 0-100, one-line reason, signals
+  // Returns: verdict (BUY | HOLD | PASS — canonical, gated by Phase 0/1
+  //          contract + Phase 2 boundary helper), confidence 0-100,
+  //          one-line reason, signals
   app.post("/intel/buy-or-pass", async (req, res) => {
     try {
       const result = buildBuyOrPassPayload(req.body || {});
-      return res.status(200).json({ ok: true, ...result });
+      // Outbound boundary: ensure verdict is canonical before it reaches
+      // the client. safeEnforceVerdict drops the payload on drift rather
+      // than 500-ing the request — full result bundle still ships with
+      // buyOrPass replaced by null + a warning log.
+      const safeBuyOrPass = safeEnforceVerdict(result?.buyOrPass, "intel/buy-or-pass");
+      return res.status(200).json({ ok: true, ...result, buyOrPass: safeBuyOrPass });
     } catch (err) {
       return res.status(200).json({ ok: false, error: "buy_or_pass_failed", reason: err?.message || String(err) });
     }
@@ -29506,7 +29757,18 @@ app.post(
         ctx.price != null   ? `Best price found: ${fmtPrice(ctx.price)}`                                 : null,
         ctx.scannedPrice != null ? `Price user is paying: ${fmtPrice(ctx.scannedPrice)}`                  : null,
         ctx.savedAmount > 0 ? `Savings vs scanned price: ${fmtPrice(ctx.savedAmount)} (${fmtPct(ctx.cheaperPct)} less)` : null,
-        ctx.buyVerdict      ? `AI deal verdict: ${ctx.buyVerdict} (score ${ctx.buyScore ?? "??"}/10)`    : null,
+        // Phase 2 boundary: LLM prompts must receive canonical verdict
+        // strings only. Bad cached payloads silently drop the line —
+        // we'd rather omit it than feed the model "STRONG_BUY" while
+        // the rest of the system says PASS.
+        // Phase 6: fire prompt-drift telemetry when normalization moved
+        // the value (i.e. raw ≠ canonical), so we can hunt down whoever
+        // stuffed a non-canonical verdict into ctx.
+        (() => {
+          const v = verdictForPrompt(ctx.buyVerdict, "api/ask");
+          if (v && v !== ctx.buyVerdict) reportPromptDrift("api/ask", v, ctx.buyVerdict);
+          return v ? `AI deal verdict: ${v} (score ${ctx.buyScore ?? "??"}/10)` : null;
+        })(),
         ctx.visionConfidence != null ? `Vision match confidence: ${fmtPct(ctx.visionConfidence * 100)}`  : null,
         ctx.visionQuery     ? `Identified as: "${ctx.visionQuery}"`                                      : null,
         ctx.historicalLow != null && ctx.historicalHigh != null
@@ -29592,7 +29854,11 @@ app.post(
           ? `Price range: ${fmtPrice(ctx.historicalLow)}–${fmtPrice(ctx.historicalHigh)}`     : null,
         ctx.ebaySoldComps?.median
           ? `eBay median sold: ${fmtPrice(ctx.ebaySoldComps.median)}`                         : null,
-        ctx.buyVerdict      ? `Condition/verdict: ${ctx.buyVerdict}`                          : null,
+        (() => {
+          const v = verdictForPrompt(ctx.buyVerdict, "api/listing/generate");
+          if (v && v !== ctx.buyVerdict) reportPromptDrift("api/listing/generate", v, ctx.buyVerdict);
+          return v ? `Condition/verdict: ${v}` : null;
+        })(),
         ctx.authenticityIntel?.tier ? `Authenticity tier: ${ctx.authenticityIntel.tier}`     : null,
         ctx.trendIntel?.buyAdvice ? `Market trend: ${ctx.trendIntel.buyAdvice}`              : null,
       ].filter(Boolean).join("\n");
@@ -30322,6 +30588,18 @@ app.post("/api/profile/flip", async (req, res) => {
   app.use(globalErrorHandler);
 
   // -------------------- Start + graceful shutdown --------------------
+  // Auto-kill any stale process on our port before binding (dev-mode safety).
+  // Prevents EADDRINUSE when restarting without explicitly killing the old process.
+  try {
+    const { execSync } = await import("child_process");
+    const pid = execSync(`lsof -ti :${PORT} 2>/dev/null || true`, { encoding: "utf8" }).trim();
+    if (pid) {
+      process.stderr.write(`[startup] Port ${PORT} occupied by pid ${pid} — killing...\n`);
+      execSync(`kill -9 ${pid} 2>/dev/null || true`);
+      await new Promise((r) => setTimeout(r, 200)); // brief settle
+    }
+  } catch { /* non-fatal */ }
+
   const server = app.listen(PORT, HOST, () => {
   logEvent("info", "server_started", {
     host: HOST,
