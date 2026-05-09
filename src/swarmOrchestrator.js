@@ -84,6 +84,15 @@ export const JOB_STATUS = Object.freeze({
   CANCELLED: "CANCELLED",
 });
 
+// PHASE 3 NOTE — LEGACY VERDICT NAMESPACE.
+// BUY_SIGNAL is a legacy parallel verdict system. Its values are
+// mirrored under `responsePayload.legacy.swarmBuySignal` (see
+// shared/legacyNamespace.js) and MUST NOT drive UI, emotion, or
+// analytics. The canonical decision is `buyOrPass.verdict` from
+// src/buyOrPassEngine.js. Internal swarm orchestration may continue
+// to use these enums for routing / handoff decisions, but anything
+// that emits to the user-facing surface must go through normalization
+// in shared/verdict.js first.
 export const BUY_SIGNAL = Object.freeze({
   STRONG_BUY:          "STRONG_BUY",
   GOOD_DEAL:           "GOOD_DEAL",

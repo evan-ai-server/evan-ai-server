@@ -2,18 +2,29 @@
 // Smart alert engine: determines when a scan warrants a push notification,
 // builds the full notification payload with title, body, urgency, and action.
 
+import { assertVerdict } from "../shared/verdict.js";
+
 // ── Alert type definitions ────────────────────────────────────────────────────
+//
+// Each alert type maps to a canonical Verdict. This is the Phase 2
+// notification-boundary contract: every notification we emit carries
+// a `verdict` field consistent with the alert's intent, so the client
+// can render colour/haptics/sound from a single source of truth.
+//
+// Per the Phase 0 rule: alert *type* (STEAL_DEAL, GOOD_DEAL, …) is a
+// notification template selector — not a verdict. They coexist; the
+// client's emotional layer keys off `verdict`, never `alertType`.
 const ALERT_TYPES = {
-  STEAL_DEAL:        { urgency: "critical", ttl: 3600,   icon: "🔥" },
-  GOOD_DEAL:         { urgency: "high",     ttl: 7200,   icon: "✅" },
-  BUY_WINDOW_OPEN:   { urgency: "high",     ttl: 86400,  icon: "📅" },
-  PRICE_TRAP:        { urgency: "high",     ttl: 86400,  icon: "🚫" },
-  AUTH_RISK:         { urgency: "critical", ttl: 86400,  icon: "⚠️" },
-  ARBITRAGE:         { urgency: "high",     ttl: 7200,   icon: "💰" },
-  TREND_DIP:         { urgency: "medium",   ttl: 172800, icon: "📉" },
-  DEMAND_SPIKE:      { urgency: "high",     ttl: 3600,   icon: "🔊" },
-  CONDITION_MISMATCH:{ urgency: "medium",   ttl: 86400,  icon: "⚖️" },
-  SUBSTITUTE_FOUND:  { urgency: "low",      ttl: 172800, icon: "💡" },
+  STEAL_DEAL:        { urgency: "critical", ttl: 3600,   icon: "🔥",  verdict: "BUY"  },
+  GOOD_DEAL:         { urgency: "high",     ttl: 7200,   icon: "✅",  verdict: "BUY"  },
+  BUY_WINDOW_OPEN:   { urgency: "high",     ttl: 86400,  icon: "📅",  verdict: "BUY"  },
+  PRICE_TRAP:        { urgency: "high",     ttl: 86400,  icon: "🚫",  verdict: "PASS" },
+  AUTH_RISK:         { urgency: "critical", ttl: 86400,  icon: "⚠️",  verdict: "HOLD" },
+  ARBITRAGE:         { urgency: "high",     ttl: 7200,   icon: "💰",  verdict: "BUY"  },
+  TREND_DIP:         { urgency: "medium",   ttl: 172800, icon: "📉",  verdict: "BUY"  },
+  DEMAND_SPIKE:      { urgency: "high",     ttl: 3600,   icon: "🔊",  verdict: "BUY"  },
+  CONDITION_MISMATCH:{ urgency: "medium",   ttl: 86400,  icon: "⚖️",  verdict: "PASS" },
+  SUBSTITUTE_FOUND:  { urgency: "low",      ttl: 172800, icon: "💡",  verdict: "HOLD" },
 };
 
 // ── Urgency rank for deduplication ────────────────────────────────────────────
@@ -134,7 +145,7 @@ export function evaluateAlertTriggers({
  * Build a push notification payload for a single alert.
  */
 export function buildNotificationPayload(alert, identity = {}, scannedPrice = null) {
-  const meta     = ALERT_TYPES[alert.type] || { urgency: "medium", ttl: 86400, icon: "ℹ️" };
+  const meta     = ALERT_TYPES[alert.type] || { urgency: "medium", ttl: 86400, icon: "ℹ️", verdict: "HOLD" };
   const itemLabel = [identity?.brand, identity?.model].filter(Boolean).join(" ") || "This item";
   const price     = scannedPrice !== null ? `$${Number(scannedPrice).toFixed(2)}` : null;
 
@@ -197,15 +208,22 @@ export function buildNotificationPayload(alert, identity = {}, scannedPrice = nu
     action:"View",
   };
 
+  // Phase 2 boundary: every notification carries a canonical verdict
+  // alongside the legacy alertType. Drop the gate before emit so a
+  // typo in ALERT_TYPES surfaces immediately rather than producing
+  // a "PASS verdict + STEAL_DEAL alert" contradiction at the device.
+  const canonicalVerdict = assertVerdict(meta.verdict, `notification:${alert.type}`);
+
   return {
     alertType:   alert.type,
+    verdict:     canonicalVerdict,
     urgency:     meta.urgency,
     ttlSeconds:  meta.ttl,
     title:       template.title,
     body:        template.body,
     action:      template.action,
     icon:        meta.icon,
-    data:        { signal: alert.signal, type: alert.type },
+    data:        { signal: alert.signal, type: alert.type, verdict: canonicalVerdict },
   };
 }
 
