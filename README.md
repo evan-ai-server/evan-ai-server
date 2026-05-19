@@ -1,3 +1,16 @@
+# Evan Byon
+
+16 · Schenectady, NY · solo founder, building [Evan AI](#evan-ai--server).
+
+Spend my time between high school, cross-country, track, and shipping
+production code. Started in JavaScript, learned the rest of the stack by
+needing to. Currently obsessed with the gap between "this works in a
+demo" and "this works in a stranger's hands."
+
+Reach: `evanappai@gmail.com`
+
+---
+
 # Evan AI — Server
 
 A camera-scan buy-or-pass tool for resellers. Point your phone at an item,
