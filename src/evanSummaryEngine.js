@@ -1,8 +1,8 @@
 // src/evanSummaryEngine.js
-// The Evan Summary — crown feature.
-// Synthesizes all intel (features 11-29) into one clean, human-readable verdict.
-// Produces: BUY / PASS / SELL / HOLD / AUTHENTICATE FIRST recommendation,
-// bullet-point top signals, and the Evan Score (0-100 composite).
+// Synthesizes all intel into one human-readable verdict.
+// Buy-side recommendation: BUY / HOLD / PASS (three states, no qualifiers).
+// Sell-side recommendation: SELL NOW / SELL SOON / HOLD / CLEAR INVENTORY.
+// Plus bullet-point top signals and the Evan Score (0-100 composite).
 
 // ── Evan Score weight registry ────────────────────────────────────────────────
 const EVAN_SCORE_WEIGHTS = {
@@ -72,27 +72,31 @@ function deriveRecommendation({
   demandTier,
   hasCriticalAuth,
 }) {
-  // Hard overrides
-  if (hasCriticalAuth || authTier === "critical") return "AUTHENTICATE FIRST";
+  // Hard overrides — both collapse to PASS in the user-facing 3-state surface.
+  // (Critical auth and risk-avoid both mean "do not buy"; the explanation lives
+  // in the supporting copy, not in a fourth verdict word.)
+  if (hasCriticalAuth || authTier === "critical") return "PASS";
   if (riskTier === "avoid")                        return "PASS";
 
-  // Score-based primary recommendation
+  // Three-state recommendation. No "BUY WITH CAUTION" — if the call isn't
+  // clean enough to land BUY, it's HOLD. The user is treated as an adult.
   if (evanScore >= 78) return "BUY";
   if (evanScore >= 55) {
     if (dealVerdict === "good_deal" || dealVerdict === "steal") return "BUY";
     if (trendPhase === "rising" || trendPhase === "evergreen")  return "BUY";
-    return "BUY WITH CAUTION";
+    return "HOLD";
   }
   if (evanScore >= 35) {
     if (dealVerdict === "overpriced" || dealVerdict === "price_trap") return "PASS";
     if (trendPhase === "fading" || trendPhase === "dead")              return "PASS";
-    if (demandTier === "cold")                                          return "HOLD";
-    return "PASS";
+    return "HOLD";
   }
   return "PASS";
 }
 
 function deriveSellRecommendation({ evanScore, trendPhase, demandTier, liquidityTier }) {
+  // No data on either trend or demand → can't recommend a sell action.
+  if (trendPhase === "unknown" && demandTier === "unknown") return "HOLD";
   if (trendPhase === "peak" && demandTier !== "cold") return "SELL NOW";
   if (trendPhase === "fading")                        return "SELL SOON";
   if (trendPhase === "dead")                          return "CLEAR INVENTORY";
@@ -219,21 +223,27 @@ export function computeEvanScore(intelPayloads = {}) {
   const tp = trendIntel?.phase;
   if (tp) add("trendMomentum", TREND_PHASE_SCORE[tp] ?? 0.50);
 
-  // Condition fairness (no mismatch = fair)
-  const hasMismatch = conditionPricing?.mismatch?.hasMismatch;
-  add("conditionFairness", hasMismatch === true ? 0.30 : hasMismatch === false ? 0.85 : 0.60);
+  // Condition fairness (no mismatch = fair). Only contribute when we have a
+  // condition payload at all — without one, "fair condition" is fabricated.
+  if (conditionPricing) {
+    const hasMismatch = conditionPricing?.mismatch?.hasMismatch;
+    add("conditionFairness", hasMismatch === true ? 0.30 : hasMismatch === false ? 0.85 : 0.60);
+  }
 
   // Liquidity
   const lt = liquidityScore?.tier;
-  if (lt) add("liquidityStrength", LIQUIDITY_TIER_SCORE[lt] ?? 0.50);
+  if (lt && lt !== "unknown") add("liquidityStrength", LIQUIDITY_TIER_SCORE[lt] ?? 0.50);
 
   // Risk inverse
   const rt = riskScore?.tier;
-  if (rt) add("riskInverse", RISK_TIER_SCORE[rt] ?? 0.50);
+  if (rt && rt !== "unknown") add("riskInverse", RISK_TIER_SCORE[rt] ?? 0.50);
 
-  // Substitute value (no substitute found = higher score for this item)
-  const hasSub = substituteIntel?.hasSavings;
-  add("substituteValue", hasSub ? 0.30 : 0.80);
+  // Substitute value (no substitute found = higher score for this item).
+  // Only contribute when substitute intel was actually computed.
+  if (substituteIntel) {
+    const hasSub = substituteIntel?.hasSavings;
+    add("substituteValue", hasSub ? 0.30 : 0.80);
+  }
 
   const raw  = totalW > 0 ? weighted / totalW : 0.50;
   return Math.round(clamp01(raw) * 100);
@@ -251,12 +261,14 @@ export function buildEvanSummary(intelPayloads = {}) {
     smartAlerts,
   } = intelPayloads;
 
-  const authTier      = authenticityIntel?.tier        || "low";
-  const riskTier      = riskScore?.tier                || "safe";
-  const dealVerdict   = dealComparator?.verdict?.verdict || "fair";
-  const trendPhase    = trendIntel?.phase              || "stable";
-  const demandTier    = demandSignals?.demandTier       || "warm";
-  const liquidityTier = liquidityScore?.tier           || "moderate";
+  // Default missing tiers to "unknown" — never to optimistic values. Absence
+  // of an intel payload must not look like "we evaluated it and it's fine."
+  const authTier      = authenticityIntel?.tier         || "unknown";
+  const riskTier      = riskScore?.tier                 || "unknown";
+  const dealVerdict   = dealComparator?.verdict?.verdict || "unknown";
+  const trendPhase    = trendIntel?.phase               || "unknown";
+  const demandTier    = demandSignals?.demandTier        || "unknown";
+  const liquidityTier = liquidityScore?.tier            || "unknown";
   const hasCriticalAuth = (authenticityIntel?.criticalFlags?.length ?? 0) > 0
     || authTier === "critical";
 
@@ -276,17 +288,27 @@ export function buildEvanSummary(intelPayloads = {}) {
                   : evanScore >= 35 ? "Weak"
                   : "Poor";
 
-  // One-liner summary
+  // One-liner summary — three states, plain language.
+  // PASS leads with the *actual* signal that forced PASS so the user knows
+  // why. The "no evidence" gate only applies on the HOLD path, since that's
+  // the genuinely-undecided case.
   const oneLiner = (() => {
-    if (buyRecommendation === "AUTHENTICATE FIRST")
-      return `Authentication required before any decision — auth risk is too high to proceed`;
-    if (buyRecommendation === "BUY")
-      return `Strong buy signal — Evan Score ${evanScore}/100, ${dealVerdict.replace("_", " ")} with ${demandTier} demand`;
-    if (buyRecommendation === "BUY WITH CAUTION")
-      return `Possible buy — Evan Score ${evanScore}/100, proceed carefully and verify condition`;
-    if (buyRecommendation === "PASS")
-      return `Pass on this one — Evan Score ${evanScore}/100, ${riskTier} risk and ${dealVerdict.replace("_", " ")}`;
-    return `Hold — Evan Score ${evanScore}/100, market conditions favor waiting`;
+    if (buyRecommendation === "BUY") {
+      return `${dealVerdict.replace("_", " ")} on recent comps with ${demandTier} demand`;
+    }
+    if (buyRecommendation === "PASS") {
+      if (authTier === "critical" || authTier === "high") return `Authenticity risk: ${authTier}`;
+      if (riskTier === "avoid")                           return "High purchase risk";
+      if (dealVerdict === "price_trap" || dealVerdict === "overpriced") {
+        return `Priced ${dealVerdict.replace("_", " ")}`;
+      }
+      return `${riskTier} risk, ${dealVerdict.replace("_", " ")} on recent comps`;
+    }
+    // HOLD — admit when there's nothing to decide on
+    if (riskTier === "unknown" && dealVerdict === "unknown" && demandTier === "unknown") {
+      return "Not enough evidence yet — clearer photo or wait for more comps";
+    }
+    return `Need more comps to lock the call`;
   })();
 
   return {

@@ -4,3 +4,21 @@ uploads/
 .env.*
 .DS_Store
 data/
+
+# Server log artifacts from local runs
+server.log
+bench-server.log
+*.log
+isolate-*-v8.log
+dump.rdb
+
+# Editor / shell backup files — these can contain secrets (nano writes .save
+# copies of whatever's in the buffer, including .env). NEVER track them.
+*.save
+*~
+*.swp
+*.bak
+
+# Local runtime state — large, machine-specific, contains scan history and
+# inventory snapshots that shouldn't live in source control.
+storage/

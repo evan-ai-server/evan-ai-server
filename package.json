@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "test": "node --test shared/"
+    "test": "node --test shared/",
+    "bench": "node bench/run.js",
+    "bench:save": "node bench/run.js --save",
+    "smoke": "node bench/vision-smoke.js"
   },
   "overrides": {
     "sharp": "^0.34.5"

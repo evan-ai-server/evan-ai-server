@@ -135,6 +135,116 @@
     }                                                                                                                                                                                                   
   }                                                                                                                                                                                                   
 
+  // ── Record structured buy/sell outcome for a scan ───────────────────────────
+  // Stores real-world purchase/sale data linked to a scan for calibration.
+
+  const RR_BUY_OUTCOME_KEY = (scanId) => `scan_buy_outcome:${scanId}`;
+  const BUY_OUTCOME_TTL_SEC = 365 * 86400; // 1 year
+
+  export async function recordBuyOutcome(redis, scanId, {
+    didBuy    = false,
+    buyPrice  = null,
+    didSell   = false,
+    sellPrice = null,
+    soldAt    = null,
+    notes     = null,
+    source    = null,
+  } = {}) {
+    if (!redis || !scanId) return null;
+
+    const now = Date.now();
+    const record = {
+      scanId,
+      didBuy:     !!didBuy,
+      buyPrice:   buyPrice  != null ? Number(buyPrice)  : null,
+      didSell:    !!didSell,
+      sellPrice:  sellPrice != null ? Number(sellPrice) : null,
+      soldAt:     soldAt    != null ? Number(soldAt)    : null,
+      notes:      notes  ? String(notes).slice(0, 500)  : null,
+      source:     source ? String(source).slice(0, 80)  : null,
+      recordedAt: now,
+      updatedAt:  now,
+    };
+
+    await redis.set(RR_BUY_OUTCOME_KEY(scanId), JSON.stringify(record), "EX", BUY_OUTCOME_TTL_SEC);
+
+    // Patch the replay record so buyOutcome is co-located for analysis
+    try {
+      const raw = await redis.get(RR_KEY(scanId));
+      if (raw) {
+        const replay   = JSON.parse(raw);
+        replay.buyOutcome = {
+          didBuy: record.didBuy, buyPrice: record.buyPrice,
+          didSell: record.didSell, sellPrice: record.sellPrice,
+        };
+        replay.updatedAt = now;
+        await redis.set(RR_KEY(scanId), JSON.stringify(replay), "EX", REPLAY_TTL_SEC());
+      }
+    } catch {}
+
+    return record;
+  }
+
+  export async function getBuyOutcome(redis, scanId) {
+    if (!redis || !scanId) return null;
+    try {
+      const raw = await redis.get(RR_BUY_OUTCOME_KEY(scanId));
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Store rescan verdict (verdict drift tracking) ────────────────────────────
+  // Records a refreshed buySignal on a scan so users can compare original vs current.
+
+  const RR_RESCAN_KEY = (scanId) => `scan_rescan:${scanId}`;
+
+  export async function storeRescanVerdict(redis, scanId, {
+    currentBuySignal  = null,
+    currentPriceStats = null,
+    currentReasoning  = null,
+  } = {}) {
+    if (!redis || !scanId) return null;
+
+    // Load original verdict from replay
+    let originalBuySignal = null;
+    try {
+      const raw = await redis.get(RR_KEY(scanId));
+      if (raw) {
+        const replay = JSON.parse(raw);
+        originalBuySignal = replay?.buySignal || null;
+      }
+    } catch {}
+
+    const now = Date.now();
+    const record = {
+      scanId,
+      originalBuySignal,
+      currentBuySignal,
+      verdictChanged:    originalBuySignal !== null && currentBuySignal !== null && originalBuySignal !== currentBuySignal,
+      verdictDelta:      originalBuySignal && currentBuySignal
+        ? `${originalBuySignal} → ${currentBuySignal}`
+        : null,
+      currentPriceStats: currentPriceStats || null,
+      currentReasoning:  currentReasoning  || null,
+      refreshedAt:       now,
+    };
+
+    await redis.set(RR_RESCAN_KEY(scanId), JSON.stringify(record), "EX", REPLAY_TTL_SEC());
+    return record;
+  }
+
+  export async function getRescanVerdict(redis, scanId) {
+    if (!redis || !scanId) return null;
+    try {
+      const raw = await redis.get(RR_RESCAN_KEY(scanId));
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
   // ── Get recent failure scans (for analysis) ───────────────────────────────────                                                                                                                     
   
   export async function getFailureScanIds(redis, limit = 100) {                                                                                                                                         

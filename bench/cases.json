@@ -1,0 +1,148 @@
+{
+  "_meta": {
+    "purpose": "Verdict regression fixtures for /market/search.",
+    "verdictMappingCanonical": {
+      "STEAL_DEAL": "BUY",
+      "BUY_NOW":    "BUY",
+      "FAIR":       "HOLD",
+      "HOLD":       "HOLD",
+      "SKIP":       "PASS"
+    },
+    "verdictMappingLegacy": {
+      "steal":      "steal",
+      "good_deal":  "good_deal",
+      "fair":       "fair",
+      "overpriced": "overpriced",
+      "price_trap": "price_trap"
+    },
+    "notes": [
+      "Expected values are LOCKED from the live server (baseline 2026-05-18). Each fixture asserts the current verdict — any future deviation is a regression.",
+      "The server's canonical verdict surface is `buyOrPass.verdict` ∈ { BUY, HOLD, PASS }.",
+      "The legacy verdict surface is `dealComparator.verdict.verdict` ∈ { steal, good_deal, fair, overpriced, price_trap }.",
+      "Tolerance: 'exact' = canonical verdict must match; 'loose' = adjacent tier allowed (BUY↔HOLD or HOLD↔PASS, but never BUY↔PASS).",
+      "Notable conservative pattern: nike $35 (72% below $125 median) and rolex $5500 (54% below $12k median) both return HOLD instead of BUY — the buyOrPass engine treats deep underpricing on low-sample categories as auth risk, not opportunity. Documented here so a future refactor that 'fixes' this doesn't silently lose the safety net."
+    ]
+  },
+  "cases": [
+    {
+      "name": "airpods_pro_2_overpriced_vs_used",
+      "query": "airpods pro 2nd gen",
+      "scannedPrice": 199,
+      "category": "electronics",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "exact",
+      "note": "Server median $100 (used market). $199 is 2x median → PASS."
+    },
+    {
+      "name": "iphone_15_pro_overpriced",
+      "query": "iphone 15 pro 256gb",
+      "scannedPrice": 1400,
+      "category": "electronics",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "exact",
+      "note": "Server median $580 (used). $1400 is 2.4x median → PASS."
+    },
+    {
+      "name": "nike_air_max_90_underpriced_held",
+      "query": "nike air max 90 white",
+      "scannedPrice": 35,
+      "category": "footwear",
+      "expectedCanonical": "HOLD",
+      "expectedLegacy": "steal",
+      "tolerance": "exact",
+      "note": "Server median $125, scan $35 (72% below). Legacy correctly flags 'steal'; canonical holds at HOLD due to small sample (n=6) — counterfeit/auth risk gate."
+    },
+    {
+      "name": "foam_roller_overpriced",
+      "query": "foam roller 18 inch high density",
+      "scannedPrice": 25,
+      "category": "fitness",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "overpriced",
+      "tolerance": "exact",
+      "note": "Server median $17.49, scan $25 (43% above) → PASS."
+    },
+    {
+      "name": "rolex_submariner_underpriced_held",
+      "query": "rolex submariner 16610",
+      "scannedPrice": 5500,
+      "category": "watches",
+      "expectedCanonical": "HOLD",
+      "expectedLegacy": "steal",
+      "tolerance": "exact",
+      "note": "Server median $12,000, scan $5500 (54% below). Legacy 'steal' fires; canonical HOLD — counterfeit gate on high-stakes category."
+    },
+    {
+      "name": "levi_501_overpriced",
+      "query": "levis 501 jeans dark wash 32x32",
+      "scannedPrice": 55,
+      "category": "apparel",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "exact",
+      "note": "Server median $47.50, scan $55 (15% above). Aggressive PASS — flag if a 15%-over scan ever returns HOLD."
+    },
+    {
+      "name": "seiko_skx007_underpriced_held",
+      "query": "seiko skx007",
+      "scannedPrice": 250,
+      "category": "watches",
+      "expectedCanonical": "HOLD",
+      "expectedLegacy": "steal",
+      "tolerance": "exact",
+      "note": "Server median $282.50, scan $250 (11% below). Legacy 'steal'; canonical HOLD."
+    },
+    {
+      "name": "coach_willow_overpriced",
+      "query": "coach willow shoulder bag",
+      "scannedPrice": 600,
+      "category": "handbags",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "exact",
+      "note": "Server median $129, scan $600 (4.6x median) → PASS."
+    },
+    {
+      "name": "canon_eos_r5_overpriced",
+      "query": "canon eos r5 body",
+      "scannedPrice": 3200,
+      "category": "cameras",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "loose",
+      "note": "Server median $2900, scan $3200 (10% above) — sits on price_trap/overpriced boundary. Canonical PASS is stable; legacy flaps between the two PASS-tier values depending on comp pool. Loose tolerance accepts either while still locking canonical."
+    },
+    {
+      "name": "lululemon_align_overpriced",
+      "query": "lululemon align leggings size 6",
+      "scannedPrice": 60,
+      "category": "apparel",
+      "expectedCanonical": "PASS",
+      "expectedLegacy": "price_trap",
+      "tolerance": "exact",
+      "note": "Server median $26.99, scan $60 (2.2x median) → PASS."
+    },
+    {
+      "name": "dyson_v15_underpriced_held",
+      "query": "dyson v15 detect vacuum",
+      "scannedPrice": 350,
+      "category": "appliances",
+      "expectedCanonical": "HOLD",
+      "expectedLegacy": "steal",
+      "tolerance": "exact",
+      "note": "Server median $522.64, scan $350 (33% below). Legacy 'steal'; canonical HOLD."
+    },
+    {
+      "name": "stainless_mixing_bowl_good_deal",
+      "query": "stainless steel mixing bowl set",
+      "scannedPrice": 20,
+      "category": "kitchen",
+      "expectedCanonical": "HOLD",
+      "expectedLegacy": "good_deal",
+      "tolerance": "exact",
+      "note": "Server median $23.47, scan $20 (15% below) → HOLD/good_deal."
+    }
+  ]
+}

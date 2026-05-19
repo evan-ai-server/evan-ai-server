@@ -236,7 +236,7 @@ export async function deliverWebhook(redis, deliveryId) {
     const success = response.status >= 200 && response.status < 300;
 
     // Set replay guard
-    await redis.set(replayKey, "1", { EX: REPLAY_TTL });
+    await redis.set(replayKey, "1", "EX", REPLAY_TTL);
 
     await redis.hSet(`p9:wh:delivery:${deliveryId}`, {
       status:     success ? "DELIVERED" : "FAILED",

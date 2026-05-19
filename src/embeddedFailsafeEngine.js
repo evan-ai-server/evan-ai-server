@@ -187,7 +187,7 @@ async function _recordCircuitError(redis, source) {
     const count = await redis.incr(`p9:fs:circuit:errors:${source}`);
     await redis.expire(`p9:fs:circuit:errors:${source}`, 60);  // rolling 60s window
     if (Number(count) >= CIRCUIT_THRESHOLD) {
-      await redis.set(`p9:fs:circuit:${source}`, "OPEN", { EX: CIRCUIT_OPEN_TTL });
+      await redis.set(`p9:fs:circuit:${source}`, "OPEN", "EX", CIRCUIT_OPEN_TTL);
     }
   } catch { /* non-critical */ }
 }

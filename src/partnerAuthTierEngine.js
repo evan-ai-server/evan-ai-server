@@ -276,7 +276,7 @@ export async function revokePartnerJWT(redis, { token, partnerId } = {}) {
     const payload = _verifyJWTUnsafe(token, secret);  // decode even if expired
     if (!payload?.jti) return { ok: false, error: "no_jti" };
     const ttl = Math.max(0, payload.exp - Math.floor(Date.now() / 1000));
-    await redis.set(`p9:jwt:blacklist:${payload.jti}`, "1", { EX: ttl + 60 });
+    await redis.set(`p9:jwt:blacklist:${payload.jti}`, "1", "EX", ttl + 60);
     if (partnerId) await _auditLog(redis, partnerId, "JWT_REVOKED", { jti: payload.jti });
     return { ok: true };
   } catch { return { ok: false }; }

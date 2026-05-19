@@ -1,5 +1,11 @@
 // src/portfolioTracker.js
 // Portfolio Tracker: Redis-backed registry of items a user owns.
+import {
+  computeOptimalListPrice,
+  selectExitPlatform,
+  computeHoldOrFold,
+  computeDaysHeld,
+} from "./exitIntelligence.js";
 // Tracks purchase price, current market value, unrealized P&L, and
 // surfaces "sell now" signals when the market moves in their favor.
 // "Portfolio: 8 items, $1,240 value, +$340 unrealized gain. 2 should sell now."
@@ -109,8 +115,33 @@ export async function getPortfolio(redis, userId = "") {
       const record = await redis.hgetall(KEY_ITEM(userId, itemId));
       if (!record) return null;
       const currentPrice = finiteOrNull(prices[itemId]) || null;
-      const pnl = computeItemPnL(record, currentPrice);
-      return { ...record, ...pnl, currentPrice };
+      const pnl      = computeItemPnL(record, currentPrice);
+      const daysHeld = computeDaysHeld(record);
+
+      // Exit intelligence: sell-side guidance attached per item
+      const listPriceResult = computeOptimalListPrice(
+        record.category || "",
+        currentPrice ? [{ price: currentPrice }] : [],
+        record.condition || "",
+        daysHeld,
+      );
+      const exitPlatform = selectExitPlatform(
+        record.category || "",
+        currentPrice ?? finiteOrNull(record.purchasePrice) ?? 0,
+        record.condition || "",
+        "NATIONAL",
+      );
+      const holdOrFold = computeHoldOrFold(record, currentPrice, daysHeld);
+      const exitIntel = {
+        recommendedListPrice: listPriceResult.price ?? currentPrice ?? finiteOrNull(record.purchasePrice),
+        preferredPlatform:    exitPlatform.primary,
+        secondaryPlatform:    exitPlatform.secondary,
+        estimatedFee:         exitPlatform.fee,
+        holdOrFold,
+        daysHeld,
+      };
+
+      return { ...record, ...pnl, currentPrice, exitIntel };
     })
   );
 

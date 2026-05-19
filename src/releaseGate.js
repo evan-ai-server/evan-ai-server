@@ -12,7 +12,7 @@
 //   RG-05  Confidence honesty: B2B does not overclaim vs consumer path
 //   RG-06  Latency baseline: P95 within allowed threshold
 //   RG-07  Calibration audit: no critical suppressions active
-//   RG-08  Incident controls: no active controls older than 7d (stale kill-switch)
+//   RG-08  Truth guard correction rate: fail if > 15%, warn if > 5% (with 50+ scans)
 //
 // Output: { pass, blockers[], warnings[], checks[], durationMs, runAt }
 //
@@ -24,6 +24,8 @@ import { getActiveAnomalies }    from "./anomalyEngine.js";
 import { getActiveControls }     from "./incidentControls.js";
 import { checkPayloadConsistency } from "./consistencyGuard.js";
 import { getAllSuppressions }    from "./calibrationAudit.js";
+import { getCorrectionRate }     from "./truthGuard.js";
+import { TRUTH_THRESHOLDS }      from "./truthGuardConfig.js";
 
 // ── Check definitions ─────────────────────────────────────────────────────────
 
@@ -167,6 +169,30 @@ export async function runReleaseGate(redis = null) {
     } catch { return pass("Latency data unavailable"); }
   });
   checks.push(rg07);
+
+  // RG-08: Truth guard correction rate
+  const rg08 = await check("RG-08", "Truth guard — correction rate within safe threshold", true, async () => {
+    const T    = TRUTH_THRESHOLDS;
+    const rate = await getCorrectionRate(redis);
+    if (!rate || rate.scans < T.CORRECTION_RATE_MIN_SCANS) {
+      return pass(`Insufficient scan data (${rate?.scans ?? 0} scans — need ${T.CORRECTION_RATE_MIN_SCANS}) — skipped`);
+    }
+    const { corrections, scans, rate: r } = rate;
+    if (r >= T.CORRECTION_RATE_CRITICAL) {
+      return fail(
+        `Correction rate ${(r * 100).toFixed(1)}% exceeds critical threshold ${(T.CORRECTION_RATE_CRITICAL * 100).toFixed(0)}% — ${corrections}/${scans} scans were corrected by TruthGuard`,
+        { corrections, scans, rate: r }
+      );
+    }
+    if (r >= T.CORRECTION_RATE_WARN) {
+      return warn(
+        `Correction rate ${(r * 100).toFixed(1)}% above warning threshold ${(T.CORRECTION_RATE_WARN * 100).toFixed(0)}% — ${corrections}/${scans} scans required correction`,
+        { corrections, scans, rate: r }
+      );
+    }
+    return pass(`Correction rate ${(r * 100).toFixed(1)}% (${corrections}/${scans} scans) — within threshold`);
+  });
+  checks.push(rg08);
 
   // Compile final report
   const blockers   = checks.filter((c) => c.status === "fail" && c.blocking);

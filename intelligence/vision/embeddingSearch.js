@@ -1,4 +1,9 @@
-import { pipeline, RawImage } from "@xenova/transformers";
+// Lazy-load @xenova/transformers (130MB WASM) — only on first embedding request.
+let _transformers = null;
+async function getTransformers() {
+  if (!_transformers) _transformers = await import("@xenova/transformers");
+  return _transformers;
+}
 
 let embedder;
 const VECTOR_INDEX = new Map();
@@ -6,6 +11,7 @@ const MAX_VECTORS = 2500;
 
 async function getEmbedder() {
   if (!embedder) {
+    const { pipeline } = await getTransformers();
     embedder = await pipeline(
       "image-feature-extraction",
       "Xenova/clip-vit-base-patch32"
@@ -31,6 +37,7 @@ function normalizeVector(vec = []) {
 export async function computeImageEmbedding(imageBuffer) {
   if (!Buffer.isBuffer(imageBuffer) || !imageBuffer.length) return null;
   try {
+    const { RawImage } = await getTransformers();
     const model = await getEmbedder();
     // RawImage.fromBlob works in Node.js via sharp; wrap buffer in a Blob
     const blob = new Blob([imageBuffer], { type: "image/jpeg" });

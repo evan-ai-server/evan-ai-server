@@ -71,12 +71,12 @@ export async function addCounterfeitPattern(redis, pattern) {
     };
 
     const multi = redis.multi();
-    multi.set(KEY_PATTERN(patternId), JSON.stringify(stored), { EX: TTL_PATTERN });
-    multi.sAdd(KEY_IDX_CAT(stored.category), patternId);
+    multi.set(KEY_PATTERN(patternId), JSON.stringify(stored), "EX", TTL_PATTERN);
+    multi.sadd(KEY_IDX_CAT(stored.category), patternId);
     if (stored.brand) {
-      multi.sAdd(KEY_IDX_BRAND(stored.category, stored.brand), patternId);
+      multi.sadd(KEY_IDX_BRAND(stored.category, stored.brand), patternId);
     }
-    multi.hIncrBy(KEY_STATS, "totalPatterns", 1);
+    multi.hincrby(KEY_STATS, "totalPatterns", 1);
     await multi.exec();
 
     return patternId;
@@ -97,7 +97,7 @@ export async function reinforcePattern(redis, patternId) {
     const p = JSON.parse(raw);
     p.reportCount = (p.reportCount || 1) + 1;
     p.confidence  = Math.min(1, p.confidence + 0.05);
-    await redis.set(KEY_PATTERN(patternId), JSON.stringify(p), { EX: TTL_PATTERN });
+    await redis.set(KEY_PATTERN(patternId), JSON.stringify(p), "EX", TTL_PATTERN);
   } catch (err) {
     console.error("[counterfeitMemory] reinforcePattern error:", err?.message);
   }
@@ -117,9 +117,9 @@ export async function lookupCounterfeitPatterns(redis, { category, brand } = {})
   try {
     let patternIds;
     if (brand) {
-      patternIds = await redis.sMembers(KEY_IDX_BRAND(category, brand));
+      patternIds = await redis.smembers(KEY_IDX_BRAND(category, brand));
     } else {
-      patternIds = await redis.sMembers(KEY_IDX_CAT(category));
+      patternIds = await redis.smembers(KEY_IDX_CAT(category));
     }
     if (!patternIds || patternIds.length === 0) return [];
 
@@ -250,8 +250,8 @@ async function incrementMatchCount(redis, patternId) {
   const p = JSON.parse(raw);
   p.matchCount  = (p.matchCount || 0) + 1;
   p.lastMatchTs = Date.now();
-  await redis.set(KEY_PATTERN(patternId), JSON.stringify(p), { EX: TTL_PATTERN });
-  await redis.hIncrBy(KEY_STATS, "totalMatches", 1);
+  await redis.set(KEY_PATTERN(patternId), JSON.stringify(p), "EX", TTL_PATTERN);
+  await redis.hincrby(KEY_STATS, "totalMatches", 1);
 }
 
 /**
@@ -260,7 +260,7 @@ async function incrementMatchCount(redis, patternId) {
 export async function getCounterfeitStats(redis) {
   if (!redis) return {};
   try {
-    const stats = await redis.hGetAll(KEY_STATS);
+    const stats = await redis.hgetall(KEY_STATS);
     return {
       totalPatterns: Number(stats.totalPatterns) || 0,
       totalMatches:  Number(stats.totalMatches)  || 0,
@@ -275,14 +275,14 @@ export async function getCounterfeitStats(redis) {
 export async function seedCounterfeitMemory(redis) {
   if (!redis) return;
   try {
-    const existing = await redis.hGet(KEY_STATS, "seeded");
+    const existing = await redis.hget(KEY_STATS, "seeded");
     if (existing) return;  // already seeded
 
     const seeds = SYSTEM_SEED_PATTERNS;
     for (const pattern of seeds) {
       await addCounterfeitPattern(redis, { ...pattern, source: "system_seed", addedBy: "system" });
     }
-    await redis.hSet(KEY_STATS, "seeded", "1");
+    await redis.hset(KEY_STATS, "seeded", "1");
     console.log(`[counterfeitMemory] Seeded ${seeds.length} known counterfeit patterns`);
   } catch (err) {
     console.error("[counterfeitMemory] seedCounterfeitMemory error:", err?.message);

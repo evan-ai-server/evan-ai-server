@@ -21,6 +21,7 @@ import { buildEffectiveThresholds, GLOBAL_FLOORS } from "./categoryThresholdEngi
 import { applyMarketDepthGate }                    from "./marketDepthGate.js";
 import { computeReplicaRisk }                      from "./replicaRiskEngine.js";
 import { generateScanWarnings }                    from "./signalWarnings.js";
+import { applyTruthGuard }                         from "./truthGuard.js";
 
 // ── Signal decision mirror ─────────────────────────────────────────────────────
 //
@@ -81,11 +82,11 @@ export function evaluateSignal({
     resaleScore             >= 70         &&
     demandScore             >= 50         &&
     (identityQuality ?? 0)  >= T_SB_IQ   &&
-    (trustScore ?? 1)       >= T_SB_TRUST;
+    (trustScore ?? 0)       >= T_SB_TRUST;  // null trust → 0, never passes STRONG BUY gate
   if (strongBuyGate) return { signal: "STRONG BUY", capReason: null };
 
   if (resaleScore >= T_GD_RS && dealStrength >= T_GD_DS) {
-    if ((trustScore ?? 1) < T_GD_TRUST)
+    if ((trustScore ?? 0) < T_GD_TRUST)  // null trust → 0, blocked from GOOD DEAL
       return { signal: "FAIR", capReason: "trust_below_good_deal" };
     if (count < 4)
       return { signal: "FAIR", capReason: "thin_market_good_deal" };
@@ -338,12 +339,295 @@ const SCENARIOS = [
       b2bConfidenceConsistent: false,  // C-grade index claiming high confidence = violation
     },
   },
+
+  // ── Adversarial cases (Phase 18) ────────────────────────────────────────────
+
+  {
+    id:   "S16",
+    name: "Null trustScore with strong signals → capped at FAIR (not STRONG BUY)",
+    criticalityLevel: "critical",
+    inputs: {
+      resaleScore: 85, dealStrength: 0.48, demandScore: 72,
+      confidenceV2: 0.88, trustScore: null, identityQuality: 0.76,
+      priceStats: { count: 30, median: 120, min: 80, max: 165, priceQualityScore: 0.78, variance: 400 },
+    },
+    assertions: {
+      signal:     "FAIR",
+      capReason:  "trust_below_good_deal",  // null → 0 in gate, 0 < T_GD_TRUST
+      neverEqual: "STRONG BUY",
+    },
+  },
+
+  {
+    id:   "S17",
+    name: "1 sold comp out of 10 total → depth gate caps to GOOD DEAL (thin/listed-dominated)",
+    criticalityLevel: "high",
+    inputs: {
+      _useDepthGateDirect: true,
+      depthGateInput: {
+        signal:        "STRONG BUY",
+        compsCount:    10,
+        soldCompCount: 1,
+        liquidityScore: 60,
+      },
+    },
+    assertions: {
+      capped:        true,
+      signalCeiling: "GOOD DEAL",
+    },
+  },
+
+  {
+    id:   "S18",
+    name: "Count=0 with non-null median → INSUFFICIENT DATA (count gates before median)",
+    criticalityLevel: "critical",
+    inputs: {
+      resaleScore: 80, dealStrength: 0.42, demandScore: 65,
+      confidenceV2: 0.85, trustScore: 0.75, identityQuality: 0.72,
+      priceStats: { count: 0, median: 250, min: 180, max: 320, priceQualityScore: 0.70, variance: 1000 },
+    },
+    assertions: {
+      signal:    "INSUFFICIENT DATA",
+      capReason: "insufficient_data",
+    },
+  },
+
+  {
+    id:   "S19",
+    name: "TruthGuard: GOOD DEAL + critically-low trust (< 0.30) → TG-01 forces RISKY",
+    criticalityLevel: "critical",
+    inputs: {
+      _useTruthGuard: true,
+      truthGuardInput: {
+        profitIntel: {
+          buySignal:      "GOOD DEAL",
+          trustScore:     0.22,
+          expectedProfit: 45,
+          primaryAction:  "BUY",
+        },
+        trustScore: 0.22,
+      },
+    },
+    assertions: {
+      signal:        "RISKY",
+      corrected:     true,
+      hasCorrection: "TG-01",
+    },
+  },
+
+  {
+    id:   "S20",
+    name: "Extreme price variance (CV > 60%, 10× spread) → RISKY:high_variance",
+    criticalityLevel: "high",
+    inputs: {
+      resaleScore: 78, dealStrength: 0.38, demandScore: 60,
+      confidenceV2: 0.78, trustScore: 0.75, identityQuality: 0.70,
+      priceStats: { count: 15, median: 100, min: 10, max: 1100, priceQualityScore: 0.55, variance: 90000 },
+    },
+    assertions: {
+      signal:    "RISKY",
+      capReason: "high_variance",
+    },
+  },
+
+  {
+    id:   "S21",
+    name: "Partial payload (all scores zero) → RISKY due to zero confidence",
+    criticalityLevel: "high",
+    inputs: {
+      resaleScore: 0, dealStrength: 0, demandScore: 0,
+      confidenceV2: 0, trustScore: 0.75, identityQuality: 0.70,
+      priceStats: { count: 10, median: 100, min: 60, max: 140, priceQualityScore: 0, variance: 0 },
+    },
+    assertions: {
+      signal:    "RISKY",
+      capReason: "low_confidence",
+    },
+  },
+
+  {
+    id:   "S22",
+    name: "identityQuality=0 (explicit zero, not null) → RISKY:weak_identity",
+    criticalityLevel: "critical",
+    inputs: {
+      resaleScore: 75, dealStrength: 0.38, demandScore: 62,
+      confidenceV2: 0.80, trustScore: 0.72, identityQuality: 0,
+      priceStats: { count: 20, median: 85, min: 55, max: 120, priceQualityScore: 0.68, variance: 500 },
+    },
+    assertions: {
+      signal:    "RISKY",
+      capReason: "weak_identity",
+    },
+  },
+
+  {
+    id:   "S23",
+    name: "TruthGuard: NaN trustScore → TG-08 clears to null without crash",
+    criticalityLevel: "high",
+    inputs: {
+      _useTruthGuard: true,
+      truthGuardInput: {
+        profitIntel: {
+          buySignal:      "FAIR",
+          trustScore:     NaN,
+          expectedProfit: null,
+        },
+        trustScore: NaN,
+      },
+    },
+    assertions: {
+      corrected:     true,
+      hasCorrection: "TG-08",
+    },
+  },
+
+  {
+    id:   "S24",
+    name: "TruthGuard: bias-raised GOOD DEAL trust=0.40 (< 0.45 floor) → TG-02 reverts to FAIR",
+    criticalityLevel: "critical",
+    inputs: {
+      _useTruthGuard: true,
+      truthGuardInput: {
+        profitIntel: {
+          buySignal:      "GOOD DEAL",
+          trustScore:     0.40,   // above 0.30 (TG-01 won't fire) but below 0.45 (TG-02 fires)
+          expectedProfit: 30,
+          primaryAction:  "BUY",
+        },
+        trustScore: 0.40,
+      },
+    },
+    assertions: {
+      signal:        "FAIR",
+      corrected:     true,
+      hasCorrection: "TG-02",
+    },
+  },
+
+  {
+    id:   "S25",
+    name: "TruthGuard: replica red-flag + affiliate link → TG-03 strips affiliate",
+    criticalityLevel: "critical",
+    inputs: {
+      _useTruthGuard: true,
+      truthGuardInput: {
+        profitIntel: {
+          buySignal:      "GOOD DEAL",
+          trustScore:     0.72,
+          expectedProfit: 40,
+          items: [{ url: "https://amzn.to/test", isAffiliate: true, affiliateProgram: "amazon" }],
+        },
+        trustScore:          0.72,
+        affiliateDisclosure: "This post contains affiliate links.",
+        categoryReplicaFlag: {
+          flagged: true,
+          tier:    "HIGH",
+          reason:  "High-replica category without authentication markers",
+        },
+      },
+    },
+    assertions: {
+      corrected:        true,
+      hasCorrection:    "TG-03",
+      affiliateStripped: true,
+    },
+  },
 ];
+
+// ── Replay test loader ─────────────────────────────────────────────────────────
+//
+// Generates test cases from `tg:corrections` ZSET (self-healing store).
+// Each correction entry records a before/after state — we replay the "before"
+// through TruthGuard and verify it produces the same correction.
+// This feeds real-world failures back into the regression harness.
+
+/**
+ * Load correction records from Redis and convert to replay test scenarios.
+ * Limited to `limit` most recent entries to keep test runs bounded.
+ *
+ * @param {object|null} redis
+ * @param {{ limit }} opts
+ * @returns {Promise<object[]>}  — array of scenario objects (same format as SCENARIOS)
+ */
+// Valid signal values accepted from the correction store
+const VALID_REPLAY_SIGNALS = new Set([
+  "STRONG BUY", "GOOD DEAL", "FAIR", "RISKY", "OVERPRICED", "INSUFFICIENT DATA",
+]);
+
+export async function loadReplayTestCases(redis, { limit = 20 } = {}) {
+  if (!redis) return [];
+  try {
+    // Read more than limit to allow for dedup/filter losses
+    const raw = await redis.zrevrange("tg:corrections", 0, (limit * 3) - 1).catch(() => []);
+    const cases     = [];
+    const seenIds   = new Set(); // scanId dedup
+    const catCounts = {};        // limit per category (max 5)
+
+    for (const r of raw) {
+      if (cases.length >= limit) break;
+      try {
+        const entry = JSON.parse(r);
+
+        // Schema validation — must have signal + corrections array
+        if (!entry.before?.signal || !Array.isArray(entry.corrections) || !entry.corrections.length) continue;
+
+        const signal = String(entry.before.signal);
+        const trust  = entry.before.trustScore;
+
+        // Signal must be a recognised value to prevent poisoning test expectations
+        if (!VALID_REPLAY_SIGNALS.has(signal)) continue;
+
+        // Trust must be numeric (null is only valid for NaN-test scenarios — skip from replay)
+        if (trust == null || !Number.isFinite(trust)) continue;
+
+        // Dedup by scanId
+        const sid = entry.scanId || null;
+        if (sid) {
+          if (seenIds.has(sid)) continue;
+          seenIds.add(sid);
+        }
+
+        // Cap per category to avoid one noisy category dominating replay
+        const cat = String(entry.category || "unknown").toLowerCase().trim();
+        catCounts[cat] = (catCounts[cat] || 0) + 1;
+        if (catCounts[cat] > 5) continue;
+
+        // Extract correction field name safely — corrections are objects, not strings.
+        // We can't assert a specific TG rule (TG-xx) here because human corrections
+        // record market judgments, not TruthGuard violations. Assert no crash instead.
+        const corrField = Array.isArray(entry.corrections) && entry.corrections[0]?.field
+          ? String(entry.corrections[0].field)
+          : "unknown";
+        cases.push({
+          id:               `REPLAY-${sid || Date.now().toString(36)}`,
+          name:             `Replay: ${corrField} correction (was ${signal}, trust=${trust})`,
+          criticalityLevel: "high",
+          inputs: {
+            _useTruthGuard:  true,
+            truthGuardInput: {
+              profitIntel: {
+                buySignal:      signal,
+                trustScore:     trust,
+                expectedProfit: Number.isFinite(entry.before.expectedProfit) ? entry.before.expectedProfit : null,
+              },
+              trustScore: trust,
+            },
+          },
+          // Replay cases verify TruthGuard runs cleanly without crash.
+          // Specific signal assertions belong in static SCENARIOS — not here —
+          // because human corrections reflect market judgment, not TG violations.
+          assertions: {},
+        });
+      } catch { /* skip malformed entry */ }
+    }
+    return cases;
+  } catch { return []; }
+}
 
 // ── Runner ─────────────────────────────────────────────────────────────────────
 
 /**
- * Run the full regression harness.
+ * Run the full regression harness, optionally including replay cases.
  *
  * @param {object|null} redis
  * @returns {Promise<RegressionResult>}
@@ -353,16 +637,26 @@ export async function runRegressionHarness(redis = null) {
   const results = [];
   let passed = 0, failed = 0;
 
+  // Static scenarios
   for (const scenario of SCENARIOS) {
     const result = await runScenario(scenario, redis);
     results.push(result);
     if (result.pass) passed++; else failed++;
   }
 
+  // Replay cases from real-world TruthGuard corrections
+  const replayCases = await loadReplayTestCases(redis, { limit: 20 });
+  for (const scenario of replayCases) {
+    const result = await runScenario(scenario, redis);
+    results.push(result);
+    if (result.pass) passed++; else failed++;
+  }
+
+  const totalCount = SCENARIOS.length + replayCases.length;
   return {
     runAt:       new Date().toISOString(),
     durationMs:  Date.now() - start,
-    total:       SCENARIOS.length,
+    total:       totalCount,
     passed,
     failed,
     criticalFailures: results.filter((r) => !r.pass && r.criticalityLevel === "critical").length,
@@ -405,6 +699,37 @@ async function runScenario(scenario, redis) {
         : true;
       const pass = tierOk && cappingOk;
       return buildResult({ id, name, criticalityLevel, pass, assertions, actual: replicaResult });
+    }
+
+    // ── Depth gate (direct params) ────────────────────────────────────────────
+    if (inputs._useDepthGateDirect) {
+      const { signal, compsCount, soldCompCount, liquidityScore } = inputs.depthGateInput;
+      const depthResult = applyMarketDepthGate({ signal, compsCount, soldCompCount, liquidityScore });
+      const cappedOk    = assertions.capped !== undefined ? depthResult.capped === assertions.capped : true;
+      const ceilOk      = assertions.signalCeiling
+        ? SIGNAL_ORDER.indexOf(depthResult.signal) >= SIGNAL_ORDER.indexOf(assertions.signalCeiling)
+        : true;
+      const pass = cappedOk && ceilOk;
+      return buildResult({ id, name, criticalityLevel, pass, assertions, actual: depthResult });
+    }
+
+    // ── TruthGuard scenario ────────────────────────────────────────────────────
+    if (inputs._useTruthGuard) {
+      // structuredClone preserves NaN (unlike JSON.parse/stringify)
+      const payload = structuredClone(inputs.truthGuardInput);
+      const { corrections, violations } = applyTruthGuard(payload, {});
+      const signalOk    = assertions.signal    ? payload.profitIntel?.buySignal === assertions.signal : true;
+      const correctedOk = assertions.corrected !== undefined ? payload._corrected === assertions.corrected : true;
+      const correctionOk = assertions.hasCorrection
+        ? corrections.some((c) => c.startsWith(assertions.hasCorrection))
+        : true;
+      const affiliateOk = assertions.affiliateStripped !== undefined
+        ? (payload.affiliateDisclosure == null) === assertions.affiliateStripped
+        : true;
+      const pass = signalOk && correctedOk && correctionOk && affiliateOk;
+      return buildResult({ id, name, criticalityLevel, pass, assertions,
+        actual: { signal: payload.profitIntel?.buySignal, corrections, _corrected: payload._corrected,
+                  affiliateDisclosure: payload.affiliateDisclosure ?? null } });
     }
 
     // ── B2B confidence check ───────────────────────────────────────────────────

@@ -91,19 +91,22 @@ function buildWinReasons(winner = {}, loser = {}, winnerLabel = "A", loserLabel 
     reasons.push(`$${wNet.toFixed(2)} vs $${(lNet ?? 0).toFixed(2)} net profit`);
   }
 
-  // Risk
-  const wRisk = winner?.riskScore?.tier || "safe";
-  const lRisk = loser?.riskScore?.tier  || "safe";
+  // Risk — skip the comparison when either side has unknown risk; we can't
+  // claim "lower risk" on a side whose risk we never evaluated.
+  const wRisk = winner?.riskScore?.tier || "unknown";
+  const lRisk = loser?.riskScore?.tier  || "unknown";
   const riskRank = { safe: 0, caution: 1, risky: 2, avoid: 3 };
-  if ((riskRank[wRisk] ?? 0) < (riskRank[lRisk] ?? 0)) {
+  if (wRisk !== "unknown" && lRisk !== "unknown" && riskRank[wRisk] < riskRank[lRisk]) {
     reasons.push(`lower risk (${wRisk} vs ${lRisk})`);
   }
 
-  // Demand
-  const wDem = winner?.demandSignals?.tier || "warm";
-  const lDem = loser?.demandSignals?.tier  || "warm";
+  // Demand — same gate as risk.
+  const wDem = winner?.demandSignals?.tier || "unknown";
+  const lDem = loser?.demandSignals?.tier  || "unknown";
   const demRank = { hot: 3, warm: 2, cool: 1, cold: 0 };
-  if ((demRank[wDem] ?? 2) > (demRank[lDem] ?? 2)) reasons.push("stronger demand");
+  if (wDem !== "unknown" && lDem !== "unknown" && demRank[wDem] > demRank[lDem]) {
+    reasons.push("stronger demand");
+  }
 
   // Condition
   const wImpact = winner?.conditionPricing?.totalImpactPct ?? 0;

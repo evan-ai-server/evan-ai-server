@@ -15,6 +15,7 @@
 import { getGlobalCalibration }   from "./accuracyEngine.js";
 import { runClusterScan }         from "./badCallClusterEngine.js";
 import { getGlobalAttributionStats } from "./revenueAttribution.js";
+import { normalizeCategory }      from "./learningStore.js";
 
 const KEY_ACTIVE  = "anomaly:active";
 const KEY_HISTORY = (d) => `anomaly:history:${d}`;
@@ -250,6 +251,102 @@ const DETECTORS = [
     },
   },
 
+  // ── A09: Trust score average distribution shift ────────────────────────────
+  {
+    id:    "A09",
+    name:  "Trust score average below healthy threshold",
+    check: async (redis) => {
+      if (!redis) return null;
+      try {
+        const [totalStr, sumStr] = await Promise.all([
+          redis.get("metrics:scans:total").catch(() => null),
+          redis.get("metrics:trust:score_sum").catch(() => null),
+        ]);
+        const total = parseInt(totalStr || "0");
+        const sum   = parseFloat(sumStr  || "0");
+        if (total < 100) return null;
+        const avg = sum / total;
+        if (avg >= 0.50) return null;
+        const severity = avg < 0.35 ? "critical" : avg < 0.42 ? "high" : "medium";
+        return {
+          anomalyId:      "A09",
+          title:          "Trust score average below healthy threshold",
+          detail:         `Average trust score ${avg.toFixed(3)} across ${total} scans (healthy baseline: ≥ 0.50)`,
+          metric:         "avg_trust_score",
+          baseline:       0.60,
+          current:        avg,
+          threshold:      0.50,
+          severity,
+          suggestedAction: "Check identity engine quality and priceQualityScore distributions. Elevated RISKY rate may be the upstream cause.",
+        };
+      } catch { return null; }
+    },
+  },
+
+  // ── A10: RISKY signal rate spike ───────────────────────────────────────────
+  {
+    id:    "A10",
+    name:  "RISKY signal rate spike",
+    check: async (redis) => {
+      if (!redis) return null;
+      try {
+        const [totalStr, riskyStr] = await Promise.all([
+          redis.get("metrics:scans:total").catch(() => null),
+          redis.get("metrics:signal:RISKY").catch(() => null),
+        ]);
+        const total = parseInt(totalStr || "0");
+        const risky = parseInt(riskyStr || "0");
+        if (total < 50) return null;
+        const rate = risky / total;
+        if (rate < 0.30) return null;
+        const severity = rate >= 0.55 ? "critical" : rate >= 0.40 ? "high" : "medium";
+        return {
+          anomalyId:      "A10",
+          title:          "Unusually high RISKY signal rate",
+          detail:         `${(rate * 100).toFixed(0)}% of ${total} scans returned RISKY (threshold: 30%)`,
+          metric:         "risky_signal_rate",
+          baseline:       0.15,
+          current:        rate,
+          threshold:      0.30,
+          severity,
+          suggestedAction: "Check for oracle fallback spike, trust engine degradation, or replica flag over-triggering.",
+        };
+      } catch { return null; }
+    },
+  },
+
+  // ── A11: Truth guard correction rate spike ─────────────────────────────────
+  {
+    id:    "A11",
+    name:  "Truth guard correction rate spike",
+    check: async (redis) => {
+      if (!redis) return null;
+      try {
+        const [totalStr, correctionsStr] = await Promise.all([
+          redis.get("metrics:scans:total").catch(() => null),
+          redis.get("metrics:truth_corrections:total").catch(() => null),
+        ]);
+        const total       = parseInt(totalStr        || "0");
+        const corrections = parseInt(correctionsStr  || "0");
+        if (total < 50) return null;
+        const rate = corrections / total;
+        if (rate < 0.10) return null;
+        const severity = rate >= 0.20 ? "critical" : "high";
+        return {
+          anomalyId:      "A11",
+          title:          "Truth guard correction rate elevated",
+          detail:         `${(rate * 100).toFixed(0)}% of ${total} scans required TruthGuard corrections (threshold: 10%)`,
+          metric:         "truth_correction_rate",
+          baseline:       0.02,
+          current:        rate,
+          threshold:      0.10,
+          severity,
+          suggestedAction: "Review TruthGuard correction logs via /api/ops/logs/truth_correction. High rate indicates signal bias or upstream pipeline issues.",
+        };
+      } catch { return null; }
+    },
+  },
+
   // ── A08: Category win-rate collapse for a specific category ───────────────
   {
     id:    "A08",
@@ -381,6 +478,57 @@ export async function getAnomalyHistory(redis, { days = 7 } = {}) {
     }
     return entries;
   } catch { return []; }
+}
+
+/**
+ * Record a single scan metric in Redis for anomaly detection + learning.
+ * Fire-and-forget — never throws, never blocks the hot path.
+ *
+ * @param {object} redis
+ * @param {{ signal, trustScore, corrected, latencyMs, category }} opts
+ */
+export function recordScanMetric(redis, { signal, trustScore, corrected, latencyMs, category } = {}) {
+  if (!redis) return;
+
+  // Global counters
+  redis.incr("metrics:scans:total").catch(() => {});
+  if (signal) redis.incr(`metrics:signal:${signal}`).catch(() => {});
+  if (corrected) redis.incr("metrics:truth_corrections:total").catch(() => {});
+  if (trustScore != null && Number.isFinite(trustScore)) {
+    redis.incrbyfloat("metrics:trust:score_sum", trustScore).catch(() => {});
+  }
+
+  // P95 latency approximation (aggressive on spikes, slow decay)
+  if (latencyMs != null && Number.isFinite(latencyMs) && latencyMs > 0) {
+    redis.get("metrics:latency:scan_p95_ms").then((prev) => {
+      const p    = parseFloat(prev || "0");
+      const next = p === 0
+        ? latencyMs
+        : latencyMs > p
+          ? Math.max(p * 0.90 + latencyMs * 0.10, latencyMs * 0.95)  // spike: weight toward new value
+          : p * 0.998;                                                   // decay: very slow
+      return redis.set("metrics:latency:scan_p95_ms", next.toFixed(0));
+    }).catch(() => {});
+  }
+
+  // Per-category counters (for adaptive threshold computation)
+  if (category) {
+    const cat = normalizeCategory(category);
+    const ttl = 90 * 86400;
+    redis.incr(`metrics:category:${cat}:total_scans`).then(() =>
+      redis.expire(`metrics:category:${cat}:total_scans`, ttl)
+    ).catch(() => {});
+    if (corrected) {
+      redis.incr(`metrics:category:${cat}:corrections`).catch(() => {});
+    }
+    if (trustScore != null && Number.isFinite(trustScore)) {
+      redis.incrbyfloat(`metrics:category:${cat}:trust_sum`, trustScore).catch(() => {});
+    }
+    if (signal) {
+      const sigKey = signal.toLowerCase().replace(/\s+/g, "_");
+      redis.incr(`metrics:category:${cat}:signal:${sigKey}`).catch(() => {});
+    }
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

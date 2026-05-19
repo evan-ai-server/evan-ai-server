@@ -1,17 +1,16 @@
 // src/buyOrPassEngine.js
-// Feature 62 — Buy or Pass Engine: THE FINAL VERDICT.
-// Synthesizes every Evan AI signal into one unambiguous recommendation:
-// BUY / PASS / WAIT — with a confidence score, exact dollar reasoning,
-// top supporting signals, and top risk flags. This is Evan's last word.
-// "BUY — 87% confidence. $43 below market, hot demand, low risk."
+// Buy or Pass Engine — three states, no qualifiers.
+//
+// BUY  — signals support the purchase.
+// PASS — signals do not support the purchase.
+// HOLD — not enough signal to lock the call (needs more comps / better photo).
+//
+// No STRONG / CAUTION / WAIT. The verdict either lands or it doesn't.
 
-// ── Verdict definitions ───────────────────────────────────────────────────────
 const VERDICTS = {
-  BUY:         { label: "BUY",          emoji: "✅", color: "green"  },
-  STRONG_BUY:  { label: "STRONG BUY",   emoji: "🔥", color: "green"  },
-  WAIT:        { label: "WAIT",          emoji: "⏳", color: "yellow" },
-  PASS:        { label: "PASS",          emoji: "❌", color: "red"    },
-  CAUTION:     { label: "CAUTION",       emoji: "⚠️", color: "orange" },
+  BUY:  { label: "BUY",  color: "green"   },
+  HOLD: { label: "HOLD", color: "neutral" },
+  PASS: { label: "PASS", color: "red"     },
 };
 
 // ── Signal weights (sum = 1.0) ────────────────────────────────────────────────
@@ -88,13 +87,51 @@ export function computeBuyOrPass(bundle = {}) {
   const priceProj    = bundle?.priceProjection?.projection;
   const fakeDetect   = bundle?.fakeDetector?.listing;
 
+  // ── Evidence gate ────────────────────────────────────────────────────────
+  // Without comps, every downstream signal (deal, flip, demand, risk) is
+  // synthesised from defaults and produces a confidently-scored verdict on
+  // no data. Short-circuit to an honest "not enough evidence" result and
+  // skip dimension scoring entirely.
+  const listingCount = bundle?.consensus?.listingCount ?? 0;
+  const itemsCount   = Array.isArray(bundle?.items) ? bundle.items.length : 0;
+  if (listingCount === 0 && itemsCount === 0) {
+    return {
+      verdict:           "HOLD",
+      verdictKey:        "HOLD",
+      color:             "neutral",
+      confidence:        15,
+      oneLineReason:     "Not enough evidence yet — try a clearer photo or wait for more comps.",
+      supportingSignals: [],
+      riskFlags:         [],
+      hardDisqualifiers: [],
+      dimensions: {
+        price:         { score: null, weight: WEIGHTS.price        },
+        flipPotential: { score: null, weight: WEIGHTS.flipScore    },
+        demand:        { score: null, weight: WEIGHTS.demand       },
+        risk:          { score: null, weight: WEIGHTS.risk         },
+        authenticity:  { score: null, weight: WEIGHTS.authenticity },
+        condition:     { score: null, weight: WEIGHTS.condition    },
+      },
+      topSignal:         "Not enough evidence yet",
+      noEvidence:        true,
+    };
+  }
+
   // ── Dimension scores ─────────────────────────────────────────────────────
+  // Missing inputs default to neutral 0.5, never to optimistic max — absence
+  // of data must not look like "we checked and it's clean."
   const priceScore    = scorePriceSignal(deal?.verdict,   deal?.savingsPct ?? deal?.discountPct);
   const demandScore   = scoreDemandSignal(demand?.tier);
   const flipScoreVal  = scoreFlipSignal(flip?.score);
-  const riskScoreVal  = scoreRiskSignal(risk?.tier ?? (risk?.score < 0.2 ? "safe" : risk?.score < 0.5 ? "moderate" : "risky"));
-  const authScoreVal  = scoreAuthSignal(auth?.riskTier ?? "low");
-  const condScoreVal  = scoreConditionSignal(bundle?.visionIdentity?.condition ?? "good");
+  const riskScoreVal  = (risk?.tier && risk.tier !== "unknown")
+    ? scoreRiskSignal(risk.tier)
+    : 0.5;
+  const authScoreVal  = auth?.riskTier
+    ? scoreAuthSignal(auth.riskTier)
+    : 0.5;
+  const condScoreVal  = bundle?.visionIdentity?.condition
+    ? scoreConditionSignal(bundle.visionIdentity.condition)
+    : 0.5;
 
   // ── Weighted composite ──────────────────────────────────────────────────
   const raw =
@@ -112,20 +149,21 @@ export function computeBuyOrPass(bundle = {}) {
   if (risk?.tier === "avoid")                                       hardPass.push("risk_avoid");
   if (deal?.verdict === "price_trap")                               hardPass.push("price_trap");
 
-  // ── Price drop signal (push toward WAIT) ────────────────────────────────
-  const forceWait = priceProj?.verdict === "WAIT" && raw >= 0.4 && raw < 0.72;
+  // ── Price drop signal pushes ambiguous reads to HOLD ────────────────────
+  const forceHold = priceProj?.verdict === "WAIT" && raw >= 0.4 && raw < 0.72;
 
   // ── Normalised confidence (0-100) ───────────────────────────────────────
   const confidence = Math.round(Math.min(100, Math.max(0, raw * 100)));
 
-  // ── Verdict assignment ───────────────────────────────────────────────────
+  // ── Three-state assignment — no qualifiers ──────────────────────────────
+  // PASS at <40 or any hard disqualifier; HOLD in the ambiguous middle;
+  // BUY when confidence clears 65. The bar to land BUY is deliberately high
+  // so the call carries weight; everything in between is honestly HOLD.
   let verdictKey;
   if (hardPass.length)        verdictKey = "PASS";
-  else if (forceWait)         verdictKey = "WAIT";
-  else if (confidence >= 82)  verdictKey = "STRONG_BUY";
+  else if (forceHold)         verdictKey = "HOLD";
   else if (confidence >= 65)  verdictKey = "BUY";
-  else if (confidence >= 48)  verdictKey = "CAUTION";
-  else if (confidence >= 35)  verdictKey = "WAIT";
+  else if (confidence >= 40)  verdictKey = "HOLD";
   else                        verdictKey = "PASS";
 
   const verdict = VERDICTS[verdictKey];
@@ -140,43 +178,43 @@ export function computeBuyOrPass(bundle = {}) {
   const scanPrice  = finiteOrNull(bundle?.scannedPrice ?? bundle?.bestPrice);
 
   if (deal?.verdict === "steal" && savingsPct) {
-    supportingSignals.push(`${savingsPct.toFixed(0)}% below market median — steal pricing`);
+    supportingSignals.push(`${savingsPct.toFixed(0)}% under market`);
   } else if (deal?.verdict === "good" && median && scanPrice) {
-    supportingSignals.push(`$${(median - scanPrice).toFixed(0)} below market median`);
+    supportingSignals.push(`$${(median - scanPrice).toFixed(0)} under market`);
   } else if (deal?.verdict === "fair") {
-    riskFlags.push("Priced at market — no built-in margin");
+    riskFlags.push("Priced at market — no margin built in");
   } else if (deal?.verdict === "high" || deal?.verdict === "price_trap") {
-    riskFlags.push("Overpriced vs market — avoid unless personal use");
+    riskFlags.push("Above market on recent comps");
   }
 
-  if (demand?.tier === "hot")        supportingSignals.push("HOT demand — fast resale");
-  else if (demand?.tier === "warm")  supportingSignals.push("Healthy demand");
-  else if (demand?.tier === "cold")  riskFlags.push("Cold demand — slow market");
+  if (demand?.tier === "hot")        supportingSignals.push("Resells fast at this price");
+  else if (demand?.tier === "warm")  supportingSignals.push("Steady resale demand");
+  else if (demand?.tier === "cold")  riskFlags.push("Slow resale at this price");
 
-  if (flip?.score >= 72)             supportingSignals.push(`Flip Score ${flip.score}/100 — strong flip potential`);
-  else if (flip?.score >= 55)        supportingSignals.push(`Flip Score ${flip.score}/100 — solid opportunity`);
-  else if (flip?.score !== undefined && flip.score < 38) riskFlags.push(`Flip Score ${flip.score}/100 — weak flip`);
+  if (flip?.score >= 72)             supportingSignals.push(`Strong margin on recent sales`);
+  else if (flip?.score >= 55)        supportingSignals.push(`Margin holds on recent sales`);
+  else if (flip?.score !== undefined && flip.score < 38) riskFlags.push(`Thin margin on recent sales`);
 
   if (risk?.tier === "safe" || (finiteOrNull(risk?.score) ?? 1) < 0.2) {
-    supportingSignals.push("Low risk profile");
+    supportingSignals.push("Clean recent sale history");
   } else if (risk?.tier === "risky" || risk?.tier === "avoid") {
-    riskFlags.push(`Risk tier: ${risk.tier}`);
+    riskFlags.push(`Listing pattern looks risky`);
   }
 
   if (["high", "extreme"].includes(auth?.riskTier)) {
-    riskFlags.push(`Auth risk: ${auth.riskTier} — authenticate before buying`);
+    riskFlags.push(`Authenticate before buying`);
   }
 
   if (condition?.hasDetectedDamage) {
-    riskFlags.push(`Condition issue: ${condition.detections?.[0]?.label ?? "damage detected"}`);
+    riskFlags.push(`Visible wear: ${condition.detections?.[0]?.label ?? "damage in photo"}`);
   }
 
   if (priceProj?.verdict === "WAIT") {
-    riskFlags.push("Price expected to drop in 90 days — consider waiting");
+    riskFlags.push("Recent comps trending down — may sell cheaper soon");
   }
 
   if (hardPass.length) {
-    riskFlags.unshift(...hardPass.map(f => `HARD PASS: ${f.replace(/_/g, " ")}`));
+    riskFlags.unshift(...hardPass.map(f => f.replace(/_/g, " ")));
   }
 
   // ── One-line reason ──────────────────────────────────────────────────────
@@ -198,7 +236,6 @@ export function computeBuyOrPass(bundle = {}) {
   return {
     verdict:           verdict.label,
     verdictKey,
-    emoji:             verdict.emoji,
     color:             verdict.color,
     confidence,
     oneLineReason,
@@ -210,17 +247,24 @@ export function computeBuyOrPass(bundle = {}) {
   };
 }
 
+// One-line summary — plain language, no jargon.
+// BUY  leads with the price truth, then the strongest supporting signal.
+// PASS leads with the strongest risk flag.
+// HOLD leads with what's missing — the user should feel we're being honest,
+//      not hedging.
 function buildOneLineReason(verdictKey, confidence, topPositive, topNegative, scanPrice, median, dealVerdict) {
   const pricePart = scanPrice && median
-    ? ` ($${(Math.abs(median - scanPrice)).toFixed(0)} ${scanPrice < median ? "below" : "above"} market)`
+    ? ` — $${(Math.abs(median - scanPrice)).toFixed(0)} ${scanPrice < median ? "under" : "over"} market`
     : "";
 
-  if (verdictKey === "STRONG_BUY")  return `STRONG BUY — ${confidence}% confidence${pricePart}${topPositive ? `. ${topPositive}` : ""}`;
-  if (verdictKey === "BUY")         return `BUY — ${confidence}% confidence${pricePart}${topPositive ? `. ${topPositive}` : ""}`;
-  if (verdictKey === "CAUTION")     return `CAUTION — ${confidence}% confidence${topNegative ? `. ${topNegative}` : ""}${topPositive ? ` but ${topPositive.toLowerCase()}` : ""}`;
-  if (verdictKey === "WAIT")        return `WAIT — ${confidence}% confidence. ${topNegative || "Better opportunity may come"}`;
-  if (verdictKey === "PASS")        return `PASS — ${confidence}% confidence. ${topNegative || "Signals do not support this purchase"}`;
-  return `REVIEWING — ${confidence}% confidence`;
+  if (verdictKey === "BUY") {
+    return `BUY${pricePart}${topPositive ? `. ${topPositive}` : ""}`;
+  }
+  if (verdictKey === "PASS") {
+    return `PASS${topNegative ? ` — ${topNegative.toLowerCase()}` : `${pricePart}`}`;
+  }
+  // HOLD — admit what's missing rather than fake certainty
+  return `HOLD — need more comps to lock the call`;
 }
 
 // ── Master payload builder ────────────────────────────────────────────────────

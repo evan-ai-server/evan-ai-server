@@ -389,15 +389,33 @@ export function globalErrorHandler(err, req, res, _next) {
 // Used alongside the existing hardeningLayer rate limits for double-layer defense.
 
 const _abuseCounts = new Map(); // ip → { count, windowStart }
-const ABUSE_WINDOW_MS  = 10_000; // 10 second burst window
-const ABUSE_BURST_MAX  = 5;      // max 5 scans in 10s
-const ABUSE_BLOCK_MS   = 60_000; // 60s block on detection
+// Env-overridable so the bench harness can lift these. Defaults stay prod-safe.
+const ABUSE_WINDOW_MS  = Number(process.env.ABUSE_WINDOW_MS || 10_000); // 10 second burst window
+const ABUSE_BURST_MAX  = Number(process.env.ABUSE_BURST_MAX || 5);      // max 5 scans in 10s
+const ABUSE_BLOCK_MS   = Number(process.env.ABUSE_BLOCK_MS  || 60_000); // 60s block on detection
 const _abuseBlocked    = new Map(); // ip → blockedUntil
+
+// Bench bypass — kept inline (no cross-module import) so this file stays
+// dependency-free. Mirrors isBenchBypass() in index.js: refuses in production,
+// requires a non-trivial secret (≥16 chars), constant-time compares.
+function _isBenchBypassHeader(req) {
+  if (process.env.NODE_ENV === "production") return false;
+  const secret = process.env.BENCH_BYPASS_SECRET || "";
+  if (secret.length < 16) return false;
+  const inbound = String(req?.headers?.["x-bench-bypass"] || "");
+  if (inbound.length !== secret.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(inbound), Buffer.from(secret));
+  } catch {
+    return false;
+  }
+}
 
 export function abuseTrackerMiddleware({ limitPaths = ["/market/search", "/api/vision/analyze", "/upload/presign"] } = {}) {
   return (req, res, next) => {
     const path = req.path;
     if (!limitPaths.some(p => path.startsWith(p))) return next();
+    if (_isBenchBypassHeader(req)) return next();
 
     const ip = _getIp(req);
     const now = Date.now();

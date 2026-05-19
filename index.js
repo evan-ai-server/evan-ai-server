@@ -40,6 +40,7 @@ async function getS3SDK() {
 }
 import helmet from "helmet";
 import { imageSimilarityScore } from "./intelligence/imageSimilarity.js";
+import { visualSimilarityScore } from "./intelligence/moat/visualTwinSearch.js";
 import { recordPriceObservation, getHistoricalStats } from "./intelligence/priceHistory.js";
 import { rememberProduct, getProductMemory } from "./intelligence/productMemory.js";
 import { categoryAdapter } from "./intelligence/categoryAdapters.js";
@@ -529,6 +530,7 @@ import {
   getQueryOutcomePrior,
   getUserCategoryAffinity,
   applyOutcomeBiasesToDecision,
+  computeBracketAdjustmentFromPrior,
 } from "./src/outcomeLearning.js";
 import {
   detectMissedOpportunity,
@@ -1232,6 +1234,8 @@ import {
 import { guardPayloadSafe, auditB2BPayload } from "./src/consistencyGuard.js";
 import { applyTruthGuardSafe, getCorrectionRate, getTruthCorrectionHistory } from "./src/truthGuard.js";
 import { logEvent as logStructuredEvent, LOG_TYPES } from "./src/structuredLogger.js";
+import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordVerdict } from "./src/scanHarness.js";
+import { register as similarityRegister, findSimilar as similarityFindSimilar, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -1370,6 +1374,13 @@ const ETSY_OAUTH_TOKEN = process.env.ETSY_OAUTH_TOKEN || "";
 // eBay
 const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || "";
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || "";
+// EBAY_SOLD_SCOPE_GRANTED — set to "true" once eBay has approved
+// access to the restricted /buy/marketplace_insights scope. When false the
+// sold-comps lane stays dormant (zero requests, zero cost). When true the
+// scan path requests sold sales alongside active listings and feeds them
+// into the comp basket marked source="ebay_sold", sold=true.
+const EBAY_SOLD_SCOPE_GRANTED = String(process.env.EBAY_SOLD_SCOPE_GRANTED || "")
+  .toLowerCase() === "true";
 
 // Walmart Marketplace
 const WALMART_CLIENT_ID = process.env.WALMART_CLIENT_ID || "";
@@ -1386,6 +1397,144 @@ let ETSY_COOLDOWN_UNTIL = 0;
 const VISION_MODEL =
   process.env.VISION_MODEL || "gpt-4.1";
 const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1";
+
+// ── Layer 3: two-tier vision ─────────────────────────────────────────────────
+// Fast pre-pass runs gpt-4.1-mini (~1.5–3 s) on every scan that bypasses
+// Layer 1 (exact + similarity caches). If the fast pass returns a confident
+// identification AND the inferred category is not high-stakes, we skip the
+// gpt-4.1 dual-pass consensus entirely. Common items (sneakers without a
+// luxury label, household goods, books) typically clear the bar; misidentifying
+// a Hermès vs a knock-off is the kind of error that earns the slower path.
+const FAST_VISION_MODEL              = process.env.FAST_VISION_MODEL || "gpt-4.1-mini";
+const FAST_PASS_ENABLED              = String(process.env.FAST_PASS_ENABLED || "true").toLowerCase() !== "false";
+const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 3500);
+const FAST_PASS_CONFIDENCE_THRESHOLD = Number(process.env.FAST_PASS_CONFIDENCE_THRESHOLD || 0.65);
+// When visual_shape returns confidence >= threshold we don't wait on the
+// heavier master pass — saves ~1.5–3 s of wall time on the common case.
+// Threshold is intentionally strict (0.95) so master only short-circuits when
+// visual_shape is already declaring near-certainty.
+const SKIP_MASTER_ON_CONFIDENT_VISUAL_ENABLED = String(process.env.SKIP_MASTER_ON_CONFIDENT_VISUAL || "true").toLowerCase() !== "false";
+const SKIP_MASTER_CONFIDENCE_THRESHOLD        = Number(process.env.SKIP_MASTER_CONFIDENCE_THRESHOLD || 0.95);
+// Percentage rollout for the master-skip experiment. 100 = always on,
+// 0 = always off (treats every scan as control). Per-scan dice roll. Tagged
+// onto the timing entry as `cohort` so /debug/timings can A/B the two paths.
+// Use 50 for a real A/B test during validation, 100 when shipping the win.
+const SKIP_MASTER_ROLLOUT_PCT                 = Math.max(0, Math.min(100, Number(process.env.SKIP_MASTER_ROLLOUT_PCT || 100)));
+// SerpAPI request timeout. Dropped from 12 s → 4 s so a slow Google Shopping
+// lane can't anchor the whole scan, but with enough headroom that legitimate
+// 3-4 s responses still land in the merged comp pool. On abort the fetch
+// returns [] and the market_search wave 2 / fallback lanes still surface
+// comps. Lane-level abort vs complete counts surface in the 📉 MERGE PIPELINE
+// log so we can tune from data instead of guessing.
+const SERPAPI_TIMEOUT_MS                      = Number(process.env.SERPAPI_TIMEOUT_MS || 4000);
+const HIGH_STAKES_CATEGORIES = new Set(
+  (process.env.HIGH_STAKES_CATEGORIES ||
+    "luxury,handbag,handbags,sneakers,sneaker,collectibles,collectible,watches,watch,jewelry,electronics,trading_cards,trading_card,coin,coins,sports_card,sports_cards"
+  ).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+);
+
+// Counters for the unified scan path, surfaced via /debug/cache so we can
+// see hit/escalation rates without scraping logs. Incremented in /vision/analyze
+// (cache outcomes) and runVisionConsensus (vision-tier outcomes).
+const visionTierStats = {
+  exactCacheHit:     0,
+  similarityCacheHit:0,
+  fastAccepted:      0,
+  fastEscalated:     0,
+  consensusOnly:     0,
+  masterSkipped:     0,
+};
+
+// Per-million-token pricing for the models we route to. Source: OpenAI public
+// pricing as of 2026-01. Cached-input lane is ~75% cheaper than uncached on
+// GPT-4.1 family. Update these in one place when prices change.
+const MODEL_PRICING_USD_PER_M = {
+  "gpt-4.1":             { input: 2.00, cachedInput: 0.50, output: 8.00 },
+  "gpt-4.1-mini":        { input: 0.40, cachedInput: 0.10, output: 1.60 },
+  "gpt-4.1-nano":        { input: 0.10, cachedInput: 0.025, output: 0.40 },
+  "gpt-4o":              { input: 2.50, cachedInput: 1.25, output: 10.00 },
+  "gpt-4o-mini":         { input: 0.15, cachedInput: 0.075, output: 0.60 },
+  "gemini-2.0-flash":    { input: 0.10, cachedInput: 0.025, output: 0.40 },
+  "gemini-2.0-flash-exp":{ input: 0.10, cachedInput: 0.025, output: 0.40 },
+};
+function costForUsage(usage, model) {
+  if (!usage || typeof usage !== "object") return 0;
+  const price = MODEL_PRICING_USD_PER_M[model] || MODEL_PRICING_USD_PER_M["gpt-4.1"];
+  const inTokens     = Number(usage.input_tokens || usage.prompt_tokens || 0);
+  const outTokens    = Number(usage.output_tokens || usage.completion_tokens || 0);
+  const cachedTokens = Number(usage?.input_tokens_details?.cached_tokens || 0);
+  const fullInTokens = Math.max(inTokens - cachedTokens, 0);
+  const inCost     = (fullInTokens / 1_000_000) * (price.input || 0);
+  const cachedCost = (cachedTokens / 1_000_000) * (price.cachedInput ?? price.input ?? 0);
+  const outCost    = (outTokens / 1_000_000) * (price.output || 0);
+  return inCost + cachedCost + outCost;
+}
+
+// Estimated cost for a vision pass that was cancelled mid-flight (OpenAI
+// returns no `usage` for aborted requests, so the actual billed amount is
+// unknown). The HTTP request body — including the full image — was already
+// sent and decoded by the time we abort, so input tokens are billed in full;
+// output is typically near zero (we abort before significant generation).
+// Default = ~1500 input tokens × gpt-4.1 input price = $0.003. Override via
+// env if your prompt is materially different. Conservative direction:
+// over-estimating cancelled cost makes the byCohort.lift.costPct look
+// SMALLER than it really is, which is the safer way to be wrong.
+const VISION_CANCELLED_COST_ESTIMATE_USD = Number(process.env.VISION_CANCELLED_COST_ESTIMATE_USD || 0.003);
+function costForCancelledPass(model) {
+  // Scale the estimate by the model's input price relative to gpt-4.1, so
+  // a cancelled gpt-4.1-mini doesn't get charged at gpt-4.1 rates.
+  const refPrice  = MODEL_PRICING_USD_PER_M["gpt-4.1"]?.input || 2.0;
+  const thisPrice = (MODEL_PRICING_USD_PER_M[model] || {}).input || refPrice;
+  return VISION_CANCELLED_COST_ESTIMATE_USD * (thisPrice / refPrice);
+}
+
+// Ring buffer of recent scan timings, surfaced via /debug/timings so we can
+// measure the speed pass before/after instead of estimating. Records the
+// wall-time each vision pass took plus which tier ultimately served the scan.
+const SCAN_TIMING_RING_SIZE = Number(process.env.SCAN_TIMING_RING_SIZE || 500);
+const scanTimingRing = [];
+function recordVisionTiming(entry) {
+  try {
+    if (!entry || typeof entry !== "object") return;
+    scanTimingRing.push({
+      rid:               entry.rid || "",
+      ts:                Date.now(),
+      tier:              entry.tier || "unknown",
+      cohort:            entry.cohort || "treatment",
+      masterSkipped:     !!entry.masterSkipped,
+      downscaled:        !!entry.downscaled,
+      downscaleFromBytes:Number(entry.downscaleFromBytes || 0) || 0,
+      downscaleToBytes:  Number(entry.downscaleToBytes || 0) || 0,
+      fastMs:            Number.isFinite(entry.fastMs) ? Math.round(entry.fastMs) : null,
+      visualMs:          Number.isFinite(entry.visualMs) ? Math.round(entry.visualMs) : null,
+      masterMs:          Number.isFinite(entry.masterMs) ? Math.round(entry.masterMs) : null,
+      visionWallMs:      Number.isFinite(entry.visionWallMs) ? Math.round(entry.visionWallMs) : null,
+      visualConfidence:  Number.isFinite(entry.visualConfidence) ? Number(entry.visualConfidence.toFixed(3)) : null,
+      costUsd:           Number.isFinite(entry.costUsd) ? Number(entry.costUsd.toFixed(6)) : 0,
+      costBreakdown:     entry.costBreakdown || null,
+    });
+    while (scanTimingRing.length > SCAN_TIMING_RING_SIZE) scanTimingRing.shift();
+  } catch {}
+}
+function percentile(sorted, p) {
+  if (!Array.isArray(sorted) || !sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((p / 100) * sorted.length)));
+  return sorted[idx];
+}
+function summarizeMs(arr) {
+  const vals = arr.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (!vals.length) return { n: 0 };
+  const sum = vals.reduce((s, v) => s + v, 0);
+  return {
+    n:    vals.length,
+    p50:  percentile(vals, 50),
+    p75:  percentile(vals, 75),
+    p95:  percentile(vals, 95),
+    p99:  percentile(vals, 99),
+    max:  vals[vals.length - 1],
+    mean: Math.round(sum / vals.length),
+  };
+}
 const TEXT_TIMEOUT_MS = process.env.TEXT_TIMEOUT_MS
   ? Number(process.env.TEXT_TIMEOUT_MS)
   : 8000;
@@ -1889,7 +2038,22 @@ function pushOpsAlert(code, payload = {}, cooldownMs = ALERT_COOLDOWN_MS) {
 }
 
 function shouldSkipInfraGuard(req) {
-  return req.path === "/health" || req.path === "/ready";
+  if (req.path === "/health" || req.path === "/ready") return true;
+  if (isBenchBypass(req)) return true;
+  return false;
+}
+
+// Bench / load-test bypass. Set BENCH_BYPASS_SECRET in dev .env to a long
+// random string, then the bench runner (and you, from curl) can send the
+// matching header to skip ALL rate-limit / abuse / quota layers. Refuses
+// to work in production regardless of secret value. Refuses short secrets
+// (< 16 chars) so a typo'd one-letter env can't accidentally enable it.
+function isBenchBypass(req) {
+  if (process.env.NODE_ENV === "production") return false;
+  const secret = process.env.BENCH_BYPASS_SECRET || "";
+  if (secret.length < 16) return false;
+  const inbound = String(req?.headers?.["x-bench-bypass"] || "");
+  return inbound.length === secret.length && safeTimingEqual(inbound, secret);
 }
 
 function requireEdgeSecret(req, res, next) {
@@ -2335,9 +2499,11 @@ function getScanPlanLimit(plan = "free") {
 // Issue 5: Per-user per-minute rate limits (scans and clicks).
 // Uses simple INCR+EXPIRE pattern consistent with existing quota infrastructure.
 // Fails OPEN — never blocks on Redis error.
-const RATE_LIMIT_SCAN_FREE_PER_MIN  = 3;
-const RATE_LIMIT_SCAN_PRO_PER_MIN   = 10;
-const RATE_LIMIT_CLICK_PER_MIN      = 10;
+// Env-overridable so the bench harness (12 sequential scans) can lift the
+// free-tier cap without dropping prod's protection.
+const RATE_LIMIT_SCAN_FREE_PER_MIN  = Number(process.env.RATE_LIMIT_SCAN_FREE_PER_MIN || 3);
+const RATE_LIMIT_SCAN_PRO_PER_MIN   = Number(process.env.RATE_LIMIT_SCAN_PRO_PER_MIN  || 10);
+const RATE_LIMIT_CLICK_PER_MIN      = Number(process.env.RATE_LIMIT_CLICK_PER_MIN     || 10);
 
 async function checkPerMinuteRateLimit(redisClient, key, limit) {
   try {
@@ -2950,6 +3116,53 @@ async function objectStoreReadBuffer(key) {
     return await fs.readFile(absPath);
   } catch {
     return null;
+  }
+}
+
+// Downscale a scan image to a max edge of VISION_MAX_EDGE_PX (default 800) and
+// re-encode as JPEG quality 85 before sending to the vision model. Saves ~2-3s
+// per scan from reduced upload + decode time. Returns the original buffer
+// untouched when the image is already small, when the env is disabled, or when
+// sharp throws (so we never block a scan on a re-encode error).
+const VISION_MAX_EDGE_PX = Number(process.env.VISION_MAX_EDGE_PX || 800);
+const VISION_DOWNSCALE_ENABLED = String(process.env.VISION_DOWNSCALE_ENABLED || "true").toLowerCase() !== "false";
+async function prepareVisionBuffer(buffer, rid = "") {
+  if (!VISION_DOWNSCALE_ENABLED) return buffer;
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4000) return buffer;
+  try {
+    const sharp = await getSharp();
+    const base = sharp(buffer, { failOn: "none" }).rotate();
+    const meta = await base.metadata().catch(() => ({}));
+    const w = Number(meta?.width || 0);
+    const h = Number(meta?.height || 0);
+    // Already small enough — skip the re-encode entirely.
+    if (w > 0 && h > 0 && Math.max(w, h) <= VISION_MAX_EDGE_PX && buffer.length <= 200_000) {
+      return buffer;
+    }
+    const out = await base
+      .resize({
+        width:              VISION_MAX_EDGE_PX,
+        height:             VISION_MAX_EDGE_PX,
+        fit:                "inside",
+        withoutEnlargement: true,
+      })
+      .jpeg({ quality: 85, mozjpeg: true })
+      .toBuffer();
+    if (Buffer.isBuffer(out) && out.length > 1000) {
+      console.log("📐 VISION DOWNSCALE", {
+        rid:      rid || "",
+        from:     buffer.length,
+        to:       out.length,
+        srcDim:   w && h ? `${w}x${h}` : "?",
+        maxEdge:  VISION_MAX_EDGE_PX,
+        savedPct: w && h ? Math.round((1 - out.length / buffer.length) * 100) : null,
+      });
+      return out;
+    }
+    return buffer;
+  } catch (e) {
+    console.warn("⚠️ VISION DOWNSCALE FAILED — using original", { rid: rid || "", err: e?.message });
+    return buffer;
   }
 }
 
@@ -4761,6 +4974,13 @@ async function withInflight(key, fn) {
 }
 
 // -------------------- Caches --------------------
+// Bump CACHE_SCHEMA_VERSION whenever the shape of cached items/payloads
+// changes incompatibly. All in-memory + persisted caches use this as a
+// prefix on their keys, so old entries become orphans (and naturally
+// expire) instead of returning broken data. v3 = post-cluster-spread fix
+// (items with proper top-level title/price/source instead of {0: listing}).
+const CACHE_SCHEMA_VERSION = String(process.env.CACHE_SCHEMA_VERSION || "v3");
+
 // Vision results: long-ish TTL; limited size
 const visionCache = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 1200 });
 // SERP caches: short TTL
@@ -4871,7 +5091,20 @@ function _recordStreamMetric(key, value) {
 const ENRICHED_SCAN_CACHE        = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 800 });
 const STREAM_PHASE1_INFLIGHT     = new Map(); // cacheKey → Promise<items[]>
 const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than this many marketplace items
-const SCAN_STREAM_ORACLE_BUDGET_MS = 8000;    // hard timeout for GPT oracle in stream route
+// Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
+// Was 8s — that's the entire user-perceived latency on degraded scans where
+// every external auth is dead. The buyOrPass engine now produces an honest
+// HOLD@15 verdict on no data, so the marginal value of a 3+s oracle wait is low:
+// the user already has a verdict; oracle just adds optional enrichment.
+// 3s is enough for typical gpt-4 oracle calls (~1.5–2.5s) while letting the
+// `complete` event fire fast on auth-broken scans.
+const SCAN_STREAM_ORACLE_BUDGET_MS = Number(process.env.SCAN_STREAM_ORACLE_BUDGET_MS || 3000);
+// Critical-mode budget: used when phase1 returned zero items (SerpAPI down,
+// no marketplace APIs configured). Oracle is the entire comp pool, so we give
+// it enough time to actually return — otherwise every scan in degraded mode
+// silently fails with "no_results". Matches the legacy /market/search path
+// which doesn't cap Oracle.
+const SCAN_STREAM_ORACLE_BUDGET_CRITICAL_MS = Number(process.env.SCAN_STREAM_ORACLE_BUDGET_CRITICAL_MS || 7000);
 
 function scanLog(event, scanId, fields = {}) {
   try { console.log(JSON.stringify({ event, scanId, ts: Date.now(), ...fields })); } catch {}
@@ -5173,6 +5406,7 @@ function rememberBetterQuery(original, improved) {
 
 function scanFingerprint(query = "", variants = []) {
   const payload = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
     query: canonicalMarketQuery(query),
     variants: uniqueQueries(variants)
       .map((x) => canonicalMarketQuery(x))
@@ -5940,6 +6174,14 @@ initializeIntelligenceLayer()
     console.warn("⚠️ Intelligence layer init failed", err?.message || err);
   });
 
+similarityLoadFromDisk()
+  .then((stats) => {
+    console.log("🎯 Similarity index ready", stats);
+  })
+  .catch((err) => {
+    console.warn("⚠️ Similarity index init failed", err?.message || err);
+  });
+
 initializeProductScale()
   .then((stats) => {
     console.log("📦 Product scale ready", stats);
@@ -6089,7 +6331,175 @@ app.get("/debug/cache", (_req, res) => {
       LOCAL_CACHE: LOCAL_CACHE.size(),
       inflight: inflight.size,
     },
+    similarity: similarityGetStats(),
+    visionTiers: visionTierStats,
+    layerBudgets: {
+      visionOpenaiCutoffMs:    Number(process.env.VISION_OPENAI_CUTOFF_MS || 12000),
+      fastVisionModel:         FAST_VISION_MODEL,
+      fastPassEnabled:         FAST_PASS_ENABLED,
+      fastPassTimeoutMs:       FAST_PASS_TIMEOUT_MS,
+      fastPassConfidenceFloor: FAST_PASS_CONFIDENCE_THRESHOLD,
+      skipMasterEnabled:       SKIP_MASTER_ON_CONFIDENT_VISUAL_ENABLED,
+      skipMasterThreshold:     SKIP_MASTER_CONFIDENCE_THRESHOLD,
+      skipMasterRolloutPct:    SKIP_MASTER_ROLLOUT_PCT,
+      serpapiTimeoutMs:        SERPAPI_TIMEOUT_MS,
+      visionDownscaleEnabled:  VISION_DOWNSCALE_ENABLED,
+      visionMaxEdgePx:         VISION_MAX_EDGE_PX,
+      streamOracleBudgetMs:    SCAN_STREAM_ORACLE_BUDGET_MS,
+      marketPhase1TimeoutMs:   Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 3500),
+    },
   });
+});
+
+// /debug/timings — wall-time histograms for the vision pipeline.
+// Drop a baseline by running ?reset=1 on a fresh server, scanning N items,
+// hitting the endpoint to capture before.json, then changing knobs and
+// repeating for after.json. Returns percentiles per tier so we can prove
+// (not estimate) the speed-pass wins.
+app.get("/debug/timings", (req, res) => {
+  try {
+    if (String(req.query?.reset || "") === "1") {
+      scanTimingRing.length = 0;
+      return res.status(200).json({ ok: true, reset: true });
+    }
+    const ring = scanTimingRing.slice();
+    if (!ring.length) {
+      return res.status(200).json({
+        ok: true,
+        sample: 0,
+        ringSize: SCAN_TIMING_RING_SIZE,
+        readiness: {
+          state:   "no_data",
+          message: "no scans recorded yet — open Expo, scan something, then hit this endpoint again",
+        },
+        rollout: {
+          skipMasterRolloutPct: SKIP_MASTER_ROLLOUT_PCT,
+          skipMasterThreshold:  SKIP_MASTER_CONFIDENCE_THRESHOLD,
+        },
+      });
+    }
+
+    const summarizeGroup = (entries) => ({
+      n:            entries.length,
+      pct:          ring.length ? Math.round((entries.length / ring.length) * 1000) / 10 : 0,
+      visionWallMs: summarizeMs(entries.map((e) => e.visionWallMs)),
+      fastMs:       summarizeMs(entries.map((e) => e.fastMs)),
+      visualMs:     summarizeMs(entries.map((e) => e.visualMs)),
+      masterMs:     summarizeMs(entries.map((e) => e.masterMs)),
+      costUsd:      (() => {
+        const vals = entries.map((e) => Number(e.costUsd || 0)).filter((v) => Number.isFinite(v));
+        if (!vals.length) return { n: 0, sum: 0 };
+        const sum = vals.reduce((s, v) => s + v, 0);
+        const sorted = vals.slice().sort((a, b) => a - b);
+        return {
+          n:    vals.length,
+          sum:  Number(sum.toFixed(6)),
+          mean: Number((sum / vals.length).toFixed(6)),
+          p50:  Number(percentile(sorted, 50).toFixed(6)),
+          p95:  Number(percentile(sorted, 95).toFixed(6)),
+          max:  Number(sorted[sorted.length - 1].toFixed(6)),
+        };
+      })(),
+    });
+
+    // Overall (every recorded scan, regardless of tier)
+    const overall = summarizeGroup(ring);
+
+    // Per-tier breakdown so we can see whether the speed wins come from the
+    // tier we expect (visual_skip_master) vs falling back to consensus.
+    const tiers = {};
+    for (const entry of ring) {
+      const t = entry.tier || "unknown";
+      if (!tiers[t]) tiers[t] = [];
+      tiers[t].push(entry);
+    }
+    const byTier = {};
+    for (const [tier, entries] of Object.entries(tiers)) {
+      byTier[tier] = summarizeGroup(entries);
+    }
+
+    // A/B cohort slice — this is the lift number for the master-skip
+    // experiment. Compare treatment vs control directly.
+    const treatment = ring.filter((e) => e.cohort === "treatment");
+    const control   = ring.filter((e) => e.cohort === "control");
+    const byCohort = {
+      treatment: summarizeGroup(treatment),
+      control:   summarizeGroup(control),
+      lift: (() => {
+        const tP50 = treatment.length ? percentile(treatment.map((e) => e.visionWallMs).filter(Number.isFinite).sort((a, b) => a - b), 50) : null;
+        const cP50 = control.length   ? percentile(control.map((e) => e.visionWallMs).filter(Number.isFinite).sort((a, b) => a - b), 50)   : null;
+        const tCost = treatment.reduce((s, e) => s + Number(e.costUsd || 0), 0) / Math.max(treatment.length, 1);
+        const cCost = control.reduce((s, e) => s + Number(e.costUsd || 0), 0) / Math.max(control.length, 1);
+        return {
+          msP50:       (tP50 != null && cP50 != null) ? cP50 - tP50 : null,
+          msP50Pct:    (tP50 != null && cP50 != null && cP50 > 0) ? Math.round(((cP50 - tP50) / cP50) * 1000) / 10 : null,
+          costPerScan: control.length ? Number((cCost - tCost).toFixed(6)) : null,
+          costPct:     (control.length && cCost > 0) ? Math.round(((cCost - tCost) / cCost) * 1000) / 10 : null,
+        };
+      })(),
+    };
+
+    // Downscale impact: bytes saved when downscale fired.
+    const downscaled = ring.filter((e) => e.downscaled);
+    const downscale = {
+      downscaledCount: downscaled.length,
+      pct:             Math.round((downscaled.length / ring.length) * 1000) / 10,
+      fromBytes:       downscaled.length ? summarizeMs(downscaled.map((e) => e.downscaleFromBytes)) : null,
+      toBytes:         downscaled.length ? summarizeMs(downscaled.map((e) => e.downscaleToBytes)) : null,
+      savedBytesAvg:   downscaled.length
+        ? Math.round(downscaled.reduce((s, e) => s + (e.downscaleFromBytes - e.downscaleToBytes), 0) / downscaled.length)
+        : 0,
+    };
+
+    // Readiness — tells the caller whether the sample is meaningful or
+    // they're staring at noise. Cohort lift needs both arms with ≥6 scans
+    // each to be even directionally trustworthy. Without this users squint
+    // at n=2 numbers and read meaning into them.
+    const MIN_PER_COHORT_FOR_LIFT = 6;
+    const treatmentN = byCohort.treatment.n;
+    const controlN   = byCohort.control.n;
+    const readiness = (() => {
+      if (ring.length === 0) {
+        return { state: "no_data", message: "no scans yet — open Expo, scan something" };
+      }
+      if (ring.length < 3) {
+        return { state: "warming", message: `only ${ring.length} scan(s) — keep scanning, p50/p95 unreliable below n=3` };
+      }
+      if (SKIP_MASTER_ROLLOUT_PCT === 100 || SKIP_MASTER_ROLLOUT_PCT === 0) {
+        return { state: "single_arm", message: `rollout is ${SKIP_MASTER_ROLLOUT_PCT}% — A/B lift unavailable, only overall + byTier are meaningful. Set SKIP_MASTER_ROLLOUT_PCT=50 to enable cohort comparison.` };
+      }
+      if (treatmentN < MIN_PER_COHORT_FOR_LIFT || controlN < MIN_PER_COHORT_FOR_LIFT) {
+        return {
+          state: "lift_not_ready",
+          message: `cohort A/B needs ≥${MIN_PER_COHORT_FOR_LIFT} scans each arm (treatment=${treatmentN}, control=${controlN}). lift numbers are present but treat as directional only`,
+          needTreatment: Math.max(0, MIN_PER_COHORT_FOR_LIFT - treatmentN),
+          needControl:   Math.max(0, MIN_PER_COHORT_FOR_LIFT - controlN),
+        };
+      }
+      return { state: "ready", message: `sample sufficient (treatment=${treatmentN}, control=${controlN}) — lift numbers are trustworthy` };
+    })();
+
+    return res.status(200).json({
+      ok: true,
+      sample: ring.length,
+      ringSize: SCAN_TIMING_RING_SIZE,
+      windowStartTs: ring[0].ts,
+      windowEndTs: ring[ring.length - 1].ts,
+      readiness,
+      rollout: {
+        skipMasterRolloutPct: SKIP_MASTER_ROLLOUT_PCT,
+        skipMasterThreshold:  SKIP_MASTER_CONFIDENCE_THRESHOLD,
+      },
+      overall,
+      byTier,
+      byCohort,
+      downscale,
+      counters: visionTierStats,
+      recent: ring.slice(-Math.min(10, ring.length)).reverse(),
+    });
+  } catch (e) {
+    return res.status(200).json({ ok: false, reason: "timings_exception", err: String(e?.message || e) });
+  }
 });
 
 app.get("/debug/retrieval", async (req, res) => {
@@ -6735,6 +7145,7 @@ async function getEbayBrowser() {
 }
 
 async function fetchEbayRenderedRows(query = "") {
+  if (process.env.DISABLE_EBAY === "true") return [];
   const q = sanitizeMarketplaceQuery(query);
   if (!q) return [];
 
@@ -6978,7 +7389,11 @@ async function searchEbayBrowse(query = "") {
     );
 
     if (!r.ok) {
-      markSourceFailure("ebay_api", `http_${r.status}`);
+      // Use the "ebay" key (not "ebay_api") so the cooldown checker at
+      // isSourceCoolingDown("ebay") actually sees these failures. Mismatch
+      // between markSourceFailure("ebay_api") and isSourceCoolingDown("ebay")
+      // previously meant we hammered the API forever after first 429.
+      markSourceFailure("ebay", `http_${r.status}`);
       console.warn("⚠️ eBay Browse search failed:", r.status, "query=", q);
       return [];
     }
@@ -7016,12 +7431,12 @@ async function searchEbayBrowse(query = "") {
       .filter((it) => Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price));
 
     items = dedupeSmart(items);
-    markSourceSuccess("ebay_api", Date.now() - startedAt);
+    markSourceSuccess("ebay", Date.now() - startedAt);
 
     return items.slice(0, 60);
   } catch (err) {
     markSourceFailure(
-      "ebay_api",
+      "ebay",
       err?.name === "AbortError" ? "timeout" : "exception"
     );
     console.warn("⚠️ eBay Browse error:", err?.message || err);
@@ -7029,7 +7444,112 @@ async function searchEbayBrowse(query = "") {
   }
 }
 
+// fetchEbaySoldComps — pulls REAL sold prices from eBay's marketplace_insights
+// endpoint. Active asks (from searchEbayBrowse) are upper-bound — sellers list
+// optimistically. Sold prices are what people actually paid. For resale
+// verdicts this is the gold standard.
+//
+// Items are marked source="ebay_sold", sold=true so the downstream comp
+// merge + bucketItemsByCondition can prefer them over asks. The endpoint is
+// restricted-access; this function refuses to fire unless hasEbaySoldScope()
+// passes, so it's safe to call unconditionally during scope-pending periods.
+//
+// Source-health key: "ebay_sold" (separate from "ebay") — that way the sold
+// endpoint can be cooling down without taking the active Browse lane offline.
+async function fetchEbaySoldComps(query = "") {
+  if (!hasEbaySoldScope()) return [];
+  if (isSourceCoolingDown("ebay_sold")) return [];
+
+  const q = sanitizeMarketplaceQuery(query);
+  if (!q) return [];
+
+  const token = await getEbayAccessToken();
+  if (!token) return [];
+
+  const startedAt = Date.now();
+
+  try {
+    const params = new URLSearchParams({
+      q,
+      limit: "30",
+    });
+
+    const r = await fetch(
+      `https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search?${params.toString()}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+        },
+      }
+    );
+
+    if (!r.ok) {
+      // 403 here typically means the marketplace.insights scope was requested
+      // but not actually granted — log loudly so the operator knows the flag
+      // is set without the scope being live yet.
+      if (r.status === 403) {
+        console.warn(
+          "⚠️ eBay sold-comps 403 — EBAY_SOLD_SCOPE_GRANTED=true but the " +
+          "marketplace.insights scope isn't actually approved on your app. " +
+          "Flip the flag back off until eBay completes the scope grant."
+        );
+      }
+      markSourceFailure("ebay_sold", `http_${r.status}`);
+      return [];
+    }
+
+    const data = await r.json().catch(() => ({}));
+    const raw = Array.isArray(data?.itemSales) ? data.itemSales : [];
+
+    const items = raw
+      .map((it, idx) => {
+        const normalized = normalizeItem({
+          title:              it?.title || null,
+          extracted_price:    Number(it?.lastSoldPrice?.value ?? it?.price?.value ?? null),
+          extracted_shipping: 0, // sold-price endpoint typically includes shipping in lastSoldPrice
+          source:             "eBay (Sold)",
+          link:               it?.itemAffiliateWebUrl || it?.itemWebUrl || null,
+          thumbnail:          it?.image?.imageUrl || null,
+          rating:             null,
+          reviews:            null,
+        });
+
+        return {
+          ...normalized,
+          condition:           it?.condition || null,
+          sold:                true,
+          source:              "ebay_sold",
+          status:              "sold",
+          __isSoldComp:        true,
+          __soldAt:            it?.lastSoldDate || null,
+          __fromMarketSearch:  true,
+          __serverRank:        idx + 1,
+        };
+      })
+      .filter((it) => it?.title)
+      .filter((it) => Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price));
+
+    const dedup = dedupeSmart(items);
+    markSourceSuccess("ebay_sold", Date.now() - startedAt);
+    return dedup.slice(0, 30);
+  } catch (err) {
+    markSourceFailure(
+      "ebay_sold",
+      err?.name === "AbortError" ? "timeout" : "exception"
+    );
+    console.warn("⚠️ eBay sold-comps error:", err?.message || err);
+    return [];
+  }
+}
+
 async function fetchEbayListings(query = "") {
+  // Short-circuit when eBay API isn't configured — otherwise we fire 20+
+  // rescue queries per scan that all return 0, drowning the logs and
+  // wasting wall time on guaranteed-empty work.
+  if (!hasEbayApi()) return { items: [] };
+
   console.log("🧪 EBAY LISTINGS START", query);
 
   const q = sanitizeMarketplaceQuery(query);
@@ -7310,7 +7830,10 @@ function marketRelevanceScore(item, query) {
   let styleBonus = 0;
 
   if (eyewearMode) {
-    if (wantsOrange) styleBonus += hasOrange ? 0.16 : -0.10;
+    // Color is a variant attribute — most sunglass listings omit it from
+    // titles. Reward presence (0.16) but only mildly penalize absence (-0.04)
+    // so comparable shapes still rank into the comp pool.
+    if (wantsOrange) styleBonus += hasOrange ? 0.16 : -0.04;
     if (wantsWrap) styleBonus += hasWrap ? 0.12 : -0.08;
     if (wantsSun) styleBonus += hasSun ? 0.20 : -0.18;
     if (wantsOversized) styleBonus += hasOversized ? 0.10 : -0.04;
@@ -7344,10 +7867,123 @@ function marketRelevanceScore(item, query) {
   );
 }
 
+// Curated brand registry for cross-category filtering. When a brand
+// token appears in the query, items lacking that brand in title need
+// elevated relevance to survive the filter — otherwise generic comps
+// dilute the median for brand-specific scans (e.g. a Nike Air Max scan
+// pulling in $20 generic running shoes drags the verdict to OVERPRICED).
+// Each entry is the brand token as it would appear in normalizeTitleKey
+// output (lowercase, no punctuation). Order matters slightly: longer
+// brand strings should appear before shorter ones that are substrings.
+const KNOWN_BRANDS = [
+  // Sneakers / athletic
+  "nike", "adidas", "jordan", "puma", "reebok", "new balance", "asics",
+  "vans", "converse", "under armour", "underarmour", "saucony", "brooks",
+  "hoka", "yeezy", "on running", "salomon", "merrell",
+  // Electronics
+  "apple", "iphone", "ipad", "macbook", "airpods", "imac", "homepod",
+  "samsung", "galaxy", "google", "pixel", "sony", "playstation", "ps5", "ps4",
+  "xbox", "nintendo", "switch", "bose", "jbl", "beats", "sonos", "fitbit",
+  "garmin", "gopro", "dji", "canon", "nikon", "fuji", "fujifilm", "leica",
+  "dell", "hp", "lenovo", "asus", "acer", "msi", "razer", "logitech",
+  "anker", "tile", "ring", "kindle",
+  // Eyewear
+  "ray-ban", "rayban", "oakley", "persol", "warby parker", "warby",
+  "maui jim", "costa", "smith", "spy", "tom ford",
+  // Luxury / bags
+  "louis vuitton", "gucci", "prada", "coach", "michael kors",
+  "kate spade", "tory burch", "rebecca minkoff", "burberry", "fendi",
+  "hermes", "chanel", "ysl", "saint laurent", "balenciaga",
+  // Watches
+  "rolex", "omega", "seiko", "casio", "g-shock", "gshock", "tag heuer",
+  "tudor", "breitling", "patek", "audemars", "richard mille", "garmin",
+  // Apparel
+  "supreme", "stussy", "champion", "carhartt", "levi", "calvin klein",
+  "tommy hilfiger", "ralph lauren", "polo", "north face", "patagonia",
+  "columbia", "uniqlo", "lululemon", "gymshark", "alo yoga",
+  // Home / kitchen
+  "dyson", "shark", "roomba", "irobot", "vitamix", "blendtec", "ninja",
+  "instant pot", "keurig", "nespresso", "breville", "kitchenaid", "cuisinart",
+  "le creuset", "all-clad", "allclad", "lodge", "yeti",
+  // Health / fitness
+  "theragun", "hyperice", "manduka", "theraband", "bowflex", "peloton",
+  "rogue", "concept2",
+  // Music / instruments
+  "fender", "gibson", "yamaha", "roland", "korg", "shure", "akai",
+  "audio-technica", "rode", "neumann", "moog",
+  // Misc
+  "lego", "funko", "magic the gathering", "pokemon", "yugioh",
+];
+
+function detectBrandsInQuery(q) {
+  const found = new Set();
+  for (const brand of KNOWN_BRANDS) {
+    if (q.includes(brand)) found.add(brand);
+  }
+  return [...found];
+}
+
+// Classify a single listing as "used"/"refurb"/"new" from title cues.
+// Returns "new" when nothing else fits — listings typically default to
+// new on retailer sites unless stated otherwise.
+const USED_TOKENS = [
+  "used", "pre owned", "pre-owned", "preowned", "preloved",
+  "secondhand", "second hand", "vintage", "retro", "y2k",
+  "thrifted", "worn", "open box", "open-box",
+];
+const REFURB_TOKENS = [
+  "refurb", "refurbished", "renewed", "reconditioned",
+  "manufacturer refurbished", "certified refurbished",
+];
+function classifyListingCondition(item) {
+  const title = String(item?.title || "").toLowerCase();
+  const src = String(item?.source || "").toLowerCase();
+  if (REFURB_TOKENS.some((t) => title.includes(t))) return "refurb";
+  if (USED_TOKENS.some((t) => title.includes(t))) return "used";
+  // eBay third-party sellers default-skew used unless title says otherwise
+  if (src.includes("ebay") && /\b(brand new|nwt|nib|sealed|new)\b/.test(title)) return "new";
+  if (src.includes("ebay") && /\b(used|pre-owned|preowned)\b/.test(title)) return "used";
+  return "new";
+}
+
+// Extract model-identifying tokens from a query: numeric model codes
+// (90, 15, 2, M2), version letters (pro, max, plus, ultra, mini, air),
+// and alphanumeric SKUs (CW2288, A2683). These are the identity-bearing
+// tokens that distinguish "AirPods Pro 2" from generic AirPods or
+// "Air Max 90" from generic Air Max. Items lacking model tokens get
+// downgraded so the comp pool isn't diluted by the broader product line.
+function detectModelTokensInQuery(q) {
+  const tokens = new Set();
+  const raw = String(q || "").toLowerCase();
+
+  // Pure numeric model codes (often standalone after brand: "Air Max 90")
+  for (const m of raw.matchAll(/\b(\d{1,4})\b/g)) {
+    const n = m[1];
+    // Skip year-like years (1900-2099) — usually descriptive, not model
+    if (n.length === 4 && Number(n) >= 1900 && Number(n) <= 2099) continue;
+    tokens.add(n);
+  }
+
+  // Alphanumeric SKUs (e.g., "CW2288", "A2683", "GW0254-001")
+  for (const m of raw.matchAll(/\b([a-z]{1,3}\d{3,6}(?:-\d{1,4})?)\b/g)) {
+    tokens.add(m[1]);
+  }
+
+  // Version letters / tier modifiers that commonly disambiguate models.
+  // Conservative list — avoid words that appear generically in titles.
+  const TIER_TOKENS = ["pro", "max", "plus", "ultra", "mini", "lite", "se", "xs", "xr"];
+  for (const t of TIER_TOKENS) {
+    if (new RegExp(`\\b${t}\\b`, "i").test(raw)) tokens.add(t);
+  }
+
+  return [...tokens];
+}
+
 function filterRelevantListings(query, items) {
   if (!Array.isArray(items)) return [];
 
   const q = normalizeTitleKey(query);
+  const queryBrands = detectBrandsInQuery(q);
 
   const eyewearMode =
     q.includes("glasses") ||
@@ -7412,7 +8048,42 @@ function filterRelevantListings(query, items) {
     }))
     .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0));
 
-  const preserved = scored.filter((it) => Number(it.__relevance || 0) >= 0.10);
+  let preserved = scored.filter((it) => Number(it.__relevance || 0) >= 0.10);
+
+  // Cross-category brand gate, applied BEFORE the eyewear-specific
+  // branch so non-eyewear queries (sneakers, electronics, watches,
+  // bags) get brand-aware filtering too. Items lacking the queried
+  // brand must clear an elevated relevance bar; otherwise the comp
+  // pool fills with generic equivalents that drag the median.
+  if (queryBrands.length > 0) {
+    const brandFiltered = preserved.filter((it) => {
+      const t = normalizeTitleKey(it?.title || "");
+      const hasBrand = queryBrands.some((b) => t.includes(b));
+      if (hasBrand) return true;
+      return Number(it.__relevance || 0) >= 0.62;
+    });
+    // Fall back to the unfiltered pool when brand-gating leaves us
+    // empty-handed (rare, e.g. when SerpAPI returned only retailer
+    // headers and no actual brand listings) so the user still sees
+    // something rather than "no comps".
+    if (brandFiltered.length >= 3) preserved = brandFiltered;
+  }
+
+  // Model/SKU token gate. When the query carries a model code (numeric
+  // or alphanumeric like "Air Max 90", "iPhone 15", "M2", "CW2288"),
+  // require the title to mention at least one matching token. Generic
+  // line-level comps (e.g. "Air Max" sneakers for a "Air Max 90" scan)
+  // sell at different prices and would skew the median.
+  const queryModelTokens = detectModelTokensInQuery(q);
+  if (queryModelTokens.length > 0 && queryBrands.length > 0) {
+    const modelFiltered = preserved.filter((it) => {
+      const t = normalizeTitleKey(it?.title || "");
+      const hasModel = queryModelTokens.some((tok) => t.includes(tok));
+      if (hasModel) return true;
+      return Number(it.__relevance || 0) >= 0.70;
+    });
+    if (modelFiltered.length >= 3) preserved = modelFiltered;
+  }
 
   if (!eyewearMode) {
     const strong = preserved.filter((it) => Number(it.__relevance || 0) >= 0.56);
@@ -7488,11 +8159,28 @@ function filterRelevantListings(query, items) {
       (hasWrap || hasSport) &&
       hasSun;
 
+    // Identity-defining attributes (brand, shape, category) stay strict.
+    // Variant attributes (color, size) relax — they're rarely in titles for
+    // sunglasses (sellers list "Wrap Sunglasses" with orange as a variant
+    // option), so requiring them in title drops valid comps and starves the
+    // median/percentile calculation.
     if (wantsOakley && !hasOakley && it.__relevance < 0.70) return false;
-    if (wantsOrange && !hasOrange && it.__relevance < 0.58) return false;
+    if (wantsOrange && !hasOrange && it.__relevance < 0.34) return false;
     if (wantsWrap && !(hasWrap || hasSport) && it.__relevance < 0.54) return false;
     if (wantsSun && !hasSun && it.__relevance < 0.56) return false;
-    if (wantsOversized && !hasOversized && it.__relevance < 0.58) return false;
+    if (wantsOversized && !hasOversized && it.__relevance < 0.42) return false;
+
+    // Cross-category brand gate. If the query names a known brand and
+    // the comp title doesn't mention it, only keep the comp at high
+    // relevance — generic equivalents at lower prices otherwise drag
+    // the median for branded scans (Nike Air Max scan pulling in $20
+    // generic running shoes → fake "overpriced" verdict). 0.62 floor
+    // matches the existing Oakley gate (0.70) but slightly looser to
+    // allow misspellings and partial matches.
+    if (queryBrands.length > 0) {
+      const titleHasAnyBrand = queryBrands.some((b) => title.includes(b));
+      if (!titleHasAnyBrand && it.__relevance < 0.62) return false;
+    }
 
     if (!wantsBlue && hasBlue && !allowBlueFallback && !hasSun && it.__relevance < 0.76) {
       return false;
@@ -7630,8 +8318,19 @@ function preferMarketplaceIfHealthy(items = [], query = "") {
       Number(it.__relevance || 0) >= 0.26
   );
 
+  // Healthy marketplace pool: keep marketplaces AND a band of relevant retail.
+  // The prior code dropped ALL retail when ≥3 marketplaces existed, which
+  // biased the comp pool toward used/Etsy listings and let outliers like a
+  // $12 mislabeled Etsy item anchor the verdict at "overpriced" against a
+  // scan that was actually at retail-market. Retail comps form the price
+  // ceiling and the median anchor for new/sealed scans.
   if (marketplace.length >= 3) {
-    return marketplace.slice(0, 60);
+    const retail = verified.filter(
+      (it) =>
+        !isMarketplaceSource(it?.source) &&
+        Number(it.__relevance || 0) >= 0.40
+    );
+    return dedupeSmart([...marketplace, ...retail]).slice(0, 60);
   }
 
   const strong = verified.filter(
@@ -7677,16 +8376,17 @@ function keepBestPriorityTier(items, query = "") {
     bucket: listingPriorityBucket(it, query),
   }));
 
-  const maxBucket = Math.max(...scored.map((x) => x.bucket));
-
-  const filtered =
-    maxBucket >= 4
-      ? scored.filter((x) => x.bucket >= 3).map((x) => x.item)
-      : maxBucket >= 3
-      ? scored.filter((x) => x.bucket >= 2).map((x) => x.item)
-      : maxBucket >= 2
-      ? scored.filter((x) => x.bucket >= 2).map((x) => x.item)
-      : items;
+  // Drop only bucket=0 (relevance < 0.52 — truly irrelevant noise). Keep
+  // everything else so retail comps survive as price-ceiling anchors. The
+  // prior code dumped bucket<3 the moment any bucket=4 marketplace item
+  // existed, which dropped most retail (retail maxes at bucket=3 only at
+  // relevance ≥0.82, rare). Median ended up anchored on cheap marketplace
+  // listings and any at-market scan read as "overpriced".
+  //
+  // Downstream stages (trimPriceOutliers + intuitionFilter + dealComparator
+  // IQR guard) handle outliers; we just need to feed them a representative
+  // distribution. Hard rejection happens upstream in filterRelevantListings.
+  const filtered = scored.filter((x) => x.bucket >= 1).map((x) => x.item);
 
   return filtered.length >= 4 ? filtered : items;
 }
@@ -8282,10 +8982,10 @@ function sleepMs(ms) {
 async function redisCommand(args = []) {
   if (!redis) return null;
 
-  if (typeof redis.sendCommand === "function") {
-    return await redis.sendCommand(args);
-  }
-
+  // ioredis exposes `.call(name, ...args)` for low-level commands. Its
+  // `.sendCommand` expects a Command instance (not the array form node-redis
+  // v4 uses), so we must prefer `.call` to avoid `undefined.toLowerCase()`
+  // crashes deep inside ioredis.
   if (typeof redis.call === "function") {
     return await redis.call(...args);
   }
@@ -8293,6 +8993,10 @@ async function redisCommand(args = []) {
   const method = String(args?.[0] || "").toLowerCase();
   if (method && typeof redis[method] === "function") {
     return await redis[method](...args.slice(1));
+  }
+
+  if (typeof redis.sendCommand === "function") {
+    return await redis.sendCommand(args);
   }
 
   throw new Error("redis_command_not_supported");
@@ -8307,9 +9011,12 @@ async function saveQueueJobDoc(job) {
   if (!job?.id) return;
 
   if (redis) {
-    await redis.set(queueJobDocKey(job.id), JSON.stringify(job), {
-      EX: 7 * 24 * 60 * 60,
-    });
+    await redis.set(
+      queueJobDocKey(job.id),
+      JSON.stringify(job),
+      "EX",
+      7 * 24 * 60 * 60
+    );
     return;
   }
 
@@ -9566,11 +10273,15 @@ CRITICAL RULES:
 
 async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
 
-  // 5 s gives SerpAPI time to return in Wave 1 while staying well under
-  // the frontend's 8 s hard abort. GPT oracle (if triggered) needs ~1-2 s,
-  // giving total backend budget of ~7 s end-to-end.
+  // Budget: SerpAPI Wave 1 typically returns in 1–2s, but the merge pipeline
+  // (relevance + outlier trim + sort) adds another 100–600ms, and eyewear/
+  // apparel queries trigger a sequential Etsy lane. The 3.5s budget was too
+  // tight for those — real SERP results arrived in time but the merge step
+  // pushed past timeout, dropping all data on the floor. 6s is the lean-but-
+  // -accurate target. Partial results are buffered so they're never lost.
+  const _partialBudget = { items: [] };
   const killTimer = new Promise((resolve) =>
-    setTimeout(() => resolve("__timeout__"), 5000)
+    setTimeout(() => resolve("__timeout__"), Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 6000))
   );
 
   const worker = (async () => {
@@ -9774,15 +10485,46 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
     ? runBudgetedSourceLane("serpapi", () => serpShopping(normalizedQuery, { softFail: true }), { plan: runtimePlan, costUnits: 6 }).catch(() => [])
     : Promise.resolve([]);
 
+  // Reactive partial-buffer: each Tier B promise pushes into a shared
+  // accumulator as soon as it resolves, INDEPENDENT of the worker's
+  // `await Promise.all`. This way the killTimer can still rescue real
+  // items even when one slow lane (e.g. Resale SerpAPI) hasn't completed
+  // and the orchestrating Promise.all is still pending. Without this,
+  // the prior "snapshot after await" logic always returned [] on timeout
+  // because the await itself was what got cancelled.
+  const _tierBAccum = { amazon: [], resale: [], shop: [] };
+  const _refreshPartialBuffer = () => {
+    try {
+      const _snap = dedupeSmart(
+        [
+          ...ebayAll, ...walmartAll, ...bestBuyAll, ...backupAll, ...etsyAll,
+          ..._tierBAccum.amazon, ..._tierBAccum.resale, ..._tierBAccum.shop,
+        ].filter((it) => it && (Number.isFinite(it.totalPrice) || Number.isFinite(it.price)))
+      );
+      _partialBudget.items = _snap
+        .sort((a, b) => Number(a.totalPrice ?? a.price ?? Infinity) - Number(b.totalPrice ?? b.price ?? Infinity))
+        .slice(0, 40);
+    } catch { /* non-fatal */ }
+  };
+  _amazonP.then((r) => { _tierBAccum.amazon = Array.isArray(r) ? r : []; _refreshPartialBuffer(); }).catch(() => {});
+  _resaleP.then((r) => { _tierBAccum.resale = Array.isArray(r) ? r.flat().filter(Boolean) : []; _refreshPartialBuffer(); }).catch(() => {});
+  _serpShopP.then((r) => { _tierBAccum.shop = Array.isArray(r) ? r : []; _refreshPartialBuffer(); }).catch(() => {});
+
   // Await Tier A: native marketplace APIs only
   const [sourceResultsArr, backupResultsArr] = await Promise.all([
     marketplaceQueries.length
       ? Promise.all(
           marketplaceQueries.map((q) =>
             marketSearchConcurrency(async () => {
-              const [ebayItems, walmartItems, bestBuyItems] = await Promise.all([
+              // ebaySold runs in the same parallel batch — when the scope
+              // isn't granted, fetchEbaySoldComps short-circuits to [] for
+              // free, so there's no cost to firing it always.
+              const [ebayItems, ebaySoldItems, walmartItems, bestBuyItems] = await Promise.all([
                 canUseEbay
                   ? runBudgetedSourceLane("ebay", () => ebayAdapterSearch(q), { plan: runtimePlan, costUnits: 1 })
+                  : Promise.resolve([]),
+                hasEbaySoldScope()
+                  ? runBudgetedSourceLane("ebay_sold", () => fetchEbaySoldComps(q), { plan: runtimePlan, costUnits: 1 })
                   : Promise.resolve([]),
                 canUseWalmart
                   ? runBudgetedSourceLane("walmart", () => walmartCatalogSearch(q), { plan: runtimePlan, costUnits: 1 })
@@ -9791,7 +10533,7 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
                   ? runBudgetedSourceLane("bestbuy", () => bestBuySearch(q), { plan: runtimePlan, costUnits: 1 })
                   : Promise.resolve([]),
               ]);
-              return { query: q, ebayItems, walmartItems, bestBuyItems };
+              return { query: q, ebayItems, ebaySoldItems, walmartItems, bestBuyItems };
             })
           )
         )
@@ -9811,6 +10553,11 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   ]);
 
   ebayAll    = sourceResultsArr.flatMap((x) => x?.ebayItems    || []);
+  // ebaySoldAll is appended to ebayAll BEFORE downstream merge so the comp
+  // basket sees sold prices alongside asks. Items carry source="ebay_sold",
+  // sold=true so bucketItemsByCondition can prefer them in the matched bucket.
+  const ebaySoldAll = sourceResultsArr.flatMap((x) => x?.ebaySoldItems || []);
+  if (ebaySoldAll.length) ebayAll = [...ebayAll, ...ebaySoldAll];
   walmartAll = sourceResultsArr.flatMap((x) => x?.walmartItems || []);
   bestBuyAll = sourceResultsArr.flatMap((x) => x?.bestBuyItems || []);
   backupAll  = backupResultsArr.flatMap((x) => x?.items        || []);
@@ -9833,6 +10580,21 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   amazonAll = Array.isArray(amazonRaw) ? amazonRaw : [];
   resaleAll = resaleRaw.flat().filter(Boolean);
   const serpShoppingWave1 = Array.isArray(serpShoppingRaw) ? serpShoppingRaw : [];
+
+  // Snapshot what we have right now so the killTimer never returns [] when
+  // real listings exist. Cheap dedupe + sort — the full merge pipeline runs
+  // below, but if we time out before then this is what we send back.
+  try {
+    const _snap = dedupeSmart(
+      [
+        ...ebayAll, ...walmartAll, ...bestBuyAll, ...backupAll,
+        ...amazonAll, ...resaleAll, ...serpShoppingWave1,
+      ].filter((it) => it && (Number.isFinite(it.totalPrice) || Number.isFinite(it.price)))
+    );
+    _partialBudget.items = _snap
+      .sort((a, b) => Number(a.totalPrice ?? a.price ?? Infinity) - Number(b.totalPrice ?? b.price ?? Infinity))
+      .slice(0, 40);
+  } catch { /* non-fatal: timeout fallback only */ }
 
   // ── Etsy lane (sequential: has cooldown state) ────────────────────────────
   const shouldRunEtsyLane =
@@ -9867,6 +10629,20 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
     }
 
     etsyAll = etsyResults.flatMap((x) => x.items || []);
+
+    if (etsyAll.length) {
+      try {
+        const _snap = dedupeSmart(
+          [
+            ...ebayAll, ...walmartAll, ...bestBuyAll, ...backupAll, ...etsyAll,
+            ...amazonAll, ...resaleAll, ...serpShoppingWave1,
+          ].filter((it) => it && (Number.isFinite(it.totalPrice) || Number.isFinite(it.price)))
+        );
+        _partialBudget.items = _snap
+          .sort((a, b) => Number(a.totalPrice ?? a.price ?? Infinity) - Number(b.totalPrice ?? b.price ?? Infinity))
+          .slice(0, 40);
+      } catch { /* non-fatal */ }
+    }
   }
 
   const [retrievalSnapshot, retrievalIndexed] = await Promise.all([
@@ -9991,6 +10767,25 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   );
   const stageDeduped = dedupeSmart(stageNotBad);
 
+  // Per-lane visibility — counts items contributed by each source so we can
+  // see when SERPAPI_TIMEOUT_MS is too aggressive (lanes contributing 0 = bad
+  // sign). Sources are normalized by lowercasing first token.
+  const _bySource = {};
+  for (const it of rawMerged) {
+    const src = String(it?.source || "unknown").toLowerCase().split(/\s+/)[0] || "unknown";
+    _bySource[src] = (_bySource[src] || 0) + 1;
+  }
+
+  // Pipeline stage diagnostic — surface which filter is collapsing the pool.
+  const _pipelineCounts = {
+    raw:        rawMerged.length,
+    bySource:   _bySource,
+    withTitle:  stageWithTitle.length,
+    withPrice:  stageWithPrice.length,
+    notBad:     stageWithPrice.length - stageNotBad.length,  // dropped count
+    deduped:    stageDeduped.length,
+  };
+
   const preservedPool = stageDeduped
     .map((it) => ({
       ...it,
@@ -10010,6 +10805,14 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   );
   const stageTrimmed = trimPriceOutliers(stageTiered);
   const stageIntuition = intuitionFilter(stageTrimmed);
+
+  Object.assign(_pipelineCounts, {
+    relevant:           stageRelevant.length,
+    marketplacePref:    stageMarketplacePreferred.length,
+    tiered:             stageTiered.length,
+    priceTrimmed:       stageTrimmed.length,
+    intuition:          stageIntuition.length,
+  });
 
   let ranked = stageIntuition;
 
@@ -10050,10 +10853,21 @@ ranked.sort((a, b) => (b.__imageScore || 0) - (a.__imageScore || 0));
     ranked = sortByAbsoluteCheapest(stageDeduped, normalizedQuery).slice(0, 60);
   }
 
-  let merged = clusterListings(ranked).map((item) => ({
-    ...item,
-    __clusterScore: Number(item?.clusterScore || 0),
-  }));
+  // clusterListings returns an array-of-arrays (each inner array = one cluster
+  // of near-duplicate listings, grouped by title prefix). Flatten back to
+  // individual listings, preserving every item's fields and attaching the
+  // cluster size as a confidence signal. A naive `...cluster` spread here
+  // would treat the array as an object, producing `{0: listing, 1: listing}`
+  // with no top-level title/price — which silently wiped every downstream
+  // filter (price outlier trim, relevance, deal scoring).
+  let merged = clusterListings(ranked).flatMap((cluster) => {
+    const listings = Array.isArray(cluster) ? cluster : [cluster];
+    const clusterSize = listings.length;
+    return listings.map((item) => ({
+      ...item,
+      __clusterScore: clusterSize,
+    }));
+  });
 
 /* ----- moat resale intelligence ----- */
 
@@ -10350,6 +11164,7 @@ merged = [...merged].sort((a, b) => {
     instantKey,
     etsyCooling: isSourceCoolingDown("etsy"),
   });
+  console.log("📉 MERGE PIPELINE", { ..._pipelineCounts, ranked: ranked.length, merged: merged.length });
 
   merged = attachMarketTruthScores(merged, normalizedQuery, identity)
     .sort((a, b) => {
@@ -10379,8 +11194,12 @@ return merged;
 
 return Promise.race([worker, killTimer]).then((r) => {
   if (r === "__timeout__") {
-    console.warn("⚡ MARKET SEARCH TIMEOUT (2.5s)");
-    return [];
+    const budgetMs = Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 6000);
+    const rescued = Array.isArray(_partialBudget.items) ? _partialBudget.items : [];
+    console.warn(
+      `⚡ MARKET SEARCH TIMEOUT (${(budgetMs / 1000).toFixed(1)}s) — returning ${rescued.length} partial items`
+    );
+    return rescued;
   }
   return r;
 });
@@ -10646,24 +11465,51 @@ function trimPriceOutliers(items) {
 
 // 🧠 HUMAN INTUITION FILTER
 function intuitionFilter(items) {
-  const prices = items
+  let working = Array.isArray(items) ? items.slice() : [];
+  const sortedPrices = working
     .map((i) => i?.totalPrice ?? i?.price)
     .filter((n) => typeof n === "number" && n > 0)
     .sort((a, b) => a - b);
 
-  if (prices.length < 5) return items;
+  // Extreme low-outlier guard. IQR's lower fence frequently goes negative
+  // when the distribution is right-skewed, so a single mislabeled generic
+  // listing (e.g. an Etsy "Sleek Wrap Sunglasses" at $12 against a real
+  // $20-$70 cluster) sneaks through. Catch it explicitly: if the cheapest
+  // is less than 40% of the next cheapest AND the next cheapest is itself
+  // reasonable, drop everything at or below the suspect price. Keeps the
+  // median anchored on real comps and stops the variance gate downstream
+  // from forcing a RISKY verdict.
+  if (sortedPrices.length >= 4) {
+    const cheapest = sortedPrices[0];
+    const second   = sortedPrices[1];
+    if (cheapest > 0 && second > 0 && cheapest < second * 0.40) {
+      const dropAtOrBelow = cheapest;
+      working = working.filter((it) => {
+        const p = Number(it?.totalPrice ?? it?.price);
+        return Number.isFinite(p) && p > dropAtOrBelow + 0.01;
+      });
+    }
+  }
+
+  // Recompute after the low-outlier drop.
+  const prices = working
+    .map((i) => i?.totalPrice ?? i?.price)
+    .filter((n) => typeof n === "number" && n > 0)
+    .sort((a, b) => a - b);
+
+  if (prices.length < 5) return working.length >= Math.min(4, items.length) ? working : items;
 
   const med = median(prices);
   const lowCut = med * 0.35;
 
-  const filtered = items.filter((it) => {
+  const filtered = working.filter((it) => {
     const p = it?.totalPrice ?? it?.price;
     if (!p) return false;
     if (p < lowCut) return false;
     return true;
   });
 
-  return filtered.length >= Math.min(4, items.length) ? filtered : items;
+  return filtered.length >= Math.min(4, items.length) ? filtered : working;
 }
 
 function resaleProbability(items) {
@@ -10760,6 +11606,13 @@ function trustScore(it) {
 function hashString(s = "") {
   return sha256(Buffer.from(s)).slice(0, 8);
 }
+
+// Bump when the merge pipeline, filter thresholds, or item shape change in
+// a way that should invalidate previously persisted snapshots. Snapshots
+// without a matching version are treated as cache misses on read.
+const INTERNAL_MARKET_SNAPSHOT_VERSION = String(
+  process.env.INTERNAL_MARKET_SNAPSHOT_VERSION || "v6",
+);
 
 const INTERNAL_MARKET_SNAPSHOT_FRESH_MS = Math.max(
   60_000,
@@ -10905,6 +11758,7 @@ async function saveInternalMarketSnapshot(query, payload = {}) {
     query: q,
     canonicalQuery: canonicalMarketQuery(q),
     source: payload?.source || "live_market",
+    _snapshotVersion: INTERNAL_MARKET_SNAPSHOT_VERSION,
     createdAt: Number(payload?.createdAt || Date.now()),
     refreshedAt: Date.now(),
     searchedQueries: uniqueQueries(payload?.searchedQueries || []).slice(0, 20),
@@ -10950,19 +11804,25 @@ async function readInternalMarketSnapshot(query = "") {
   const q = normalizeQuery(query);
   if (!q) return null;
 
+  // Snapshots without a matching version stamp are from before a pipeline
+  // change (filter relaxation, IQR guard, etc.) and would mask the fix.
+  // Treat as cache miss.
+  const versionMatches = (doc) => doc?._snapshotVersion === INTERNAL_MARKET_SNAPSHOT_VERSION;
+
   const l1 = INTERNAL_MARKET_SNAPSHOT_L1.get(q);
-  if (l1) return l1;
+  if (l1 && versionMatches(l1)) return l1;
+  if (l1) INTERNAL_MARKET_SNAPSHOT_L1.delete(q);
 
   try {
     const l2 = await cacheGet(internalMarketSnapshotRedisKey(q));
-    if (l2?.items?.length) {
+    if (l2?.items?.length && versionMatches(l2)) {
       INTERNAL_MARKET_SNAPSHOT_L1.set(q, l2);
       return l2;
     }
   } catch {}
 
   const disk = await readJson(internalMarketSnapshotDiskKey(q));
-  if (disk?.items?.length) {
+  if (disk?.items?.length && versionMatches(disk)) {
     INTERNAL_MARKET_SNAPSHOT_L1.set(q, disk);
 
     try {
@@ -11420,19 +12280,38 @@ const walmartTokenState = {
 };
 
 function hasEbayApi() {
+  if (process.env.DISABLE_EBAY === "true") return false;
   return !!(EBAY_CLIENT_ID && EBAY_CLIENT_SECRET);
 }
 
+// hasEbaySoldScope — true only when (a) Browse API creds work, (b) the
+// EBAY_SOLD_SCOPE_GRANTED flag is set, and (c) the sold endpoint hasn't been
+// cooling down due to repeated failures. The flag flip is the only switch the
+// operator needs to flip once eBay approves the restricted marketplace.insights
+// scope. Until then this returns false and zero sold requests are made.
+function hasEbaySoldScope() {
+  if (!hasEbayApi()) return false;
+  if (!EBAY_SOLD_SCOPE_GRANTED) return false;
+  if (process.env.DISABLE_EBAY_SOLD === "true") return false;
+  return true;
+}
+
 function hasWalmartApi() {
+  if (process.env.DISABLE_WALMART === "true") return false;
   return !!(WALMART_CLIENT_ID && WALMART_CLIENT_SECRET);
 }
 
 function hasBestBuyApi() {
+  if (process.env.DISABLE_BESTBUY === "true") return false;
   return !!BESTBUY_API_KEY;
 }
 
 function hasEtsyApi() {
-  return !!(ETSY_API_KEY && ETSY_SHARED_SECRET && ETSY_OAUTH_TOKEN);
+  // /v3/application/listings/active is public-scope (API key only — no OAuth
+  // user token required). Don't gate on ETSY_OAUTH_TOKEN. If you later add
+  // user-scoped endpoints (favorites, listing creation, shop management),
+  // gate those individually on ETSY_OAUTH_TOKEN, not the whole API.
+  return !!(ETSY_API_KEY && ETSY_SHARED_SECRET);
 }
 
 function hasAnyMarketSource() {
@@ -11440,9 +12319,11 @@ function hasAnyMarketSource() {
 }
 
 function buildEtsyApiKeyHeader() {
-  return ETSY_SHARED_SECRET
-    ? `${ETSY_API_KEY}:${ETSY_SHARED_SECRET}`
-    : ETSY_API_KEY;
+  // Etsy v3 expects ONLY the keystring (API key) in x-api-key — NOT the
+  // KEY:SECRET pair. The pair format is for OAuth signing, which we don't
+  // need for the public /listings/active endpoint. Previously this header
+  // sent KEY:SECRET → Etsy returned 403 "Key/app access rejected".
+  return ETSY_API_KEY;
 }
 
 function newCorrelationId() {
@@ -11472,10 +12353,21 @@ async function getEbayAccessToken() {
         `${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`
       ).toString("base64");
 
+      // Build scope list. Always include the public Browse scope. Only
+      // append the restricted marketplace.insights scope when the operator
+      // has set EBAY_SOLD_SCOPE_GRANTED=true — requesting an unapproved
+      // scope causes eBay to reject the whole token, which would take down
+      // active Browse calls too.
+      const scopes = [
+        "https://api.ebay.com/oauth/api_scope",
+        "https://api.ebay.com/oauth/api_scope/buy.item.bulk",
+      ];
+      if (EBAY_SOLD_SCOPE_GRANTED) {
+        scopes.push("https://api.ebay.com/oauth/api_scope/buy.marketplace.insights");
+      }
       const body = new URLSearchParams({
         grant_type: "client_credentials",
-        scope:
-          "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/buy.item.bulk",
+        scope:      scopes.join(" "),
       });
 
       const r = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
@@ -11489,7 +12381,7 @@ async function getEbayAccessToken() {
       });
 
       if (!r.ok) {
-        markSourceFailure("ebay_api_auth", `http_${r.status}`);
+        markSourceFailure("ebay", `http_${r.status}`);
         console.warn("⚠️ eBay token request failed:", r.status);
         return null;
       }
@@ -11500,7 +12392,7 @@ async function getEbayAccessToken() {
       const expiresIn = Number(data?.expires_in || 7200);
 
       if (!token) {
-        markSourceFailure("ebay_api_auth", "missing_token");
+        markSourceFailure("ebay", "missing_token");
         return null;
       }
 
@@ -11508,11 +12400,11 @@ async function getEbayAccessToken() {
       ebayTokenState.expiresAt =
         Date.now() + Math.max(5 * 60 * 1000, (expiresIn - 60) * 1000);
 
-      markSourceSuccess("ebay_api_auth", Date.now() - startedAt);
+      markSourceSuccess("ebay", Date.now() - startedAt);
       return token;
     } catch (err) {
       markSourceFailure(
-        "ebay_api_auth",
+        "ebay",
         err?.name === "AbortError" ? "timeout" : "exception"
       );
       console.warn("⚠️ eBay token error:", err?.message || err);
@@ -11631,6 +12523,7 @@ const visionLimiter = rateLimit({
   max: 20,           // 20 vision calls/min per fingerprint (OpenAI cost guard)
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => shouldSkipInfraGuard(req),
   keyGenerator: (req) => getClientFingerprint(req),
   handler: (_req, res) =>
     res.status(429).json({ ok: false, error: "vision_rate_limited" }),
@@ -13227,14 +14120,30 @@ async function _callGeminiVisionPass({ base64, mimeType, mode, propContext, pass
   }
 }
 
-async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid }) {
-  // OpenAI gets a 3s head start; if it doesn't respond, Gemini fires immediately.
-  const openaiCutoffMs = Number(process.env.VISION_OPENAI_CUTOFF_MS || 3000);
+async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid, modelOverride, timeoutMs, externalSignal }) {
+  // OpenAI gets a 12s head start; if it doesn't respond, Gemini fires immediately.
+  // Was 3s — too short for master/visual_shape passes, which were aborting on every
+  // scan and falling through to the generic "item" placeholder identification.
+  // Layer 3 fast-pass overrides both the model (gpt-4.1-mini) and the timeout
+  // (~3 s) by passing modelOverride/timeoutMs.
+  // externalSignal: optional caller-provided AbortSignal. When the caller
+  // decides the pass is no longer needed (e.g. visual_shape returned with
+  // high confidence and we want to cancel the in-flight master), aborting
+  // this signal terminates the OpenAI HTTP request — saving tokens, not
+  // just wall time.
+  const visionModel    = modelOverride || VISION_MODEL;
+  const openaiCutoffMs = Number(timeoutMs || process.env.VISION_OPENAI_CUTOFF_MS || 12000);
   const timeout        = withTimeout(openaiCutoffMs);
+  // Combine internal timeout signal with caller-supplied external signal so
+  // either source can terminate the request. AbortSignal.any is Node 20.3+.
+  const combinedSignal = externalSignal
+    ? AbortSignal.any([timeout.signal, externalSignal])
+    : timeout.signal;
   const base64   = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
   const mimeType = dataUrl.startsWith("data:") ? dataUrl.split(";")[0].slice(5) : "image/jpeg";
 
   let openaiResult = null;
+  let openaiUsage  = null;
   try {
 
 const response = await withModelServing(
@@ -13243,7 +14152,7 @@ const response = await withModelServing(
     withHardTimeout(
       openai.responses.create(
         {
-          model: VISION_MODEL,
+          model: visionModel,
           temperature: 0.1,
           max_output_tokens: 600,
           prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
@@ -13277,20 +14186,21 @@ const response = await withModelServing(
           ],
           metadata: { rid: rid || "", mode, pass: passLabel },
         },
-        { signal: timeout.signal }
+        { signal: combinedSignal }
       ),
       openaiCutoffMs + 500,
       `vision_pass_timeout:${passLabel}`
     ),
   {
     provider: "openai",
-    model: VISION_MODEL,
+    model: visionModel,
     maxConsecutiveFailures: 4,
     circuitMs: 60_000,
   }
 );
 
     timeout.cancel();
+    openaiUsage = response?.usage || null;
 
 const rawText =
   typeof response?.output_text === "string" && response.output_text.trim()
@@ -13337,12 +14247,22 @@ console.log("🧾 VISION PASS RAW", {
   rawPreview: String(rawText || "").slice(0, 280),
 });
 
-    openaiResult = { rawText, parsed, source: "openai" };
+    openaiResult = { rawText, parsed, source: "openai", usage: openaiUsage, model: visionModel };
     // Fast path: OpenAI returned a usable query — no need for Gemini
     if (parsed.query) return openaiResult;
 
 } catch (err) {
   timeout.cancel?.();
+
+  // Caller cancelled via externalSignal — detect this BEFORE checking
+  // err.name, because OpenAI's SDK throws APIUserAbortError (not AbortError)
+  // when the underlying fetch is aborted. The smoke test caught this:
+  // master was reported as "failed" (not "cancelled"), masterCost fell back
+  // to $0 instead of the cancellation estimate, and byCohort.lift.costPct
+  // under-reported real savings.
+  if (externalSignal?.aborted) {
+    return { rawText: "", parsed: {}, source: "openai", model: visionModel, cancelled: true };
+  }
 
   if (err?.name !== "AbortError") {
     console.warn("❌ VISION PASS FAILED (OpenAI)", {
@@ -13354,11 +14274,11 @@ console.log("🧾 VISION PASS RAW", {
 }
 
   // Gemini fallback: OpenAI timed out / failed / returned empty query
-  if (process.env.GEMINI_API_KEY) {
+  if (process.env.GEMINI_API_KEY && !externalSignal?.aborted) {
     try {
       console.log("🔄 VISION PASS → Gemini fallback", { rid: rid || "", pass: passLabel });
       const gemResult = await _callGeminiVisionPass({ base64, mimeType, mode, propContext, passLabel, rid });
-      if (gemResult?.parsed?.query) return { ...gemResult, source: "gemini" };
+      if (gemResult?.parsed?.query) return { ...gemResult, source: "gemini", model: process.env.GEMINI_VISION_MODEL || "gemini-2.0-flash" };
     } catch (e) {
       console.warn("❌ VISION PASS GEMINI FALLBACK FAILED", {
         rid: rid || "",
@@ -13368,12 +14288,14 @@ console.log("🧾 VISION PASS RAW", {
     }
   }
 
-  return openaiResult || { rawText: "", parsed: {}, error: "vision_pass_failed", source: "openai" };
+  return openaiResult || { rawText: "", parsed: {}, error: "vision_pass_failed", source: "openai", model: visionModel };
 }
 
 async function runVisionRecoveryPass({ req, file, mode, propContext }) {
-  const base64 = file.buffer.toString("base64");
-  const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
+  const visionBuffer = await prepareVisionBuffer(file.buffer, req.rid);
+  const base64 = visionBuffer.toString("base64");
+  const mime = visionBuffer === file.buffer ? (file.mimetype || "image/jpeg") : "image/jpeg";
+  const dataUrl = `data:${mime};base64,${base64}`;
   const timeout = withTimeout(7000);
 
   try {
@@ -13578,10 +14500,45 @@ function mergeVisionIdentityObjects(objects = [], fallbackQuery = "") {
  * Returns null if fewer than 2 clean prices.
  */
 function buildPriceStats(items) {
-  const raw = (Array.isArray(items) ? items : [])
-    .map((i) => finitePrice(i?.totalPrice ?? i?.price))
-    .filter((p) => p !== null && p > 0)
-    .sort((a, b) => a - b);
+  // Condition-aware pre-split. When the comp pool contains both new
+  // and used/refurb listings in meaningful proportions, their price
+  // distributions are essentially two different markets — a $400 new
+  // AirPod Pro and a $200 refurbished one shouldn't blend to a $300
+  // median that misleads either condition. Use the dominant condition's
+  // sub-population for the headline stats, but expose the mix.
+  const itemsArr = Array.isArray(items) ? items : [];
+  const byCondition = { new: [], used: [], refurb: [] };
+  for (const it of itemsArr) {
+    const p = finitePrice(it?.totalPrice ?? it?.price);
+    if (p === null || p <= 0) continue;
+    const cond = classifyListingCondition(it);
+    (byCondition[cond] || byCondition.new).push(p);
+  }
+  const conditionMix = {
+    new: byCondition.new.length,
+    used: byCondition.used.length,
+    refurb: byCondition.refurb.length,
+  };
+  const totalCount = conditionMix.new + conditionMix.used + conditionMix.refurb;
+  // "Meaningful" = at least 3 listings and ≥25% of pool. Below that the
+  // group is a long-tail outlier; treat the whole pool as one market.
+  const dominantCondition = (() => {
+    if (totalCount < 6) return null; // small pool — don't split
+    const entries = Object.entries(conditionMix).sort((a, b) => b[1] - a[1]);
+    const [topName, topCount] = entries[0];
+    const [secondName, secondCount] = entries[1] || [null, 0];
+    if (topCount >= 3 && secondCount >= 3 && secondCount / totalCount >= 0.25) {
+      return topName; // mixed pool — use dominant only
+    }
+    return null; // single-condition pool, no split needed
+  })();
+
+  const raw = (dominantCondition
+    ? byCondition[dominantCondition].slice()
+    : itemsArr
+        .map((i) => finitePrice(i?.totalPrice ?? i?.price))
+        .filter((p) => p !== null && p > 0)
+  ).sort((a, b) => a - b);
 
   if (raw.length < 2) return null;
 
@@ -13600,6 +14557,13 @@ function buildPriceStats(items) {
   const med    = median(prices);
   const avg    = round2(prices.reduce((a, b) => a + b, 0) / count);
   const spread = round2(maxP - minP);
+  // q1/q3/iqr above were computed on the RAW unclean array (used only for
+  // the fence calculation). Recompute on the post-fence `prices` so the
+  // returned dispersion reflects the cleaned distribution downstream
+  // gates (e.g. buildBuySignal variance check) should reason against.
+  const cleanQ1  = round2(quantile(prices, 0.25) ?? minP);
+  const cleanQ3  = round2(quantile(prices, 0.75) ?? maxP);
+  const cleanIqr = round2(Math.max(cleanQ3 - cleanQ1, 0));
 
   // Variance (population)
   const variance = count > 1
@@ -13612,7 +14576,12 @@ function buildPriceStats(items) {
   const spreadFactor = clamp01(1 - spreadRatio);
   const priceQualityScore = clamp01(countFactor * 0.50 + spreadFactor * 0.50);
 
-  return { min: minP, max: maxP, median: med, average: avg, spread, variance, count, priceQualityScore };
+  return {
+    min: minP, max: maxP, median: med, average: avg,
+    spread, variance, count, priceQualityScore,
+    q1: cleanQ1, q3: cleanQ3, iqr: cleanIqr,
+    conditionMix, dominantCondition,
+  };
 }
 
 /**
@@ -13839,7 +14808,22 @@ function buildBuySignal({
   }
 
   // ── Hard override 5: high price variability ──────────────────────────────────
-  if (priceStats.variance > 0 && Math.sqrt(priceStats.variance) / Math.max(med, 1) > 0.60) {
+  // std/median was too punitive for legitimately spread categories (a
+  // sunglasses comp pool of $15-$70 has CV ~0.6-0.9 yet still produces a
+  // trustworthy deal call). Three changes:
+  //   (a) use IQR/median instead of std/median — robust to long tails;
+  //   (b) raise the threshold to 1.10 (IQR is naturally tighter than std);
+  //   (c) honor downstream agreement: when count is healthy and the deal
+  //       strength is clearly positive, the spread isn't noise, it's
+  //       category-real and dealComparator/percentile handles it.
+  const iqrVal          = Number(priceStats?.iqr) || 0;
+  const dispersionRatio = iqrVal / Math.max(med, 1);
+  const healthyComps    = (priceStats?.count ?? 0) >= 6;
+  const positiveDeal    = (dealStrength ?? 0) >= 0.12;
+  if (
+    dispersionRatio > 1.10 &&
+    !(healthyComps && positiveDeal)
+  ) {
     return {
       signal: "RISKY",
       warnings: [...warnings, "High price variability"],
@@ -14639,20 +15623,238 @@ function buildResaleFallbackQuery(identity = null) {
   return null;
 }
 
-async function runVisionConsensus({ req, file, mode, propContext }) {
-  const base64 = file.buffer.toString("base64");
-  const dataUrl = `data:${file.mimetype || "image/jpeg"};base64,${base64}`;
+// Layer 3: gate for accepting the fast pre-pass result without escalating.
+// Skips heavy consensus when the fast pass is confidently sure AND the
+// inferred category isn't one where misidentification is expensive (luxury,
+// sneakers, watches, etc.). Returns false on any uncertainty so the dual-pass
+// consensus runs as a safety net.
+function shouldAcceptFastVisionResult(result) {
+  const parsed = result?.parsed;
+  if (!parsed) return false;
 
-  const passes = await Promise.all([
-    runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid }),
-    runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
-  ]);
+  const conf = Number(parsed.confidence ?? 0);
+  if (!Number.isFinite(conf) || conf < FAST_PASS_CONFIDENCE_THRESHOLD) return false;
+
+  // Empty / placeholder identity cannot be trusted as "fast accept".
+  const id = parsed.identity || {};
+  const hasMeaningfulIdentity =
+    !!(id.brand || id.model || id.itemType) && !isWeakGenericVisionQuery(id.itemType || "");
+  if (!hasMeaningfulIdentity) return false;
+
+  const cat = String(id.category || "").trim().toLowerCase();
+  if (cat && HIGH_STAKES_CATEGORIES.has(cat)) return false;
+
+  return true;
+}
+
+async function runVisionConsensus({ req, file, mode, propContext }) {
+  // Downscale to VISION_MAX_EDGE_PX before encoding — full-res phone photos
+  // (3–8 MB) take 1–3 s longer to upload + decode at OpenAI without improving
+  // identification accuracy at this model class.
+  const downscaleFromBytes = Buffer.isBuffer(file.buffer) ? file.buffer.length : 0;
+  const visionBuffer = await prepareVisionBuffer(file.buffer, req.rid);
+  const downscaled = visionBuffer !== file.buffer;
+  const downscaleToBytes = downscaled ? visionBuffer.length : downscaleFromBytes;
+  const base64 = visionBuffer.toString("base64");
+  // Always emit JPEG after downscale; original mimetype may be HEIC/PNG which
+  // sharp's jpeg() encoder has converted.
+  const mime = visionBuffer === file.buffer ? (file.mimetype || "image/jpeg") : "image/jpeg";
+  const dataUrl = `data:${mime};base64,${base64}`;
+
+  // Per-pass wall-time capture. Each promise is wrapped so we record the time
+  // at which it actually resolves (vs when we await it), so master's true wall
+  // time is captured even if we don't end up using its result.
+  const passT0 = Date.now();
+  let fastMs = null, visualMs = null, masterMs = null;
+  const timed = (p, on) => p.then((v) => { on(Date.now() - passT0); return v; }, (e) => { on(Date.now() - passT0); throw e; });
+
+  // Per-scan cohort assignment for the master-skip rollout. The dice roll is
+  // sticky for the lifetime of this scan, so the decision logic + telemetry
+  // tag agree on which arm the scan belongs to.
+  const cohort = (Math.random() * 100) < SKIP_MASTER_ROLLOUT_PCT ? "treatment" : "control";
+  const skipMasterAllowed = SKIP_MASTER_ON_CONFIDENT_VISUAL_ENABLED && cohort === "treatment";
+
+  // ── Vision passes (parallel) ───────────────────────────────────────────────
+  // All three passes race from t=0. Previously fast pass ran sequentially —
+  // when it aborted (which it did on every fresh scan in production), we paid
+  // ~3.5 s of dead time before even starting master/visual_shape. Now total
+  // vision wall time is max(passes), not fast + max(consensus).
+  //
+  // If the fast pass returns an acceptable result, we still prefer it over
+  // the heavier passes (cheaper signal, less drift). Otherwise we fall through
+  // to the master/visual_shape consensus.
+  let passes;
+  let passLabels;
+  let visionTier = "consensus";
+
+  if (FAST_PASS_ENABLED) {
+    // Fire all three passes in parallel, but resolve as soon as fast +
+    // visual_shape are in. If either is confident enough, we cancel the
+    // master OpenAI request — saves both wall time AND tokens (real
+    // cancellation, not just promise abandonment).
+    const masterAbortCtrl = new AbortController();
+    const fastPromise   = timed(
+      runVisionPass({
+        dataUrl,
+        mode,
+        propContext,
+        passLabel:     "fast",
+        rid:           req.rid,
+        modelOverride: FAST_VISION_MODEL,
+        timeoutMs:     FAST_PASS_TIMEOUT_MS,
+      }),
+      (ms) => { fastMs = ms; }
+    ).catch(() => null);
+    const masterPromise = timed(
+      runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid, externalSignal: masterAbortCtrl.signal }),
+      (ms) => { masterMs = ms; }
+    ).catch(() => null);
+    const visualPromise = timed(
+      runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
+      (ms) => { visualMs = ms; }
+    ).catch(() => null);
+
+    // Always drain master in the background to prevent unhandled rejection +
+    // free its memory once it completes, even if we don't use the result.
+    masterPromise.catch(() => null);
+
+    const [fastResult, visualResult] = await Promise.all([fastPromise, visualPromise]);
+
+    const visualConfidence = Number(visualResult?.parsed?.confidence ?? 0);
+    const visualAcceptable =
+      skipMasterAllowed &&
+      visualResult &&
+      Number.isFinite(visualConfidence) &&
+      visualConfidence >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
+      !!(visualResult.parsed?.identity?.brand || visualResult.parsed?.identity?.model || visualResult.parsed?.identity?.itemType);
+
+    if (fastResult && shouldAcceptFastVisionResult(fastResult)) {
+      // Cancel the in-flight master OpenAI request — saves tokens, not just
+      // wall time. Safe to call even if master already finished (abort is a
+      // no-op on resolved requests).
+      try { masterAbortCtrl.abort(); } catch {}
+      passes     = [fastResult];
+      passLabels = ["fast"];
+      visionTier = "fast";
+      visionTierStats.fastAccepted++;
+      console.log("⚡ FAST VISION PASS ACCEPTED", {
+        rid:        req.rid,
+        confidence: Number(fastResult.parsed?.confidence ?? 0).toFixed(2),
+        category:   fastResult.parsed?.identity?.category || null,
+      });
+    } else if (visualAcceptable) {
+      // Skip waiting for master — visual_shape already gave us a high-confidence
+      // identity. Cancel the master OpenAI request so we don't burn tokens on
+      // a result we'll never use.
+      try { masterAbortCtrl.abort(); } catch {}
+      const consensusPasses = [visualResult];
+      passes     = fastResult ? [fastResult, ...consensusPasses] : consensusPasses;
+      passLabels = fastResult ? ["fast", "visual_shape"] : ["visual_shape"];
+      visionTier = "visual_skip_master";
+      visionTierStats.masterSkipped = (visionTierStats.masterSkipped || 0) + 1;
+      console.log("🎯 MASTER PASS SKIPPED (visual_shape confident)", {
+        rid:              req.rid,
+        visualConfidence: visualConfidence.toFixed(2),
+        threshold:        SKIP_MASTER_CONFIDENCE_THRESHOLD,
+        category:         visualResult.parsed?.identity?.category || null,
+      });
+    } else {
+      // Visual was not confident enough — wait for master to chime in. Master
+      // has been racing since t=0 so we usually don't add fresh wall time here.
+      const master = await masterPromise;
+      const consensusPasses = [master, visualResult].filter(Boolean);
+      passes     = fastResult ? [fastResult, ...consensusPasses] : consensusPasses;
+      passLabels = fastResult ? ["fast", "master", "visual_shape"].slice(0, passes.length)
+                              : ["master", "visual_shape"].slice(0, passes.length);
+      visionTier = fastResult ? "consensus_with_fast_seed" : "consensus";
+      if (fastResult) visionTierStats.fastEscalated++;
+      else            visionTierStats.consensusOnly++;
+      if (fastResult) {
+        console.log("📈 FAST VISION ESCALATED", {
+          rid:           req.rid,
+          fastConfidence: Number(fastResult.parsed?.confidence ?? 0).toFixed(2),
+          category:      fastResult.parsed?.identity?.category || null,
+          reason:        Number(fastResult.parsed?.confidence ?? 0) < FAST_PASS_CONFIDENCE_THRESHOLD
+                            ? "low_confidence" : "high_stakes_category",
+        });
+      }
+    }
+
+    // Cost is summed over the passes whose tokens we actually billed for.
+    // When master is cancelled mid-flight, openai still returns usage for the
+    // tokens consumed up to the abort point — so we read usage off whatever
+    // came back. For passes that were cancelled before any tokens billed,
+    // usage will be null and contribute 0.
+    const masterUsageAvailable = (visionTier === "visual_skip_master" || visionTier === "fast");
+    let settledMaster = null;
+    if (!masterUsageAvailable) {
+      // Consensus branch already awaited master earlier; re-await is cheap (resolved)
+      try { settledMaster = await masterPromise; } catch { settledMaster = null; }
+    } else {
+      // Peek at master in case it had already resolved before we cancelled —
+      // we still want to bill those tokens accurately.
+      settledMaster = await masterPromise.catch(() => null);
+    }
+    const fastCost   = fastResult   ? costForUsage(fastResult.usage, fastResult.model)     : 0;
+    const visualCost = visualResult ? costForUsage(visualResult.usage, visualResult.model) : 0;
+    // When master was cancelled mid-flight, settledMaster.usage is null. Use
+    // the cancelled-pass estimate so we don't under-count on the master-skip
+    // arm — without this, byCohort.lift.costPct looks bigger than reality.
+    const masterCost = settledMaster?.cancelled
+      ? costForCancelledPass(settledMaster.model || "gpt-4.1")
+      : (settledMaster ? costForUsage(settledMaster.usage, settledMaster.model) : 0);
+    const totalCost  = fastCost + visualCost + masterCost;
+
+    recordVisionTiming({
+      rid:                req.rid,
+      tier:               visionTier,
+      cohort,
+      masterSkipped:      visionTier === "visual_skip_master" || visionTier === "fast",
+      downscaled,
+      downscaleFromBytes,
+      downscaleToBytes,
+      fastMs,
+      visualMs,
+      masterMs:           masterUsageAvailable ? (settledMaster?.cancelled ? null : masterMs) : masterMs,
+      visionWallMs:       Date.now() - passT0,
+      visualConfidence:   Number(visualResult?.parsed?.confidence ?? NaN),
+      costUsd:            totalCost,
+      costBreakdown:      { fast: fastCost, visual: visualCost, master: masterCost, masterCancelled: !!settledMaster?.cancelled },
+    });
+  } else {
+    const noFastT0 = Date.now();
+    let nfMasterMs = null, nfVisualMs = null;
+    const [master, visual] = await Promise.all([
+      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "master",       rid: req.rid }), (ms) => { nfMasterMs = ms; }),
+      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }), (ms) => { nfVisualMs = ms; }),
+    ]);
+    passes = [master, visual];
+    passLabels = ["master", "visual_shape"];
+    visionTierStats.consensusOnly++;
+    const masterCost = master ? costForUsage(master.usage, master.model) : 0;
+    const visualCost = visual ? costForUsage(visual.usage, visual.model) : 0;
+    recordVisionTiming({
+      rid:                req.rid,
+      tier:               "consensus_no_fast",
+      cohort,
+      masterSkipped:      false,
+      downscaled,
+      downscaleFromBytes,
+      downscaleToBytes,
+      fastMs:             null,
+      visualMs:           nfVisualMs,
+      masterMs:           nfMasterMs,
+      visionWallMs:       Date.now() - noFastT0,
+      visualConfidence:   Number(visual?.parsed?.confidence ?? NaN),
+      costUsd:            masterCost + visualCost,
+      costBreakdown:      { fast: 0, visual: visualCost, master: masterCost, masterCancelled: false },
+    });
+  }
 
   // Track which model served each pass — "gemini" if any pass fell back
   const visionSource = passes.some((p) => p?.source === "gemini") ? "gemini" : "openai";
 
   const parsedList = passes.map((p) => p?.parsed || {});
-  const passLabels = ["master", "visual_shape"];
 
   // Track which passes returned actual responses (vs total failure)
   const anyPassGotResponse = passes.some(
@@ -14749,7 +15951,19 @@ const identityPreferredQuery = chooseBestIdentityQuery(
   query || ""
 );
 
-if (
+// Trust the pass directly when one returned a high-confidence non-garbage
+// query. The identity synthesis layer can fabricate tokens by reconciling
+// disagreeing shape/material hints across passes (e.g. injecting "round"
+// when one pass said "wraparound" and the other said "wrap"). For confident
+// passes that's worse than just using their query verbatim.
+const HIGH_CONF_TRUST_FLOOR = 0.85;
+const trustedPass = passMeta
+  .filter((p) => p.query && !isGarbageQuery(p.query) && p.confidence >= HIGH_CONF_TRUST_FLOOR)
+  .sort((a, b) => b.confidence - a.confidence)[0];
+
+if (trustedPass?.query) {
+  query = trustedPass.query;
+} else if (
   identityPreferredQuery &&
   (
     !query ||
@@ -14945,8 +16159,10 @@ if (
       identity: mergedIdentity,
       attributeCertainty: mergedAttributeCertainty,
       visionSource,
+      visionTier,
       debug: {
         passQueries: rawQueries,
+        passLabels,
       },
     };
   }
@@ -15325,11 +16541,51 @@ if (!openai) {
       const imgHash = sha256(file.buffer);
       const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
 
-      let cached = await cacheGet(cacheKey);
-      if (!cached) cached = visionCache.get(cacheKey);
+      // Bench bypass also bypasses both cache layers — so the smoke test can
+      // exercise the FULL pipeline every run without being short-circuited by
+      // the perceptual-similarity cache (which matches synthetic noise images
+      // by embedding even when bytes differ).
+      const skipCaches = isBenchBypass(req);
+
+      let cached = skipCaches ? null : await cacheGet(cacheKey);
+      if (!cached && !skipCaches) cached = visionCache.get(cacheKey);
 
       if (cached) {
-        return res.status(200).json({ ...cached, cached: true });
+        visionTierStats.exactCacheHit++;
+        return res.status(200).json({ ...cached, cached: true, cacheSource: "exact" });
+      }
+
+      // Perceptual-similarity early-return — saves the 5–12s vision call when
+      // the same item has been scanned recently from a different angle/lighting
+      // (different bytes, but visually the same object). The embedding is
+      // hoisted so we can reuse it at the success path to register the new
+      // result without re-computing. Skipped under bench bypass.
+      let _similarityVec = null;
+      try {
+        _similarityVec = await computeImageEmbedding(file.buffer);
+        if (!skipCaches && Array.isArray(_similarityVec) && _similarityVec.length) {
+          const hit = similarityFindSimilar(_similarityVec);
+          if (hit?.payload) {
+            visionTierStats.similarityCacheHit++;
+            console.log("🎯 SIMILARITY HIT", {
+              rid: req.rid,
+              priorImageHash: hit.imageHash,
+              similarity: Number(hit.similarity.toFixed(4)),
+            });
+            // Reuse the prior identity but stamp the new image hash so
+            // downstream code (storage, harness, market query) reflects the
+            // current upload, not the cached one.
+            return res.status(200).json({
+              ...hit.payload,
+              imageHash:    imgHash,
+              cached:       true,
+              cacheSource:  "similarity",
+              similarity:   hit.similarity,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("similarity_lookup_error", e?.message || e);
       }
 
       const originalHash = imgHash;
@@ -15517,6 +16773,8 @@ if (!openai) {
           authenticityFlags: Array.isArray(result?.authenticityFlags) ? result.authenticityFlags : [],
           conditionFlags:    Array.isArray(result?.conditionFlags)    ? result.conditionFlags    : [],
           visionSource: result?.visionSource || "openai",
+          visionTier:   result?.visionTier   || "consensus",
+          cacheSource:  "miss",
           debug: result?.debug || null,
         };
 
@@ -15796,6 +17054,15 @@ if (!openai) {
         visionCache.set(cacheKey, shaped);
         await cacheSet(cacheKey, shaped, 86400);
 
+        // Register this scan in the similarity index so the next visually-
+        // similar upload can early-return without paying the vision cost.
+        // Skip if vision identity is empty — caching a no-op identity would
+        // satisfy future similarity hits with garbage.
+        if (_similarityVec && (shaped?.identity || shaped?.visionIdentity)) {
+          similarityRegister(originalHash, _similarityVec, shaped);
+        }
+
+        harnessRecordScan(req, shaped).catch(() => {});
         return res.status(200).json(shaped);
     } catch (err) {
       if (err?.status === 429 || String(err?.message || "").includes("429")) {
@@ -16040,7 +17307,7 @@ async function serpShopping(query, opts = {}) {
   });
 
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 12000);
+  const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
@@ -16212,7 +17479,7 @@ async function serpEbaySold(query) {
   if (isSourceCoolingDown("serpapi")) return [];
 
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 12000);
+  const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
   try {
     // SerpAPI eBay engine: _nkw = keyword, LH_Complete=1 & LH_Sold=1 via ebay params
@@ -16366,7 +17633,7 @@ async function serpLocalShopping(query, location) {
   if (isSourceCoolingDown("serpapi")) return null;
 
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 12000);
+  const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
   try {
     const params = new URLSearchParams({
@@ -16464,7 +17731,7 @@ async function serpAmazon(query, opts = {}) {
   });
 
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 12000);
+  const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
@@ -16547,7 +17814,7 @@ async function serpScopedSearch(query, site, opts = {}) {
   });
 
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 12000);
+  const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
@@ -16724,7 +17991,13 @@ async function etsySearch(query) {
       signal: controller.signal,
       headers: {
         "x-api-key": buildEtsyApiKeyHeader(),
-        Authorization: `Bearer ${ETSY_OAUTH_TOKEN}`,
+        // Authorization: Bearer was a leftover from a deprecated OAuth
+        // requirement. /listings/active is API-key-only. Including a Bearer
+        // header alongside x-api-key actually causes Etsy to attempt OAuth
+        // validation and 401 the request when the token is stale or missing.
+        ...(ETSY_OAUTH_TOKEN
+          ? { Authorization: `Bearer ${ETSY_OAUTH_TOKEN}` }
+          : {}),
         Accept: "application/json",
       },
     });
@@ -16996,9 +18269,28 @@ async function buildMarketSearchResponsePayload({
   conditionFlags = [],
   retrievalMeta = null,
   persistSnapshot = false,
+  // Outcome-learning bias (#45) — pre-computed at the route handler from
+  // getCategoryOutcomePrior. Pass null to skip the bias entirely (back-compat:
+  // legacy callers that don't pass this default to neutral 0% shift).
+  categoryPrior = null,
 } = {}) {
   const baseQuery = normalizeQuery(query || "");
   const sourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
+
+  // Hoisted (TDZ-safe): bracket-median shift applied by the dealComparator
+  // call below. Default 0 means "no learned adjustment". Computed from the
+  // user's per-category outcome track record — see computeBracketAdjustmentFromPrior.
+  let _learnedBracketShiftPct = 0;
+  let _learnedBracketMeta     = null;
+  try {
+    if (categoryPrior) {
+      const adj = computeBracketAdjustmentFromPrior(categoryPrior);
+      if (Number.isFinite(adj?.pct) && adj.pct !== 0) {
+        _learnedBracketShiftPct = adj.pct;
+      }
+      _learnedBracketMeta = adj;
+    }
+  } catch { /* non-fatal — fall back to neutral 0% */ }
 
   const resolvedFinalQuery = normalizeQuery(
     finalQuery ||
@@ -17143,12 +18435,19 @@ async function buildMarketSearchResponsePayload({
     });
 
     // ── Deal comparator ───────────────────────────────────────────────────────
+    // scanCondition narrows the comp basket to the matching condition tier so
+    // verdict math is apples-to-apples (a "Used – Acceptable" scan stops
+    // competing against a "New Sealed"–dominated basket). learnedAdjustmentPct
+    // is populated below from getCategoryOutcomePrior; we capture it before
+    // the call so it can shift the bracket median per user track record.
     const dealComparator = buildDealComparatorPayload({
       scannedPrice,
       uiItems,
       consensus,
       category,
-      identity: visionIdentity || null,
+      identity:             visionIdentity || null,
+      scanCondition:        visionIdentity?.condition || null,
+      learnedAdjustmentPct: _learnedBracketShiftPct || 0,
     });
 
     // ── Trend intelligence ────────────────────────────────────────────────────
@@ -17768,6 +19067,15 @@ async function buildMarketSearchResponsePayload({
       source: Array.isArray(sourceItems) && sourceItems.length ? "live_market" : "empty",
       kind: Array.isArray(sourceItems) && sourceItems.length ? "live_market" : "empty",
     },
+
+    // Outcome-learning bias applied to this scan's verdict bracket.
+    // pct: signed bracket-median shift in percent (negative = tightened
+    //       because category historically loses money; positive = loosened
+    //       because user wins consistently in this category).
+    // samples: number of past wins+losses in this category for this user.
+    // confidence: 0..1 dampener tied to sample count; multiplied into pct.
+    // Null when no userId or no prior data.
+    learning: _learnedBracketMeta || null,
   };
 
   // Phase 3 boundary: every parallel verdict system this response carries
@@ -17780,18 +19088,49 @@ async function buildMarketSearchResponsePayload({
   // whose normalized form contradicts the canonical buyOrPass.verdict.
   // Silent when everything agrees. The sink (configured at boot) ships
   // events to whatever analytics surface the host wires up.
+  //
+  // Suppress drift events when the disagreement is explained by an
+  // identity-confidence demotion: legacy verdict engines look only at
+  // price (so a $22 item against a $45 median says STEAL/BUY), while
+  // canonical correctly demotes to HOLD/SKIP when trust/identity is
+  // weak (we're not confident WHAT we're looking at). That's expected
+  // separation of concerns — not drift the team needs to investigate.
   try {
     const canonicalVerdict = _responsePayload?.buyOrPass?.verdict ?? null;
-    if (canonicalVerdict) {
-      reportLegacyDrift("scan/main-response", canonicalVerdict, _responsePayload.legacy._trace);
+    const trustScore = Number(_responsePayload?.trustScore ?? _responsePayload?.profitIntel?.trustScore ?? 0);
+    const conservativeCanonical =
+      canonicalVerdict === "HOLD" ||
+      canonicalVerdict === "SKIP" ||
+      canonicalVerdict === "AVOID" ||
+      canonicalVerdict === "PASS";
+    const lowTrustDemotion = trustScore < 0.5 && conservativeCanonical;
+    // Filter the trace so we only report real verdict drift: entries whose
+    // legacy value actually normalizes to a canonical verdict. Alert types
+    // (smartAlertEngine.alertType emits "AUTH_RISK", "STEAL_DEAL", etc.)
+    // aren't verdicts — they're UI dispatch hints — and they normalize to
+    // null. Flagging null-vs-canonical adds noise without revealing drift.
+    const significantTrace = Array.isArray(_responsePayload.legacy._trace)
+      ? _responsePayload.legacy._trace.filter((entry) => entry?.normalized !== null)
+      : [];
+    if (canonicalVerdict && !lowTrustDemotion && significantTrace.length > 0) {
+      reportLegacyDrift("scan/main-response", canonicalVerdict, significantTrace);
     }
   } catch { /* telemetry never propagates */ }
 
   // Phase 10: emit a clean analytics event keyed by canonical verdict.
   // Legacy values demoted to .legacy; primary key is verdict + source.
+  //
+  // Skip the emission when profitIntel hasn't been set on the payload
+  // yet — the caller (stream's _buildPayload) attaches profitIntel
+  // immediately after this function returns, then re-assembles the
+  // legacy namespace and re-emits the analytics event with the real
+  // signals. Emitting here first would log a permanently-stale
+  // legacy.profitIntelBuySignal: null and undercount RISKY signals
+  // downstream.
   try {
+    const hasProfitIntel = !!_responsePayload?.profitIntel?.buySignal;
     const canonicalVerdict = _responsePayload?.buyOrPass?.verdict ?? null;
-    if (canonicalVerdict) {
+    if (canonicalVerdict && hasProfitIntel) {
       const evt = buildVerdictAnalyticsEvent({
         event:   "scan_response",
         verdict: canonicalVerdict,
@@ -17812,6 +19151,7 @@ async function buildMarketSearchResponsePayload({
     }
   } catch { /* analytics must not break a response */ }
 
+  harnessRecordVerdict("buildMarketSearchResponsePayload", _responsePayload).catch(() => {});
   return _responsePayload;
 }
 // ── Price history API ──────────────────────────────────────────────────────
@@ -19084,6 +20424,121 @@ app.post("/api/scan/consume", clockSkewMiddleware(), bodySchemaMiddleware(SCHEMA
   }
 });
 
+// ── POST /api/debug/reset-quota ───────────────────────────────────────────────
+// TEMPORARY DEBUG ENDPOINT — clears today's scan quota for the requesting
+// actor so the client can re-trigger the free-tier flow during QA. Pairs
+// with the long-press "reset" button in the app's profile tab.
+//
+// Disabled in production by default. Set DEBUG_RESET_QUOTA_ENABLED=1 to
+// allow in prod (or remove the gate). When you ship for real, delete this
+// route entirely.
+app.post("/api/debug/reset-quota", async (req, res) => {
+  const allowedInProd = process.env.DEBUG_RESET_QUOTA_ENABLED === "1";
+  if (process.env.NODE_ENV === "production" && !allowedInProd) {
+    return res.status(404).json({ ok: false, error: "not_found" });
+  }
+  try {
+    const today = _scanDay();
+    const cleared = [];
+    if (!redis) {
+      return res.json({ ok: true, day: today, cleared, note: "no_redis" });
+    }
+
+    // Resolve EVERY identity the various quota systems might use, so a
+    // single reset clears all of them. /api/scan/consume uses one scheme
+    // (u:/g:/ip:), the enforceScanQuota middleware uses another
+    // (getResolvedUserId / getDeviceId / getClientIp + plan). We have to
+    // wipe both schemes for every plausible value or the user stays
+    // locked out from one side or the other.
+    const scanLimitActorIds = new Set();
+    const middlewareIdentityCandidates = new Set();
+
+    // From request body (what the client sent — pre-reset local state)
+    const bodyUserId  = String(req.body?.userId  || "").trim();
+    const bodyGuestId = String(req.body?.guestId || "").trim();
+    if (bodyUserId)  { scanLimitActorIds.add(`u:${bodyUserId}`);  middlewareIdentityCandidates.add(bodyUserId); }
+    if (bodyGuestId) { scanLimitActorIds.add(`g:${bodyGuestId}`); middlewareIdentityCandidates.add(bodyGuestId); }
+
+    // From middleware resolution (what the SERVER sees — JWT, headers, IP)
+    const resolvedUid = getResolvedUserId(req);
+    const resolvedDev = getDeviceId(req);
+    const resolvedIp  = getClientIp(req);
+    if (resolvedUid) { scanLimitActorIds.add(`u:${resolvedUid}`); middlewareIdentityCandidates.add(resolvedUid); }
+    if (resolvedDev) {                                            middlewareIdentityCandidates.add(resolvedDev); }
+    if (resolvedIp)  { scanLimitActorIds.add(`ip:${resolvedIp}`); middlewareIdentityCandidates.add(resolvedIp); }
+    middlewareIdentityCandidates.add("anonymous");
+
+    // 1. Wipe user-facing scan counter (powers /api/scan/status + UI "X/3").
+    for (const id of scanLimitActorIds) {
+      const k = _scanDayKey(id, today);
+      if (await redis.del(k).catch(() => 0)) cleared.push(k);
+      const abuseK = _abuseKey(id);
+      if (await redis.del(abuseK).catch(() => 0)) cleared.push(abuseK);
+    }
+
+    // 2. Wipe enforceScanQuota middleware counter for every (plan, identity).
+    const planCandidates = ["free", "plus", "pro", "internal", "anonymous"];
+    for (const rawId of middlewareIdentityCandidates) {
+      const stable = stableStateKeyPart(rawId);
+      for (const plan of planCandidates) {
+        const k = `quota:scan:${plan}:${stable}:${today}`;
+        if (await redis.del(k).catch(() => 0)) cleared.push(k);
+      }
+    }
+
+    // 3. Catch-all SCAN — anything we missed because of a stableStateKeyPart
+    // collision or a plan name we don't know about.
+    try {
+      let cursor = "0";
+      do {
+        const [next, keys] = await redis.scan(cursor, "MATCH", `quota:scan:*:*:${today}`, "COUNT", 200);
+        cursor = next;
+        for (const k of keys) {
+          for (const candidate of middlewareIdentityCandidates) {
+            if (k.includes(stableStateKeyPart(candidate))) {
+              if (await redis.del(k).catch(() => 0)) cleared.push(k);
+              break;
+            }
+          }
+        }
+      } while (cursor !== "0");
+    } catch {}
+
+    // 4. Image-dedup window — let the same photo be rescanned immediately.
+    const imageHash = String(req.body?.imageHash || "").trim().slice(0, 128);
+    if (imageHash) {
+      const dKey = _dedupKey(imageHash);
+      if (await redis.del(dKey).catch(() => 0)) cleared.push(dKey);
+    }
+
+    // 5. Guest fingerprint→id mapping. Without this, /api/guest/identify
+    // returns the SAME guestId on next call (whose quota we may not have
+    // wiped if the client sent the post-reset guestId). Force a fresh
+    // identity so /api/scan/consume increments a clean row.
+    const fpRaw  = String(req.body?.fingerprint || req.body?.installId || "").trim().slice(0, 128);
+    if (fpRaw) {
+      const fpKey = _guestFpKey(fpRaw);
+      if (await redis.del(fpKey).catch(() => 0)) cleared.push(fpKey);
+    }
+    if (bodyGuestId) {
+      const gidKey = _guestIdKey(bodyGuestId);
+      if (await redis.del(gidKey).catch(() => 0)) cleared.push(gidKey);
+    }
+
+    console.warn(`🧹 DEBUG quota reset → ${cleared.length} keys cleared`, {
+      bodyUserId, bodyGuestId, resolvedUid, resolvedDev, resolvedIp,
+    });
+    return res.json({
+      ok: true,
+      day: today,
+      cleared,
+      resolved: { bodyUserId, bodyGuestId, resolvedUid, resolvedDev, resolvedIp },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "reset_failed", reason: e?.message });
+  }
+});
+
 // ── POST /api/guest/identify ──────────────────────────────────────────────────
 // Issues or recovers a persistent guestId tied to device fingerprint (installId).
 // Anti-bypass: fingerprint is hashed server-side; new installs on same device
@@ -19840,7 +21295,7 @@ const canonicalVariantKey = uniqueQueries(
   searchedQueries.map((q) => canonicalMarketQuery(q))
 ).join("|");
 const identityKey = visionIdentity ? hashString(JSON.stringify(visionIdentity)) : "noid";
-const cacheKey = `market|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
+const cacheKey = `market|${CACHE_SCHEMA_VERSION}|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
 // ── Multi-angle consensus (Feature 64) ───────────────────────────────────────
 let multiAngleResult = null;
 const _visionPasses = Array.isArray(req.body?.visionPasses) ? req.body.visionPasses : [];
@@ -19911,6 +21366,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     visionIdentity,
     authenticityFlags: _authFlags,
     conditionFlags:    _condFlags,
+    categoryPrior:    _categoryPrior,
     retrievalMeta: {
       source: internalHit.source,
       kind: internalHit.kind,
@@ -19968,11 +21424,17 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     }
   } catch {}
   const _planA = getResolvedPlan(req);
-  // Issue 5: per-minute scan rate limit
-  if (_userId && !isPaidPlan(_planA)) {
+  // Hoisted: applyCategoryDomination reads `_scanIdA` before the later declaration
+  // at line ~21176 would make it visible (TDZ violation that silently fired
+  // every /market/search request through the catch handler). Pulling the
+  // const up here keeps the later re-declaration site as a no-op intentionally
+  // removed below.
+  const _scanIdA = responsePayload.scanId || null;
+  // Issue 5: per-minute scan rate limit (bench bypass honored)
+  if (_userId && !isBenchBypass(req) && !isPaidPlan(_planA)) {
     const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_FREE_PER_MIN).catch(() => true);
     if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
-  } else if (_userId && isPaidPlan(_planA)) {
+  } else if (_userId && !isBenchBypass(req) && isPaidPlan(_planA)) {
     const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_PRO_PER_MIN).catch(() => true);
     if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
   }
@@ -20022,7 +21484,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   // Phase 19: affiliate decision logging — uses FINAL corrected signal and trust
   const _finalSignalA = responsePayload.profitIntel.buySignal;
   const _finalTrustA  = responsePayload.trustScore ?? 0;
-  const _scanIdA      = responsePayload.scanId || null;
+  // _scanIdA hoisted to top of route handler (TDZ fix)
   if (_finalTrustA >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalA)) {
     attachAffiliateLinksToPayload(responsePayload);
     logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA }, redis);
@@ -20039,6 +21501,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   // Phase 3: fire watchlist check non-blocking
   if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalA, scanId: _scanIdA, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
+  harnessRecordScan(req, responsePayload).catch(() => {});
   return res.status(200).json(responsePayload);
 }
 
@@ -20054,6 +21517,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     visionIdentity,
     authenticityFlags: _authFlags,
     conditionFlags:    _condFlags,
+    categoryPrior:    _categoryPrior,
     retrievalMeta: {
       source: "l1_route_cache",
       kind: "route_cache_hit",
@@ -20112,8 +21576,10 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     responsePayload.__scanIdentityConf = visionConfidence || 0;
   }
   const _planB = getResolvedPlan(req);
-  // Issue 5: per-minute scan rate limit
-  if (_userId) {
+  // Hoisted (TDZ fix — same pattern as _scanIdA / _scanIdC).
+  const _scanIdB = responsePayload.scanId || null;
+  // Issue 5: per-minute scan rate limit (bench bypass honored)
+  if (_userId && !isBenchBypass(req)) {
     const _rlLimitB = isPaidPlan(_planB) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
     const _rlOkB = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planB), _rlLimitB).catch(() => true);
     if (!_rlOkB) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
@@ -20164,7 +21630,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   // Phase 19: affiliate decision logging — final corrected signal and trust
   const _finalSignalB = responsePayload.profitIntel.buySignal;
   const _finalTrustB  = responsePayload.trustScore ?? 0;
-  const _scanIdB      = responsePayload.scanId || null;
+  // _scanIdB hoisted to top of route handler (TDZ fix)
   if (_finalTrustB >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalB)) {
     attachAffiliateLinksToPayload(responsePayload);
     logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB }, redis);
@@ -20181,6 +21647,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   // Phase 3: fire watchlist check non-blocking
   if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalB, scanId: _scanIdB, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
+  harnessRecordScan(req, responsePayload).catch(() => {});
   return res.status(200).json(responsePayload);
 }
 
@@ -20296,6 +21763,7 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     visionIdentity,
     authenticityFlags: _authFlags,
     conditionFlags:    _condFlags,
+    categoryPrior:    _categoryPrior,
     retrievalMeta: {
       source: _oracleOnlyResult ? "gpt_oracle" : (Array.isArray(items) && items.length > 0 ? "live_market" : "empty"),
       kind:   _oracleOnlyResult ? "oracle"     : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
@@ -20383,8 +21851,11 @@ if (Array.isArray(items) && items.length >= 2 && visionIdentity?.brand && vision
 // ─────────────────────────────────────────────────────────────────────────────
 
 const _planC = getResolvedPlan(req);
-// Issue 5: per-minute scan rate limit
-if (_userId) {
+// Hoisted: applyCategoryDomination reads `_scanIdC` before the later
+// declaration (TDZ violation — same pattern as _scanIdA above).
+const _scanIdC = responsePayload.scanId || null;
+// Issue 5: per-minute scan rate limit (bench bypass honored)
+if (_userId && !isBenchBypass(req)) {
   const _rlLimitC = isPaidPlan(_planC) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
   const _rlOkC = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planC), _rlLimitC).catch(() => true);
   if (!_rlOkC) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
@@ -20435,7 +21906,7 @@ if (!responsePayload?.profitIntel?.buySignal) {
 // Phase 19: affiliate decision logging — final corrected signal and trust
 const _finalSignalC = responsePayload.profitIntel.buySignal;
 const _finalTrustC  = responsePayload.trustScore ?? 0;
-const _scanIdC      = responsePayload.scanId || null;
+// _scanIdC hoisted to top of route handler (TDZ fix)
 if (_finalTrustC >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalC)) {
   attachAffiliateLinksToPayload(responsePayload);
   logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC }, redis);
@@ -20452,9 +21923,19 @@ storeSignalSnapshot(redis, _scanIdC, { userId: _userId, signal: _finalSignalC, t
 // Phase 3: fire watchlist check non-blocking
 if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalC, scanId: _scanIdC, itemName: responsePayload.itemName || null }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
+harnessRecordScan(req, responsePayload).catch(() => {});
 return res.status(200).json(responsePayload);
 
   } catch (err) {
+    // Log to server only — don't leak exception details to clients in any env.
+    // (Previously had a dev-only _error field to surface the silent TDZ bugs
+    // in _scanIdA/B/C; those are fixed, so the field is no longer needed and
+    // its absence prevents any chance of leaking to a misconfigured build.)
+    console.error("❌ /market/search exception", {
+      rid:     req.rid,
+      message: err?.message,
+      stack:   String(err?.stack || "").split("\n").slice(0, 6).join("\n"),
+    });
     return res.status(200).json({
       ok: true,
       items: [],
@@ -20636,6 +22117,7 @@ app.post("/market/search/stream", async (req, res) => {
         query, searchedQueries, variants, items, scannedPrice,
         visionConfidence: cv2, category, visionIdentity,
         authenticityFlags: _authFlags, conditionFlags: _condFlags,
+        categoryPrior:    _categoryPrior,
         retrievalMeta: { source, kind },
         persistSnapshot: !isOracleOnly,
       });
@@ -20664,6 +22146,36 @@ app.post("/market/search/stream", async (req, res) => {
         if (_pi?.timingSignal)             payload.timingSignal      = _pi.timingSignal;
         if (_pi?.trustScore       != null) payload.trustScore        = _pi.trustScore;
         if (_pi?.identityQuality  != null) payload.identityQuality   = _pi.identityQuality;
+        // buildMarketSearchResponsePayload assembled payload.legacy from
+        // an earlier snapshot when profitIntel didn't exist yet, so
+        // legacy.profitIntelBuySignal was always null and downstream
+        // drift telemetry / analytics undercounted real RISKY signals.
+        // Refresh now that profitIntel is in place AND re-emit the
+        // scan_response analytics so the logged event mirrors reality.
+        try {
+          payload.legacy = assembleLegacyNamespace(payload);
+          const canonicalVerdict = payload?.buyOrPass?.verdict ?? null;
+          if (canonicalVerdict) {
+            const evt = buildVerdictAnalyticsEvent({
+              event:   "scan_response",
+              verdict: canonicalVerdict,
+              source:  "server",
+              legacy:  {
+                profitIntelBuySignal: payload?.legacy?.profitIntelBuySignal ?? null,
+                dealQualityVerdict:   payload?.legacy?.dealQualityVerdict   ?? null,
+                dealEngineVerdict:    payload?.legacy?.dealEngineVerdict    ?? null,
+                swarmBuySignal:       payload?.legacy?.swarmBuySignal       ?? null,
+                smartAlertType:       payload?.legacy?.smartAlertType       ?? null,
+              },
+              extra: {
+                confidence: payload?.buyOrPass?.confidence ?? null,
+                reasonCode: payload?.buyOrPass?.reasonCode ?? null,
+                _stage:     "post_profit_intel",
+              },
+            });
+            logEvent("info", "scan_response", evt);
+          }
+        } catch {}
       } catch (_piErr) {
         console.warn("stream_profit_intel_error", _piErr?.message);
       }
@@ -20689,6 +22201,7 @@ app.post("/market/search/stream", async (req, res) => {
         plan:         _planD,
       }).catch(() => {});
       // Phase 2: Category Domination Engine
+      const _scanIdD = payload.scanId || null;
       await applyCategoryDomination(redis, payload, {
         identity:         visionIdentity || {},
         category,
@@ -20722,7 +22235,6 @@ app.post("/market/search/stream", async (req, res) => {
       // Phase 19: affiliate decision logging — final corrected signal and trust
       const _finalSignalD = payload.profitIntel.buySignal;
       const _finalTrustD  = payload.trustScore ?? 0;
-      const _scanIdD      = payload.scanId || null;
       if (_finalTrustD >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalD)) {
         attachAffiliateLinksToPayload(payload);
         logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD }, redis);
@@ -20951,8 +22463,19 @@ app.post("/market/search/stream", async (req, res) => {
       _recordStreamMetric("oracleInvocations", 1);
       const _tOracle = Date.now();
       let _oracleTimedOut = false;
+      // Adaptive Oracle budget: when phase1 returned NOTHING (SerpAPI 429,
+      // marketplace APIs not configured, etc.), Oracle IS our entire comp
+      // pool — giving it 3s would guarantee a no-results degraded scan.
+      // Boost to SCAN_STREAM_ORACLE_BUDGET_CRITICAL_MS (default 7s) when
+      // phase1Items.length === 0, otherwise stay at the fast budget so a
+      // normal scan with partial phase1 data doesn't pay extra latency.
+      // This matches the legacy /market/search path which awaits Oracle
+      // without a hard timeout.
+      const oracleBudget = phase1Items.length === 0
+        ? SCAN_STREAM_ORACLE_BUDGET_CRITICAL_MS
+        : SCAN_STREAM_ORACLE_BUDGET_MS;
       const oracleTimeout = new Promise((resolve) =>
-        setTimeout(() => { _oracleTimedOut = true; resolve([]); }, SCAN_STREAM_ORACLE_BUDGET_MS)
+        setTimeout(() => { _oracleTimedOut = true; resolve([]); }, oracleBudget)
       );
       const oracleItems = await Promise.race([
         gptMarketOracle(query, visionIdentity).catch(() => []),
@@ -20964,7 +22487,7 @@ app.post("/market/search/stream", async (req, res) => {
         _degraded       = true;
         _degradedReason = "oracle_timeout";
         _recordStreamMetric("oracleTimeouts", 1);
-        scanLog("oracle_timeout", scanId, { budgetMs: SCAN_STREAM_ORACLE_BUDGET_MS, phase1Count: phase1Items.length });
+        scanLog("oracle_timeout", scanId, { budgetMs: oracleBudget, phase1Count: phase1Items.length, mode: phase1Items.length === 0 ? "critical" : "fast" });
       }
 
       if (Array.isArray(oracleItems) && oracleItems.length) {
@@ -21051,6 +22574,7 @@ app.post("/market/search/stream", async (req, res) => {
       verdictChanged: _diff.verdictChanged, oracleContributed: _oracleContributed,
       degraded: _degraded, totalMs: _totalMs,
     });
+    harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
 
   } catch (err) {
     console.error("scan_stream_error:", err?.message || err);
@@ -21250,7 +22774,7 @@ const canonicalVariantKey = uniqueQueries(
   searchedQueries.map((q) => canonicalMarketQuery(q))
 ).join("|");
 const identityKey = visionIdentity ? hashString(JSON.stringify(visionIdentity)) : "noid";
-const cacheKey = `market|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
+const cacheKey = `market|${CACHE_SCHEMA_VERSION}|${canonicalKey}|${canonicalVariantKey}|${identityKey}`;
 
 const cached = SERP_CACHE.get(cacheKey);
 
@@ -25945,8 +27469,8 @@ app.post(
   app.get("/data-product/readiness", async (_req, res) => {
     try {
       const [vOps, tmOps] = await Promise.all([
-        redis.hGetAll("ev:ops").catch(() => ({})),
-        redis.hGetAll("tm:ops").catch(() => ({})),
+        redis.hgetall("ev:ops").catch(() => ({})),
+        redis.hgetall("tm:ops").catch(() => ({})),
       ]);
 
       const verificationOps = { total: Number(vOps["verified"] || 0) + Number(vOps["failed"] || 0) };
@@ -28532,11 +30056,27 @@ app.post(
   // -------------------- DEAL COMPARATOR (standalone) --------------------
 
   // POST /intel/deal-compare
-  // Body: { scannedPrice, uiItems, consensus, category, identity }
+  // Body: { scannedPrice, uiItems, consensus, category, identity, scanCondition?,
+  //         learnedAdjustmentPct? }
+  // scanCondition: canonical tier key (new|like_new|good|fair|poor) or eBay
+  // enum. When provided, the comp basket is narrowed to the matching tier
+  // (with adjacent-tier fallback) so percentile/savings are apples-to-apples.
   app.post("/intel/deal-compare", async (req, res) => {
     try {
-      const { scannedPrice = null, uiItems = [], consensus = null, category = "", identity = null } = req.body || {};
-      const result = buildDealComparatorPayload({ scannedPrice, uiItems, consensus, category, identity });
+      const {
+        scannedPrice         = null,
+        uiItems              = [],
+        consensus            = null,
+        category             = "",
+        identity             = null,
+        scanCondition        = null,
+        learnedAdjustmentPct = 0,
+      } = req.body || {};
+      const result = buildDealComparatorPayload({
+        scannedPrice, uiItems, consensus, category, identity,
+        scanCondition:        scanCondition || identity?.condition || null,
+        learnedAdjustmentPct,
+      });
       return res.status(200).json({ ok: true, ...result });
     } catch (err) {
       return res.status(200).json({ ok: false, error: "deal_compare_failed", reason: err?.message || String(err) });
@@ -30915,6 +32455,107 @@ app.post("/api/profile/flip", async (req, res) => {
       },
       60 * 60 * 1000
     );
+  }
+
+  // Surface marketplace API gaps at boot. If only SerpAPI is configured, the
+  // system runs in "Oracle-dependent" mode — when SerpAPI rate-limits (free
+  // tier hits 100 calls/month easily), every scan falls back to GPT-synthesized
+  // comps. That's ~$0.01-0.03 of GPT per scan just for comp generation, and
+  // arguably less accurate than real marketplace listings. This warning makes
+  // the gap visible instead of silently degrading.
+  const sources = {
+    ebay:    hasEbayApi(),
+    walmart: hasWalmartApi(),
+    bestbuy: hasBestBuyApi(),
+    etsy:    hasEtsyApi(),
+    serpapi: !!SERPAPI_KEY,
+  };
+  const liveCount = Object.values(sources).filter(Boolean).length;
+  const missing   = Object.entries(sources).filter(([, on]) => !on).map(([k]) => k);
+  if (liveCount === 0) {
+    console.warn(
+      "\n\x1b[31m" +
+      "╔══════════════════════════════════════════════════════════════════════╗\n" +
+      "║  NO MARKETPLACE APIs CONFIGURED — running on GPT Oracle only         ║\n" +
+      "║  Every scan will pay GPT tokens for synthesized comps (~$0.01-0.03).  ║\n" +
+      "║  Wire at least one real source for accurate, cheap comps:            ║\n" +
+      "║    EBAY_APP_ID, EBAY_CERT_ID  (or)  SERPAPI_KEY  (or)  WALMART_*     ║\n" +
+      "╚══════════════════════════════════════════════════════════════════════╝" +
+      "\x1b[0m\n"
+    );
+    pushOpsAlert("no_marketplace_apis", { sources }, 60 * 60 * 1000);
+  } else if (liveCount === 1 && sources.serpapi) {
+    console.warn(
+      "\n\x1b[33m" +
+      "╔══════════════════════════════════════════════════════════════════════╗\n" +
+      "║  ONLY SerpAPI CONFIGURED — when it rate-limits (free tier hits      ║\n" +
+      "║  ~100 calls/mo), every scan falls back to GPT Oracle (~$0.02/scan).  ║\n" +
+      "║  Missing: " + missing.filter(s => s !== "serpapi").join(", ").padEnd(56) + " ║\n" +
+      "║  Wire eBay/Walmart for free, accurate comps that survive 429s.       ║\n" +
+      "╚══════════════════════════════════════════════════════════════════════╝" +
+      "\x1b[0m\n"
+    );
+    pushOpsAlert("single_marketplace_serpapi_only", { sources, missing }, 60 * 60 * 1000);
+  } else if (missing.length) {
+    console.log(`ℹ️  Marketplace APIs: ${liveCount}/${Object.keys(sources).length} live (${Object.entries(sources).filter(([,on])=>on).map(([k])=>k).join(", ")}); missing ${missing.join(", ")}`);
+  }
+
+  // Production safety: warn loudly if any of the new env-overridable rate
+  // limits or abuse thresholds are set above safe ceilings. These knobs
+  // exist so the bench can crank them locally, but in prod they should stay
+  // at defaults (the bench-bypass header is the supported way to relax
+  // limits — it refuses to work in production). If you genuinely need to
+  // raise a limit in prod, ack the warning intentionally; if you don't,
+  // this catches a mis-deploy that silently disables your abuse guard.
+  if (process.env.NODE_ENV === "production") {
+    const SAFE_CEILINGS = {
+      RATE_LIMIT_SCAN_FREE_PER_MIN:  { value: RATE_LIMIT_SCAN_FREE_PER_MIN,  safeMax: 10,   default: 3   },
+      RATE_LIMIT_SCAN_PRO_PER_MIN:   { value: RATE_LIMIT_SCAN_PRO_PER_MIN,   safeMax: 30,   default: 10  },
+      ABUSE_BURST_MAX:               { value: Number(process.env.ABUSE_BURST_MAX || 5),        safeMax: 20,   default: 5   },
+      ABUSE_BLOCK_MS:                { value: Number(process.env.ABUSE_BLOCK_MS  || 60_000),   safeMin: 30_000, default: 60_000 },
+      ABUSE_IP_MAX:                  { value: Number(process.env.ABUSE_IP_MAX     || 240),     safeMax: 600,  default: 240 },
+      ABUSE_DEVICE_MAX:              { value: Number(process.env.ABUSE_DEVICE_MAX || 180),     safeMax: 500,  default: 180 },
+      ABUSE_USER_MAX:                { value: Number(process.env.ABUSE_USER_MAX   || 300),     safeMax: 800,  default: 300 },
+      PHASE5_WRITE_IP_MAX:           { value: Number(process.env.PHASE5_WRITE_IP_MAX     || 240), safeMax: 600, default: 240 },
+      PHASE5_WRITE_DEVICE_MAX:       { value: Number(process.env.PHASE5_WRITE_DEVICE_MAX || 180), safeMax: 500, default: 180 },
+      PHASE5_WRITE_USER_MAX:         { value: Number(process.env.PHASE5_WRITE_USER_MAX   || 300), safeMax: 800, default: 300 },
+      WRITE_RATE_MAX:                { value: WRITE_RATE_MAX,  safeMax: 300, default: 90 },
+      GLOBAL_RATE_MAX:               { value: GLOBAL_RATE_MAX, safeMax: 600, default: 240 },
+    };
+    const breaches = [];
+    for (const [name, spec] of Object.entries(SAFE_CEILINGS)) {
+      const violatesMax = spec.safeMax != null && spec.value > spec.safeMax;
+      const violatesMin = spec.safeMin != null && spec.value < spec.safeMin;
+      if (violatesMax || violatesMin) {
+        breaches.push({
+          env:     name,
+          value:   spec.value,
+          default: spec.default,
+          safe:    spec.safeMax != null ? `≤ ${spec.safeMax}` : `≥ ${spec.safeMin}`,
+        });
+      }
+    }
+    if (breaches.length) {
+      console.warn(
+        "\n[31m" +
+        "╔══════════════════════════════════════════════════════════════════════╗\n" +
+        "║  PRODUCTION SAFETY WARNING — abuse/rate-limit env overrides active   ║\n" +
+        "║  These knobs exist for local benchmarking. In production they should ║\n" +
+        "║  stay at defaults. Use the BENCH_BYPASS_SECRET header for testing —  ║\n" +
+        "║  the server refuses to honor it when NODE_ENV=production.            ║\n" +
+        "╚══════════════════════════════════════════════════════════════════════╝" +
+        "[0m"
+      );
+      for (const b of breaches) {
+        console.warn(`  • ${b.env} = ${b.value}  (default ${b.default}, safe ${b.safe})`);
+      }
+      console.warn("");
+      pushOpsAlert(
+        "prod_abuse_guard_relaxed",
+        { breaches, count: breaches.length },
+        60 * 60 * 1000
+      );
+    }
   }
 });
 

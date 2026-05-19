@@ -138,39 +138,348 @@ export async function getWatchlistPriceHistory(redis, fingerprint, limit = 30) {
   return entries;
 }
 
+// Alert cooldown: prevents firing the same alert type for the same item within 12h
+const ALERT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const KEY_ALERT_COOLDOWN    = (userId, fp, type) => `watchlist:alert_cd:${userId}:${fp}:${type}`;
+const KEY_SIMILAR_SEEN      = (userId, fp)        => `watchlist:sim_seen:${userId}:${fp}`;
+const KEY_ESCALATION_ANCHOR = (userId, fp)        => `watchlist:esc_anchor:${userId}:${fp}`;
+const SIMILAR_SEEN_TTL      = 24 * 3600; // 24h dedup for similar items
+const ESCALATION_ANCHOR_TTL = 48 * 3600; // 48h between escalation alerts
+
+async function isAlertOnCooldown(redis, userId, fp, type) {
+  if (!redis) return false;
+  const raw = await redis.get(KEY_ALERT_COOLDOWN(userId, fp, type));
+  return !!raw;
+}
+
+async function setAlertCooldown(redis, userId, fp, type) {
+  if (!redis) return;
+  await redis.set(KEY_ALERT_COOLDOWN(userId, fp, type), "1", "PX", ALERT_COOLDOWN_MS);
+}
+
 /**
- * Check if any watched item's price has hit the user's target.
- * Returns items where currentPrice <= targetPrice.
+ * Build the next recommended action for a watched item.
+ * BUY_NOW | KEEP_WATCHING | REMOVE_OR_PASS | MONITOR
+ */
+export function buildWatchNextAction(item, currentPrice, priceHistory = []) {
+  const target = finiteOrNull(item?.targetPrice);
+
+  // Target hit → BUY_NOW
+  if (target && currentPrice && currentPrice <= target) {
+    return { action: "BUY_NOW", reason: `Price hit your target of $${target.toFixed(2)}` };
+  }
+
+  // New historical low → BUY_NOW if it's also reasonable vs target
+  if (priceHistory.length >= 3 && currentPrice) {
+    const prices  = priceHistory.map((h) => h.price).filter(Number.isFinite);
+    const prevMin = prices.length > 1 ? Math.min(...prices.slice(1)) : null;
+    if (prevMin && currentPrice < prevMin) {
+      return { action: "BUY_NOW", reason: `New historical low at $${currentPrice.toFixed(2)}` };
+    }
+  }
+
+  // Price improved significantly (10%+ drop from first seen)
+  const firstPrice = finiteOrNull(item?.marketPriceAtAdd);
+  if (firstPrice && currentPrice && (firstPrice - currentPrice) / firstPrice >= 0.10) {
+    return { action: "BUY_NOW", reason: `Price dropped ${Math.round(((firstPrice - currentPrice) / firstPrice) * 100)}% since you started watching` };
+  }
+
+  // Price trending up or no movement
+  if (firstPrice && currentPrice && currentPrice > firstPrice * 1.05) {
+    return { action: "REMOVE_OR_PASS", reason: "Price is rising — consider removing or acting now" };
+  }
+
+  // No target, no significant movement
+  if (!target) {
+    return { action: "MONITOR", reason: "No target price set — update your target to get alerts" };
+  }
+
+  return { action: "KEEP_WATCHING", reason: "Price not yet at target — keep watching" };
+}
+
+/**
+ * Check watched items for alert conditions.
+ * Fires on: target hit, new historical low, significant drop, meaningful upgrade.
+ * Each alert has: alertType, priority (HIGH|MEDIUM|LOW), reason, action, nextAction.
  */
 export async function checkWatchlistAlerts(redis, userId, currentPriceMap = {}) {
   if (!redis || !userId) return [];
-  const items   = await listWatchlistItems(redis, userId, 100);
-  const alerts  = [];
+  const items  = await listWatchlistItems(redis, userId, 100);
+  const alerts = [];
 
   for (const item of items) {
-    if (!item.targetPrice || item.alertFired === true) continue;
-
     const fp           = item.fingerprint;
-    const currentPrice = finiteOrNull(currentPriceMap[fp]) || null;
+    const currentPrice = finiteOrNull(currentPriceMap[fp]) ?? null;
     if (!currentPrice) continue;
 
-    if (currentPrice <= item.targetPrice) {
-      alerts.push({
-        itemId:       item.itemId,
-        brand:        item.brand,
-        model:        item.model,
-        targetPrice:  item.targetPrice,
-        currentPrice,
-        savings:      round2(item.targetPrice - currentPrice),
-        savingsPct:   round2(((item.targetPrice - currentPrice) / item.targetPrice) * 100),
-        signal:       `${item.brand} ${item.model} hit your target price of $${item.targetPrice.toFixed(2)} — now $${currentPrice.toFixed(2)}`,
-      });
-      // Mark alert fired
-      await redis.hset(KEY_ITEM(userId, item.itemId), "alertFired", "true", "lastSeenPrice", String(currentPrice));
+    const lastSeen   = finiteOrNull(item.lastSeenPrice) ?? null;
+    const target     = finiteOrNull(item.targetPrice)   ?? null;
+    const addedPrice = finiteOrNull(item.marketPriceAtAdd) ?? null;
+
+    // Update lastSeenPrice always
+    await redis.hset(KEY_ITEM(userId, item.itemId), "lastSeenPrice", String(currentPrice));
+
+    // ── Alert 1: TARGET HIT (HIGH) ────────────────────────────────────────────
+    if (target && currentPrice <= target && item.alertFired !== true) {
+      const onCd = await isAlertOnCooldown(redis, userId, fp, "target_hit");
+      if (!onCd) {
+        alerts.push({
+          itemId:       item.itemId,
+          brand:        item.brand,
+          model:        item.model,
+          alertType:    "target_hit",
+          priority:     "HIGH",
+          currentPrice,
+          targetPrice:  target,
+          savings:      round2(target - currentPrice),
+          savingsPct:   round2(((target - currentPrice) / target) * 100),
+          reason:       `Hit your target of $${target.toFixed(2)} — now $${currentPrice.toFixed(2)}`,
+          nextAction:   { action: "BUY_NOW", reason: `Price hit your target of $${target.toFixed(2)}` },
+        });
+        await redis.hset(KEY_ITEM(userId, item.itemId), "alertFired", "true");
+        await setAlertCooldown(redis, userId, fp, "target_hit");
+      }
+      continue; // target hit is the highest priority — skip lower ones
+    }
+
+    // ── Alert 2: NEW HISTORICAL LOW (HIGH) ────────────────────────────────────
+    if (lastSeen && currentPrice < lastSeen) {
+      const drop    = round2(lastSeen - currentPrice);
+      const dropPct = round2((drop / lastSeen) * 100);
+      if (dropPct >= 10) {
+        const onCd = await isAlertOnCooldown(redis, userId, fp, "new_low");
+        if (!onCd) {
+          alerts.push({
+            itemId:     item.itemId,
+            brand:      item.brand,
+            model:      item.model,
+            alertType:  "new_low",
+            priority:   dropPct >= 20 ? "HIGH" : "MEDIUM",
+            currentPrice,
+            previousPrice: lastSeen,
+            dropAmount: drop,
+            dropPct,
+            reason:     `New low: dropped ${dropPct}% to $${currentPrice.toFixed(2)}`,
+            nextAction: { action: "BUY_NOW", reason: `New low at $${currentPrice.toFixed(2)} — ${dropPct}% below last seen` },
+          });
+          await setAlertCooldown(redis, userId, fp, "new_low");
+        }
+      }
+    }
+
+    // ── Alert 3: SIGNIFICANT DROP FROM INITIAL PRICE (MEDIUM) ────────────────
+    if (addedPrice && currentPrice < addedPrice) {
+      const drop    = round2(addedPrice - currentPrice);
+      const dropPct = round2((drop / addedPrice) * 100);
+      if (dropPct >= 15) {
+        const onCd = await isAlertOnCooldown(redis, userId, fp, "sig_drop");
+        if (!onCd) {
+          alerts.push({
+            itemId:     item.itemId,
+            brand:      item.brand,
+            model:      item.model,
+            alertType:  "significant_drop",
+            priority:   "MEDIUM",
+            currentPrice,
+            addedPrice,
+            dropAmount: drop,
+            dropPct,
+            reason:     `Down ${dropPct}% from $${addedPrice.toFixed(2)} when you added it`,
+            nextAction: { action: "BUY_NOW", reason: `Price dropped ${dropPct}% since you started watching` },
+          });
+          await setAlertCooldown(redis, userId, fp, "sig_drop");
+        }
+      }
     }
   }
 
   return alerts;
+}
+
+// ── New alert types (Phase 8) ─────────────────────────────────────────────────
+
+/**
+ * Alert type: RELIST_OPPORTUNITY
+ * Fires when a previously-watched item that disappeared (went out of stock / sold)
+ * comes back on the market at equal or better price.
+ *
+ * Trigger: lastSeenPrice was set, no new price observed for > 5 days,
+ *          now a new listing at same or lower price appears.
+ *
+ * @param {object} item         — watchlist item
+ * @param {number} currentPrice — new observation price
+ * @param {Array}  priceHistory — from getWatchlistPriceHistory
+ * @returns {object|null} alert or null
+ */
+export async function checkRelistAlert(redis, userId, item, currentPrice, priceHistory = []) {
+  if (!redis || !item?.fingerprint || !currentPrice) return null;
+  const fp = item.fingerprint;
+
+  // Check cooldown
+  const onCd = await isAlertOnCooldown(redis, userId, fp, "relist");
+  if (onCd) return null;
+
+  const lastSeen = finiteOrNull(item.lastSeenPrice);
+  if (!lastSeen) return null; // never seen before — not a relist
+
+  const lastSeenAt = Number(item.lastCheckedAt) || 0;
+  if (!lastSeenAt) return null;
+
+  // Must have had a gap of at least 5 days without price observation
+  const gapDays = (Date.now() - lastSeenAt) / 86400000;
+  if (gapDays < 5) return null;
+
+  // New price must be at or below the last seen price
+  if (currentPrice > lastSeen * 1.02) return null;
+
+  const savings = round2(lastSeen - currentPrice);
+  await setAlertCooldown(redis, userId, fp, "relist");
+
+  return {
+    itemId:       item.itemId,
+    brand:        item.brand,
+    model:        item.model,
+    fingerprint:  fp,
+    alertType:    "relist_opportunity",
+    priority:     "MEDIUM",
+    currentPrice,
+    lastSeenPrice: lastSeen,
+    gapDays:      Math.round(gapDays),
+    savings:      savings > 0 ? savings : 0,
+    reason:       `Back on market after ${Math.round(gapDays)} days${savings > 0 ? ` — $${savings.toFixed(2)} cheaper` : " — same price as before"}`,
+    nextAction:   { action: "BUY_NOW", reason: `Relisted at $${currentPrice.toFixed(2)} — was $${lastSeen.toFixed(2)}` },
+  };
+}
+
+/**
+ * Alert type: SIMILAR_ITEM_SURFACED
+ * Fires when a different listing for the same item fingerprint appears
+ * at a meaningfully better price than the item currently on the watchlist.
+ *
+ * Requirements:
+ *   - Different listing (different source or URL)
+ *   - At least 8% cheaper than current watchlist marketPrice
+ *   - Alert not in seen set
+ *
+ * @param {object} item         — watchlist item
+ * @param {Array}  liveListings — fresh market listings for the same fingerprint
+ * @returns {object|null} alert or null
+ */
+export async function checkSimilarItemAlert(redis, userId, item, liveListings = []) {
+  if (!redis || !item?.fingerprint || !liveListings.length) return null;
+  const fp = item.fingerprint;
+
+  const onCd = await isAlertOnCooldown(redis, userId, fp, "similar");
+  if (onCd) return null;
+
+  const basePrice = finiteOrNull(item.lastSeenPrice) || finiteOrNull(item.marketPriceAtAdd);
+  if (!basePrice) return null;
+
+  // Find listings meaningfully cheaper than the watched price
+  const better = liveListings
+    .map(l => ({
+      ...l,
+      _p: Number(l?.price ?? l?.totalPrice ?? l?.currentPrice),
+      _src: String(l?.source || l?.marketplace || "").toLowerCase(),
+    }))
+    .filter(l => Number.isFinite(l._p) && l._p > 0 && (basePrice - l._p) / basePrice >= 0.08)
+    .sort((a, b) => a._p - b._p);
+
+  if (!better.length) return null;
+
+  const best = better[0];
+  const saving = round2(basePrice - best._p);
+  const savingPct = round2((saving / basePrice) * 100);
+
+  // Check dedup
+  const seenKey = `${best._src}|${round2(best._p)}`;
+  const alreadySeen = await redis.sismember(KEY_SIMILAR_SEEN(userId, fp), seenKey).catch(() => 0);
+  if (alreadySeen) return null;
+
+  await redis.sadd(KEY_SIMILAR_SEEN(userId, fp), seenKey).catch(() => {});
+  await redis.expire(KEY_SIMILAR_SEEN(userId, fp), SIMILAR_SEEN_TTL).catch(() => {});
+  await setAlertCooldown(redis, userId, fp, "similar");
+
+  return {
+    itemId:       item.itemId,
+    brand:        item.brand,
+    model:        item.model,
+    fingerprint:  fp,
+    alertType:    "similar_item_surfaced",
+    priority:     savingPct >= 20 ? "HIGH" : "MEDIUM",
+    currentPrice:    best._p,
+    watchlistPrice:  basePrice,
+    savingAmount:    saving,
+    savingPct,
+    source:          best._src,
+    listingUrl:      best.url || best.link || null,
+    listingTitle:    String(best.title || "").slice(0, 100),
+    reason:          `Better listing found: $${best._p.toFixed(2)} on ${best._src} — ${savingPct}% below your watched price`,
+    nextAction:      { action: "BUY_NOW", reason: `$${saving.toFixed(2)} savings vs. your watched price` },
+  };
+}
+
+/**
+ * Alert type: OPPORTUNITY_ESCALATION
+ * Fires when an item's opportunity signal has meaningfully improved since
+ * the last escalation anchor (bigger spread, improved urgency, better signal).
+ *
+ * Trigger: current spread vs market has grown by >= 10% since last check.
+ *
+ * @param {object} item          — watchlist item
+ * @param {number} currentPrice
+ * @param {number} marketMedian
+ * @param {string} currentSignal — current buy signal
+ * @returns {object|null} alert or null
+ */
+export async function checkEscalationAlert(redis, userId, item, currentPrice, marketMedian, currentSignal) {
+  if (!redis || !item?.fingerprint || !currentPrice || !marketMedian) return null;
+  if (!["STRONG BUY", "GOOD DEAL"].includes(currentSignal)) return null;
+
+  const fp = item.fingerprint;
+
+  // Load anchor: { price, spread, signal, setAt }
+  const anchorRaw = await redis.get(KEY_ESCALATION_ANCHOR(userId, fp)).catch(() => null);
+  const anchor    = anchorRaw ? (() => { try { return JSON.parse(anchorRaw); } catch { return null; } })() : null;
+
+  const currentSpread = marketMedian > 0 ? round2((marketMedian - currentPrice) / marketMedian) : 0;
+
+  if (!anchor) {
+    // First time — just store anchor, no alert
+    await redis.set(KEY_ESCALATION_ANCHOR(userId, fp), JSON.stringify({ price: currentPrice, spread: currentSpread, signal: currentSignal, setAt: Date.now() }), "EX", ESCALATION_ANCHOR_TTL).catch(() => {});
+    return null;
+  }
+
+  // Check if opportunity materially improved
+  const spreadImprovement = currentSpread - (anchor.spread || 0);
+  const signalUpgrade = anchor.signal !== "STRONG BUY" && currentSignal === "STRONG BUY";
+
+  const escalated = spreadImprovement >= 0.10 || signalUpgrade;
+  if (!escalated) return null;
+
+  // Update anchor
+  await redis.set(KEY_ESCALATION_ANCHOR(userId, fp), JSON.stringify({ price: currentPrice, spread: currentSpread, signal: currentSignal, setAt: Date.now() }), "EX", ESCALATION_ANCHOR_TTL).catch(() => {});
+
+  const reason = signalUpgrade
+    ? `Signal upgraded to STRONG BUY — better deal than when you added it`
+    : `Spread improved ${Math.round(spreadImprovement * 100)}% — now ${Math.round(currentSpread * 100)}% below market`;
+
+  return {
+    itemId:       item.itemId,
+    brand:        item.brand,
+    model:        item.model,
+    fingerprint:  fp,
+    alertType:    "opportunity_escalation",
+    priority:     signalUpgrade ? "HIGH" : "MEDIUM",
+    currentPrice,
+    marketMedian,
+    currentSpread:   round2(currentSpread * 100),
+    spreadImprovement: round2(spreadImprovement * 100),
+    previousSignal:  anchor.signal,
+    currentSignal,
+    reason,
+    nextAction:   { action: "BUY_NOW", reason: reason },
+  };
 }
 
 /**

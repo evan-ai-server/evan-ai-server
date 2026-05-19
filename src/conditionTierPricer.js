@@ -59,16 +59,68 @@ const RANK_TO_KEY = Object.fromEntries(
   Object.entries(CONDITION_TIERS).map(([k, v]) => [v.rank, k])
 );
 
+// ── Structured-condition → canonical-tier map ─────────────────────────────────
+// Marketplace APIs return condition codes; we map them to our tier keys so
+// the classifier can prefer them over flaky title-text parsing.
+//
+//   eBay Browse:          NEW / LIKE_NEW / NEW_OTHER / NEW_WITH_DEFECTS /
+//                         USED_EXCELLENT / USED_VERY_GOOD / USED_GOOD /
+//                         USED_ACCEPTABLE / FOR_PARTS_OR_NOT_WORKING /
+//                         CERTIFIED_REFURBISHED / SELLER_REFURBISHED /
+//                         MANUFACTURER_REFURBISHED
+//   Free-text from other sources is normalized by lower-casing + trimming.
+const STRUCTURED_CONDITION_MAP = {
+  // eBay enums
+  NEW:                          "new",
+  NEW_OTHER:                    "new",
+  NEW_WITH_DEFECTS:             "like_new",
+  LIKE_NEW:                     "like_new",
+  CERTIFIED_REFURBISHED:        "like_new",
+  MANUFACTURER_REFURBISHED:     "like_new",
+  SELLER_REFURBISHED:           "good",
+  USED_EXCELLENT:               "like_new",
+  USED_VERY_GOOD:               "like_new",
+  USED_GOOD:                    "good",
+  USED_ACCEPTABLE:              "fair",
+  FOR_PARTS_OR_NOT_WORKING:     "poor",
+  // Lower-case canonical (in case caller already normalized)
+  new:                          "new",
+  like_new:                     "like_new",
+  good:                         "good",
+  fair:                         "fair",
+  poor:                         "poor",
+};
+
+function normalizeStructuredCondition(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (STRUCTURED_CONDITION_MAP[s]) return STRUCTURED_CONDITION_MAP[s];
+  const upper = s.toUpperCase().replace(/[\s-]+/g, "_");
+  if (STRUCTURED_CONDITION_MAP[upper]) return STRUCTURED_CONDITION_MAP[upper];
+  const lower = s.toLowerCase();
+  if (STRUCTURED_CONDITION_MAP[lower]) return STRUCTURED_CONDITION_MAP[lower];
+  return null;
+}
+
 // ── Condition classifier ──────────────────────────────────────────────────────
 
 /**
- * Classify a listing into a condition tier based on title + description text.
- * Returns the tier key (e.g., "like_new") or null if no match.
+ * Classify a listing into a condition tier.
+ *
+ * Prefers a structured condition field (e.g. eBay's `condition` enum) over
+ * title-text parsing — structured codes don't lie, title keywords sometimes do
+ * ("Brand New In Box" appearing in the title of a refurbished listing, etc.).
+ *
+ * Returns the tier key (e.g., "like_new") or null if no signal matches.
  */
-export function classifyCondition(title = "", description = "") {
-  const text = `${title} ${description}`.toLowerCase();
+export function classifyCondition(title = "", description = "", structured = null) {
+  // 1. Structured field wins when present and recognized.
+  const fromStructured = normalizeStructuredCondition(structured);
+  if (fromStructured) return fromStructured;
 
-  // Check from best condition down — first match wins
+  // 2. Fall back to title/description keyword match — best tier first.
+  const text = `${title} ${description}`.toLowerCase();
   for (const rank of [5, 4, 3, 2, 1]) {
     const key = RANK_TO_KEY[rank];
     const tier = CONDITION_TIERS[key];
@@ -105,20 +157,29 @@ function statsForPrices(prices) {
 // ── Core bucketing engine ─────────────────────────────────────────────────────
 
 /**
- * Bucket sold comps by condition tier and compute stats per tier.
- * soldItems: array of { title, description?, price?, totalPrice?, salePrice?, sold? }
+ * Bucket comps by condition tier and compute stats per tier.
+ *
+ * By default this buckets ALL items (active asks + sold). Pass
+ * { soldOnly: true } to restore the old behavior — only useful when the
+ * caller has true sold-comp data (e.g. from /buy/marketplace_insights).
+ *
+ * items: array of { title, description?, condition?, price?, totalPrice?,
+ *                   salePrice?, sold?, source? }
  */
-export function priceByConditionTier(soldItems = []) {
-  if (!Array.isArray(soldItems) || !soldItems.length) return buildEmptyResult();
+export function priceByConditionTier(items = [], { soldOnly = false } = {}) {
+  if (!Array.isArray(items) || !items.length) return buildEmptyResult();
 
-  // Filter to sold items only
-  const sold = soldItems.filter(item =>
-    item?.sold === true ||
-    String(item?.status || "").toLowerCase() === "sold" ||
-    item?.source === "ebay_sold"
-  );
+  // Filter scope. Default = all comps. Opt-in soldOnly preserves legacy
+  // behavior for callers that only want sold prices in the buckets.
+  const pool = soldOnly
+    ? items.filter(item =>
+        item?.sold === true ||
+        String(item?.status || "").toLowerCase() === "sold" ||
+        item?.source === "ebay_sold"
+      )
+    : items;
 
-  if (!sold.length) return buildEmptyResult();
+  if (!pool.length) return buildEmptyResult();
 
   // Initialize buckets
   const buckets = {};
@@ -127,11 +188,17 @@ export function priceByConditionTier(soldItems = []) {
   }
   const unclassified = [];
 
-  for (const item of sold) {
+  for (const item of pool) {
     const price = Number(item?.totalPrice ?? item?.price ?? item?.salePrice ?? 0);
     if (!Number.isFinite(price) || price <= 0) continue;
 
-    const tier = classifyCondition(item?.title || "", item?.description || "");
+    // Structured field on the item beats title-text parsing — eBay returns
+    // a real `condition` enum on every Browse listing.
+    const tier = classifyCondition(
+      item?.title       || "",
+      item?.description || "",
+      item?.condition   ?? null,
+    );
     if (tier && buckets[tier]) {
       buckets[tier].push(price);
     } else {
@@ -160,6 +227,15 @@ export function priceByConditionTier(soldItems = []) {
 
   const topSignal = buildTopSignal(tiers, ladder);
 
+  // totalSold is the count of true sold comps in the pool (post-filter).
+  // When soldOnly=false this is computed separately so downstream code can
+  // tell "this stat is sold data" vs "this stat is mixed asks + sold".
+  const soldInPool = pool.reduce((acc, item) => acc + (
+    (item?.sold === true ||
+     String(item?.status || "").toLowerCase() === "sold" ||
+     item?.source === "ebay_sold") ? 1 : 0
+  ), 0);
+
   return {
     tiers,
     unclassified: unclassifiedStats
@@ -169,7 +245,8 @@ export function priceByConditionTier(soldItems = []) {
     bestDataTier,
     topSignal,
     totalClassified: Object.values(buckets).reduce((s, a) => s + a.length, 0),
-    totalSold: sold.length,
+    totalConsidered: pool.length,
+    totalSold:       soldInPool,
   };
 }
 
@@ -239,7 +316,8 @@ function buildEmptyResult() {
     bestDataTier: null,
     topSignal: null,
     totalClassified: 0,
-    totalSold: 0,
+    totalConsidered: 0,
+    totalSold:       0,
   };
 }
 
@@ -271,8 +349,8 @@ export function estimatePriceForCondition(conditionKey, tierResult) {
 
 // ── Master payload builder ─────────────────────────────────────────────────────
 
-export function buildConditionTierPayload(soldItems = [], currentCondition = null) {
-  const result = priceByConditionTier(soldItems);
+export function buildConditionTierPayload(items = [], currentCondition = null) {
+  const result = priceByConditionTier(items);
   let conditionEstimate = null;
   if (currentCondition) {
     conditionEstimate = estimatePriceForCondition(currentCondition, result);
@@ -281,5 +359,159 @@ export function buildConditionTierPayload(soldItems = [], currentCondition = nul
     conditionTiers:    result,
     conditionEstimate,
     topSignal:         result.topSignal,
+  };
+}
+
+// ── Bucketing for the price-bracket math ──────────────────────────────────────
+// Picks the subset of comps that best represents what the scanned item should
+// be compared against. Used by dealComparator to escape the failure mode where
+// a "Used – Acceptable" listing gets compared against a basket containing
+// mostly "New Sealed" comps (or vice-versa) and the verdict ends up wrong.
+//
+// Strategy:
+//   1. Bucket all comps by condition tier (structured field preferred, title
+//      keywords as fallback).
+//   2. If the scan's own condition bucket has >= minBucketSize items, use it.
+//   3. Else try the adjacent tier (one tier up or down — closest substitute).
+//   4. Else fall back to all comps. Better an honest "we don't have condition-
+//      matched data" than a falsely confident verdict.
+//
+// Returns:
+//   {
+//     bucketItems:      Item[],    // the chosen subset
+//     bucketCondition:  string,    // canonical tier key OR "all_conditions"
+//     bucketSource:     "matched_condition" | "adjacent_condition" | "all_listings",
+//     bucketSize:       number,
+//     scanConditionTier: string|null,
+//   }
+const TIER_ORDER = ["new", "like_new", "good", "fair", "poor"];
+const TIER_NEIGHBORS = {
+  new:      ["like_new"],
+  like_new: ["new", "good"],
+  good:     ["like_new", "fair"],
+  fair:     ["good", "poor"],
+  poor:     ["fair"],
+};
+
+// Sold comps are the gold standard for resale verdicts — they're what people
+// actually paid, vs asks which are upper-bound (sellers list optimistically).
+// When a tier bucket has enough sold comps on its own, we use those exclusively.
+const SOLD_PREFERENCE_MIN = 3;
+
+function isSoldComp(item) {
+  if (!item) return false;
+  return (
+    item.sold === true ||
+    item.__isSoldComp === true ||
+    item.source === "ebay_sold" ||
+    String(item.status || "").toLowerCase() === "sold"
+  );
+}
+
+export function bucketItemsByCondition(items = [], scanCondition = null, minBucketSize = 5) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const total = safeItems.length;
+
+  // No condition info on the scan → no condition-aware bracketing possible.
+  // Return everything (with sold-preference still applied) and tell the
+  // caller why.
+  const scanTier = normalizeStructuredCondition(scanCondition);
+  if (!scanTier || total === 0) {
+    const allSold = safeItems.filter(isSoldComp);
+    if (allSold.length >= SOLD_PREFERENCE_MIN) {
+      return {
+        bucketItems:       allSold,
+        bucketCondition:   "all_conditions",
+        bucketSource:      "sold_listings_only",
+        bucketSize:        allSold.length,
+        scanConditionTier: scanTier,
+      };
+    }
+    return {
+      bucketItems:       safeItems,
+      bucketCondition:   "all_conditions",
+      bucketSource:      "all_listings",
+      bucketSize:        total,
+      scanConditionTier: scanTier,
+    };
+  }
+
+  // Classify every item once, cache the tier on a parallel array so we don't
+  // re-parse titles when picking adjacent buckets.
+  const tiers = safeItems.map((it) =>
+    classifyCondition(it?.title || "", it?.description || "", it?.condition ?? null)
+  );
+
+  const itemsForTier = (tierKey) =>
+    safeItems.filter((_, i) => tiers[i] === tierKey);
+
+  // 1. Exact match — prefer sold comps within the bucket when possible.
+  const matched = itemsForTier(scanTier);
+  if (matched.length) {
+    const matchedSold = matched.filter(isSoldComp);
+    if (matchedSold.length >= SOLD_PREFERENCE_MIN) {
+      return {
+        bucketItems:       matchedSold,
+        bucketCondition:   scanTier,
+        bucketSource:      "matched_condition_sold",
+        bucketSize:        matchedSold.length,
+        scanConditionTier: scanTier,
+      };
+    }
+    if (matched.length >= minBucketSize) {
+      return {
+        bucketItems:       matched,
+        bucketCondition:   scanTier,
+        bucketSource:      "matched_condition",
+        bucketSize:        matched.length,
+        scanConditionTier: scanTier,
+      };
+    }
+  }
+
+  // 2. Adjacent tier(s) — pool the matched bucket with its closest neighbors
+  //    before giving up. A "good" scan with only 2 matched + 4 "like_new" is
+  //    better compared against those 6 than against all conditions.
+  const neighborTiers = TIER_NEIGHBORS[scanTier] || [];
+  const pooled = [...matched];
+  for (const t of neighborTiers) pooled.push(...itemsForTier(t));
+  if (pooled.length >= minBucketSize) {
+    const pooledSold = pooled.filter(isSoldComp);
+    if (pooledSold.length >= SOLD_PREFERENCE_MIN) {
+      return {
+        bucketItems:       pooledSold,
+        bucketCondition:   scanTier,
+        bucketSource:      "adjacent_condition_sold",
+        bucketSize:        pooledSold.length,
+        scanConditionTier: scanTier,
+      };
+    }
+    return {
+      bucketItems:       pooled,
+      bucketCondition:   scanTier,
+      bucketSource:      "adjacent_condition",
+      bucketSize:        pooled.length,
+      scanConditionTier: scanTier,
+    };
+  }
+
+  // 3. Fall back to all comps — honest under-data state. Still apply
+  //    sold-preference when enough exist globally.
+  const allSold = safeItems.filter(isSoldComp);
+  if (allSold.length >= SOLD_PREFERENCE_MIN) {
+    return {
+      bucketItems:       allSold,
+      bucketCondition:   "all_conditions",
+      bucketSource:      "sold_listings_only",
+      bucketSize:        allSold.length,
+      scanConditionTier: scanTier,
+    };
+  }
+  return {
+    bucketItems:       safeItems,
+    bucketCondition:   "all_conditions",
+    bucketSource:      "all_listings",
+    bucketSize:        total,
+    scanConditionTier: scanTier,
   };
 }

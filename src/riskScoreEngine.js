@@ -82,6 +82,10 @@ export function computePurchaseRiskScore({
   }
 
   // ── Price floor violation ──────────────────────────────────────────────────
+  // The previous `else { totalW += W }` branches on each missing factor padded
+  // total weight without contributing score, diluting real risk signals into
+  // "safe" (e.g. auth=high alone scored 0.23 because 5 phantom dimensions
+  // voted 0). Missing factors must be excluded from the average, not zeroed.
   const floorCheck = authenticityIntel?.priceFloorCheck || conditionPricing?.mismatch || null;
   if (floorCheck?.violated) {
     const score = floorCheck.riskLevel === "critical" ? 0.95 : 0.70;
@@ -94,8 +98,6 @@ export function computePurchaseRiskScore({
       detail:   floorCheck.warning || null,
       score,
     });
-  } else {
-    totalW += WEIGHTS.priceFloorViolation;
   }
 
   // ── Condition mismatch ────────────────────────────────────────────────────
@@ -111,8 +113,6 @@ export function computePurchaseRiskScore({
       detail:   mismatch.signal || null,
       score,
     });
-  } else {
-    totalW += WEIGHTS.conditionMismatch;
   }
 
   // ── Deal verdict risk ─────────────────────────────────────────────────────
@@ -130,8 +130,6 @@ export function computePurchaseRiskScore({
         score,
       });
     }
-  } else {
-    totalW += WEIGHTS.dealVerdict;
   }
 
   // ── Demand / liquidity risk ───────────────────────────────────────────────
@@ -149,8 +147,6 @@ export function computePurchaseRiskScore({
         score,
       });
     }
-  } else {
-    totalW += WEIGHTS.demandTier;
   }
 
   // ── Trend risk ────────────────────────────────────────────────────────────
@@ -168,12 +164,25 @@ export function computePurchaseRiskScore({
         score,
       });
     }
-  } else {
-    totalW += WEIGHTS.trendPhase;
+  }
+
+  // No factors evaluated → no opinion. Returning a default 0.25 here would
+  // map to "safe", which downstream consumers read as "Safe to buy — no major
+  // risk signals" — a fabricated all-clear on no data.
+  if (totalW === 0) {
+    return {
+      riskScore:  null,
+      tier:       "unknown",
+      verdict:    "Not enough data to assess risk",
+      topFactors: [],
+      allFactors: [],
+      shouldBuy:  false,
+      signal:     "Risk unknown — not enough evidence",
+    };
   }
 
   // Normalize to 0-1
-  const riskScore = totalW > 0 ? round2(weighted / totalW) : 0.25;
+  const riskScore = round2(weighted / totalW);
 
   const tier = riskScore >= 0.70 ? "avoid"
              : riskScore >= 0.50 ? "risky"
