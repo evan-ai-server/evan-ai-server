@@ -166,6 +166,20 @@ export function computeBuyOrPass(bundle = {}) {
   else if (confidence >= 40)  verdictKey = "HOLD";
   else                        verdictKey = "PASS";
 
+  // ── SerpAPI market-evidence cap ─────────────────────────────────────────
+  // A BUY that rests on weak market evidence (few/all-indirect listings,
+  // wide price spread, low query relevance) is downgraded to HOLD. The
+  // verdict can still PASS — we never *upgrade* on this signal, only cap.
+  const marketEvidence = bundle?.marketEvidence;
+  const capReasons = [];
+  if (verdictKey === "BUY" && marketEvidence?.confidence === "low") {
+    verdictKey = "HOLD";
+    capReasons.push(`weak market evidence (${marketEvidence.reason || "low_confidence"})`);
+  } else if (verdictKey === "BUY" && marketEvidence?.confidence === "medium" && confidence < 75) {
+    verdictKey = "HOLD";
+    capReasons.push(`limited market evidence (${marketEvidence.reason || "few_direct_urls"})`);
+  }
+
   const verdict = VERDICTS[verdictKey];
 
   // ── Supporting signal text ───────────────────────────────────────────────
@@ -217,6 +231,12 @@ export function computeBuyOrPass(bundle = {}) {
     riskFlags.unshift(...hardPass.map(f => f.replace(/_/g, " ")));
   }
 
+  // Surface the SerpAPI evidence cap reason so the user sees *why* we held
+  // back, rather than a silent BUY → HOLD swap.
+  if (capReasons.length) {
+    riskFlags.unshift(...capReasons);
+  }
+
   // ── One-line reason ──────────────────────────────────────────────────────
   const topPositive = supportingSignals[0] || null;
   const topNegative = riskFlags[0] || null;
@@ -244,6 +264,7 @@ export function computeBuyOrPass(bundle = {}) {
     hardDisqualifiers: hardPass,
     dimensions,
     topSignal:         oneLineReason,
+    marketEvidence:    marketEvidence || null,
   };
 }
 

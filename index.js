@@ -441,6 +441,26 @@ import { startThriftSession, addSessionScan, getSessionSummary, endThriftSession
 import { buildEvanScoreExplainerPayload, extractSignals, buildExplanation } from "./src/evanScoreExplainer.js";
 import { buildBuyOrPassPayload, computeBuyOrPass } from "./src/buyOrPassEngine.js";
 import {
+  isGoogleRedirect            as isGoogleRedirectHardened,
+  extractFromGoogleRedirect,
+  resolveDirectProductUrl,
+  filterAndRankSerpItems,
+  computeMarketEvidence,
+  buildSerpQuery,
+  buildSerpFallbackQueries,
+  SerpCache,
+  serpCacheKey,
+  recordSerpFetch,
+  recordUrlOutcome,
+  getSerpDebug,
+  resetSerpDebug,
+  SERPAPI_TIMEOUT_MS       as SERPAPI_TIMEOUT_MS_HARDENED,
+  SERPAPI_MAX_RESULTS,
+  SERPAPI_MIN_GOOD_RESULTS,
+  SERPAPI_CACHE_TTL_MS,
+  SERPAPI_STALE_TTL_MS,
+} from "./src/serpapiHardening.js";
+import {
   enforceVerdictOnPayload,
   verdictForPrompt,
   sanitizePromptContext,
@@ -1426,7 +1446,10 @@ const SKIP_MASTER_ROLLOUT_PCT                 = Math.max(0, Math.min(100, Number
 // returns [] and the market_search wave 2 / fallback lanes still surface
 // comps. Lane-level abort vs complete counts surface in the 📉 MERGE PIPELINE
 // log so we can tune from data instead of guessing.
-const SERPAPI_TIMEOUT_MS                      = Number(process.env.SERPAPI_TIMEOUT_MS || 4000);
+// Default tightened 4000 → 3000 (Phase 3, SerpAPI hardening) so the whole
+// market stage stays inside the 6-second scan budget. Override via env if a
+// region needs more headroom.
+const SERPAPI_TIMEOUT_MS                      = Number(process.env.SERPAPI_TIMEOUT_MS || 3000);
 const HIGH_STAKES_CATEGORIES = new Set(
   (process.env.HIGH_STAKES_CATEGORIES ||
     "luxury,handbag,handbags,sneakers,sneaker,collectibles,collectible,watches,watch,jewelry,electronics,trading_cards,trading_card,coin,coins,sports_card,sports_cards"
@@ -4985,6 +5008,16 @@ const CACHE_SCHEMA_VERSION = String(process.env.CACHE_SCHEMA_VERSION || "v3");
 const visionCache = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 1200 });
 // SERP caches: short TTL
 const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
+
+// SerpAPI hardened cache (Phase 6, SWR): fresh hit → instant, stale hit →
+// returned instantly + background refresh, miss → live fetch with timeout.
+// TTLs are env-driven (SERPAPI_CACHE_TTL_MS / SERPAPI_STALE_TTL_MS, defaults
+// 6h / 24h) so a viral scan day can extend the stale window without a deploy.
+const SERP_HARDENED_CACHE = new SerpCache({
+  freshTtlMs: SERPAPI_CACHE_TTL_MS,
+  staleTtlMs: SERPAPI_STALE_TTL_MS,
+  maxSize:    2500,
+});
 const RESEARCH_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1000 });
 const LOCAL_CACHE = new TTLCache({ ttlMs: 10 * 60 * 1000, maxSize: 600 });
 
@@ -6530,6 +6563,25 @@ app.get("/debug/retrieval", async (req, res) => {
   }
 });
 
+// /debug/serp — SerpAPI hardening telemetry. Returns cache hit/stale/miss
+// counters, p95 latency, usable-result and direct-URL rates, rejection
+// reasons, and the live config tunables. Useful for proving the 6-second
+// scan budget actually holds. `?reset=1` zeroes counters.
+app.get("/debug/serp", (req, res) => {
+  if (String(req.query?.reset || "") === "1") {
+    resetSerpDebug();
+    return res.status(200).json({ ok: true, reset: true });
+  }
+  res.status(200).json({
+    ok: true,
+    cache: {
+      hardenedSize: SERP_HARDENED_CACHE.size(),
+      legacySize:   SERP_CACHE.size(),
+    },
+    ...getSerpDebug(),
+  });
+});
+
 app.get("/debug/source-health", (_req, res) => {
   const sources = {};
 
@@ -6860,16 +6912,25 @@ function isGoogleShoppingProductUrl(value) {
 }
 
 function chooseBestListingUrl(it = {}) {
-  const googleProductLink = unwrapGoogleishUrl(
+  // Delegate to the hardened resolver — single source of truth for what is
+  // safe to open. Rejects google.com/search, /url, /aclk, /shopping/product/,
+  // googleadservices, doubleclick, and extracts the inner destination from
+  // Google redirect wrappers when one exists.
+  const resolved = resolveDirectProductUrl(it);
+  recordUrlOutcome(resolved.source);
+
+  // Legacy fields kept so downstream callers that read googleProductLink /
+  // merchantLink directly keep working. These are *informational* — `link`
+  // below is always the hardened directUrl (or null).
+  const googleProductLinkRaw = unwrapGoogleishUrl(
     it.product_link ||
       it.product_page_url ||
       it.google_product_link ||
       it.google_shopping_product_link ||
       it.shopping_result_link ||
       null
-  );
-
-  const merchantLink = unwrapGoogleishUrl(
+  ) || null;
+  const merchantLinkRaw = unwrapGoogleishUrl(
     it.offer_page_url ||
       it.offer_link ||
       it.merchant_link ||
@@ -6877,47 +6938,29 @@ function chooseBestListingUrl(it = {}) {
       it.url ||
       it.link ||
       null
-  );
+  ) || null;
 
-  const candidates = [
-    googleProductLink,
-    merchantLink,
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (candidate && isGoogleShoppingProductUrl(candidate)) {
-      return {
-        link: candidate,
-        googleProductLink: candidate,
-        merchantLink: merchantLink || null,
-        linkVerified: true,
-        linkKind: "google_product",
-        linkHost: urlHost(candidate),
-      };
-    }
-  }
-
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    if (isGoogleSearchUrl(candidate)) continue;
-
-    return {
-      link: candidate,
-      googleProductLink: googleProductLink || null,
-      merchantLink: merchantLink || null,
-      linkVerified: true,
-      linkKind: urlHost(candidate).includes("google.") ? "google_product" : "merchant",
-      linkHost: urlHost(candidate),
-    };
-  }
+  const linkVerified = !!resolved.directUrl;
+  const linkKind = !linkVerified
+    ? "none"
+    : resolved.source === "extracted"
+      ? "extracted_merchant"
+      : "merchant";
+  const linkHost = resolved.directUrl ? urlHost(resolved.directUrl) : null;
 
   return {
-    link: null,
-    googleProductLink: googleProductLink || null,
-    merchantLink: merchantLink || null,
-    linkVerified: false,
-    linkKind: "none",
-    linkHost: null,
+    link:              resolved.directUrl,
+    googleProductLink: googleProductLinkRaw,
+    merchantLink:      merchantLinkRaw,
+    linkVerified,
+    linkKind,
+    linkHost,
+
+    // Hardened fields (Phase 2). Frontend opens `directUrl` only.
+    directUrl:     resolved.directUrl,
+    originalUrl:   resolved.originalUrl,
+    urlSource:     resolved.source,      // direct | extracted | rejected | missing
+    urlConfidence: resolved.confidence,  // 0..1
   };
 }
 
@@ -6996,6 +7039,12 @@ return {
     linkVerified: !!bestLink.linkVerified,
     linkKind: bestLink.linkKind || "none",
     linkHost: bestLink.linkHost || null,
+
+    // Hardened URL trio — frontend opens `directUrl` only.
+    directUrl:     bestLink.directUrl     || null,
+    originalUrl:   bestLink.originalUrl   || null,
+    urlSource:     bestLink.urlSource     || "missing",
+    urlConfidence: bestLink.urlConfidence ?? 0,
 
     image:
       it.thumbnail ||
@@ -17287,7 +17336,7 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
 
 // -------------------- SERP: google shopping --------------------
 async function serpShopping(query, opts = {}) {
-  const { bypassCooldown = false, softFail = false } = opts || {};
+  const { bypassCooldown = false, softFail = false, bypassHardenedCache = false } = opts || {};
 
   if (!SERPAPI_KEY) return [];
   if (process.env.DISABLE_SERP === "true") return [];
@@ -17295,6 +17344,37 @@ async function serpShopping(query, opts = {}) {
   console.warn("⚠️ SerpAPI cooling — allowing fallback queries");
 }
 
+  // ── Phase 6: stale-while-revalidate ────────────────────────────────────
+  // Fresh hit → instant return. Stale hit → instant return + background
+  // refresh (no await; calls itself with bypassHardenedCache:true). Miss →
+  // fall through to the live fetch below.
+  const _cacheKey = serpCacheKey(query, "shopping");
+  if (!bypassHardenedCache) {
+    const cached = SERP_HARDENED_CACHE.get(_cacheKey);
+    if (cached.fresh) {
+      recordSerpFetch({
+        cacheStatus:    "fresh",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+    if (cached.stale) {
+      setImmediate(() => {
+        serpShopping(query, { ...opts, bypassHardenedCache: true, softFail: true }).catch(() => {});
+      });
+      recordSerpFetch({
+        cacheStatus:    "stale",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+  }
 
   const startedAt = Date.now();
 
@@ -17367,51 +17447,21 @@ async function serpShopping(query, opts = {}) {
       hasInlineShoppingResults: Array.isArray(data.inline_shopping_results),
     });
 
+    // Tag sponsored vs organic. shopping_results = organic ranked; inline /
+    // ads tend to live in inline_shopping_results.
+    const organicSet = new Set(Array.isArray(data.shopping_results) ? data.shopping_results : []);
+
     let items = raw
       .map((it, idx) => {
-        const normalized = normalizeItem({
-          ...it,
-          link:
-            it.link ||
-            it.product_link ||
-            it.product_page_url ||
-            it.google_product_link ||
-            it.google_shopping_product_link ||
-            it.offer_page_url ||
-            it.offer_link ||
-            it.merchant_link ||
-            it.product_url ||
-            it.url ||
-            it.serpapi_link ||
-            null,
-        });
-
-        const fallbackLink =
-          normalized.link ||
-          normalized.googleProductLink ||
-          normalized.merchantLink ||
-          it.link ||
-          it.product_link ||
-          it.product_page_url ||
-          it.google_product_link ||
-          it.google_shopping_product_link ||
-          it.offer_page_url ||
-          it.offer_link ||
-          it.merchant_link ||
-          it.product_url ||
-          it.url ||
-          it.serpapi_link ||
-          null;
-
+        const normalized = normalizeItem(it);
         return {
           ...normalized,
-          link: fallbackLink,
-          url: fallbackLink,
-          buyLink: fallbackLink,
-          linkVerified: Boolean(fallbackLink),
+          // `link`/`url`/`buyLink` already point to the hardened directUrl
+          // (or null if no direct URL could be resolved). Do NOT fall back
+          // to googleProductLink / raw fields — that's what was leaking
+          // google.com/shopping/product/ and /aclk wrappers to the frontend.
           source:
             normalized.source ||
-            it.source ||
             it.store_name ||
             it.store ||
             it.seller ||
@@ -17419,6 +17469,7 @@ async function serpShopping(query, opts = {}) {
             "google shopping",
           __fromMarketSearch: true,
           __serverRank: idx + 1,
+          __isSponsored: organicSet.has(it) ? false : !!(it.sponsored || it.is_sponsored || it.ad),
         };
       })
       .filter((x) => x.title)
@@ -17442,10 +17493,28 @@ async function serpShopping(query, opts = {}) {
 
     markSourceSuccess("serpapi", Date.now() - startedAt);
 
+    const _final = items.slice(0, 60);
+    const _directUrlCount = _final.filter((x) => x.directUrl).length;
+    if (_final.length) {
+      SERP_HARDENED_CACHE.set(_cacheKey, {
+        items:          _final,
+        rawCount:       raw.length,
+        directUrlCount: _directUrlCount,
+        query,
+      });
+    }
+    recordSerpFetch({
+      cacheStatus:    "miss",
+      latencyMs:      Date.now() - startedAt,
+      rawCount:       raw.length,
+      usableCount:    _final.length,
+      directUrlCount: _directUrlCount,
+    });
+
     // IMPORTANT:
     // keep serpShopping relaxed.
     // mergeCheapestSources already does the smarter filtering/ranking later.
-    return items.slice(0, 60);
+    return _final;
   } catch (err) {
     if (!softFail) {
       markSourceFailure(
@@ -17453,6 +17522,16 @@ async function serpShopping(query, opts = {}) {
         err?.name === "AbortError" ? "timeout" : "exception"
       );
     }
+
+    recordSerpFetch({
+      cacheStatus: "miss",
+      latencyMs:   Date.now() - startedAt,
+      rawCount:    0,
+      usableCount: 0,
+      directUrlCount: 0,
+      timeout:     err?.name === "AbortError",
+      error:       err?.name !== "AbortError",
+    });
 
     console.warn(
       "⚠️ SerpAPI search error:",
@@ -17715,11 +17794,40 @@ async function serpLocalShopping(query, location) {
 
 // -------------------- SERP: Amazon --------------------
 async function serpAmazon(query, opts = {}) {
-  const { bypassCooldown = false, softFail = false } = opts || {};
+  const { bypassCooldown = false, softFail = false, bypassHardenedCache = false } = opts || {};
 
   if (!SERPAPI_KEY) return [];
   if (process.env.DISABLE_SERP === "true") return [];
   if (!bypassCooldown && isSourceCoolingDown("serpapi")) return [];
+
+  // ── Phase 6: stale-while-revalidate ────────────────────────────────────
+  const _cacheKey = serpCacheKey(query, "amazon");
+  if (!bypassHardenedCache) {
+    const cached = SERP_HARDENED_CACHE.get(_cacheKey);
+    if (cached.fresh) {
+      recordSerpFetch({
+        cacheStatus:    "fresh",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+    if (cached.stale) {
+      setImmediate(() => {
+        serpAmazon(query, { ...opts, bypassHardenedCache: true, softFail: true }).catch(() => {});
+      });
+      recordSerpFetch({
+        cacheStatus:    "stale",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+  }
 
   const startedAt = Date.now();
 
@@ -17769,14 +17877,13 @@ async function serpAmazon(query, opts = {}) {
           image: it.thumbnail,
           source: "Amazon",
         });
+        // Trust normalized.link (hardened directUrl); do NOT re-spread raw `link`.
         return {
           ...normalized,
-          link,
-          url: link,
-          buyLink: link,
           source: "Amazon",
           __fromMarketSearch: true,
           __serverRank: idx + 1,
+          __isSponsored: !!(it.sponsored || it.is_sponsored || it.ad),
         };
       })
       .filter((x) => x.title)
@@ -17785,9 +17892,37 @@ async function serpAmazon(query, opts = {}) {
     items = dedupeSmart(items);
     markSourceSuccess("serpapi", Date.now() - startedAt);
     console.log("🛒 SERP AMAZON COUNT", { query, kept: items.length });
-    return items.slice(0, 40);
+
+    const _final = items.slice(0, 40);
+    const _directUrlCount = _final.filter((x) => x.directUrl).length;
+    if (_final.length) {
+      SERP_HARDENED_CACHE.set(_cacheKey, {
+        items:          _final,
+        rawCount:       raw.length,
+        directUrlCount: _directUrlCount,
+        query,
+      });
+    }
+    recordSerpFetch({
+      cacheStatus:    "miss",
+      latencyMs:      Date.now() - startedAt,
+      rawCount:       raw.length,
+      usableCount:    _final.length,
+      directUrlCount: _directUrlCount,
+    });
+
+    return _final;
   } catch (err) {
     if (!softFail) markSourceFailure("serpapi", err?.name === "AbortError" ? "timeout" : "exception");
+    recordSerpFetch({
+      cacheStatus: "miss",
+      latencyMs:   Date.now() - startedAt,
+      rawCount:    0,
+      usableCount: 0,
+      directUrlCount: 0,
+      timeout:     err?.name === "AbortError",
+      error:       err?.name !== "AbortError",
+    });
     console.warn("⚠️ serpAmazon error:", err?.message || err, "query=", query);
     return [];
   } finally {
@@ -17797,11 +17932,40 @@ async function serpAmazon(query, opts = {}) {
 
 // -------------------- SERP: Scoped resale search (StockX / Poshmark / Depop / Mercari) --------------------
 async function serpScopedSearch(query, site, opts = {}) {
-  const { bypassCooldown = false, softFail = false, label = site } = opts || {};
+  const { bypassCooldown = false, softFail = false, label = site, bypassHardenedCache = false } = opts || {};
 
   if (!SERPAPI_KEY) return [];
   if (process.env.DISABLE_SERP === "true") return [];
   if (!bypassCooldown && isSourceCoolingDown("serpapi")) return [];
+
+  // ── Phase 6: stale-while-revalidate ────────────────────────────────────
+  const _cacheKey = serpCacheKey(`${query}|${site}`, "scoped");
+  if (!bypassHardenedCache) {
+    const cached = SERP_HARDENED_CACHE.get(_cacheKey);
+    if (cached.fresh) {
+      recordSerpFetch({
+        cacheStatus:    "fresh",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+    if (cached.stale) {
+      setImmediate(() => {
+        serpScopedSearch(query, site, { ...opts, bypassHardenedCache: true, softFail: true }).catch(() => {});
+      });
+      recordSerpFetch({
+        cacheStatus:    "stale",
+        latencyMs:      0,
+        rawCount:       cached.entry.rawCount,
+        usableCount:    cached.entry.items.length,
+        directUrlCount: cached.entry.directUrlCount,
+      });
+      return cached.entry.items;
+    }
+  }
 
   const startedAt = Date.now();
 
@@ -17839,22 +18003,16 @@ async function serpScopedSearch(query, site, opts = {}) {
       ...(Array.isArray(data.inline_shopping_results) ? data.inline_shopping_results : []),
     ];
 
+    const organicSet = new Set(Array.isArray(data.shopping_results) ? data.shopping_results : []);
     let items = raw
       .map((it, idx) => {
-        const normalized = normalizeItem({
-          ...it,
-          link: it.link || it.product_link || it.product_page_url || it.url || null,
-        });
-        const fallbackLink =
-          normalized.link || it.link || it.product_link || it.product_page_url || null;
+        const normalized = normalizeItem(it);
         return {
           ...normalized,
-          link: fallbackLink,
-          url: fallbackLink,
-          buyLink: fallbackLink,
           source: label,
           __fromMarketSearch: true,
           __serverRank: idx + 1,
+          __isSponsored: organicSet.has(it) ? false : !!(it.sponsored || it.is_sponsored || it.ad),
         };
       })
       .filter((x) => x.title)
@@ -17863,9 +18021,37 @@ async function serpScopedSearch(query, site, opts = {}) {
     items = dedupeSmart(items);
     markSourceSuccess("serpapi", Date.now() - startedAt);
     console.log(`🔍 SERP SCOPED [${label}]`, { query, kept: items.length });
-    return items.slice(0, 30);
+
+    const _final = items.slice(0, 30);
+    const _directUrlCount = _final.filter((x) => x.directUrl).length;
+    if (_final.length) {
+      SERP_HARDENED_CACHE.set(_cacheKey, {
+        items:          _final,
+        rawCount:       raw.length,
+        directUrlCount: _directUrlCount,
+        query,
+      });
+    }
+    recordSerpFetch({
+      cacheStatus:    "miss",
+      latencyMs:      Date.now() - startedAt,
+      rawCount:       raw.length,
+      usableCount:    _final.length,
+      directUrlCount: _directUrlCount,
+    });
+
+    return _final;
   } catch (err) {
     if (!softFail) markSourceFailure("serpapi", err?.name === "AbortError" ? "timeout" : "exception");
+    recordSerpFetch({
+      cacheStatus: "miss",
+      latencyMs:   Date.now() - startedAt,
+      rawCount:    0,
+      usableCount: 0,
+      directUrlCount: 0,
+      timeout:     err?.name === "AbortError",
+      error:       err?.name !== "AbortError",
+    });
     console.warn(`⚠️ serpScopedSearch [${label}] error:`, err?.message || err);
     return [];
   } finally {
@@ -18823,6 +19009,16 @@ async function buildMarketSearchResponsePayload({
       evanSummary,
     });
 
+    // ── Phase 7: SerpAPI market-evidence safety gate ──────────────────────────
+    // Computed off the user-facing items list. Caps BUY confidence when the
+    // market evidence behind a verdict is weak (e.g. fewer than 3 direct-URL
+    // listings, prices too spread out, low query-relevance overall). Without
+    // this gate, a small SerpAPI result set can produce false BUY confidence.
+    const marketEvidence = computeMarketEvidence(
+      Array.isArray(uiItems) ? uiItems : [],
+      visionIdentity?.title || ""
+    );
+
     // ── Feature 62: Buy or Pass Engine (THE FINAL VERDICT) ────────────────────
     const buyOrPassResult = buildBuyOrPassPayload({
       dealComparator,
@@ -18838,6 +19034,7 @@ async function buildMarketSearchResponsePayload({
       priceProjection,
       visionIdentity,
       evanSummary,
+      marketEvidence,
     });
 
     // ── Feature 68: Seal / Tag / Sticker Detector ─────────────────────────────
