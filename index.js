@@ -1427,7 +1427,12 @@ const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1";
 // a Hermès vs a knock-off is the kind of error that earns the slower path.
 const FAST_VISION_MODEL              = process.env.FAST_VISION_MODEL || "gpt-4.1-mini";
 const FAST_PASS_ENABLED              = String(process.env.FAST_PASS_ENABLED || "true").toLowerCase() !== "false";
-const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 3500);
+// Default bumped 3500 → 6000ms after live-log audit (2026-05-20): gpt-4.1-mini
+// structured JSON output with a downscaled image consistently lands at 4–6s.
+// At 3500ms the fast pass aborted on every cold-cache scan, eliminating the
+// entire fast-accepted tier and forcing every scan through the full consensus
+// (master + visual_shape), which is what we see in the 11.5s vision wall time.
+const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 6000);
 const FAST_PASS_CONFIDENCE_THRESHOLD = Number(process.env.FAST_PASS_CONFIDENCE_THRESHOLD || 0.65);
 // When visual_shape returns confidence >= threshold we don't wait on the
 // heavier master pass — saves ~1.5–3 s of wall time on the common case.
@@ -14316,7 +14321,25 @@ console.log("🧾 VISION PASS RAW", {
     return { rawText: "", parsed: {}, source: "openai", model: visionModel, cancelled: true };
   }
 
-  if (err?.name !== "AbortError") {
+  // OpenAI Node SDK throws APIUserAbortError (not AbortError) when the
+  // underlying fetch's signal fires — and the message is literally
+  // "Request was aborted." Without recognizing those, our own internal
+  // timeout fires (e.g. fast pass at 6s) and we mis-log it as a vision
+  // failure, which is what the live audit caught: every scan showed
+  // "❌ VISION PASS FAILED" for the fast pass even though it was just our
+  // self-timeout deciding the pass was no longer useful.
+  const isAbort =
+    err?.name === "AbortError" ||
+    err?.name === "APIUserAbortError" ||
+    err?.type === "abort" ||
+    /aborted/i.test(String(err?.message || ""));
+  if (isAbort) {
+    console.log("⏱️ VISION PASS ABORTED", {
+      rid: rid || "",
+      pass: passLabel,
+      reason: err?.name || "abort",
+    });
+  } else {
     console.warn("❌ VISION PASS FAILED (OpenAI)", {
       rid: rid || "",
       pass: passLabel,
@@ -15740,11 +15763,18 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   let visionTier = "consensus";
 
   if (FAST_PASS_ENABLED) {
-    // Fire all three passes in parallel, but resolve as soon as fast +
-    // visual_shape are in. If either is confident enough, we cancel the
-    // master OpenAI request — saves both wall time AND tokens (real
-    // cancellation, not just promise abandonment).
+    // Fire all three passes in parallel, but resolve as soon as ANY pass
+    // is decisive — fast acceptable, or visual_shape >= 0.95. Without
+    // race-aware short-circuiting, the prior `Promise.all([fast, visual])`
+    // wait blocked on the slower of the two, even when the faster one had
+    // already given us an answer good enough to skip the rest.
+    //
+    // All three passes get an external AbortSignal so we can cancel the
+    // in-flight OpenAI HTTP request the moment we decide the result isn't
+    // needed — saves tokens AND wall time, not just promise abandonment.
+    const fastAbortCtrl   = new AbortController();
     const masterAbortCtrl = new AbortController();
+    const visualAbortCtrl = new AbortController();
     const fastPromise   = timed(
       runVisionPass({
         dataUrl,
@@ -15754,6 +15784,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         rid:           req.rid,
         modelOverride: FAST_VISION_MODEL,
         timeoutMs:     FAST_PASS_TIMEOUT_MS,
+        externalSignal: fastAbortCtrl.signal,
       }),
       (ms) => { fastMs = ms; }
     ).catch(() => null);
@@ -15762,7 +15793,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       (ms) => { masterMs = ms; }
     ).catch(() => null);
     const visualPromise = timed(
-      runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }),
+      runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid, externalSignal: visualAbortCtrl.signal }),
       (ms) => { visualMs = ms; }
     ).catch(() => null);
 
@@ -15770,7 +15801,58 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     // free its memory once it completes, even if we don't use the result.
     masterPromise.catch(() => null);
 
-    const [fastResult, visualResult] = await Promise.all([fastPromise, visualPromise]);
+    // ── Race-aware wait ────────────────────────────────────────────────────
+    // Resolve immediately when fast is acceptable OR visual_shape clears the
+    // master-skip threshold. Falls through to Promise.all(fast, visual) when
+    // neither pass is individually decisive.
+    let raceWinner = null; // 'fast' | 'visual_early' | 'consensus'
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = (winner) => {
+        if (done) return;
+        done = true;
+        raceWinner = winner;
+        resolve();
+      };
+
+      fastPromise.then((r) => {
+        if (r && shouldAcceptFastVisionResult(r)) finish("fast");
+      }).catch(() => {});
+
+      visualPromise.then((r) => {
+        const conf = Number(r?.parsed?.confidence ?? 0);
+        if (
+          skipMasterAllowed &&
+          r &&
+          Number.isFinite(conf) &&
+          conf >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
+          !!(r.parsed?.identity?.brand || r.parsed?.identity?.model || r.parsed?.identity?.itemType)
+        ) {
+          finish("visual_early");
+        }
+      }).catch(() => {});
+
+      // Fallback: when neither pass is individually decisive, wait for both
+      // before continuing to the consensus logic.
+      Promise.all([fastPromise, visualPromise]).then(() => finish("consensus")).catch(() => finish("consensus"));
+    });
+
+    // Cancel the losers in-flight. Cancelling a pass that already settled is
+    // a no-op; cancelling one still mid-fetch causes OpenAI to abort the
+    // request and runVisionPass to return `{cancelled: true}` quickly.
+    if (raceWinner === "fast") {
+      try { masterAbortCtrl.abort(); } catch {}
+      try { visualAbortCtrl.abort(); } catch {}
+    } else if (raceWinner === "visual_early") {
+      try { fastAbortCtrl.abort(); } catch {}
+      try { masterAbortCtrl.abort(); } catch {}
+    }
+
+    // Re-await both — cancelled promises resolve quickly via the catch handler
+    // in runVisionPass (which returns the `cancelled: true` placeholder so we
+    // can still bill its partial token usage correctly).
+    const fastResult   = await fastPromise;
+    const visualResult = await visualPromise;
 
     const visualConfidence = Number(visualResult?.parsed?.confidence ?? 0);
     const visualAcceptable =
@@ -15847,15 +15929,40 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       // we still want to bill those tokens accurately.
       settledMaster = await masterPromise.catch(() => null);
     }
-    const fastCost   = fastResult   ? costForUsage(fastResult.usage, fastResult.model)     : 0;
-    const visualCost = visualResult ? costForUsage(visualResult.usage, visualResult.model) : 0;
-    // When master was cancelled mid-flight, settledMaster.usage is null. Use
-    // the cancelled-pass estimate so we don't under-count on the master-skip
-    // arm — without this, byCohort.lift.costPct looks bigger than reality.
+    // Cancellation-aware cost: when a pass was aborted mid-flight by the race
+    // logic above, its `.usage` is null. costForCancelledPass returns the
+    // estimated input-token cost (HTTP body was already sent before abort).
+    const fastCost   = fastResult?.cancelled
+      ? costForCancelledPass(fastResult.model || FAST_VISION_MODEL)
+      : (fastResult   ? costForUsage(fastResult.usage, fastResult.model)     : 0);
+    const visualCost = visualResult?.cancelled
+      ? costForCancelledPass(visualResult.model || VISION_MODEL)
+      : (visualResult ? costForUsage(visualResult.usage, visualResult.model) : 0);
     const masterCost = settledMaster?.cancelled
       ? costForCancelledPass(settledMaster.model || "gpt-4.1")
       : (settledMaster ? costForUsage(settledMaster.usage, settledMaster.model) : 0);
     const totalCost  = fastCost + visualCost + masterCost;
+
+    // ── Per-pass timing log ────────────────────────────────────────────────
+    // Single line surfacing all three pass wall times + which tier won, so
+    // live-log audits can see exactly where the budget went without grepping
+    // multiple lines. raceWinner reveals whether short-circuiting kicked in.
+    const visionWallMsLog = Date.now() - passT0;
+    console.log("⏱️ VISION PASS TIMINGS", {
+      rid:              req.rid,
+      tier:             visionTier,
+      raceWinner,
+      fastMs,
+      visualMs,
+      masterMs,
+      visionWallMs:     visionWallMsLog,
+      visualConfidence: Number.isFinite(Number(visualResult?.parsed?.confidence))
+        ? Number(visualResult.parsed.confidence).toFixed(2)
+        : null,
+      fastCancelled:    !!fastResult?.cancelled,
+      visualCancelled:  !!visualResult?.cancelled,
+      masterCancelled:  !!settledMaster?.cancelled,
+    });
 
     recordVisionTiming({
       rid:                req.rid,
@@ -15875,13 +15982,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     });
   } else {
     const noFastT0 = Date.now();
-    let nfMasterMs = null, nfVisualMs = null;
+    // Populate the outer-scope counters so the return shape's visionTimings
+    // is consistent across both FAST_PASS_ENABLED branches.
     const [master, visual] = await Promise.all([
-      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "master",       rid: req.rid }), (ms) => { nfMasterMs = ms; }),
-      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }), (ms) => { nfVisualMs = ms; }),
+      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "master",       rid: req.rid }), (ms) => { masterMs = ms; }),
+      timed(runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid }), (ms) => { visualMs = ms; }),
     ]);
     passes = [master, visual];
     passLabels = ["master", "visual_shape"];
+    visionTier = "consensus_no_fast";
     visionTierStats.consensusOnly++;
     const masterCost = master ? costForUsage(master.usage, master.model) : 0;
     const visualCost = visual ? costForUsage(visual.usage, visual.model) : 0;
@@ -15894,12 +16003,24 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       downscaleFromBytes,
       downscaleToBytes,
       fastMs:             null,
-      visualMs:           nfVisualMs,
-      masterMs:           nfMasterMs,
+      visualMs,
+      masterMs,
       visionWallMs:       Date.now() - noFastT0,
       visualConfidence:   Number(visual?.parsed?.confidence ?? NaN),
       costUsd:            masterCost + visualCost,
       costBreakdown:      { fast: 0, visual: visualCost, master: masterCost, masterCancelled: false },
+    });
+    console.log("⏱️ VISION PASS TIMINGS", {
+      rid:              req.rid,
+      tier:             visionTier,
+      raceWinner:       "no_fast",
+      fastMs:           null,
+      visualMs,
+      masterMs,
+      visionWallMs:     Date.now() - noFastT0,
+      visualConfidence: Number.isFinite(Number(visual?.parsed?.confidence))
+        ? Number(visual.parsed.confidence).toFixed(2)
+        : null,
     });
   }
 
@@ -16212,6 +16333,12 @@ if (
       attributeCertainty: mergedAttributeCertainty,
       visionSource,
       visionTier,
+      visionTimings: {
+        fastMs,
+        visualMs,
+        masterMs,
+        visionWallMs: Date.now() - passT0,
+      },
       debug: {
         passQueries: rawQueries,
         passLabels,
@@ -16824,9 +16951,10 @@ if (!openai) {
             : null,
           authenticityFlags: Array.isArray(result?.authenticityFlags) ? result.authenticityFlags : [],
           conditionFlags:    Array.isArray(result?.conditionFlags)    ? result.conditionFlags    : [],
-          visionSource: result?.visionSource || "openai",
-          visionTier:   result?.visionTier   || "consensus",
-          cacheSource:  "miss",
+          visionSource:  result?.visionSource || "openai",
+          visionTier:    result?.visionTier   || "consensus",
+          visionTimings: result?.visionTimings || null,
+          cacheSource:   "miss",
           debug: result?.debug || null,
         };
 
