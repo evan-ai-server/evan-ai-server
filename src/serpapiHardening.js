@@ -189,6 +189,31 @@ export function resolveDirectProductUrl(rawItem = {}) {
     }
   }
 
+  // Pass 3: allow Google Shopping aggregator pages (/shopping/product/…) as
+  // a low-confidence fallback. The aggregator lists merchant offers — not
+  // ideal, but strictly better than returning null and forcing the frontend
+  // to fall back to an eBay search built from the title. The frontend can
+  // surface the lower confidence with a "via Google" badge if it wants.
+  // The blocked patterns (/url, /search, /aclk, googleadservices,
+  // googlesyndication, doubleclick) are still rejected — those are pure
+  // redirect/ad wrappers, not browsable pages.
+  for (const c of candidates) {
+    if (!/^https?:\/\//i.test(c)) continue;
+    let u;
+    try { u = new URL(c); } catch { continue; }
+    const host = String(u.hostname || "").toLowerCase();
+    const path = String(u.pathname || "").toLowerCase();
+    if (_isGoogleHost(host) && path.startsWith("/shopping/product")) {
+      return {
+        directUrl: c,
+        originalUrl: original,
+        source: "google_product",
+        confidence: 0.4,
+        reason: "google_shopping_aggregator_fallback",
+      };
+    }
+  }
+
   return {
     directUrl: null,
     originalUrl: original,

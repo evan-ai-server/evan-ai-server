@@ -105,12 +105,23 @@ function testResolveDirectProductUrl() {
   });
   ok("extracts ebay from google redirect", extracted.directUrl?.includes("ebay.com") && extracted.source === "extracted");
 
-  // Only Google wrappers and nothing else → rejected.
+  // Only pure-redirect google wrappers → rejected (no openable fallback).
   const rejected = resolveDirectProductUrl({
-    google_product_link: "https://www.google.com/shopping/product/12345",
-    link:                "https://www.google.com/search?q=foo",
+    link: "https://www.google.com/search?q=foo",
+    url:  "https://www.google.com/url?q=https%3A%2F%2Fwww.google.com",
   });
-  ok("rejects when only google wrappers", rejected.directUrl === null && rejected.source === "rejected");
+  ok("rejects when only pure google redirects",
+    rejected.directUrl === null && rejected.source === "rejected");
+
+  // /shopping/product/ is accepted as low-confidence aggregator fallback
+  // (browsable page, lists merchant offers — better than null).
+  const shopFallback = resolveDirectProductUrl({
+    google_product_link: "https://www.google.com/shopping/product/12345",
+  });
+  ok("accepts /shopping/product as google_product fallback",
+    shopFallback.directUrl?.includes("/shopping/product") &&
+    shopFallback.source === "google_product" &&
+    shopFallback.confidence < 0.6);
 
   // Missing.
   const missing = resolveDirectProductUrl({});

@@ -93,6 +93,8 @@ const LEGACY_PAIRS = /** @type {ReadonlyArray<readonly [string, Verdict]>} */ ([
   ["GOOD",        "BUY"],   // dealComparator (some paths emit bare "good")
   ["STEAL DEAL",  "BUY"],   // notification alert legacy (covers STEAL_DEAL)
   ["GREAT FLIP",  "BUY"],   // notification alert legacy (covers GREAT_FLIP)
+  ["BUY NOW",     "BUY"],   // covers BUY_NOW — timingIntel / personalAgent / dealScout / seasonal
+  ["BUYNOW",      "BUY"],   // safety net for unspaced casing
 
   // ── Legacy → HOLD ──────────────────────────────────────────────────
   ["FAIR",              "HOLD"],
@@ -100,6 +102,8 @@ const LEGACY_PAIRS = /** @type {ReadonlyArray<readonly [string, Verdict]>} */ ([
   ["CHECK",             "HOLD"],   // dealEngineVerdict
   ["BUY WITH CAUTION",  "HOLD"],   // notification alert legacy
   ["AUTHENTICATE FIRST","HOLD"],   // notification alert legacy
+  ["KEEP WATCHING",     "HOLD"],   // watchlistIntelligence action
+  ["MONITOR",           "HOLD"],   // watchlistIntelligence action
 
   // ── Legacy → PASS ──────────────────────────────────────────────────
   ["OVERPRICED",        "PASS"],
@@ -107,6 +111,7 @@ const LEGACY_PAIRS = /** @type {ReadonlyArray<readonly [string, Verdict]>} */ ([
   ["INSUFFICIENT DATA", "PASS"],
   ["HIGH",              "PASS"],   // dealComparator
   ["PRICE TRAP",        "PASS"],   // covers price_trap
+  ["REMOVE OR PASS",    "PASS"],   // watchlistIntelligence action
 ]);
 
 /**

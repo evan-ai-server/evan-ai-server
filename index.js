@@ -1446,10 +1446,13 @@ const SKIP_MASTER_ROLLOUT_PCT                 = Math.max(0, Math.min(100, Number
 // returns [] and the market_search wave 2 / fallback lanes still surface
 // comps. Lane-level abort vs complete counts surface in the 📉 MERGE PIPELINE
 // log so we can tune from data instead of guessing.
-// Default tightened 4000 → 3000 (Phase 3, SerpAPI hardening) so the whole
-// market stage stays inside the 6-second scan budget. Override via env if a
-// region needs more headroom.
-const SERPAPI_TIMEOUT_MS                      = Number(process.env.SERPAPI_TIMEOUT_MS || 3000);
+// Default tuned to 4500ms after live-log audit (2026-05-20): 3000ms was
+// aborting ~75% of non-Amazon SerpAPI lanes (google_shopping / Mercari /
+// Poshmark), starving the SWR cache and forcing the verdict engine to
+// compute resale calls from Amazon-retail data only. 4500ms lets the
+// slower engines land while still bounding the market stage. Override
+// via env if a region needs more or less headroom.
+const SERPAPI_TIMEOUT_MS                      = Number(process.env.SERPAPI_TIMEOUT_MS || 4500);
 const HIGH_STAKES_CATEGORIES = new Set(
   (process.env.HIGH_STAKES_CATEGORIES ||
     "luxury,handbag,handbags,sneakers,sneaker,collectibles,collectible,watches,watch,jewelry,electronics,trading_cards,trading_card,coin,coins,sports_card,sports_cards"
@@ -22310,6 +22313,17 @@ app.post("/market/search/stream", async (req, res) => {
 
     // ── Helper: assemble trusted profit intel + response payload ─────────
     const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence } = {}) => {
+      // ── Phase 3 instrumentation: timestamp every major stage so the
+      // 10s gap between phase1_done and scan_response becomes visible.
+      // Format: BUILD_STAGE { scanId, kind, stage, ms } — grep-friendly.
+      const _bp_t0 = Date.now();
+      const _bp_log = (stage, fromTs) => {
+        try {
+          scanLog("build_stage", scanId, { kind, stage, ms: Date.now() - fromTs });
+        } catch {}
+      };
+
+      const _t_buildResp = Date.now();
       const payload = await buildMarketSearchResponsePayload({
         query, searchedQueries, variants, items, scannedPrice,
         visionConfidence: cv2, category, visionIdentity,
@@ -22318,6 +22332,7 @@ app.post("/market/search/stream", async (req, res) => {
         retrievalMeta: { source, kind },
         persistSnapshot: !isOracleOnly,
       });
+      _bp_log("buildMarketSearchResponsePayload", _t_buildResp);
       try {
         const _signals   = extractResultSignals(items, 8);
         const _consensus = buildResultConsensus(_signals);
@@ -22388,6 +22403,7 @@ app.post("/market/search/stream", async (req, res) => {
       }
       // Phase 15: Category Intelligence enrichment — AWAITED (not fire-and-forget)
       // Must complete before truth guard so categoryReplicaFlag is applied before TG-03 runs.
+      const _t_catIntel = Date.now();
       await applyCategoryIntelligenceToPayload(payload, {
         redis,
         userId:       _userId,
@@ -22397,8 +22413,10 @@ app.post("/market/search/stream", async (req, res) => {
         medianMarket: payload.profitIntel?.medianPrice ?? null,
         plan:         _planD,
       }).catch(() => {});
+      _bp_log("applyCategoryIntelligence", _t_catIntel);
       // Phase 2: Category Domination Engine
       const _scanIdD = payload.scanId || null;
+      const _t_catDom = Date.now();
       await applyCategoryDomination(redis, payload, {
         identity:         visionIdentity || {},
         category,
@@ -22408,6 +22426,7 @@ app.post("/market/search/stream", async (req, res) => {
         scanId:           _scanIdD,
         userId:           _userId,
       }).catch(() => {});
+      _bp_log("applyCategoryDomination", _t_catDom);
       // Phase 16: consistency guard (lightweight, sync, zero I/O — logs violations only)
       const _cViolationsD = guardPayloadSafe(payload, _planD);
       if (_cViolationsD.length) {
@@ -22447,6 +22466,7 @@ app.post("/market/search/stream", async (req, res) => {
       storeSignalSnapshot(redis, _scanIdD, { userId: _userId, signal: _finalSignalD, trustScore: _finalTrustD || null, category, itemName: payload.itemName || null });
       // Phase 3: fire watchlist check non-blocking
       if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: payload.identity?.brand || null, model: payload.identity?.model || null, scannedPrice: payload.profitIntel?.marketPriceMedian || null, signal: _finalSignalD, scanId: _scanIdD, itemName: payload.itemName || null }).catch(() => {});
+      _bp_log("buildPayload_total", _bp_t0);
       return payload;
     };
 
@@ -22459,8 +22479,14 @@ app.post("/market/search/stream", async (req, res) => {
       if (enrichedHit.ebaySoldComps) payload.ebaySoldComps = enrichedHit.ebaySoldComps;
       if (enrichedHit.localComps)    payload.localComps    = enrichedHit.localComps;
       const _totalMs = Date.now() - _t0;
+      const _cacheVerdict =
+        normalizeVerdict(payload?.buyOrPass?.verdict) ||
+        normalizeVerdict(payload?.profitIntel?.verdict) ||
+        "HOLD";
       send("complete", {
-        ...payload, status: "complete", enriching: false,
+        ...payload,
+        verdict: _cacheVerdict,   // canonical-only top-level verdict
+        status: "complete", enriching: false,
         dataDepth: enrichedHit.items.length < 3 ? "thin" : "normal",
         _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
       });
@@ -22484,8 +22510,14 @@ app.post("/market/search/stream", async (req, res) => {
       if (localC)   payload.localComps    = localC;
       ENRICHED_SCAN_CACHE.set(cacheKey, { items: internalHit.items, ebaySoldComps: ebaySold || null, localComps: localC || null });
       const _totalMs = Date.now() - _t0;
+      const _cacheVerdict =
+        normalizeVerdict(payload?.buyOrPass?.verdict) ||
+        normalizeVerdict(payload?.profitIntel?.verdict) ||
+        "HOLD";
       send("complete", {
-        ...payload, status: "complete", enriching: false,
+        ...payload,
+        verdict: _cacheVerdict,   // canonical-only top-level verdict
+        status: "complete", enriching: false,
         dataDepth: internalHit.items.length < 3 ? "thin" : "normal",
         _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
       });
@@ -22505,8 +22537,14 @@ app.post("/market/search/stream", async (req, res) => {
       if (localC)   payload.localComps    = localC;
       ENRICHED_SCAN_CACHE.set(cacheKey, { items: serpCached, ebaySoldComps: ebaySold || null, localComps: localC || null });
       const _totalMs = Date.now() - _t0;
+      const _cacheVerdict =
+        normalizeVerdict(payload?.buyOrPass?.verdict) ||
+        normalizeVerdict(payload?.profitIntel?.verdict) ||
+        "HOLD";
       send("complete", {
-        ...payload, status: "complete", enriching: false,
+        ...payload,
+        verdict: _cacheVerdict,   // canonical-only top-level verdict
+        status: "complete", enriching: false,
         dataDepth: serpCached.length < 3 ? "thin" : "normal",
         _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
       });
@@ -22542,11 +22580,20 @@ app.post("/market/search/stream", async (req, res) => {
         source: "live_market", kind: "fast_provisional", isOracleOnly: false,
       }).catch(() => null);
       if (!earlyPayload || clientClosed) return;
-      _provVerdictKey = earlyPayload.profitIntel?.verdict || earlyPayload.agentAction || null;
+      // Canonical-first read. buyOrPass.verdict is the single source of
+      // truth; legacy fields (profitIntel.verdict / agentAction) only act
+      // as fallbacks and are normalized through the same map that absorbs
+      // BUY_NOW / GOOD_DEAL / STEAL into BUY|HOLD|PASS.
+      _provVerdictKey =
+        normalizeVerdict(earlyPayload?.buyOrPass?.verdict) ||
+        normalizeVerdict(earlyPayload?.profitIntel?.verdict) ||
+        normalizeVerdict(earlyPayload?.agentAction) ||
+        "HOLD";
       const _earlyMs = Date.now() - _t1;
       _recordStreamMetric("ttfrMs", _earlyMs);
       send("provisional", {
         ...earlyPayload,
+        verdict: _provVerdictKey,   // canonical-only top-level verdict
         status: "provisional", enriching: true,
         needsOracle: _earlyItems.length < SCAN_STREAM_ORACLE_THRESHOLD,
         dataDepth: _earlyItems.length < 3 ? "thin" : "normal",
@@ -22627,10 +22674,18 @@ app.post("/market/search/stream", async (req, res) => {
       const provPayload = await _buildPayload(phase1Items, {
         source: "live_market", kind: "provisional", isOracleOnly: false,
       });
-      _provVerdictKey = provPayload.profitIntel?.verdict || provPayload.agentAction || null;
+      // Canonical-first read (same rule as early_provisional). Anything not
+      // mappable to BUY|HOLD|PASS defaults to HOLD — never let a legacy
+      // string like "BUY_NOW" escape this boundary.
+      _provVerdictKey =
+        normalizeVerdict(provPayload?.buyOrPass?.verdict) ||
+        normalizeVerdict(provPayload?.profitIntel?.verdict) ||
+        normalizeVerdict(provPayload?.agentAction) ||
+        "HOLD";
       _recordStreamMetric("ttfrMs", _phase1Ms);
       send("provisional", {
         ...provPayload,
+        verdict: _provVerdictKey,   // canonical-only top-level verdict
         status: "provisional", enriching: true, needsOracle,
         dataDepth: phase1Items.length < 3 ? "thin" : "normal",
         _timing: { phase1Ms: _phase1Ms, buildMs: Date.now() - _tProvBuild },
@@ -22744,7 +22799,14 @@ app.post("/market/search/stream", async (req, res) => {
     if (_ebaySoldComps) finalPayload.ebaySoldComps = _ebaySoldComps;
     if (_localComps)    finalPayload.localComps    = _localComps;
 
-    const _finalVerdictKey = finalPayload.profitIntel?.verdict || finalPayload.agentAction || null;
+    // Canonical-first read. Never emit a legacy verdict on the complete
+    // event — the frontend uses this to lock the verdict UI; a "BUY_NOW"
+    // leak here is exactly the bug the verdict-authority work prevents.
+    const _finalVerdictKey =
+      normalizeVerdict(finalPayload?.buyOrPass?.verdict) ||
+      normalizeVerdict(finalPayload?.profitIntel?.verdict) ||
+      normalizeVerdict(finalPayload?.agentAction) ||
+      "HOLD";
     const _diff = {
       itemsAdded:        enrichedItems.length - phase1Items.length,
       verdictChanged:    _provVerdictKey !== null && _finalVerdictKey !== _provVerdictKey,
@@ -22754,6 +22816,7 @@ app.post("/market/search/stream", async (req, res) => {
     const _totalMs = Date.now() - _t0;
     send("complete", {
       ...finalPayload,
+      verdict: _finalVerdictKey,   // canonical-only top-level verdict
       status: "complete", enriching: false,
       dataDepth: enrichedItems.length < 3 ? "thin" : "normal",
       ...(_degraded ? { degraded: true, degradedReason: _degradedReason } : {}),
