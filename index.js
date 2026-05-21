@@ -1427,13 +1427,22 @@ const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1";
 // a Hermès vs a knock-off is the kind of error that earns the slower path.
 const FAST_VISION_MODEL              = process.env.FAST_VISION_MODEL || "gpt-4.1-mini";
 const FAST_PASS_ENABLED              = String(process.env.FAST_PASS_ENABLED || "true").toLowerCase() !== "false";
-// Default bumped 3500 → 6000ms after live-log audit (2026-05-20): gpt-4.1-mini
-// structured JSON output with a downscaled image consistently lands at 4–6s.
-// At 3500ms the fast pass aborted on every cold-cache scan, eliminating the
-// entire fast-accepted tier and forcing every scan through the full consensus
-// (master + visual_shape), which is what we see in the 11.5s vision wall time.
-const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 6000);
+// Default bumped 3500 → 6000 → 7000ms after two rounds of live-log audit
+// (2026-05-20). gpt-4.1-mini structured JSON output with a downscaled image
+// lands at 5–7s; at 6000ms fast still aborted on most cold-cache scans. The
+// race-aware wait means visual_early no longer blocks on fast — bumping its
+// timeout adds at most some cancelled-pass cost when visual wins first, and
+// gives fast a genuine chance to win the race when it's the faster path.
+const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 7000);
 const FAST_PASS_CONFIDENCE_THRESHOLD = Number(process.env.FAST_PASS_CONFIDENCE_THRESHOLD || 0.65);
+// Visual_shape historically used VISION_MODEL (gpt-4.1) which lands at 7–11s
+// and was binding the entire scan wall time even when its result was clearly
+// the winner. Switching to gpt-4.1-mini cuts visual_shape latency roughly in
+// half (3–5s). Master still races on gpt-4.1 as the safety net — if visual
+// confidence falls below SKIP_MASTER_CONFIDENCE_THRESHOLD or the inferred
+// category is high-stakes, we fall through to master and consensus runs as
+// before. Override to "gpt-4.1" to disable the mini downgrade if needed.
+const VISUAL_SHAPE_MODEL             = process.env.VISUAL_SHAPE_MODEL || "gpt-4.1-mini";
 // When visual_shape returns confidence >= threshold we don't wait on the
 // heavier master pass — saves ~1.5–3 s of wall time on the common case.
 // Threshold is intentionally strict (0.95) so master only short-circuits when
@@ -15793,7 +15802,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       (ms) => { masterMs = ms; }
     ).catch(() => null);
     const visualPromise = timed(
-      runVisionPass({ dataUrl, mode, propContext, passLabel: "visual_shape", rid: req.rid, externalSignal: visualAbortCtrl.signal }),
+      runVisionPass({
+        dataUrl,
+        mode,
+        propContext,
+        passLabel:      "visual_shape",
+        rid:            req.rid,
+        modelOverride:  VISUAL_SHAPE_MODEL,
+        externalSignal: visualAbortCtrl.signal,
+      }),
       (ms) => { visualMs = ms; }
     ).catch(() => null);
 
@@ -15821,12 +15838,19 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
 
       visualPromise.then((r) => {
         const conf = Number(r?.parsed?.confidence ?? 0);
+        // Don't fire visual_early on high-stakes categories — visual_shape now
+        // runs on gpt-4.1-mini for speed, and we don't trust mini to identify
+        // luxury / sneakers / watches / electronics / cards on its own. Master
+        // (gpt-4.1) is still racing in the background; wait for it to escalate.
+        const cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
+        const isHighStakes = !!cat && HIGH_STAKES_CATEGORIES.has(cat);
         if (
           skipMasterAllowed &&
           r &&
           Number.isFinite(conf) &&
           conf >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
-          !!(r.parsed?.identity?.brand || r.parsed?.identity?.model || r.parsed?.identity?.itemType)
+          !!(r.parsed?.identity?.brand || r.parsed?.identity?.model || r.parsed?.identity?.itemType) &&
+          !isHighStakes
         ) {
           finish("visual_early");
         }
@@ -15855,12 +15879,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     const visualResult = await visualPromise;
 
     const visualConfidence = Number(visualResult?.parsed?.confidence ?? 0);
+    const visualCategory   = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
+    const visualHighStakes = !!visualCategory && HIGH_STAKES_CATEGORIES.has(visualCategory);
     const visualAcceptable =
       skipMasterAllowed &&
       visualResult &&
       Number.isFinite(visualConfidence) &&
       visualConfidence >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
-      !!(visualResult.parsed?.identity?.brand || visualResult.parsed?.identity?.model || visualResult.parsed?.identity?.itemType);
+      !!(visualResult.parsed?.identity?.brand || visualResult.parsed?.identity?.model || visualResult.parsed?.identity?.itemType) &&
+      !visualHighStakes;
 
     if (fastResult && shouldAcceptFastVisionResult(fastResult)) {
       // Cancel the in-flight master OpenAI request — saves tokens, not just
@@ -16604,6 +16631,14 @@ app.post(
   visionLimiter,
   upload.single("image"),
   async (req, res) => {
+    // Endpoint-level timing anchors. Surfaced via a single VISION_ENDPOINT_TIMINGS
+    // log right before res.json so live-log audits can pinpoint where the
+    // wall time is going — multer/upload vs pre-consensus work (embedding,
+    // preprocess, sourceBudget) vs consensus vs post-consensus features.
+    const _epT0 = Date.now();
+    let _epT1FileAccepted   = null;
+    let _epT2PreConsensus   = null;
+    let _epT3PostConsensus  = null;
     try {
 const uploadedObjectKey =
   safeStr(
@@ -16670,6 +16705,7 @@ if (!file && uploadedObjectKey) {
         size: file.size,
         mimetype: file.mimetype,
       });
+      _epT1FileAccepted = Date.now();
 
 // Phase 4: compute scan embedding
 let scanEmbedding = null;
@@ -16880,6 +16916,7 @@ if (!openai) {
 
       global.metrics.visionCalls++;
 
+      _epT2PreConsensus = Date.now();
       const result = await withInflight(cacheKey, async () =>
         distributedSingleflight.run(
           `vision:${mode}:${propContext}:${originalHash}`,
@@ -16898,6 +16935,7 @@ if (!openai) {
             )
         )
       );
+      _epT3PostConsensus = Date.now();
 
       // Embedding is background-only; scanEmbedding/visualMatches stay null for immediate response
       scanEmbedding = null;
@@ -17243,6 +17281,26 @@ if (!openai) {
         }
 
         harnessRecordScan(req, shaped).catch(() => {});
+
+        // ── Endpoint-level timing log ──────────────────────────────────────
+        // One line surfacing where the /api/vision/analyze wall time went.
+        // uploadMs           = multer + body parse (handler entry → file accepted)
+        // preConsensusMs     = sha256 + caches + embedding + preprocess + budget
+        // consensusMs        = runVisionConsensus (inner consensus.wall = visionTimings.visionWallMs)
+        // postConsensusMs    = serial/barcode/box/logo/firewall/jargon/signal/fee + cacheSet
+        // totalMs            = wall from handler entry to res.json
+        const _epT4PreResponse = Date.now();
+        const _ep = {
+          rid:              req.rid,
+          visionTier:       shaped?.visionTier || null,
+          uploadMs:         _epT1FileAccepted   ? _epT1FileAccepted   - _epT0              : null,
+          preConsensusMs:   _epT2PreConsensus && _epT1FileAccepted   ? _epT2PreConsensus - _epT1FileAccepted   : null,
+          consensusMs:      _epT3PostConsensus && _epT2PreConsensus  ? _epT3PostConsensus - _epT2PreConsensus  : null,
+          postConsensusMs:  _epT3PostConsensus  ? _epT4PreResponse - _epT3PostConsensus  : null,
+          totalMs:          _epT4PreResponse - _epT0,
+          innerWallMs:      shaped?.visionTimings?.visionWallMs || null,
+        };
+        console.log("⏱️ VISION_ENDPOINT_TIMINGS", _ep);
         return res.status(200).json(shaped);
     } catch (err) {
       if (err?.status === 429 || String(err?.message || "").includes("429")) {
@@ -32959,9 +33017,19 @@ if (OPENAI_API_KEY && openai) {
         "base64"
       );
       const warmDataUrl = `data:image/jpeg;base64,${warmPixel.toString("base64")}`;
-      for (const passLabel of ["master", "brand_model", "visual_shape"]) {
+      // Each (pass × model) combo needs its own warmup — prompt_cache is scoped
+      // per model, so a gpt-4.1 warmup doesn't help a gpt-4.1-mini call even
+      // with the same cache key. visual_shape now uses VISUAL_SHAPE_MODEL
+      // (mini by default) and fast uses FAST_VISION_MODEL — warm both.
+      const warmupPasses = [
+        { passLabel: "master",       model: VISION_MODEL },
+        { passLabel: "brand_model",  model: VISION_MODEL },
+        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL },
+        { passLabel: "fast",         model: FAST_VISION_MODEL },
+      ];
+      for (const { passLabel, model } of warmupPasses) {
         openai.responses.create({
-          model: VISION_MODEL,
+          model,
           temperature: 0.1,
           max_output_tokens: 10,
           prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
@@ -32973,7 +33041,7 @@ if (OPENAI_API_KEY && openai) {
           ],
         }).catch(() => {});
       }
-      console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape passes");
+      console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape/fast passes");
     } catch (e) {
       // non-critical
     }
