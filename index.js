@@ -16753,6 +16753,11 @@ if (!file && uploadedObjectKey) {
         mimetype: file.mimetype,
       });
       _epT1FileAccepted = Date.now();
+      // Per-step preConsensus instrumentation. Each step records ms into _ppSteps
+      // so the final VISION_ENDPOINT_TIMINGS log can break down where the
+      // pre-consensus wall went (sha256 / cache / embed / preprocess / budget).
+      const _ppSteps = {};
+      const _stepLog = (name, fromTs) => { _ppSteps[name] = Date.now() - fromTs; };
 
 // Phase 4: compute scan embedding
 let scanEmbedding = null;
@@ -16800,7 +16805,9 @@ if (!openai) {
         : "";
       const hintContext = itemHint ? `hint:${itemHint}` : "";
       const propContext = [rawPropContext, priceContext, hintContext].filter(Boolean).join("|");
+      const _t_sha = Date.now();
       const imgHash = sha256(file.buffer);
+      _stepLog("sha256", _t_sha);
       const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
 
       // Bench bypass also bypasses both cache layers — so the smoke test can
@@ -16809,8 +16816,10 @@ if (!openai) {
       // by embedding even when bytes differ).
       const skipCaches = isBenchBypass(req);
 
+      const _t_cache = Date.now();
       let cached = skipCaches ? null : await cacheGet(cacheKey);
       if (!cached && !skipCaches) cached = visionCache.get(cacheKey);
+      _stepLog("cacheGet", _t_cache);
 
       if (cached) {
         visionTierStats.exactCacheHit++;
@@ -16818,42 +16827,63 @@ if (!openai) {
       }
 
       // Perceptual-similarity early-return — saves the 5–12s vision call when
-      // the same item has been scanned recently from a different angle/lighting
-      // (different bytes, but visually the same object). The embedding is
-      // hoisted so we can reuse it at the success path to register the new
-      // result without re-computing. Skipped under bench bypass.
+      // the same item has been scanned recently from a different angle/lighting.
+      // CLIP embedding is now raced behind a 300ms timeout: if the embedding
+      // doesn't return in 300ms we skip the similarity check this scan rather
+      // than block the critical path. The embedding still completes in the
+      // background and can be used later for registration. Live-log audit
+      // (2026-05-21) showed CLIP costing ~1–3s on cold scans, eating most of
+      // the preConsensus wall.
+      const _t_embed = Date.now();
       let _similarityVec = null;
-      try {
-        _similarityVec = await computeImageEmbedding(file.buffer);
-        if (!skipCaches && Array.isArray(_similarityVec) && _similarityVec.length) {
-          const hit = similarityFindSimilar(_similarityVec);
-          if (hit?.payload) {
-            visionTierStats.similarityCacheHit++;
-            console.log("🎯 SIMILARITY HIT", {
-              rid: req.rid,
-              priorImageHash: hit.imageHash,
-              similarity: Number(hit.similarity.toFixed(4)),
-            });
-            // Reuse the prior identity but stamp the new image hash so
-            // downstream code (storage, harness, market query) reflects the
-            // current upload, not the cached one.
-            return res.status(200).json({
-              ...hit.payload,
-              imageHash:    imgHash,
-              cached:       true,
-              cacheSource:  "similarity",
-              similarity:   hit.similarity,
-            });
+      let _embedTimedOut = false;
+      const _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
+      const _embedRace = await Promise.race([
+        _embedPromise.then((v) => ({ kind: "ready", vec: v })),
+        new Promise((r) => setTimeout(() => r({ kind: "timeout" }), 300)),
+      ]);
+      _stepLog("embed", _t_embed);
+
+      if (_embedRace?.kind === "ready" && Array.isArray(_embedRace.vec) && _embedRace.vec.length) {
+        _similarityVec = _embedRace.vec;
+        try {
+          if (!skipCaches) {
+            const hit = similarityFindSimilar(_similarityVec);
+            if (hit?.payload) {
+              visionTierStats.similarityCacheHit++;
+              console.log("🎯 SIMILARITY HIT", {
+                rid: req.rid,
+                priorImageHash: hit.imageHash,
+                similarity: Number(hit.similarity.toFixed(4)),
+              });
+              return res.status(200).json({
+                ...hit.payload,
+                imageHash:    imgHash,
+                cached:       true,
+                cacheSource:  "similarity",
+                similarity:   hit.similarity,
+              });
+            }
           }
+        } catch (e) {
+          console.warn("similarity_lookup_error", e?.message || e);
         }
-      } catch (e) {
-        console.warn("similarity_lookup_error", e?.message || e);
+      } else if (_embedRace?.kind === "timeout") {
+        _embedTimedOut = true;
+        // Background-drain so the embedding still becomes available for the
+        // similarityRegister step at the end of the handler (best-effort —
+        // if the late vec arrives before registration, we use it; otherwise
+        // we skip registration and next scan re-embeds).
+        _embedPromise.then((v) => {
+          if (Array.isArray(v) && v.length) _similarityVec = v;
+        }).catch(() => {});
       }
 
       const originalHash = imgHash;
 
       // Preprocess synchronously (needed for vision API call)
       // Storage writes fire in background — don't block the vision call
+      const _t_pp = Date.now();
       const processed = await preprocessScanUpload(file).catch(() => ({
         buffer: file.buffer,
         mimetype: file.mimetype || "image/jpeg",
@@ -16862,6 +16892,7 @@ if (!openai) {
         quality: null,
         metadata: { transformed: false, size: file.buffer.length, originalSize: file.buffer.length },
       }));
+      _stepLog("preprocess", _t_pp);
 
       const preparedFile = {
         ...file,
@@ -16924,6 +16955,7 @@ if (!openai) {
       }
 
       const visionCostUnits = requestPlan === "free" ? 1 : 2;
+      const _t_budget = Date.now();
       const canSpendVision = await sourceBudget.canUse("vision", {
         plan: requestPlan,
         costUnits: visionCostUnits,
@@ -16947,6 +16979,7 @@ if (!openai) {
       await sourceBudget.note("vision", {
         costUnits: visionCostUnits,
       });
+      _stepLog("sourceBudget", _t_budget);
 
       const allowFreshEmbedding =
         requestPlan === "pro" || requestPlan === "internal";
@@ -17342,6 +17375,8 @@ if (!openai) {
           visionTier:       shaped?.visionTier || null,
           uploadMs:         _epT1FileAccepted   ? _epT1FileAccepted   - _epT0              : null,
           preConsensusMs:   _epT2PreConsensus && _epT1FileAccepted   ? _epT2PreConsensus - _epT1FileAccepted   : null,
+          preSteps:         _ppSteps,
+          embedTimedOut:    _embedTimedOut,
           consensusMs:      _epT3PostConsensus && _epT2PreConsensus  ? _epT3PostConsensus - _epT2PreConsensus  : null,
           postConsensusMs:  _epT3PostConsensus  ? _epT4PreResponse - _epT3PostConsensus  : null,
           totalMs:          _epT4PreResponse - _epT0,
@@ -18695,7 +18730,17 @@ async function buildMarketSearchResponsePayload({
   // getCategoryOutcomePrior. Pass null to skip the bias entirely (back-compat:
   // legacy callers that don't pass this default to neutral 0% shift).
   categoryPrior = null,
+  // Lite mode — skip the network-bound premium-price/regional/etc. builders
+  // that each fire SerpAPI calls behind a 5s timeout. The provisional path
+  // sets lite=true so the first result lands fast; live_refresh runs with
+  // lite=false and benefits from the SWR cache populated by background
+  // re-fetches.
+  lite = false,
 } = {}) {
+  const _bmt0 = Date.now();
+  const _bmSteps = {};
+  const _bmLog = (name, fromTs) => { _bmSteps[name] = Date.now() - fromTs; };
+
   const baseQuery = normalizeQuery(query || "");
   const sourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
 
@@ -18721,6 +18766,7 @@ async function buildMarketSearchResponsePayload({
 
   const activeQuery = resolvedFinalQuery || baseQuery;
 
+  const _t_finalUi = Date.now();
   const { uiItems, intelligence } = await buildFinalUiItemsWithIntelligence(
     activeQuery,
     sourceItems,
@@ -18729,6 +18775,7 @@ async function buildMarketSearchResponsePayload({
       visionConfidence,
     }
   );
+  _bmLog("buildFinalUiItemsWithIntelligence", _t_finalUi);
 
   const soldPool = uiItems.filter(
     (i) => i?.sold === true || String(i?.status || "").toLowerCase() === "sold"
@@ -19301,9 +19348,15 @@ async function buildMarketSearchResponsePayload({
     const soldCompsDateFilter = buildSoldCompsDateFilterPayload(uiItems);
 
     // ── Feature 71 + 72: Premium Price Sources (async, fire-and-forget on miss) ─
+    // Fires 4 parallel SerpAPI calls (StockX/GOAT/Poshmark/Depop) each with a
+    // 5s timeout — accounts for most of the 6s provisional wall time per the
+    // 2026-05-21 live-log audit. Skipped on lite=true so the provisional
+    // payload can ship under 300ms; the next live_refresh call hits the SWR
+    // cache populated by this same fetch when SERPAPI_KEY is configured.
     let premiumPrices = null;
+    const _t_premiumPrices = Date.now();
     try {
-      if (SERPAPI_KEY && activeQuery) {
+      if (!lite && SERPAPI_KEY && activeQuery) {
         const _ppResult = await buildPremiumPriceSourcesPayload({
           query:    activeQuery,
           serpKey:  SERPAPI_KEY,
@@ -19312,11 +19365,16 @@ async function buildMarketSearchResponsePayload({
         premiumPrices = _ppResult;
       }
     } catch { /* non-fatal */ }
+    _bmLog("premiumPrices", _t_premiumPrices);
 
     // ── Feature 73: Price Floor Tracker ───────────────────────────────────────
+    // Hits Redis SERPAPI cache + optional live fetch. Cheap on cache hit,
+    // bounded by SerpAPI on miss. Skipped on lite so the provisional doesn't
+    // pay any cold-Redis cost.
     let priceFloor = null;
+    const _t_priceFloor = Date.now();
     try {
-      if (activeQuery) {
+      if (!lite && activeQuery) {
         const _pfResult = await buildPriceFloorPayload({
           queryOrSku:   activeQuery,
           uiItems,
@@ -19326,14 +19384,17 @@ async function buildMarketSearchResponsePayload({
         priceFloor = _pfResult;
       }
     } catch { /* non-fatal */ }
+    _bmLog("priceFloor", _t_priceFloor);
 
     // ── Feature 75: Condition Tier Pricer ─────────────────────────────────────
     const conditionTierPricing = buildConditionTierPayload(uiItems, visionIdentity?.condition || null);
 
     // ── Feature 76: Regional Price Variance (async, only if SERP available) ───
+    // Fires 4 SerpAPI region queries; same lite gate as premium prices above.
     let regionalPricing = null;
+    const _t_regional = Date.now();
     try {
-      if (SERPAPI_KEY && activeQuery) {
+      if (!lite && SERPAPI_KEY && activeQuery) {
         const _rpResult = await buildRegionalPricePayload({
           query:   activeQuery,
           serpKey: SERPAPI_KEY,
@@ -19342,6 +19403,7 @@ async function buildMarketSearchResponsePayload({
         regionalPricing = _rpResult;
       }
     } catch { /* non-fatal */ }
+    _bmLog("regionalPricing", _t_regional);
 
     // ── Feature 77: Lot / Bundle Detector ─────────────────────────────────────
     const lotBundle = buildLotBundlePayload(uiItems, {
@@ -19585,6 +19647,19 @@ async function buildMarketSearchResponsePayload({
   } catch { /* analytics must not break a response */ }
 
   harnessRecordVerdict("buildMarketSearchResponsePayload", _responsePayload).catch(() => {});
+  // ── Per-section timing log ──────────────────────────────────────────────
+  // Emits once per call so the kind=provisional vs kind=live_refresh wall
+  // breakdown becomes visible in live logs. Largest contributors usually:
+  // buildFinalUiItemsWithIntelligence (rerankWithIntelligence on cold scans),
+  // premiumPrices (4x SerpAPI 5s timeouts), regionalPricing (4x SerpAPI).
+  try {
+    console.log("⏱️ PAYLOAD_BUILD_TIMINGS", {
+      lite,
+      kind: retrievalMeta?.kind || null,
+      totalMs: Date.now() - _bmt0,
+      steps:   _bmSteps,
+    });
+  } catch {}
   return _responsePayload;
 }
 // ── Price history API ──────────────────────────────────────────────────────
@@ -22556,6 +22631,15 @@ app.post("/market/search/stream", async (req, res) => {
         } catch {}
       };
 
+      // Lite mode for any "first-result" kind: provisional and fast_provisional
+      // both ship the initial verdict to the UI. Skip the SerpAPI-bound premium
+      // builders so the first result lands fast; live_refresh runs the full
+      // path right after and hits the SWR cache populated in the background.
+      const _isLite =
+        kind === "provisional" ||
+        kind === "fast_provisional" ||
+        kind === "stale_snapshot";
+
       const _t_buildResp = Date.now();
       const payload = await buildMarketSearchResponsePayload({
         query, searchedQueries, variants, items, scannedPrice,
@@ -22564,6 +22648,7 @@ app.post("/market/search/stream", async (req, res) => {
         categoryPrior:    _categoryPrior,
         retrievalMeta: { source, kind },
         persistSnapshot: !isOracleOnly,
+        lite:             _isLite,
       });
       _bp_log("buildMarketSearchResponsePayload", _t_buildResp);
       try {
