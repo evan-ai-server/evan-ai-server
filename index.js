@@ -5026,6 +5026,53 @@ const visionCache = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 1200 });
 // SERP caches: short TTL
 const SERP_CACHE = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 1200 });
 
+// ── L2 Redis persistence for SERP_CACHE ───────────────────────────────────
+// In-memory L1 is wiped on every server restart, which means the first
+// /watch/poll after restart pays full SerpAPI cost for every saved item
+// (5 lanes × 3 items = 15 SerpAPI calls per cold-launch app open in the
+// observed live trace). Mirroring writes to Redis lets a restarted process
+// hydrate L1 from L2 on first read, so a restart inside the 5-min TTL
+// window pays nothing instead of paying full cost.
+const SERP_CACHE_REDIS_PREFIX  = `serpcache:${CACHE_SCHEMA_VERSION}:`;
+const SERP_CACHE_REDIS_TTL_SEC = 5 * 60;
+
+async function serpCacheGetWithRedis(key) {
+  const mem = SERP_CACHE.get(key);
+  if (mem) return mem;
+  if (!redis) return null;
+  try {
+    const raw = await redis.get(`${SERP_CACHE_REDIS_PREFIX}${key}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length) {
+      SERP_CACHE.set(key, parsed); // hydrate L1 (also re-writes to Redis, idempotent)
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+
+// Wrap SERP_CACHE.set so every legacy call site automatically writes to
+// Redis L2 without touching their existing sync API. Redis write is
+// fire-and-forget via setImmediate — caller is not delayed.
+const _origSerpCacheSet = SERP_CACHE.set.bind(SERP_CACHE);
+SERP_CACHE.set = function _serpCacheSetWithRedisMirror(key, value) {
+  const v = _origSerpCacheSet(key, value);
+  if (redis && Array.isArray(value) && value.length) {
+    setImmediate(() => {
+      redis
+        .set(
+          `${SERP_CACHE_REDIS_PREFIX}${key}`,
+          JSON.stringify(value),
+          "EX",
+          SERP_CACHE_REDIS_TTL_SEC
+        )
+        .catch(() => {});
+    });
+  }
+  return v;
+};
+
 // SerpAPI hardened cache (Phase 6, SWR): fresh hit → instant, stale hit →
 // returned instantly + background refresh, miss → live fetch with timeout.
 // TTLs are env-driven (SERPAPI_CACHE_TTL_MS / SERPAPI_STALE_TTL_MS, defaults
@@ -24262,25 +24309,52 @@ function buildWatchState(query, items = [], prev = null, delta = null) {
   };
 }
 
+// Watch-poll lite path: Amazon-only (via SerpAPI) so /watch/poll doesn't fire
+// five lanes per saved item on every app open. Mercari/Poshmark/Google
+// Shopping routinely abort under the 4.5s SerpAPI timeout, Etsy 403s on most
+// scans, and runWatchCheck only needs a cheapest-price signal — Amazon
+// alone is sufficient for the price-drop detection that drives notifications.
+// Full lanes are still used by the scan flow (/market/search and
+// /market/search/stream) — only /watch/poll switches to lite.
+async function mergeForWatchLite(query) {
+  const normalizedQuery = selfHealQuery(normalizeQuery(query));
+  if (!normalizedQuery) return [];
+
+  const cacheKey = `watch_check|${canonicalMarketQuery(normalizedQuery)}`;
+  const cached = await serpCacheGetWithRedis(cacheKey);
+  if (Array.isArray(cached) && cached.length) return cached;
+
+  if (!SERPAPI_KEY || isSourceCoolingDown("serpapi")) return [];
+
+  let items = [];
+  try {
+    const amazon = await serpAmazon(normalizedQuery, { softFail: true });
+    items = Array.isArray(amazon) ? amazon : [];
+  } catch {
+    items = [];
+  }
+
+  items = items
+    .filter((x) => x && Number(x.totalPrice ?? x.price) > 0)
+    .sort(
+      (a, b) =>
+        Number(a.totalPrice ?? a.price) - Number(b.totalPrice ?? b.price)
+    );
+
+  if (items.length) SERP_CACHE.set(cacheKey, items);
+  return items;
+}
+
 async function runWatchCheck(userId, rawQuery) {
   const query = normalizeQuery(safeStr(rawQuery, 220));
   if (!userId || !query) return null;
 
   const prev = await loadWatchState(userId, query);
 
-  const cacheKey = `watch_check|${canonicalMarketQuery(query)}`;
-  let items = SERP_CACHE.get(cacheKey);
-
-  if (!Array.isArray(items) || !items.length) {
-    if (!hasAnyMarketSource() && !SERPAPI_KEY) {
-      items = [];
-    } else {
-      items = await mergeCheapestSources(query);
-      if (Array.isArray(items) && items.length) {
-        SERP_CACHE.set(cacheKey, items);
-      }
-    }
-  }
+  // Lite path checks L1 + L2 internally and only fires SerpAPI Amazon
+  // on full miss. SERPAPI_KEY check guards the no-source case.
+  let items = await mergeForWatchLite(query);
+  if (!Array.isArray(items)) items = [];
 
   const delta = computeWatchDelta(prev, items);
   const state = buildWatchState(query, items, prev, delta);
