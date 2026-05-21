@@ -1443,6 +1443,17 @@ const FAST_PASS_CONFIDENCE_THRESHOLD = Number(process.env.FAST_PASS_CONFIDENCE_T
 // category is high-stakes, we fall through to master and consensus runs as
 // before. Override to "gpt-4.1" to disable the mini downgrade if needed.
 const VISUAL_SHAPE_MODEL             = process.env.VISUAL_SHAPE_MODEL || "gpt-4.1-mini";
+// Hard wall-time budget for the visual_shape pass at the consensus layer.
+// Below this, visualPromise wins or loses naturally; above it we abort the
+// in-flight HTTP request via externalSignal so runVisionPass returns a
+// `{cancelled:true}` stub and — critically — skips the Gemini fallback
+// (`if (process.env.GEMINI_API_KEY && !externalSignal?.aborted)` at the
+// fallback site). Without this clamp, an OpenAI 12s timeout on visual_shape
+// chains into a 9s Gemini retry, blowing the scan to 24s while master has
+// been ready since 8.7s (logged 2026-05-21, rid 80f970693636d85b). 7s gives
+// gpt-4.1-mini room to land on warm-cache scans without ever extending the
+// scan past master's natural landing time.
+const VISUAL_SHAPE_TIMEOUT_MS        = Number(process.env.VISUAL_SHAPE_TIMEOUT_MS || 7000);
 // When visual_shape returns confidence >= threshold we don't wait on the
 // heavier master pass — saves ~1.5–3 s of wall time on the common case.
 // Threshold is intentionally strict (0.95) so master only short-circuits when
@@ -15856,6 +15867,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         passLabel:      "visual_shape",
         rid:            req.rid,
         modelOverride:  VISUAL_SHAPE_MODEL,
+        timeoutMs:      VISUAL_SHAPE_TIMEOUT_MS,
         externalSignal: visualAbortCtrl.signal,
       }),
       (ms) => { visualMs = ms; }
@@ -15864,6 +15876,19 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     // Always drain master in the background to prevent unhandled rejection +
     // free its memory once it completes, even if we don't use the result.
     masterPromise.catch(() => null);
+
+    // Hard consensus-layer deadline for visual_shape. The `timeoutMs` above
+    // caps the OpenAI call inside runVisionPass at VISUAL_SHAPE_TIMEOUT_MS,
+    // but on timeout that function falls through to a Gemini fallback (~9s
+    // more wall time). This setTimeout aborts externalSignal at the same
+    // budget so the fallback's `!externalSignal?.aborted` guard short-circuits
+    // — visualPromise settles in milliseconds with `{cancelled:true}` instead
+    // of extending the scan to 24s.
+    const visualDeadlineTimer = setTimeout(() => {
+      try { visualAbortCtrl.abort(); } catch {}
+    }, VISUAL_SHAPE_TIMEOUT_MS);
+    // unref so a pending deadline timer can't block process exit during tests.
+    if (typeof visualDeadlineTimer.unref === "function") visualDeadlineTimer.unref();
 
     // ── Race-aware wait ────────────────────────────────────────────────────
     // Resolve immediately when fast is acceptable OR visual_shape clears the
@@ -15903,10 +15928,36 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         }
       }).catch(() => {});
 
-      // Fallback: when neither pass is individually decisive, wait for both
-      // before continuing to the consensus logic.
-      Promise.all([fastPromise, visualPromise]).then(() => finish("consensus")).catch(() => finish("consensus"));
+      // Consensus fallback. Deadline-aware: we proceed once master is ready
+      // and visual has either settled or hit its hard deadline. Previously
+      // this was `Promise.all([fastPromise, visualPromise])`, which blocked
+      // the endpoint at 24s when visual escalated to its Gemini fallback
+      // even though master had been ready for 15 seconds. The new shape:
+      //   • visualSettleOrDeadline — resolves when visual settles OR when
+      //     visualAbortCtrl fires (timer above); either way the value is
+      //     irrelevant here, we just need it to unblock.
+      //   • masterPromise — we wait for master because it's the result the
+      //     consensus branch downstream actually uses. Without master here,
+      //     the race could resolve while master is still in flight and the
+      //     `await masterPromise` below would still add wall time.
+      // fastPromise is intentionally NOT in this Promise.all — fast has its
+      // own FAST_PASS_TIMEOUT_MS internal cap, and if it hangs on a Gemini
+      // fallback we don't want it to block the master-based consensus result.
+      const visualSettleOrDeadline = new Promise((res) => {
+        let settled = false;
+        const tryResolve = () => { if (!settled) { settled = true; res(); } };
+        visualPromise.then(tryResolve, tryResolve);
+        // Mirror the same deadline as visualAbortCtrl so the race unblocks
+        // even if visualPromise is slow to observe the abort.
+        setTimeout(tryResolve, VISUAL_SHAPE_TIMEOUT_MS).unref?.();
+      });
+      Promise.all([masterPromise, visualSettleOrDeadline])
+        .then(() => finish("consensus"))
+        .catch(() => finish("consensus"));
     });
+
+    // Race is done — clear the visual deadline timer (no-op if already fired).
+    clearTimeout(visualDeadlineTimer);
 
     // Cancel the losers in-flight. Cancelling a pass that already settled is
     // a no-op; cancelling one still mid-fetch causes OpenAI to abort the
@@ -15917,13 +15968,40 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     } else if (raceWinner === "visual_early") {
       try { fastAbortCtrl.abort(); } catch {}
       try { masterAbortCtrl.abort(); } catch {}
+    } else if (raceWinner === "consensus") {
+      // Consensus winner: master is ready, visual may have deadline-aborted.
+      // Cancel fast if it's still in-flight so we don't pay the Gemini-fallback
+      // tax on a result we're about to discard.
+      try { fastAbortCtrl.abort(); } catch {}
+      // Visual deadline timer above has already aborted if it fired; this is
+      // a safety no-op for the case where visual settled naturally.
+      try { visualAbortCtrl.abort(); } catch {}
     }
 
     // Re-await both — cancelled promises resolve quickly via the catch handler
     // in runVisionPass (which returns the `cancelled: true` placeholder so we
     // can still bill its partial token usage correctly).
-    const fastResult   = await fastPromise;
-    const visualResult = await visualPromise;
+    //
+    // Grace-bounded on the consensus path: _callGeminiVisionPass does NOT
+    // accept externalSignal, so if the OpenAI internal timeout fires a tick
+    // before our consensus-layer abort, Gemini can fire and run for ~9s even
+    // after we've decided to use master. The 250ms grace is long enough to
+    // absorb timer imprecision in the normal case (abort already propagated,
+    // promise resolves instantly) but short enough that a runaway Gemini
+    // fallback can't add seconds to the endpoint.
+    const CONSENSUS_AWAIT_GRACE_MS = 250;
+    const graceAwait = (p) => {
+      if (raceWinner !== "consensus") return p;
+      return Promise.race([
+        p,
+        new Promise((res) => {
+          const t = setTimeout(() => res(null), CONSENSUS_AWAIT_GRACE_MS);
+          if (typeof t.unref === "function") t.unref();
+        }),
+      ]);
+    };
+    const fastResult   = await graceAwait(fastPromise);
+    const visualResult = await graceAwait(visualPromise);
 
     const visualConfidence = Number(visualResult?.parsed?.confidence ?? 0);
     const visualCategory   = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
