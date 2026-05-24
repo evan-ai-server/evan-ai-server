@@ -10399,6 +10399,45 @@ CRITICAL RULES:
   }
 }
 
+// ── Retrieval expansion variant generator ────────────────────────────────────
+// Produces progressively shorter / structurally varied queries from a base
+// query so the expansion pass hits different index facets on SerpAPI.
+// Examples for "brass bugle musical instrument":
+//   → "brass bugle musical", "brass bugle", "bugle musical instrument",
+//     "bugle musical", "musical instrument"
+function buildExpansionVariants(query) {
+  const tokens = normalizeQuery(String(query || "")).split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return [];
+
+  const out = new Set();
+
+  // Progressively shorter prefix phrases (drop trailing tokens one at a time)
+  for (let end = Math.min(tokens.length - 1, 4); end >= 2; end--) {
+    out.add(tokens.slice(0, end).join(" "));
+  }
+
+  // Drop the first token (often an adjective/color)
+  if (tokens.length >= 3) {
+    out.add(tokens.slice(1).join(" "));
+    out.add(tokens.slice(1, 3).join(" "));
+  }
+
+  // Tail-anchored: last 2–3 tokens (useful for "type material" orderings)
+  if (tokens.length >= 3) {
+    out.add(tokens.slice(-2).join(" "));
+    out.add(tokens.slice(-3).join(" "));
+  }
+
+  // Middle pair
+  if (tokens.length >= 4) {
+    const mid = Math.floor(tokens.length / 2);
+    out.add(tokens.slice(mid - 1, mid + 1).join(" "));
+  }
+
+  out.delete(query);
+  return [...out].filter(q => q.split(/\s+/).length >= 2).slice(0, 6);
+}
+
 async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
 
   // Budget: SerpAPI Wave 1 typically returns in 1–2s, but the merge pipeline
@@ -11277,6 +11316,87 @@ merged = [...merged].sort((a, b) => {
       query: normalizedQuery,
     });
   }
+
+  // ── Thin-evidence / single-source retrieval expansion ────────────────────
+  // Fires a second wave of SerpAPI queries using shorter, structurally varied
+  // query fragments whenever the primary wave produced thin or non-diverse
+  // results. The 2500ms budget is intentionally tight — cached SERP responses
+  // return instantly; live fetches may partially complete. Only substitutes
+  // `merged` when the expansion materially improves relevant count or source
+  // diversity so ranking integrity is never degraded.
+  const _expSrcGroups = new Set(
+    merged.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+  );
+  const _thinRelevant = stageRelevant.length <= 2;
+  const _singleSource = _expSrcGroups.size <= 1;
+  const _needsExpansion =
+    canUseSerpForce &&
+    !isSourceCoolingDown("serpapi") &&
+    (_thinRelevant || _singleSource);
+
+  const _retrievalLog = {
+    retrievalExpansionTriggered: _needsExpansion,
+    expansionReason:             _needsExpansion ? (_thinRelevant ? "thin_relevant" : "single_source") : null,
+    variantQueriesTried:         [],
+    finalRelevantCount:          stageRelevant.length,
+    finalSourceGroups:           _expSrcGroups.size,
+    retrievalDepthScore:         Math.round(Math.min(1, stageRelevant.length / 6) * Math.min(1, _expSrcGroups.size / 3) * 100) / 100,
+  };
+
+  if (_needsExpansion) {
+    const _expVariants = uniqueQueries([
+      ...buildExpansionVariants(normalizedQuery),
+      ...buildSearchIntentLadder(normalizedQuery, { broad: true }).slice(0, 3),
+    ]).filter(q => q !== normalizedQuery).slice(0, 5);
+
+    _retrievalLog.variantQueriesTried = _expVariants;
+
+    const EXPANSION_TIMEOUT_MS = 2500;
+    const _expTimeoutP = new Promise(res => {
+      const t = setTimeout(() => res([]), EXPANSION_TIMEOUT_MS);
+      if (typeof t.unref === "function") t.unref();
+    });
+
+    const _expRaw = await Promise.race([
+      Promise.all(
+        _expVariants.map(q =>
+          marketSearchConcurrency(() => serpShopping(q, { softFail: true })).catch(() => [])
+        )
+      ),
+      _expTimeoutP,
+    ]);
+
+    const _expFlat = (Array.isArray(_expRaw) ? _expRaw : []).flat().filter(Boolean);
+
+    if (_expFlat.length > 0) {
+      const _expFiltered = _expFlat
+        .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
+        .filter(it => !isBadListing(it.title, normalizedQuery));
+
+      const _expMerged = dedupeSmart([...merged, ..._expFiltered]);
+      const _expRelevant = filterRelevantListings(normalizedQuery, _expMerged);
+      const _expGroups = new Set(
+        _expMerged.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+      );
+
+      // Only adopt expansion if it materially improves relevant count or diversity
+      if (_expRelevant.length > stageRelevant.length || _expGroups.size > _expSrcGroups.size) {
+        // Score new items so the final ranking has meaningful signals
+        for (const item of _expFiltered) {
+          item.trustModelScore = listingTrustScore(item);
+          item.dealScore       = detectDeal(item, marketStats || {});
+        }
+        const _expBase = _expRelevant.length ? _expRelevant : _expMerged;
+        merged = sortByAbsoluteCheapest(_expBase, normalizedQuery).slice(0, 60);
+        _retrievalLog.finalRelevantCount = _expRelevant.length;
+        _retrievalLog.finalSourceGroups  = _expGroups.size;
+        _retrievalLog.retrievalDepthScore =
+          Math.round(Math.min(1, _expRelevant.length / 6) * Math.min(1, _expGroups.size / 3) * 100) / 100;
+      }
+    }
+  }
+
+  console.log("🔍 RETRIEVAL DEPTH", _retrievalLog);
 
   if (merged[0]?.source) {
     rememberSourceWin(normalizedQuery, merged[0].source);
