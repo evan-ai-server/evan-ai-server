@@ -466,6 +466,18 @@ export function computeMarketEvidence(items, query = "") {
     reasons.push("single_source");
   }
 
+  // Minimum listing depth gate: fewer than 3 listings cannot support anything
+  // above "low" confidence regardless of other signals.
+  if (list.length < 3 && confidence !== "low") {
+    console.log("📊 CONFIDENCE_FLOOR_APPLIED", {
+      listingCount:       list.length,
+      previousConfidence: confidence,
+      finalConfidence:    "low",
+    });
+    confidence = "low";
+    reasons.push("insufficient_listing_depth");
+  }
+
   return {
     listingCount:   list.length,
     directUrlCount,
