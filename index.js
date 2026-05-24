@@ -16232,7 +16232,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       downscaleToBytes,
       fastMs,
       visualMs,
-      masterMs:           masterUsageAvailable ? (settledMaster?.cancelled ? null : masterMs) : masterMs,
+      masterMs:           (visionTier === "visual_skip_master" || visionTier === "fast") ? (settledMaster?.cancelled ? null : masterMs) : masterMs,
       visionWallMs:       Date.now() - passT0,
       visualConfidence:   Number(visualResult?.parsed?.confidence ?? NaN),
       costUsd:            totalCost,
