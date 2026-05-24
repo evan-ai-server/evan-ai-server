@@ -23446,33 +23446,49 @@ app.post("/market/search/stream", async (req, res) => {
         const _bgT0 = Date.now();
 
         try {
-          const _bgTimeoutP = new Promise(res => {
-            const t = setTimeout(() => res([]), BACKGROUND_RETRIEVAL_EXPANSION_MS);
-            if (typeof t.unref === "function") t.unref();
-          });
+          // Sequential execution with early-stop: stop as soon as we have
+          // enough depth (≥6 relevant, ≥3 source groups) rather than running
+          // all variants to the full budget ceiling.
+          let _bgAccumulated = [];
+          let _bgRelFinal    = _bgRelevant;
+          let _bgGroupsFinal = _bgSrcGroups;
 
-          const _bgRaw = await Promise.race([
-            Promise.all(
-              _bgVariants.map(q =>
-                marketSearchConcurrency(() => serpShopping(q, { softFail: true })).catch(() => [])
-              )
-            ),
-            _bgTimeoutP,
-          ]);
+          for (const q of _bgVariants) {
+            if (Date.now() - _bgT0 > BACKGROUND_RETRIEVAL_EXPANSION_MS) break;
 
-          const _bgFlat = (Array.isArray(_bgRaw) ? _bgRaw : []).flat().filter(Boolean);
-          const _bgDurationMs = Date.now() - _bgT0;
+            const _qResults = await marketSearchConcurrency(
+              () => serpShopping(q, { softFail: true })
+            ).catch(() => []);
 
-          if (_bgFlat.length > 0 && !clientClosed) {
-            const _bgFiltered = _bgFlat
+            if (!Array.isArray(_qResults) || _qResults.length === 0) continue;
+
+            const _qFiltered = _qResults
               .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
               .filter(it => !isBadListing(it.title, query));
 
-            const _bgPool        = dedupeSmart([...enrichedItems, ..._bgFiltered]);
-            const _bgRelFinal    = filterRelevantListings(query, _bgPool);
-            const _bgGroupsFinal = new Set(
-              _bgPool.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+            _bgAccumulated.push(..._qFiltered);
+
+            const _pool = dedupeSmart([...enrichedItems, ..._bgAccumulated]);
+            _bgRelFinal    = filterRelevantListings(query, _pool);
+            _bgGroupsFinal = new Set(
+              _pool.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
             );
+
+            if (_bgRelFinal.length >= 6 && _bgGroupsFinal.size >= 3) {
+              console.log("🔍 BACKGROUND_EXPANSION_EARLY_STOP", {
+                scanId,
+                relevant:     _bgRelFinal.length,
+                sourceGroups: _bgGroupsFinal.size,
+              });
+              break;
+            }
+          }
+
+          const _bgFiltered    = _bgAccumulated;
+          const _bgPool        = dedupeSmart([...enrichedItems, ..._bgFiltered]);
+          const _bgDurationMs  = Date.now() - _bgT0;
+
+          if (_bgFiltered.length > 0 && !clientClosed) {
 
             // Material improvement: relevant count up by ≥2, new source, trusted
             // marketplace appears, or cheaper anchor is found.
@@ -23534,12 +23550,12 @@ app.post("/market/search/stream", async (req, res) => {
               });
             }
           } else {
-            // Timeout or no new results
+            // Loop produced no new items (all variants empty or filtered out)
             console.log("🔍 BACKGROUND_RETRIEVAL_EXPANSION_DONE", {
               scanId, durationMs: _bgDurationMs,
               addedListings:      0,
-              finalRelevantCount: _bgRelevant.length,
-              finalSourceGroups:  _bgSrcGroups.size,
+              finalRelevantCount: _bgRelFinal.length,
+              finalSourceGroups:  _bgGroupsFinal.size,
               evidenceImproved:   false,
               refreshSent:        false,
             });
