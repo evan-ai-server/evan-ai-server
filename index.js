@@ -444,6 +444,7 @@ import {
   isGoogleRedirect            as isGoogleRedirectHardened,
   extractFromGoogleRedirect,
   resolveDirectProductUrl,
+  sanitizeListingUrl,
   filterAndRankSerpItems,
   computeMarketEvidence,
   buildSerpQuery,
@@ -10954,7 +10955,27 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   const stageNotBad = stageWithPrice.filter(
     (it) => !isBadListing(it.title, normalizedQuery)
   );
-  const stageDeduped = dedupeSmart(stageNotBad);
+
+  // URL filter — drop listings whose directUrl is not a real product page
+  // (Amazon search pages, eBay /sch/ pages, Google wrappers, etc.). Stamps
+  // canonicalized URL back onto passing items so downstream links are clean.
+  const _urlDropsBySource = {};
+  const stageValidUrl = stageNotBad.filter(it => {
+    const clean = sanitizeListingUrl(it);
+    if (!clean) {
+      const src = String(it?.source || "unknown").toLowerCase().split(/\s+/)[0];
+      _urlDropsBySource[src] = (_urlDropsBySource[src] || 0) + 1;
+      return false;
+    }
+    it.directUrl = clean;
+    it.link      = clean;
+    return true;
+  });
+  if (Object.keys(_urlDropsBySource).length > 0) {
+    console.log("🔗 INVALID_URL_DROPPED", { query: normalizedQuery, bySource: _urlDropsBySource });
+  }
+
+  const stageDeduped = dedupeSmart(stageValidUrl);
 
   // Per-lane visibility — counts items contributed by each source so we can
   // see when SERPAPI_TIMEOUT_MS is too aggressive (lanes contributing 0 = bad
@@ -10967,12 +10988,13 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
 
   // Pipeline stage diagnostic — surface which filter is collapsing the pool.
   const _pipelineCounts = {
-    raw:        rawMerged.length,
-    bySource:   _bySource,
-    withTitle:  stageWithTitle.length,
-    withPrice:  stageWithPrice.length,
-    notBad:     stageWithPrice.length - stageNotBad.length,  // dropped count
-    deduped:    stageDeduped.length,
+    raw:           rawMerged.length,
+    bySource:      _bySource,
+    withTitle:     stageWithTitle.length,
+    withPrice:     stageWithPrice.length,
+    notBad:        stageWithPrice.length - stageNotBad.length,
+    removedForUrl: stageNotBad.length - stageValidUrl.length,
+    deduped:       stageDeduped.length,
   };
 
   const preservedPool = stageDeduped
@@ -11001,6 +11023,14 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
     tiered:             stageTiered.length,
     priceTrimmed:       stageTrimmed.length,
     intuition:          stageIntuition.length,
+  });
+
+  console.log("📋 LISTING_FILTER_SUMMARY", {
+    totalRaw:           rawMerged.length,
+    removedForUrl:      _pipelineCounts.removedForUrl,
+    removedForRelevance: stageDeduped.length - stageRelevant.length,
+    finalAccepted:      stageRelevant.length,
+    sourceGroups:       Object.keys(_bySource).length,
   });
 
   let ranked = stageIntuition;
@@ -11223,7 +11253,14 @@ merged = [...merged].sort((a, b) => {
     const backupStageNotBad = backupStageWithPrice.filter(
       (it) => !isBadListing(it.title, normalizedQuery)
     );
-    const backupStageDeduped = dedupeSmart(backupStageNotBad);
+    const backupStageValidUrl = backupStageNotBad.filter(it => {
+      const clean = sanitizeListingUrl(it);
+      if (!clean) return false;
+      it.directUrl = clean;
+      it.link      = clean;
+      return true;
+    });
+    const backupStageDeduped = dedupeSmart(backupStageValidUrl);
 
     const fallbackPool = backupStageDeduped
       .map((it) => ({

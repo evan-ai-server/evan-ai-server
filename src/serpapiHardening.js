@@ -126,6 +126,54 @@ export function extractFromGoogleRedirect(url) {
 }
 
 /**
+ * sanitizeListingUrl — validate that a listing's directUrl is a real product
+ * page, not a search page, redirect wrapper, or tracking URL.
+ *
+ * Amazon: accepts /dp/ and /gp/product/ only; canonicalizes to bare /dp/ASIN.
+ * eBay:   accepts /itm/ only; strips everything after the numeric item ID.
+ * Others: trusts whatever directUrl resolveDirectProductUrl already resolved.
+ *
+ * Returns the canonical URL string, or null if the URL is invalid/search page.
+ */
+export function sanitizeListingUrl(item = {}) {
+  const url = item.directUrl || null;
+  if (!url || typeof url !== "string") return null;
+
+  let u;
+  try { u = new URL(url); } catch { return null; }
+
+  const host = String(u.hostname || "").toLowerCase();
+  const path = String(u.pathname || "").toLowerCase();
+
+  // Reject any residual Google/SerpAPI wrappers that slipped through hardening
+  if (_isGoogleHost(host) || host.includes("serpapi.")) return null;
+
+  // Amazon — only product-page paths are trustworthy price anchors
+  if (host.includes("amazon.")) {
+    if (/^\/s(\/|\?|$)/.test(path))      return null; // search results
+    if (path.startsWith("/gp/aw/s"))      return null; // mobile search
+    if (path.startsWith("/gp/search"))    return null; // desktop search
+    // Canonicalize to bare /dp/ASIN (strips all tracking params)
+    const dpMatch  = path.match(/\/dp\/([A-Z0-9]{10})/i);
+    if (dpMatch) return `https://www.amazon.com/dp/${dpMatch[1].toUpperCase()}`;
+    const gpMatch  = path.match(/\/gp\/product\/([A-Z0-9]{10})/i);
+    if (gpMatch) return `https://www.amazon.com/dp/${gpMatch[1].toUpperCase()}`;
+    return null; // any other Amazon path rejected
+  }
+
+  // eBay — only individual listing pages
+  if (host.includes("ebay.")) {
+    if (!path.startsWith("/itm/")) return null; // search/sch/category pages
+    const itemMatch = path.match(/\/itm\/(?:[^/]+\/)?(\d+)/);
+    if (itemMatch) return `https://www.ebay.com/itm/${itemMatch[1]}`;
+    return null;
+  }
+
+  // All other sources: trust the already-hardened directUrl
+  return url;
+}
+
+/**
  * resolveDirectProductUrl — pick the safest merchant URL for a raw SerpAPI item.
  *
  *   {
