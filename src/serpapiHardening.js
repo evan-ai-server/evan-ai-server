@@ -380,6 +380,12 @@ export function computeMarketEvidence(items, query = "") {
 
   const qualityAvg = _avg(list.map((x) => scoreListing(x, query)));
 
+  // Source diversity — single-source results (e.g. Amazon-only) cannot be
+  // treated as representative market evidence regardless of listing count.
+  const srcGroups = new Set(
+    list.map((x) => String(x?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+  );
+
   const reasons = [];
   let confidence = "high";
 
@@ -402,6 +408,14 @@ export function computeMarketEvidence(items, query = "") {
       confidence = confidence === "high" ? "medium" : confidence;
       reasons.push("low_quality_avg");
     }
+  }
+
+  // Single-source downgrade: one marketplace with a thin result set cannot
+  // support a high- or medium-confidence verdict.
+  if (srcGroups.size === 1 && list.length < 6) {
+    if (confidence === "high") confidence = "medium";
+    if (confidence === "medium" && list.length < SERPAPI_MIN_GOOD_RESULTS + 2) confidence = "low";
+    reasons.push("single_source");
   }
 
   return {

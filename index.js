@@ -7196,7 +7196,12 @@ function sanitizeMarketplaceQuery(raw = "") {
   const base = normalizeQuery(String(raw || ""));
   if (!base) return "";
 
-  const junk = new Set(["item", "object", "thing", "product", "listing"]);
+  // Lifestyle/condition modifiers injected by vision STYLE CUES that are noise
+  // in marketplace search (e.g. "brass bugle musical instrument casual").
+  const junk = new Set([
+    "item", "object", "thing", "product", "listing",
+    "casual", "everyday", "minimalist", "oversized", "slim",
+  ]);
   const seen = new Set();
   const out = [];
 
@@ -17971,6 +17976,16 @@ async function serpShopping(query, opts = {}) {
     // mergeCheapestSources already does the smarter filtering/ranking later.
     return _final;
   } catch (err) {
+    // On timeout, serve stale cache rather than returning empty — stale data
+    // beats an empty result set for market confidence.
+    if (err?.name === "AbortError" && !bypassHardenedCache) {
+      const fallback = SERP_HARDENED_CACHE.get(_cacheKey);
+      if (fallback.stale || fallback.fresh) {
+        console.warn("⚠️ SerpAPI timeout — stale-cache fallback", { query, stale: fallback.stale, fresh: fallback.fresh });
+        return fallback.entry.items;
+      }
+    }
+
     if (!softFail) {
       markSourceFailure(
         "serpapi",
@@ -20645,7 +20660,7 @@ app.post("/api/haggle/score", async (req, res) => {
               ],
             },
           ],
-        });
+        }, { signal: AbortSignal.timeout(3000) });
         const rawText = scriptRes?.output_text || scriptRes?.output?.[0]?.content?.[0]?.text || "";
         if (rawText) {
           const parsed = JSON.parse(rawText);

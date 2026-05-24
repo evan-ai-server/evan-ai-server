@@ -180,6 +180,18 @@ export function computeBuyOrPass(bundle = {}) {
     capReasons.push(`limited market evidence (${marketEvidence.reason || "few_direct_urls"})`);
   }
 
+  // Single-source thin market: HOLD with low evidence → PASS.
+  // When all results come from one marketplace and evidence is weak, we have
+  // no cross-market price signal — HOLD is overconfident, PASS is honest.
+  if (
+    verdictKey === "HOLD" &&
+    marketEvidence?.confidence === "low" &&
+    marketEvidence?.reason?.includes("single_source")
+  ) {
+    verdictKey = "PASS";
+    capReasons.push(`single-source thin market (${marketEvidence.reason})`);
+  }
+
   const verdict = VERDICTS[verdictKey];
 
   // ── Supporting signal text ───────────────────────────────────────────────
