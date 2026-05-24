@@ -16059,30 +16059,38 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       try { visualAbortCtrl.abort(); } catch {}
     }
 
-    // Re-await both — cancelled promises resolve quickly via the catch handler
-    // in runVisionPass (which returns the `cancelled: true` placeholder so we
-    // can still bill its partial token usage correctly).
+    // Path-specific awaits — winner is already settled so awaiting it is
+    // instant. Losers are draining in the background (aborted above). We
+    // intentionally do NOT await loser promises here: the OpenAI SDK can
+    // take up to openaiCutoffMs + 500 ms to acknowledge an abort (the
+    // external signal fires but the in-flight fetch doesn't terminate until
+    // the SDK's hard-timeout killer, ~7.5s for fast). Awaiting the loser
+    // would add that latency to visionWallMs even though we already have a
+    // winner — turning a 6.1s visual_early win into a 7.5s endpoint.
     //
-    // Grace-bounded on the consensus path: _callGeminiVisionPass does NOT
-    // accept externalSignal, so if the OpenAI internal timeout fires a tick
-    // before our consensus-layer abort, Gemini can fire and run for ~9s even
-    // after we've decided to use master. The 250ms grace is long enough to
-    // absorb timer imprecision in the normal case (abort already propagated,
-    // promise resolves instantly) but short enough that a runaway Gemini
-    // fallback can't add seconds to the endpoint.
-    const CONSENSUS_AWAIT_GRACE_MS = 250;
-    const graceAwait = (p) => {
-      if (raceWinner !== "consensus") return p;
-      return Promise.race([
+    // consensus path keeps its 250ms grace so a Gemini fallback that races
+    // past the abort can't extend wall time to 24s.
+    let fastResult, visualResult;
+    if (raceWinner === "consensus") {
+      const CONSENSUS_AWAIT_GRACE_MS = 250;
+      const graceP = (p) => Promise.race([
         p,
         new Promise((res) => {
           const t = setTimeout(() => res(null), CONSENSUS_AWAIT_GRACE_MS);
           if (typeof t.unref === "function") t.unref();
         }),
       ]);
-    };
-    const fastResult   = await graceAwait(fastPromise);
-    const visualResult = await graceAwait(visualPromise);
+      fastResult   = await graceP(fastPromise);
+      visualResult = await graceP(visualPromise);
+    } else if (raceWinner === "fast") {
+      fastResult   = await fastPromise;  // already settled — instant
+      visualResult = null;               // drain in background
+      visualPromise.catch(() => null);
+    } else { // visual_early
+      fastResult   = null;               // drain in background
+      visualResult = await visualPromise; // already settled — instant
+      fastPromise.catch(() => null);
+    }
 
     const visualConfidence    = Number(visualResult?.parsed?.confidence ?? 0);
     const visualCategory      = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
@@ -16163,15 +16171,19 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     // tokens consumed up to the abort point — so we read usage off whatever
     // came back. For passes that were cancelled before any tokens billed,
     // usage will be null and contribute 0.
-    const masterUsageAvailable = (visionTier === "visual_skip_master" || visionTier === "fast");
     let settledMaster = null;
-    if (!masterUsageAvailable) {
-      // Consensus branch already awaited master earlier; re-await is cheap (resolved)
+    if (raceWinner === "consensus") {
+      // Consensus branch awaited master inside the else block above; re-await is cheap.
       try { settledMaster = await masterPromise; } catch { settledMaster = null; }
     } else {
-      // Peek at master in case it had already resolved before we cancelled —
-      // we still want to bill those tokens accurately.
-      settledMaster = await masterPromise.catch(() => null);
+      // fast/visual_early: don't block waiting for master to drain. Peek with a
+      // 0-ms race — captures usage when master already settled before the winner
+      // was declared (common when earlyMasterTimer launches it at 1500ms and it
+      // finishes before visual wins at ~6s). If still in-flight, returns null.
+      settledMaster = await Promise.race([
+        masterPromise,
+        new Promise((res) => { const t = setTimeout(() => res(null), 0); if (typeof t.unref === "function") t.unref(); }),
+      ]).catch(() => null);
     }
     // Cancellation-aware cost: when a pass was aborted mid-flight by the race
     // logic above, its `.usage` is null. costForCancelledPass returns the
