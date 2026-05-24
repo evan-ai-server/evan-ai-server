@@ -1460,6 +1460,20 @@ const VISUAL_SHAPE_TIMEOUT_MS        = Number(process.env.VISUAL_SHAPE_TIMEOUT_M
 // visual_shape is already declaring near-certainty.
 const SKIP_MASTER_ON_CONFIDENT_VISUAL_ENABLED = String(process.env.SKIP_MASTER_ON_CONFIDENT_VISUAL || "true").toLowerCase() !== "false";
 const SKIP_MASTER_CONFIDENCE_THRESHOLD        = Number(process.env.SKIP_MASTER_CONFIDENCE_THRESHOLD || 0.95);
+// Secondary early-exit for generic/no-brand items: when visual_shape hits
+// this threshold AND brand certainty is 0 AND category is not high-stakes,
+// skip master entirely. Saves ~1.5–3s on the most common scan type (generic
+// retail items where brand auth is irrelevant). Lowered from 0.95 because
+// the brand/model identity requirement already gates this path — no-brand
+// items don't need the master safety net.
+const GENERIC_EARLY_EXIT_CONFIDENCE           = Number(process.env.GENERIC_EARLY_EXIT_CONFIDENCE || 0.82);
+// Lazy master invocation: master is not started at t=0. Instead we wait
+// MASTER_LAZY_DELAY_MS for fast/visual_shape to resolve. If either pass
+// wins early, we cancel master before it's even launched (saving the full
+// OpenAI request cost). If neither wins, master starts late — the uncertain
+// path pays ~MASTER_LAZY_DELAY_MS extra latency vs eager parallel. Trade-off
+// is worth it: most generic scans (≥0.82 confidence) never need master.
+const MASTER_LAZY_DELAY_MS                    = Number(process.env.MASTER_LAZY_DELAY_MS || 1500);
 // Percentage rollout for the master-skip experiment. 100 = always on,
 // 0 = always off (treats every scan as control). Per-scan dice roll. Tagged
 // onto the timing entry as `cohort` so /debug/timings can A/B the two paths.
@@ -3197,7 +3211,7 @@ async function prepareVisionBuffer(buffer, rid = "") {
         fit:                "inside",
         withoutEnlargement: true,
       })
-      .jpeg({ quality: 85, mozjpeg: true })
+      .jpeg({ quality: 85 })
       .toBuffer();
     if (Buffer.isBuffer(out) && out.length > 1000) {
       console.log("📐 VISION DOWNSCALE", {
@@ -3222,20 +3236,19 @@ async function analyzeImageQuality(buffer) {
     const sharp = await getSharp();
     const base = sharp(buffer, { failOn: "none" }).rotate();
 
-    const metadata = await base.metadata().catch(() => ({}));
-    const stats = await base.stats().catch(() => null);
-
-    const tiny = await base
-      .clone()
-      .greyscale()
-      .resize({
-        width: 64,
-        height: 64,
-        fit: "inside",
-        withoutEnlargement: true,
-      })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    // Parallelize the three sharp operations — previously serial (metadata →
+    // stats → greyscale-resize), now concurrent. stats() is the expensive one
+    // (~200ms on a full image); running all three at once cuts this to ~200ms.
+    const [metadata, stats, tiny] = await Promise.all([
+      base.metadata().catch(() => ({})),
+      base.stats().catch(() => null),
+      base
+        .clone()
+        .greyscale()
+        .resize({ width: 64, height: 64, fit: "inside", withoutEnlargement: true })
+        .raw()
+        .toBuffer({ resolveWithObject: true }),
+    ]);
 
     const raw = tiny.data || Buffer.from([]);
     const width = Number(tiny.info?.width || 0);
@@ -3340,36 +3353,22 @@ async function preprocessScanUpload(file) {
     const sharp = await getSharp();
     const base = sharp(originalBuffer, { failOn: "none" }).rotate();
 
-    const transformed = await base
-      .clone()
-      .resize({
-        width: PREPROCESS_MAX_EDGE,
-        height: PREPROCESS_MAX_EDGE,
-        fit: "inside",
-        withoutEnlargement: true,
-      })
-      .sharpen({ sigma: 0.6, m1: 1.5, m2: 2.0 })
-      .jpeg({
-        quality: PREPROCESS_JPEG_QUALITY,
-        mozjpeg: true,
-      })
-      .toBuffer({ resolveWithObject: true });
-
-    const thumb = await base
-      .clone()
-      .resize({
-        width: PREPROCESS_THUMB_EDGE,
-        height: PREPROCESS_THUMB_EDGE,
-        fit: "inside",
-        withoutEnlargement: true,
-      })
-      .jpeg({
-        quality: 76,
-        mozjpeg: true,
-      })
-      .toBuffer({ resolveWithObject: true });
-
-    const quality = await analyzeImageQuality(transformed.data);
+    // Parallelize main encode + thumbnail — previously serial (transformed then
+    // thumb then quality). Now all three race concurrently; wall time = slowest
+    // single operation instead of their sum.
+    const [transformed, thumb, quality] = await Promise.all([
+      base
+        .clone()
+        .resize({ width: PREPROCESS_MAX_EDGE, height: PREPROCESS_MAX_EDGE, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: PREPROCESS_JPEG_QUALITY })
+        .toBuffer({ resolveWithObject: true }),
+      base
+        .clone()
+        .resize({ width: PREPROCESS_THUMB_EDGE, height: PREPROCESS_THUMB_EDGE, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: 76 })
+        .toBuffer({ resolveWithObject: true }),
+      analyzeImageQuality(originalBuffer).catch(() => null),
+    ]);
 
     return {
       buffer: transformed.data,
@@ -10564,6 +10563,10 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
     } else if (resaleCat === "watch") {
       resaleSitesForSerp.push({ site: "stockx.com",   label: "StockX"   });
       resaleSitesForSerp.push({ site: "chrono24.com", label: "Chrono24" });
+    } else if (resaleCat === "eyewear" || resaleCat === "headwear") {
+      // Generic accessories: Poshmark/Mercari consistently return 0 results for
+      // eyewear/headwear queries, and Etsy is 403-blocked. Skip resale SERP
+      // entirely to save ~800ms of wasted parallel fetch time.
     } else {
       resaleSitesForSerp.push({ site: "mercari.com",  label: "Mercari"  });
       resaleSitesForSerp.push({ site: "poshmark.com", label: "Poshmark" });
@@ -10790,6 +10793,24 @@ let rawMerged = [
   ...serpShoppingWave1,   // Wave 1 Google Shopping (primary SerpAPI lane)
   ...retrievalSeed,
 ];
+
+// Pre-merge source cap — applied BEFORE dedup/ranking so high-volume sources
+// (Amazon commonly returns 40–47 items) don't dominate merge cost and skew
+// source diversity scoring. serpAmazon returns results sorted by relevance,
+// so the first N are already the best ones. Amazon is capped at 3 (down from 6)
+// to prevent same-product variants flooding the merged result and causing
+// frontend title-dedup to collapse the visible card deck.
+{
+  const _PRE_MERGE_CAPS = { amazon: 3, walmart: 4, target: 3 };
+  const _capCounts = {};
+  rawMerged = rawMerged.filter((it) => {
+    const src = String(it?.source || "").toLowerCase().split(/\s+/)[0];
+    const cap = _PRE_MERGE_CAPS[src];
+    if (!cap) return true;
+    _capCounts[src] = (_capCounts[src] || 0) + 1;
+    return _capCounts[src] <= cap;
+  });
+}
 
 /* ----- compute embeddings for visual vector search ----- */
 
@@ -11381,19 +11402,28 @@ function attachMarketTruthScores(items, query, identity) {
   });
 }
 
-// Stronger dedupe: titleKey + rounded total
+// Stronger dedupe: titleKey + rounded total + source.
+// Also guards against same title + same source at different price points —
+// Amazon lists the same product at multiple prices (variants); keeping all
+// of them causes the frontend card deck to collapse them to 1 via title dedup,
+// starving the visible alt deck. One title per source is sufficient.
 function dedupeSmart(items) {
   const seen = new Set();
+  const seenTitlePerSource = new Set();
   const out = [];
   for (const it of items) {
     const titleKey = normalizeTitleKey(it?.title || "");
     const total = it?.totalPrice ?? it?.price;
     const bucket = typeof total === "number" ? Math.round(total * 2) / 2 : "na";
-    const key = `${titleKey}|${bucket}|${String(it?.source || "")}`;
+    const src = String(it?.source || "").toLowerCase().split(/[^a-z]/)[0] || "other";
+    const key = `${titleKey}|${bucket}|${src}`;
+    const titleSrcKey = `${titleKey}|${src}`;
 
     if (!titleKey) continue;
     if (seen.has(key)) continue;
+    if (seenTitlePerSource.has(titleSrcKey)) continue; // same product, same store, different price
     seen.add(key);
+    seenTitlePerSource.add(titleSrcKey);
     out.push(it);
   }
   return out;
@@ -14265,6 +14295,7 @@ async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid, model
     : timeout.signal;
   const base64   = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
   const mimeType = dataUrl.startsWith("data:") ? dataUrl.split(";")[0].slice(5) : "image/jpeg";
+  const passStartTime = Date.now();
 
   let openaiResult = null;
   let openaiUsage  = null;
@@ -14402,15 +14433,23 @@ console.log("🧾 VISION PASS RAW", {
     /aborted/i.test(String(err?.message || ""));
   if (isAbort) {
     console.log("⏱️ VISION PASS ABORTED", {
-      rid: rid || "",
-      pass: passLabel,
-      reason: err?.name || "abort",
+      rid:             rid || "",
+      pass:            passLabel,
+      errorName:       err?.name,
+      errorMessage:    err?.message,
+      errorCode:       err?.code,
+      cancelledByRace: !!externalSignal?.aborted,
+      timedOut:        !!timeout.signal?.aborted && !externalSignal?.aborted,
+      elapsedMs:       Date.now() - passStartTime,
     });
   } else {
     console.warn("❌ VISION PASS FAILED (OpenAI)", {
-      rid: rid || "",
-      pass: passLabel,
-      error: err?.message || err,
+      rid:          rid || "",
+      pass:         passLabel,
+      errorName:    err?.name,
+      errorMessage: err?.message,
+      errorCode:    err?.code,
+      elapsedMs:    Date.now() - passStartTime,
     });
   }
 }
@@ -15830,15 +15869,13 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   let visionTier = "consensus";
 
   if (FAST_PASS_ENABLED) {
-    // Fire all three passes in parallel, but resolve as soon as ANY pass
-    // is decisive — fast acceptable, or visual_shape >= 0.95. Without
-    // race-aware short-circuiting, the prior `Promise.all([fast, visual])`
-    // wait blocked on the slower of the two, even when the faster one had
-    // already given us an answer good enough to skip the rest.
-    //
-    // All three passes get an external AbortSignal so we can cancel the
-    // in-flight OpenAI HTTP request the moment we decide the result isn't
-    // needed — saves tokens AND wall time, not just promise abandonment.
+    // fast + visual_shape start at t=0. Master is NOT started immediately —
+    // it launches lazily after MASTER_LAZY_DELAY_MS. If visual_shape or fast
+    // wins before master launches, we abort the AbortController BEFORE launch,
+    // preventing the OpenAI request entirely (real skip, not just abandon).
+    // On the uncertain path (visual_shape fails confidence), the consensus
+    // fallback adds ~MASTER_LAZY_DELAY_MS - master_time wall time vs eager
+    // parallel (~500ms with defaults since master ≈ 4s, visual ≈ 5s).
     const fastAbortCtrl   = new AbortController();
     const masterAbortCtrl = new AbortController();
     const visualAbortCtrl = new AbortController();
@@ -15855,10 +15892,6 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       }),
       (ms) => { fastMs = ms; }
     ).catch(() => null);
-    const masterPromise = timed(
-      runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid, externalSignal: masterAbortCtrl.signal }),
-      (ms) => { masterMs = ms; }
-    ).catch(() => null);
     const visualPromise = timed(
       runVisionPass({
         dataUrl,
@@ -15873,8 +15906,35 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       (ms) => { visualMs = ms; }
     ).catch(() => null);
 
-    // Always drain master in the background to prevent unhandled rejection +
-    // free its memory once it completes, even if we don't use the result.
+    // masterPromise is a synthetic promise wired to the lazy-launched actual
+    // runVisionPass call. Resolves with null immediately if master is aborted
+    // before launch (via the abort event listener below).
+    let masterLaunched = false;
+    let _masterResolve;
+    const masterPromise = new Promise((res) => { _masterResolve = res; });
+    masterAbortCtrl.signal.addEventListener("abort", () => {
+      if (!masterLaunched) _masterResolve(null);
+    }, { once: true });
+    const launchMasterNow = () => {
+      if (masterLaunched || masterAbortCtrl.signal.aborted) return;
+      masterLaunched = true;
+      timed(
+        runVisionPass({ dataUrl, mode, propContext, passLabel: "master", rid: req.rid, externalSignal: masterAbortCtrl.signal }),
+        (ms) => { masterMs = ms; }
+      ).catch(() => null).then(_masterResolve, () => _masterResolve(null));
+    };
+    // Early master launch: fires at MASTER_LAZY_DELAY_MS (default 1500ms) so
+    // master is racing in parallel rather than waiting until visual_shape fails
+    // at 7s. gpt-4.1-mini can take >7s cold, making lazy launch cost 7s before
+    // master even starts. With an early timer, total vision wall = delay + master
+    // duration (~1.5s + ~3.4s = ~5s) instead of 7s + master_duration (~10.4s).
+    // If fast or visual_shape win before master finishes, we cancel master.
+    const earlyMasterTimer = setTimeout(launchMasterNow, MASTER_LAZY_DELAY_MS);
+    if (typeof earlyMasterTimer.unref === "function") earlyMasterTimer.unref();
+    // Safety-net: if the early timer somehow misfires, ensure master launches
+    // before visual_shape's full deadline + buffer.
+    const masterLaunchTimer = setTimeout(launchMasterNow, VISUAL_SHAPE_TIMEOUT_MS + 500);
+    if (typeof masterLaunchTimer.unref === "function") masterLaunchTimer.unref();
     masterPromise.catch(() => null);
 
     // Hard consensus-layer deadline for visual_shape. The `timeoutMs` above
@@ -15916,15 +15976,33 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         // (gpt-4.1) is still racing in the background; wait for it to escalate.
         const cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
         const isHighStakes = !!cat && HIGH_STAKES_CATEGORIES.has(cat);
+        const brandCertainty = Number(r?.parsed?.attributeCertainty?.brand ?? 0);
         if (
           skipMasterAllowed &&
           r &&
           Number.isFinite(conf) &&
-          conf >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
-          !!(r.parsed?.identity?.brand || r.parsed?.identity?.model || r.parsed?.identity?.itemType) &&
-          !isHighStakes
+          !isHighStakes &&
+          (
+            // Standard path: high confidence + brand/model identity detected
+            (
+              conf >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
+              !!(r.parsed?.identity?.brand || r.parsed?.identity?.model || r.parsed?.identity?.itemType)
+            ) ||
+            // Generic early exit: no brand detected, category is generic — master
+            // provides no additional auth signal so the extra wall time is wasted.
+            (
+              conf >= GENERIC_EARLY_EXIT_CONFIDENCE &&
+              brandCertainty === 0
+            )
+          )
         ) {
           finish("visual_early");
+        } else {
+          // visual_shape didn't meet the early-exit bar — launch master now
+          // rather than waiting for the timer. This minimises the uncertain-
+          // path wall-time penalty: master starts as soon as we know we need
+          // it instead of waiting for the remaining MASTER_LAZY_DELAY_MS.
+          launchMasterNow();
         }
       }).catch(() => {});
 
@@ -15947,29 +16025,32 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         let settled = false;
         const tryResolve = () => { if (!settled) { settled = true; res(); } };
         visualPromise.then(tryResolve, tryResolve);
-        // Mirror the same deadline as visualAbortCtrl so the race unblocks
-        // even if visualPromise is slow to observe the abort.
-        setTimeout(tryResolve, VISUAL_SHAPE_TIMEOUT_MS).unref?.();
+        // Safety-net deadline: if visualPromise hangs (e.g. Gemini fallback
+        // delays the cancelled-result), kick off launchMasterNow so masterPromise
+        // doesn't hang indefinitely waiting for a launch that never came.
+        setTimeout(() => { launchMasterNow(); tryResolve(); }, VISUAL_SHAPE_TIMEOUT_MS).unref?.();
       });
       Promise.all([masterPromise, visualSettleOrDeadline])
         .then(() => finish("consensus"))
         .catch(() => finish("consensus"));
     });
 
-    // Race is done — clear the visual deadline timer (no-op if already fired).
+    // Race is done — clear all pending launch timers (no-ops if already fired).
     clearTimeout(visualDeadlineTimer);
+    clearTimeout(earlyMasterTimer);
+    clearTimeout(masterLaunchTimer);
 
-    // Cancel the losers in-flight. Cancelling a pass that already settled is
-    // a no-op; cancelling one still mid-fetch causes OpenAI to abort the
-    // request and runVisionPass to return `{cancelled: true}` quickly.
+    // Cancel the losers in-flight. Aborting masterAbortCtrl before master
+    // launches → abort event fires → masterPromise resolves(null) immediately
+    // (no OpenAI request sent). Aborting after launch → real in-flight cancel.
     if (raceWinner === "fast") {
       try { masterAbortCtrl.abort(); } catch {}
       try { visualAbortCtrl.abort(); } catch {}
     } else if (raceWinner === "visual_early") {
       try { fastAbortCtrl.abort(); } catch {}
-      try { masterAbortCtrl.abort(); } catch {}
+      try { masterAbortCtrl.abort(); } catch {} // real cancel if in-flight; skip if pre-launch
     } else if (raceWinner === "consensus") {
-      // Consensus winner: master is ready, visual may have deadline-aborted.
+      // Consensus winner: master is ready (or resolving), visual may have deadline-aborted.
       // Cancel fast if it's still in-flight so we don't pay the Gemini-fallback
       // tax on a result we're about to discard.
       try { fastAbortCtrl.abort(); } catch {}
@@ -16003,16 +16084,27 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     const fastResult   = await graceAwait(fastPromise);
     const visualResult = await graceAwait(visualPromise);
 
-    const visualConfidence = Number(visualResult?.parsed?.confidence ?? 0);
-    const visualCategory   = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
-    const visualHighStakes = !!visualCategory && HIGH_STAKES_CATEGORIES.has(visualCategory);
+    const visualConfidence    = Number(visualResult?.parsed?.confidence ?? 0);
+    const visualCategory      = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
+    const visualHighStakes    = !!visualCategory && HIGH_STAKES_CATEGORIES.has(visualCategory);
+    const visualBrandCertainty = Number(visualResult?.parsed?.attributeCertainty?.brand ?? 0);
     const visualAcceptable =
       skipMasterAllowed &&
       visualResult &&
       Number.isFinite(visualConfidence) &&
-      visualConfidence >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
-      !!(visualResult.parsed?.identity?.brand || visualResult.parsed?.identity?.model || visualResult.parsed?.identity?.itemType) &&
-      !visualHighStakes;
+      !visualHighStakes &&
+      (
+        // Standard path: high confidence + brand/model identity
+        (
+          visualConfidence >= SKIP_MASTER_CONFIDENCE_THRESHOLD &&
+          !!(visualResult.parsed?.identity?.brand || visualResult.parsed?.identity?.model || visualResult.parsed?.identity?.itemType)
+        ) ||
+        // Generic early exit: no brand → master adds no auth signal
+        (
+          visualConfidence >= GENERIC_EARLY_EXIT_CONFIDENCE &&
+          visualBrandCertainty === 0
+        )
+      );
 
     if (fastResult && shouldAcceptFastVisionResult(fastResult)) {
       // Cancel the in-flight master OpenAI request — saves tokens, not just
@@ -16114,6 +16206,8 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       fastCancelled:    !!fastResult?.cancelled,
       visualCancelled:  !!visualResult?.cancelled,
       masterCancelled:  !!settledMaster?.cancelled,
+      masterLaunched,
+      masterLaunchedEarlyMs: masterLaunched ? MASTER_LAZY_DELAY_MS : null,
     });
 
     recordVisionTiming({
@@ -19425,25 +19519,33 @@ async function buildMarketSearchResponsePayload({
     // ── Feature 70: Sold Comps Date Filter ────────────────────────────────────
     const soldCompsDateFilter = buildSoldCompsDateFilterPayload(uiItems);
 
-    // ── Feature 71 + 72: Premium Price Sources (async, fire-and-forget on miss) ─
-    // Fires 4 parallel SerpAPI calls (StockX/GOAT/Poshmark/Depop) each with a
-    // 5s timeout — accounts for most of the 6s provisional wall time per the
-    // 2026-05-21 live-log audit. Skipped on lite=true so the provisional
-    // payload can ship under 300ms; the next live_refresh call hits the SWR
-    // cache populated by this same fetch when SERPAPI_KEY is configured.
-    let premiumPrices = null;
+    // ── Feature 71 + 72 + 76: Premium Prices + Regional Pricing (parallelized) ─
+    // Previously serial (5001ms + 3403ms = 8404ms); now parallel (max ~5001ms).
+    // Both are lite-gated so provisional payload ships in <300ms; live_refresh
+    // fires both concurrently to cut wall time by ~3.4s on cache misses.
+    let premiumPrices  = null;
+    let regionalPricing = null;
     const _t_premiumPrices = Date.now();
-    try {
-      if (!lite && SERPAPI_KEY && activeQuery) {
-        const _ppResult = await buildPremiumPriceSourcesPayload({
-          query:    activeQuery,
-          serpKey:  SERPAPI_KEY,
-          category,
-        });
-        premiumPrices = _ppResult;
-      }
-    } catch { /* non-fatal */ }
+    const _t_regional      = Date.now();
+    // Hard cap: enrichments must not dominate live_refresh wall time. Previously
+    // premiumPrices hit 5-6s and regionalPricing hit 3-4s (parallel = 6s).
+    // Cap each at 1500ms — on SWR cache hit they land in <100ms anyway; on
+    // cold miss we return null and the frontend hydrates on the next refresh.
+    const ENRICHMENT_TIMEOUT_MS = Number(process.env.ENRICHMENT_TIMEOUT_MS || 1500);
+    const _withEnrichTimeout = (p) => Promise.race([
+      p,
+      new Promise((res) => { const t = setTimeout(() => res(null), ENRICHMENT_TIMEOUT_MS); if (typeof t.unref === "function") t.unref(); }),
+    ]);
+    if (!lite && SERPAPI_KEY && activeQuery) {
+      const [_ppResult, _rpResult] = await Promise.all([
+        _withEnrichTimeout(buildPremiumPriceSourcesPayload({ query: activeQuery, serpKey: SERPAPI_KEY, category }).catch(() => null)),
+        _withEnrichTimeout(buildRegionalPricePayload({ query: activeQuery, serpKey: SERPAPI_KEY, category }).catch(() => null)),
+      ]);
+      premiumPrices   = _ppResult;
+      regionalPricing = _rpResult;
+    }
     _bmLog("premiumPrices", _t_premiumPrices);
+    _bmLog("regionalPricing", _t_regional);
 
     // ── Feature 73: Price Floor Tracker ───────────────────────────────────────
     // Hits Redis SERPAPI cache + optional live fetch. Cheap on cache hit,
@@ -19466,22 +19568,6 @@ async function buildMarketSearchResponsePayload({
 
     // ── Feature 75: Condition Tier Pricer ─────────────────────────────────────
     const conditionTierPricing = buildConditionTierPayload(uiItems, visionIdentity?.condition || null);
-
-    // ── Feature 76: Regional Price Variance (async, only if SERP available) ───
-    // Fires 4 SerpAPI region queries; same lite gate as premium prices above.
-    let regionalPricing = null;
-    const _t_regional = Date.now();
-    try {
-      if (!lite && SERPAPI_KEY && activeQuery) {
-        const _rpResult = await buildRegionalPricePayload({
-          query:   activeQuery,
-          serpKey: SERPAPI_KEY,
-          category,
-        });
-        regionalPricing = _rpResult;
-      }
-    } catch { /* non-fatal */ }
-    _bmLog("regionalPricing", _t_regional);
 
     // ── Feature 77: Lot / Bundle Detector ─────────────────────────────────────
     const lotBundle = buildLotBundlePayload(uiItems, {
@@ -33451,8 +33537,14 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 server.on("clientError", (err, socket) => {
+  // ECONNRESET / ECONNABORTED = client closed the connection (SSE teardown,
+  // app backgrounded, iOS timeout). Not a server error — destroy quietly.
+  const code = err?.code || "";
+  if (code === "ECONNRESET" || code === "ECONNABORTED" || !socket.writable) {
+    try { socket.destroy(); } catch {}
+    return;
+  }
   console.warn("CLIENT ERROR:", err?.message || err);
-
   try {
     socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
   } catch {}
