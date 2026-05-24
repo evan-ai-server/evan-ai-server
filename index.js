@@ -11317,86 +11317,20 @@ merged = [...merged].sort((a, b) => {
     });
   }
 
-  // ── Thin-evidence / single-source retrieval expansion ────────────────────
-  // Fires a second wave of SerpAPI queries using shorter, structurally varied
-  // query fragments whenever the primary wave produced thin or non-diverse
-  // results. The 2500ms budget is intentionally tight — cached SERP responses
-  // return instantly; live fetches may partially complete. Only substitutes
-  // `merged` when the expansion materially improves relevant count or source
-  // diversity so ranking integrity is never degraded.
-  const _expSrcGroups = new Set(
+  // Retrieval expansion is now handled as a background pass in /market/search/stream
+  // after the complete event is sent — not here inside the kill-timer-bounded worker.
+  // Log the depth snapshot so the background pass can reference the baseline.
+  const _depthSrcGroups = new Set(
     merged.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
   );
-  const _thinRelevant = stageRelevant.length <= 2;
-  const _singleSource = _expSrcGroups.size <= 1;
-  const _needsExpansion =
-    canUseSerpForce &&
-    !isSourceCoolingDown("serpapi") &&
-    (_thinRelevant || _singleSource);
-
-  const _retrievalLog = {
-    retrievalExpansionTriggered: _needsExpansion,
-    expansionReason:             _needsExpansion ? (_thinRelevant ? "thin_relevant" : "single_source") : null,
+  console.log("🔍 RETRIEVAL DEPTH", {
+    retrievalExpansionTriggered: false,
+    expansionReason:             null,
     variantQueriesTried:         [],
     finalRelevantCount:          stageRelevant.length,
-    finalSourceGroups:           _expSrcGroups.size,
-    retrievalDepthScore:         Math.round(Math.min(1, stageRelevant.length / 6) * Math.min(1, _expSrcGroups.size / 3) * 100) / 100,
-  };
-
-  if (_needsExpansion) {
-    const _expVariants = uniqueQueries([
-      ...buildExpansionVariants(normalizedQuery),
-      ...buildSearchIntentLadder(normalizedQuery, { broad: true }).slice(0, 3),
-    ]).filter(q => q !== normalizedQuery).slice(0, 5);
-
-    _retrievalLog.variantQueriesTried = _expVariants;
-
-    const EXPANSION_TIMEOUT_MS = 2500;
-    const _expTimeoutP = new Promise(res => {
-      const t = setTimeout(() => res([]), EXPANSION_TIMEOUT_MS);
-      if (typeof t.unref === "function") t.unref();
-    });
-
-    const _expRaw = await Promise.race([
-      Promise.all(
-        _expVariants.map(q =>
-          marketSearchConcurrency(() => serpShopping(q, { softFail: true })).catch(() => [])
-        )
-      ),
-      _expTimeoutP,
-    ]);
-
-    const _expFlat = (Array.isArray(_expRaw) ? _expRaw : []).flat().filter(Boolean);
-
-    if (_expFlat.length > 0) {
-      const _expFiltered = _expFlat
-        .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
-        .filter(it => !isBadListing(it.title, normalizedQuery));
-
-      const _expMerged = dedupeSmart([...merged, ..._expFiltered]);
-      const _expRelevant = filterRelevantListings(normalizedQuery, _expMerged);
-      const _expGroups = new Set(
-        _expMerged.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
-      );
-
-      // Only adopt expansion if it materially improves relevant count or diversity
-      if (_expRelevant.length > stageRelevant.length || _expGroups.size > _expSrcGroups.size) {
-        // Score new items so the final ranking has meaningful signals
-        for (const item of _expFiltered) {
-          item.trustModelScore = listingTrustScore(item);
-          item.dealScore       = detectDeal(item, marketStats || {});
-        }
-        const _expBase = _expRelevant.length ? _expRelevant : _expMerged;
-        merged = sortByAbsoluteCheapest(_expBase, normalizedQuery).slice(0, 60);
-        _retrievalLog.finalRelevantCount = _expRelevant.length;
-        _retrievalLog.finalSourceGroups  = _expGroups.size;
-        _retrievalLog.retrievalDepthScore =
-          Math.round(Math.min(1, _expRelevant.length / 6) * Math.min(1, _expGroups.size / 3) * 100) / 100;
-      }
-    }
-  }
-
-  console.log("🔍 RETRIEVAL DEPTH", _retrievalLog);
+    finalSourceGroups:           _depthSrcGroups.size,
+    retrievalDepthScore:         Math.round(Math.min(1, stageRelevant.length / 6) * Math.min(1, _depthSrcGroups.size / 3) * 100) / 100,
+  });
 
   if (merged[0]?.source) {
     rememberSourceWin(normalizedQuery, merged[0].source);
@@ -23464,6 +23398,157 @@ app.post("/market/search/stream", async (req, res) => {
       degraded: _degraded, totalMs: _totalMs,
     });
     harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
+
+    // ── Background retrieval expansion ────────────────────────────────────────
+    // The `complete` event is already on the wire. The SSE connection stays open
+    // (endStream() fires in finally) so we can emit a `background_refresh` event
+    // if the expansion produces materially stronger market evidence.
+    //
+    // Conditions: thin relevant count, single-source results, or low marketEvidence
+    // confidence — exactly the cases the 6s kill timer was starving.
+    {
+      const _bgSrcGroups = new Set(
+        enrichedItems.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+      );
+      const _bgRelevant = filterRelevantListings(query, enrichedItems);
+      const _bgCanExpand =
+        SERPAPI_KEY &&
+        process.env.DISABLE_SERP !== "true" &&
+        !isSourceCoolingDown("serpapi") &&
+        !clientClosed &&
+        (
+          _bgRelevant.length <= 2    ||
+          _bgSrcGroups.size  <= 1    ||
+          enrichedItems.length <= 3  ||
+          finalPayload?.buyOrPass?.marketEvidence?.confidence === "low"
+        );
+
+      if (_bgCanExpand) {
+        const _bgReason =
+          _bgRelevant.length <= 2   ? "thin_relevant"  :
+          _bgSrcGroups.size  <= 1   ? "single_source"  :
+          enrichedItems.length <= 3 ? "thin_total"      : "low_confidence";
+
+        const _bgVariants = uniqueQueries([
+          ...buildExpansionVariants(query),
+          ...buildSearchIntentLadder(query, { broad: true }).slice(0, 3),
+        ]).filter(q => q !== query).slice(0, 6);
+
+        console.log("🔍 BACKGROUND_RETRIEVAL_EXPANSION_START", {
+          scanId, query,
+          reason:               _bgReason,
+          initialRelevantCount: _bgRelevant.length,
+          initialSourceGroups:  _bgSrcGroups.size,
+          variants:             _bgVariants,
+        });
+
+        const BACKGROUND_RETRIEVAL_EXPANSION_MS = Number(process.env.BACKGROUND_RETRIEVAL_EXPANSION_MS || 8000);
+        const _bgT0 = Date.now();
+
+        try {
+          const _bgTimeoutP = new Promise(res => {
+            const t = setTimeout(() => res([]), BACKGROUND_RETRIEVAL_EXPANSION_MS);
+            if (typeof t.unref === "function") t.unref();
+          });
+
+          const _bgRaw = await Promise.race([
+            Promise.all(
+              _bgVariants.map(q =>
+                marketSearchConcurrency(() => serpShopping(q, { softFail: true })).catch(() => [])
+              )
+            ),
+            _bgTimeoutP,
+          ]);
+
+          const _bgFlat = (Array.isArray(_bgRaw) ? _bgRaw : []).flat().filter(Boolean);
+          const _bgDurationMs = Date.now() - _bgT0;
+
+          if (_bgFlat.length > 0 && !clientClosed) {
+            const _bgFiltered = _bgFlat
+              .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
+              .filter(it => !isBadListing(it.title, query));
+
+            const _bgPool        = dedupeSmart([...enrichedItems, ..._bgFiltered]);
+            const _bgRelFinal    = filterRelevantListings(query, _bgPool);
+            const _bgGroupsFinal = new Set(
+              _bgPool.map(it => String(it?.source || "").toLowerCase().split(/[\s/]/)[0]).filter(Boolean)
+            );
+
+            // Material improvement: relevant count up by ≥2, new source, trusted
+            // marketplace appears, or cheaper anchor is found.
+            const _relImproved     = _bgRelFinal.length >= _bgRelevant.length + 2;
+            const _divImproved     = _bgGroupsFinal.size > _bgSrcGroups.size;
+            const _trustedAppeared = _bgFiltered.some(it =>
+              ["ebay", "walmart", "bestbuy"].includes(String(it?.source || "").toLowerCase())
+            );
+            const _evidenceImproved = _relImproved || _divImproved || _trustedAppeared;
+
+            console.log("🔍 BACKGROUND_RETRIEVAL_EXPANSION_DONE", {
+              scanId, durationMs: _bgDurationMs,
+              addedListings:    _bgFiltered.length,
+              finalRelevantCount: _bgRelFinal.length,
+              finalSourceGroups:  _bgGroupsFinal.size,
+              evidenceImproved:   _evidenceImproved,
+              refreshSent:        _evidenceImproved && !clientClosed,
+            });
+
+            if (_evidenceImproved && !clientClosed) {
+              // Stamp trust/deal on new items so ranking has signals
+              for (const item of _bgFiltered) {
+                item.trustModelScore = listingTrustScore(item);
+              }
+              const _bgBase   = _bgRelFinal.length ? _bgRelFinal : _bgPool;
+              const _bgSorted = assignItemIds(sortByAbsoluteCheapest(_bgBase, query).slice(0, 60));
+              const _bgPayload = await _buildPayload(_bgSorted, {
+                source: "background_expansion", kind: "background_refresh",
+              }).catch(() => null);
+
+              if (_bgPayload && !clientClosed) {
+                const _bgVerdict =
+                  normalizeVerdict(_bgPayload?.buyOrPass?.verdict) ||
+                  normalizeVerdict(_bgPayload?.profitIntel?.verdict) ||
+                  "HOLD";
+                send("background_refresh", {
+                  ..._bgPayload,
+                  verdict:         _bgVerdict,
+                  status:          "background_refresh",
+                  enriching:       false,
+                  dataDepth:       _bgSorted.length < 3 ? "thin" : "normal",
+                  expansionReason: _bgReason,
+                  _timing: { expansionMs: _bgDurationMs, totalMs: Date.now() - _t0 },
+                });
+                // Warm the caches so the next scan of the same item is instant
+                SERP_CACHE.set(cacheKey, _bgSorted);
+                ENRICHED_SCAN_CACHE.set(cacheKey, {
+                  items:         _bgSorted,
+                  ebaySoldComps: _ebaySoldComps || null,
+                  localComps:    _localComps    || null,
+                });
+              }
+            } else {
+              console.log("🔍 RETRIEVAL_REFRESH_SKIPPED", {
+                scanId,
+                reason:             "no_material_improvement",
+                finalRelevantCount: _bgRelFinal.length,
+                finalSourceGroups:  _bgGroupsFinal.size,
+              });
+            }
+          } else {
+            // Timeout or no new results
+            console.log("🔍 BACKGROUND_RETRIEVAL_EXPANSION_DONE", {
+              scanId, durationMs: _bgDurationMs,
+              addedListings:      0,
+              finalRelevantCount: _bgRelevant.length,
+              finalSourceGroups:  _bgSrcGroups.size,
+              evidenceImproved:   false,
+              refreshSent:        false,
+            });
+          }
+        } catch (_bgErr) {
+          console.warn("⚠️ background_expansion_error:", _bgErr?.message);
+        }
+      }
+    }
 
   } catch (err) {
     console.error("scan_stream_error:", err?.message || err);
