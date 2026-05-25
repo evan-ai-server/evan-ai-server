@@ -261,6 +261,16 @@ import {
   } from "./src/cheaperAlternativeEngine.js";
 
   import {
+    recordPredictionSnapshot,
+    getPredictionSnapshot,
+    recordOutcome,
+    getOutcome as getOutcomeRecord,
+    getOutcomeWithPrediction,
+    listOutcomesForUser,
+    computeOutcomeMetrics,
+  } from "./src/outcomeStore.js";
+
+  import {
     buildArbitrageIntelPayload,
     detectPlatformArbitrage,
     detectBuyOpportunity,
@@ -22742,6 +22752,63 @@ return res.status(200).json(responsePayload);
 // ─────────────────────────────────────────────────────────────────────────────
 // STAGED SCAN STREAM  —  POST /market/search/stream
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Extracts prediction snapshot fields from the completed scan payload.
+// Uses actual field names from this codebase — not the generic template names.
+function extractPredictionSnapshotFromPayload({
+  req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence,
+}) {
+  const buyOrPass   = finalPayload?.buyOrPass || {};
+  const profitIntel = finalPayload?.profitIntel || {};
+  const priceStats  = profitIntel?.priceStats || {};
+  const marketEv    = buyOrPass?.marketEvidence || {};
+
+  const verdict   = buyOrPass?.verdict || null;
+  const confidence = buyOrPass?.confidence ?? null;
+  const reasonCode = buyOrPass?.reasonCode || null;
+
+  // estimatedResale is the resale price estimate; fall back to medianPrice
+  const predictedResalePrice = priceStats?.estimatedResale ?? priceStats?.medianPrice ?? null;
+  const predictedProfit      = profitIntel?.expectedProfit ?? null;
+
+  const topListings = Array.isArray(enrichedItems) ? enrichedItems.slice(0, 8) : [];
+  const sourceGroups = new Set(
+    topListings
+      .map((x) => String(x?.source || x?.store || "").toLowerCase().split(/[\s/]/)[0])
+      .filter(Boolean)
+  ).size;
+
+  return {
+    scanId,
+    userId:    req?.body?.userId || req?.query?.userId || null,
+    deviceId:  req?.body?.deviceId || null,
+    guestId:   req?.body?.guestId || req?.query?.guestId || null,
+    query,
+    category,
+    itemName:  finalPayload?.itemName || topListings?.[0]?.title || null,
+    scannedPrice,
+    verdict,
+    confidence,
+    reasonCode,
+    predictedResalePrice: typeof predictedResalePrice === "number" ? predictedResalePrice : null,
+    predictedProfit:      typeof predictedProfit      === "number" ? predictedProfit      : null,
+    predictedMarginPct:   null,
+    suggestedOffer:       null,
+    estimatedFees:        null,
+    listingCount:         Array.isArray(enrichedItems) ? enrichedItems.length : null,
+    relevantListingCount: marketEv?.listingCount ?? null,
+    sourceGroups,
+    marketConfidence:     marketEv?.confidence || null,
+    marketEvidenceReason: marketEv?.reason || null,
+    topListings,
+    rawLiteMeta: {
+      visionConfidence: visionConfidence ?? null,
+      visionTier:       finalPayload?.visionTier ?? null,
+      retrievalDepthScore: finalPayload?.retrievalDepthScore ?? null,
+      dataDepth:        finalPayload?.dataDepth ?? null,
+    },
+  };
+}
 // Event sequence:
 //   event: phase        data: { phase: "analyzing_fast"|"enriching", query?, scanId }
 //   event: provisional  data: { ...payload, status:"provisional", enriching:true,
@@ -23435,6 +23502,26 @@ app.post("/market/search/stream", async (req, res) => {
       degraded: _degraded, totalMs: _totalMs,
     });
     harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
+
+    // ── Outcome flywheel: record immutable prediction snapshot ────────────────
+    recordPredictionSnapshot(
+      extractPredictionSnapshotFromPayload({
+        req, scanId, query, category, scannedPrice,
+        finalPayload, enrichedItems, visionConfidence,
+      })
+    ).then((snap) => {
+      if (snap) {
+        console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
+          scanId,
+          query,
+          verdict: snap.verdict,
+          confidence: snap.confidence,
+          predictedProfit: snap.predictedProfit,
+        });
+      }
+    }).catch((e) => {
+      console.warn("⚠️ prediction_snapshot_record_failed", { scanId, error: e?.message || String(e) });
+    });
 
     // ── Background retrieval expansion ────────────────────────────────────────
     // The `complete` event is already on the wire. The SSE connection stays open
@@ -35923,6 +36010,88 @@ app.post("/api/ops/repair/run", requireOpsAccess, async (req, res) => {
     return res.status(200).json({ ok: result.ok, ...result });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "repair_failed", reason: err?.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OUTCOME FLYWHEEL API  —  prediction + realized profit tracking
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Route order matters: /metrics and the bare list must come before /:scanId
+// so Express doesn't swallow them as scanId params.
+//
+// Test curl examples:
+//   curl -X POST http://localhost:3001/api/outcomes/test_scan_123 \
+//     -H "Content-Type: application/json" \
+//     -d '{"userId":"debug_user","bought":true,"actualBuyPrice":20,"sold":true,"actualSellPrice":45,"actualFees":5,"shippingCost":4,"salePlatform":"eBay","daysToSell":6}'
+//   curl "http://localhost:3001/api/outcomes/test_scan_123"
+//   curl "http://localhost:3001/api/outcomes/metrics?userId=debug_user"
+//   curl "http://localhost:3001/api/outcomes?userId=debug_user"
+
+app.get("/api/outcomes/metrics", async (req, res) => {
+  try {
+    const userId  = safeStr(req.query?.userId, 128) || null;
+    const metrics = await computeOutcomeMetrics(userId);
+    console.log("📊 OUTCOME_METRICS_READ", {
+      userId,
+      outcomeCount:    metrics.outcomeCount,
+      totalProfit:     metrics.totalProfit,
+      directionAccuracy: metrics.directionAccuracy,
+    });
+    return res.json({ ok: true, metrics });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "outcome_metrics_failed" });
+  }
+});
+
+app.get("/api/outcomes", async (req, res) => {
+  try {
+    const userId  = safeStr(req.query?.userId, 128) || null;
+    const limit   = Math.min(500, Number(req.query?.limit || 100));
+    const outcomes = await listOutcomesForUser(userId, limit);
+    return res.json({ ok: true, userId, outcomes });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "outcome_list_failed" });
+  }
+});
+
+app.get("/api/outcomes/:scanId", async (req, res) => {
+  try {
+    const scanId = safeStr(req.params?.scanId, 128);
+    if (!scanId) return res.status(400).json({ ok: false, error: "missing_scan_id" });
+    const row = await getOutcomeWithPrediction(scanId);
+    return res.json({ ok: true, ...row });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "outcome_read_failed" });
+  }
+});
+
+app.post("/api/outcomes/:scanId", async (req, res) => {
+  try {
+    const scanId = safeStr(req.params?.scanId, 128);
+    if (!scanId) return res.status(400).json({ ok: false, error: "missing_scan_id" });
+
+    const outcome = await recordOutcome(scanId, {
+      ...req.body,
+      userId:   safeStr(req.body?.userId   || req.query?.userId,   128) || null,
+      deviceId: safeStr(req.body?.deviceId || req.query?.deviceId, 128) || null,
+      guestId:  safeStr(req.body?.guestId  || req.query?.guestId,  128) || null,
+    });
+
+    const prediction = await getPredictionSnapshot(scanId);
+    console.log("💰 OUTCOME_RECORDED", {
+      scanId,
+      userId:           outcome?.userId || null,
+      bought:           outcome?.bought,
+      sold:             outcome?.sold,
+      realizedProfit:   outcome?.realizedProfit,
+      directionCorrect: outcome?.predictionError?.directionCorrect,
+    });
+
+    return res.json({ ok: true, scanId, outcome, prediction });
+  } catch (e) {
+    console.warn("⚠️ outcome_record_failed", { scanId: req.params?.scanId, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "outcome_record_failed" });
   }
 });
 
