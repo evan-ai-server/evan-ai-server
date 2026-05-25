@@ -10422,6 +10422,60 @@ CRITICAL RULES:
 // Examples for "brass bugle musical instrument":
 //   → "brass bugle musical", "brass bugle", "bugle musical instrument",
 //     "bugle musical", "musical instrument"
+// Product noun whitelist used by expansion-variant filtering. Variants that
+// drop the core product noun (e.g. "black plastic" derived from "black plastic
+// wrap sunglasses") pull in unrelated categories like polyethylene sheeting,
+// so every emitted variant must keep at least one of these nouns when the
+// original query contains one.
+const EXPANSION_PRODUCT_NOUNS = [
+  "sunglasses", "shoes", "jacket", "hoodie", "shirt", "jeans",
+  "bag", "purse", "watch", "trumpet", "bugle", "camera",
+  "headphones", "toy", "figure", "hat", "cleats", "boots",
+  "jersey", "glasses",
+];
+
+// Synonym groups — if the original query contains any noun in a group, all
+// nouns in that group are acceptable in variants (so "glasses" stays valid
+// expansion for a "sunglasses" query).
+const EXPANSION_NOUN_SYNONYMS = {
+  sunglasses: ["sunglasses", "glasses"],
+  glasses:    ["glasses",    "sunglasses"],
+};
+
+function detectProductNouns(tokens) {
+  const found = new Set();
+  for (const t of tokens) {
+    if (EXPANSION_PRODUCT_NOUNS.includes(t)) found.add(t);
+  }
+  return [...found];
+}
+
+function buildAllowedNounSet(productNouns) {
+  const allowed = new Set();
+  for (const n of productNouns) {
+    allowed.add(n);
+    for (const s of EXPANSION_NOUN_SYNONYMS[n] || []) allowed.add(s);
+  }
+  return allowed;
+}
+
+// Returns null if no product noun is in the original query (caller should not
+// filter); otherwise returns a Set of acceptable nouns to look for in variants.
+function expansionNounGuard(originalQuery) {
+  const tokens = normalizeQuery(String(originalQuery || ""))
+    .split(/\s+/)
+    .filter(Boolean);
+  const nouns = detectProductNouns(tokens);
+  if (nouns.length === 0) return null;
+  return buildAllowedNounSet(nouns);
+}
+
+function variantPreservesProductNoun(variant, allowedNounSet) {
+  if (!allowedNounSet) return true; // no guard active
+  const vTokens = String(variant || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return vTokens.some(t => allowedNounSet.has(t));
+}
+
 function buildExpansionVariants(query) {
   const tokens = normalizeQuery(String(query || "")).split(/\s+/).filter(Boolean);
   if (tokens.length < 2) return [];
@@ -10452,7 +10506,28 @@ function buildExpansionVariants(query) {
   }
 
   out.delete(query);
-  return [...out].filter(q => q.split(/\s+/).length >= 2).slice(0, 6);
+
+  // Drop variants that lose the core product noun. Rejections are logged
+  // here AND at the background-expansion call site so we get visibility into
+  // both helper-generated variants and anything else fed into the pool.
+  const productNouns = detectProductNouns(tokens);
+  const allowedNouns = productNouns.length
+    ? buildAllowedNounSet(productNouns)
+    : null;
+
+  const kept = [];
+  for (const v of out) {
+    if (v.split(/\s+/).length < 2) continue;
+    if (!variantPreservesProductNoun(v, allowedNouns)) {
+      console.log("🚫 BACKGROUND_EXPANSION_VARIANT_REJECTED", {
+        query, variant: v, reason: "missing_product_noun",
+      });
+      continue;
+    }
+    kept.push(v);
+    if (kept.length >= 6) break;
+  }
+  return kept;
 }
 
 async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
@@ -23559,10 +23634,27 @@ app.post("/market/search/stream", async (req, res) => {
           _bgSrcGroups.size  <= 1   ? "single_source"  :
           enrichedItems.length <= 3 ? "thin_total"      : "low_confidence";
 
-        const _bgVariants = uniqueQueries([
+        // Combined variant pool from both expansion sources. We apply the
+        // product-noun guard here (not just inside buildExpansionVariants) so
+        // any broad variants leaking out of buildSearchIntentLadder are
+        // rejected with the same rule and logged uniformly.
+        const _bgAllowedNouns = expansionNounGuard(query);
+        const _bgCandidates = uniqueQueries([
           ...buildExpansionVariants(query),
           ...buildSearchIntentLadder(query, { broad: true }).slice(0, 3),
-        ]).filter(q => q !== query).slice(0, 6);
+        ]).filter(q => q !== query);
+
+        const _bgVariants = [];
+        for (const v of _bgCandidates) {
+          if (!variantPreservesProductNoun(v, _bgAllowedNouns)) {
+            console.log("🚫 BACKGROUND_EXPANSION_VARIANT_REJECTED", {
+              query, variant: v, reason: "missing_product_noun",
+            });
+            continue;
+          }
+          _bgVariants.push(v);
+          if (_bgVariants.length >= 6) break;
+        }
 
         console.log("🔍 BACKGROUND_RETRIEVAL_EXPANSION_START", {
           scanId, query,
@@ -23582,6 +23674,7 @@ app.post("/market/search/stream", async (req, res) => {
           let _bgAccumulated = [];
           let _bgRelFinal    = _bgRelevant;
           let _bgGroupsFinal = _bgSrcGroups;
+          let _bgUrlDropped  = 0;
 
           for (const q of _bgVariants) {
             if (Date.now() - _bgT0 > BACKGROUND_RETRIEVAL_EXPANSION_MS) break;
@@ -23594,7 +23687,18 @@ app.post("/market/search/stream", async (req, res) => {
 
             const _qFiltered = _qResults
               .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
-              .filter(it => !isBadListing(it.title, query));
+              .filter(it => !isBadListing(it.title, query))
+              .filter(it => {
+                // URL validation mirrors the main merge pipeline: reject
+                // search pages, redirect wrappers, and category URLs so
+                // background expansion never reintroduces invalid product
+                // links. Canonical URL is stamped back onto the item.
+                const clean = sanitizeListingUrl(it);
+                if (!clean) { _bgUrlDropped++; return false; }
+                it.directUrl = clean;
+                it.link      = clean;
+                return true;
+              });
 
             _bgAccumulated.push(..._qFiltered);
 
@@ -23617,6 +23721,12 @@ app.post("/market/search/stream", async (req, res) => {
           const _bgFiltered    = _bgAccumulated;
           const _bgPool        = dedupeSmart([...enrichedItems, ..._bgFiltered]);
           const _bgDurationMs  = Date.now() - _bgT0;
+
+          if (_bgUrlDropped > 0) {
+            console.log("🔗 BACKGROUND_EXPANSION_URL_DROPPED", {
+              scanId, count: _bgUrlDropped,
+            });
+          }
 
           if (_bgFiltered.length > 0 && !clientClosed) {
 
