@@ -56,8 +56,20 @@ function outcomePath(scanId) {
 }
 
 function numOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+// Merge numeric field while treating "" / undefined as "no change."
+// Plain null in the new payload still preserves existing — only an
+// explicit finite number overwrites. This stops form-field clears
+// (which submit empty strings) from erasing previously captured prices.
+function pickNumeric(newVal, oldVal) {
+  if (newVal === undefined || newVal === null || newVal === "") {
+    return numOrNull(oldVal);
+  }
+  return numOrNull(newVal);
 }
 
 function computeRealized(outcome = {}) {
@@ -204,16 +216,12 @@ export async function recordOutcome(scanId, outcome = {}) {
       typeof outcome.sold === "boolean"
         ? outcome.sold
         : existing.sold ?? null,
-    actualBuyPrice: numOrNull(
-      outcome.actualBuyPrice ?? existing.actualBuyPrice
-    ),
-    actualSellPrice: numOrNull(
-      outcome.actualSellPrice ?? existing.actualSellPrice
-    ),
-    actualFees: numOrNull(outcome.actualFees ?? existing.actualFees),
-    shippingCost: numOrNull(outcome.shippingCost ?? existing.shippingCost),
-    daysToSell: numOrNull(outcome.daysToSell ?? existing.daysToSell),
-    listingPrice: numOrNull(outcome.listingPrice ?? existing.listingPrice),
+    actualBuyPrice: pickNumeric(outcome.actualBuyPrice, existing.actualBuyPrice),
+    actualSellPrice: pickNumeric(outcome.actualSellPrice, existing.actualSellPrice),
+    actualFees: pickNumeric(outcome.actualFees, existing.actualFees),
+    shippingCost: pickNumeric(outcome.shippingCost, existing.shippingCost),
+    daysToSell: pickNumeric(outcome.daysToSell, existing.daysToSell),
+    listingPrice: pickNumeric(outcome.listingPrice, existing.listingPrice),
     listedAt: outcome.listedAt || existing.listedAt || null,
     soldAt: outcome.soldAt || existing.soldAt || null,
     salePlatform: outcome.salePlatform || existing.salePlatform || null,
@@ -272,13 +280,12 @@ export async function computeOutcomeMetrics(userId) {
   let daysToSellCount = 0;
 
   for (const o of outcomes) {
+    // Use numOrNull, not Number.isFinite(Number(v)), because Number(null) === 0
+    // is finite — that would inflate counts and treat null profit as zero.
+    const realized = numOrNull(o.realizedProfit);
     if (o.sold === true) {
       soldCount++;
-      if (Number.isFinite(Number(o.realizedProfit))) {
-        const p = Number(o.realizedProfit);
-        if (p > 0) profitableCount++;
-      }
-      // days to sell: explicit field or derived from timestamps
+      if (realized != null && realized > 0) profitableCount++;
       const explicit = numOrNull(o.daysToSell);
       if (explicit != null) {
         daysToSellSum += explicit;
@@ -292,12 +299,13 @@ export async function computeOutcomeMetrics(userId) {
         }
       }
     }
-    if (Number.isFinite(Number(o.realizedProfit))) {
-      totalProfit += Number(o.realizedProfit);
+    if (realized != null) {
+      totalProfit += realized;
     }
     const pe = o.predictionError || {};
-    if (Number.isFinite(Number(pe.profitError))) {
-      profitErrorAbsSum += Math.abs(Number(pe.profitError));
+    const profitErr = numOrNull(pe.profitError);
+    if (profitErr != null) {
+      profitErrorAbsSum += Math.abs(profitErr);
       profitErrorCount++;
     }
     if (typeof pe.directionCorrect === "boolean") {

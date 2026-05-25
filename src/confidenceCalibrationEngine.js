@@ -32,8 +32,10 @@ const MIN_COUNT_FOR_ADJUSTMENT = 10;
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function bucketConfidence(confidence) {
-  const c = Number(confidence);
-  if (!Number.isFinite(c)) return "unknown";
+  // numOrNull, not Number(): Number(null) === 0 would silently bucket
+  // missing-confidence predictions as "0-20" and pollute the lowest band.
+  const c = numOrNull(confidence);
+  if (c == null) return "unknown";
   if (c < 20) return "0-20";
   if (c < 40) return "20-40";
   if (c < 60) return "40-60";
@@ -141,11 +143,13 @@ async function collectUsableRows(userId) {
     const prediction = await getPredictionSnapshot(o.scanId);
     if (!prediction) continue;
 
+    // numOrNull, not Number.isFinite(Number(v)): Number(null) === 0 is finite,
+    // so the old form admitted unsold/no-signal rows and inflated usableOutcomes.
     const hasPredictionError =
       o.predictionError &&
-      (Number.isFinite(Number(o.predictionError.profitError)) ||
+      (numOrNull(o.predictionError.profitError) != null ||
         typeof o.predictionError.directionCorrect === "boolean");
-    const hasRealizedProfit = Number.isFinite(Number(o.realizedProfit));
+    const hasRealizedProfit = numOrNull(o.realizedProfit) != null;
     if (!hasPredictionError && !hasRealizedProfit) continue;
 
     rows.push({ prediction, outcome: o });

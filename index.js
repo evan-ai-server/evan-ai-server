@@ -36190,7 +36190,7 @@ app.get("/api/outcomes/calibration", async (req, res) => {
   try {
     const userId = safeStr(req.query?.userId, 128) || null;
     let report = await loadLatestCalibrationReport();
-    if (!report || (userId && report.userId !== userId)) {
+    if (!report || (report.userId ?? null) !== (userId ?? null)) {
       report = await buildConfidenceCalibrationReport(userId);
       await saveCalibrationReport(report);
     }
@@ -36230,7 +36230,7 @@ app.get("/api/outcomes/market-accuracy", async (req, res) => {
   try {
     const userId = safeStr(req.query?.userId, 128) || null;
     let report = await loadLatestMarketPredictionAccuracyReport();
-    if (!report || (userId && report.userId !== userId)) {
+    if (!report || (report.userId ?? null) !== (userId ?? null)) {
       report = await buildMarketPredictionAccuracyReport(userId);
       await saveMarketPredictionAccuracyReport(report);
     }

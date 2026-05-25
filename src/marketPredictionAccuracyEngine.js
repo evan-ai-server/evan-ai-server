@@ -119,10 +119,13 @@ function summarizePriceRows(rows = []) {
 }
 
 function summarizeProfitRows(rows = []) {
+  // Drop the inner Number(): Number(null) === 0 is finite, which would
+  // otherwise let rows with null predicted/realized profit pass and contribute
+  // synthetic zero errors to the profit accuracy averages.
   const usable = rows.filter(
     (r) =>
-      Number.isFinite(Number(r.predictedProfit)) &&
-      Number.isFinite(Number(r.realizedProfit))
+      Number.isFinite(r.predictedProfit) &&
+      Number.isFinite(r.realizedProfit)
   );
 
   if (!usable.length) {
