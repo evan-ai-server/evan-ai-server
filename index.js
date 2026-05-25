@@ -10550,15 +10550,15 @@ function buildExpansionVariants(query) {
 
 async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
 
-  // Budget: SerpAPI Wave 1 typically returns in 1–2s, but the merge pipeline
-  // (relevance + outlier trim + sort) adds another 100–600ms, and eyewear/
-  // apparel queries trigger a sequential Etsy lane. The 3.5s budget was too
-  // tight for those — real SERP results arrived in time but the merge step
-  // pushed past timeout, dropping all data on the floor. 6s is the lean-but-
-  // -accurate target. Partial results are buffered so they're never lost.
+  // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
+  // A 6s kill timer added ~1.5s of dead wait after SerpAPI either landed or
+  // timed out. 4.5s matches the SerpAPI lane budget so the kill fires exactly
+  // when the last possible SERP response would arrive. Partial results are
+  // buffered reactively (each Tier B promise pushes into _tierBAccum as it
+  // resolves) so the kill never returns [] when real data exists.
   const _partialBudget = { items: [] };
   const killTimer = new Promise((resolve) =>
-    setTimeout(() => resolve("__timeout__"), Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 6000))
+    setTimeout(() => resolve("__timeout__"), Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500))
   );
 
   const worker = (async () => {
@@ -11544,11 +11544,18 @@ return merged;
 
 return Promise.race([worker, killTimer]).then((r) => {
   if (r === "__timeout__") {
-    const budgetMs = Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 6000);
+    const budgetMs = Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500);
     const rescued = Array.isArray(_partialBudget.items) ? _partialBudget.items : [];
-    console.warn(
-      `⚡ MARKET SEARCH TIMEOUT (${(budgetMs / 1000).toFixed(1)}s) — returning ${rescued.length} partial items`
+    const tierBCount = (
+      (_tierBAccum?.amazon?.length ?? 0) +
+      (_tierBAccum?.resale?.length ?? 0) +
+      (_tierBAccum?.shop?.length ?? 0)
     );
+    console.warn("MARKETPLACE_PHASE1_TIMEOUT", {
+      timeoutMs:     budgetMs,
+      partialCount:  rescued.length,
+      tierBAccumCount: tierBCount,
+    });
     return rescued;
   }
   return r;
@@ -23068,7 +23075,7 @@ app.post("/market/search/stream", async (req, res) => {
     ]);
 
     // ── Helper: assemble trusted profit intel + response payload ─────────
-    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence } = {}) => {
+    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false } = {}) => {
       // ── Phase 3 instrumentation: timestamp every major stage so the
       // 10s gap between phase1_done and scan_response becomes visible.
       // Format: BUILD_STAGE { scanId, kind, stage, ms } — grep-friendly.
@@ -23083,6 +23090,10 @@ app.post("/market/search/stream", async (req, res) => {
       // both ship the initial verdict to the UI. Skip the SerpAPI-bound premium
       // builders so the first result lands fast; live_refresh runs the full
       // path right after and hits the SWR cache populated in the background.
+      // deferEnrichments extends the lite gate to the live_refresh complete path:
+      // premiumPrices, regionalPricing, and priceFloor are skipped so complete
+      // fires ~1-1.5s sooner. The frontend closes the SSE connection on complete
+      // so background_refresh would never reach the client anyway.
       const _isLite =
         kind === "provisional" ||
         kind === "fast_provisional" ||
@@ -23096,7 +23107,7 @@ app.post("/market/search/stream", async (req, res) => {
         categoryPrior:    _categoryPrior,
         retrievalMeta: { source, kind },
         persistSnapshot: !isOracleOnly,
-        lite:             _isLite,
+        lite:             _isLite || deferEnrichments,
       });
       _bp_log("buildMarketSearchResponsePayload", _t_buildResp);
       try {
@@ -23557,9 +23568,10 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _tFinalBuild = Date.now();
     const finalPayload = await _buildPayload(enrichedItems, {
-      source:       _oracleOnlyResult ? "gpt_oracle"  : "live_market",
-      kind:         _oracleOnlyResult ? "oracle"       : "live_refresh",
-      isOracleOnly: _oracleOnlyResult,
+      source:            _oracleOnlyResult ? "gpt_oracle" : "live_market",
+      kind:              _oracleOnlyResult ? "oracle"      : "live_refresh",
+      isOracleOnly:      _oracleOnlyResult,
+      deferEnrichments:  true,
     }).catch(() => ({ items: [], query, searchedQueries: searchedQueries || [query] }));
 
     if (_ebaySoldComps) finalPayload.ebaySoldComps = _ebaySoldComps;
@@ -23600,6 +23612,38 @@ app.post("/market/search/stream", async (req, res) => {
       verdictChanged: _diff.verdictChanged, oracleContributed: _oracleContributed,
       degraded: _degraded, totalMs: _totalMs,
     });
+
+    // One structured log per scan — grep-friendly critical path breakdown.
+    console.log("SCAN_CRITICAL_PATH_TIMING", {
+      scanId,
+      marketPhase1Ms:          _phase1Ms,
+      marketPhase2Ms:          _phase2Ms,
+      oracleMs:                _oracleMs ?? null,
+      payloadBuildMs:          Date.now() - _tFinalBuild,
+      totalMs:                 _totalMs,
+      itemCount:               enrichedItems.length,
+      oracleInvoked:           needsOracle,
+      earlyProvisionalSent:    _earlyProvSent,
+      degraded:                _degraded,
+    });
+
+    // Enrichments (premiumPrices, regionalPricing, priceFloor) were deferred
+    // from this complete event. The frontend closes the SSE connection on
+    // complete so background_refresh would never arrive — skip computation.
+    console.log("BACKGROUND_ENRICHMENT_DEFERRED", {
+      scanId,
+      fields: ["premiumPrices", "regionalPricing", "priceFloor"],
+    });
+    console.log("BACKGROUND_ENRICHMENT_READY", {
+      scanId,
+      durationMs:          0,
+      hasPremiumPrices:    false,
+      hasRegionalPricing:  false,
+      hasPriceFloor:       false,
+      refreshSent:         false,
+      skipped:             "client_closes_on_complete",
+    });
+
     harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
 
     // ── Outcome flywheel: record immutable prediction snapshot ────────────────
