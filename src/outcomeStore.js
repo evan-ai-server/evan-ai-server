@@ -22,9 +22,15 @@ async function ensureDir(dir) {
 }
 
 function safeId(id = "") {
-  return String(id || "")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .slice(0, 120);
+  const cleaned = String(id || "").replace(/[^a-zA-Z0-9._-]/g, "_");
+  // Backward-compatible: any id that already fits returns unchanged so
+  // existing files on disk keep resolving to the same path.
+  if (cleaned.length <= 120) return cleaned;
+  // For long ids, keep a recognizable prefix + short hash of the full
+  // cleaned id so two long ids sharing the first 120 chars don't collide
+  // and silently overwrite each other's snapshot or outcome file.
+  const hash = crypto.createHash("sha1").update(cleaned).digest("hex").slice(0, 12);
+  return `${cleaned.slice(0, 100)}.${hash}`;
 }
 
 function nowIso() {
@@ -114,15 +120,27 @@ function computePredictionError(prediction = {}, outcome = {}) {
       ? Number((profitError / realizedProfit).toFixed(4))
       : null;
 
+  // Direction correctness only applies when the verdict made an explicit
+  // directional bet. BUY-leaning predicts profitable; PASS-leaning predicts
+  // not profitable. HOLD (and any unknown verdict) is an explicit
+  // "uncertain / no call" — counting it as either direction would inflate
+  // or deflate accuracy depending on how the item happened to play out.
   const verdictUpper = String(prediction.verdict || "").toUpperCase();
-  const predictedPositive =
+  const isPositive =
     verdictUpper === "BUY" ||
     verdictUpper.includes("GOOD") ||
     verdictUpper.includes("FLIP");
+  const isNegative =
+    verdictUpper === "PASS" ||
+    verdictUpper.includes("AVOID") ||
+    verdictUpper.includes("BAD");
   const actuallyProfitable =
     realizedProfit != null ? realizedProfit > 0 : null;
-  const directionCorrect =
-    actuallyProfitable == null ? null : predictedPositive === actuallyProfitable;
+  let directionCorrect = null;
+  if (actuallyProfitable != null) {
+    if (isPositive) directionCorrect = actuallyProfitable === true;
+    else if (isNegative) directionCorrect = actuallyProfitable === false;
+  }
 
   return {
     resalePriceError,

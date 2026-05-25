@@ -186,8 +186,16 @@ function sourceDepthKey(prediction = {}) {
   return "unknown";
 }
 
+// Minimum sold-outcome counts before we treat statistical claims as load-
+// bearing. Below MIN_SAMPLES_FOR_BIAS we don't claim a directional bias from
+// the over/under rates; below MIN_SAMPLES_FOR_BUCKET we don't issue
+// source-depth recommendations sourced from one or two rows.
+const MIN_SAMPLES_FOR_BIAS = 5;
+const MIN_SAMPLES_FOR_BUCKET = 5;
+
 function computePricingBias(globalStats) {
   if (!globalStats || !globalStats.count) return "unknown";
+  if (globalStats.count < MIN_SAMPLES_FOR_BIAS) return "insufficient_data";
   const over = globalStats.overestimateRate ?? 0;
   const under = globalStats.underestimateRate ?? 0;
   if (over - under >= 0.15) return "overestimating";
@@ -197,9 +205,16 @@ function computePricingBias(globalStats) {
 
 function recommendationFromReport(report) {
   const recs = [];
-  if (!report.usableOutcomes) {
+  const usable = Number(report.usableOutcomes) || 0;
+  if (!usable) {
     recs.push(
       "Collect more sold outcomes before changing market prediction behavior."
+    );
+    return recs;
+  }
+  if (usable < MIN_SAMPLES_FOR_BIAS) {
+    recs.push(
+      `Only ${usable} sold outcome${usable === 1 ? "" : "s"} on file — treat market accuracy metrics as preliminary until at least ${MIN_SAMPLES_FOR_BIAS} are collected.`
     );
     return recs;
   }
@@ -221,17 +236,21 @@ function recommendationFromReport(report) {
       "Evan is underestimating resale prices more often than overestimating; investigate missed upside in strong categories."
     );
   }
+  const singleSource = report.bySourceDepth?.singleSource;
   if (
-    report.bySourceDepth?.singleSource?.marketAccuracyScore != null &&
-    report.bySourceDepth.singleSource.marketAccuracyScore < 0.75
+    singleSource?.marketAccuracyScore != null &&
+    singleSource.marketAccuracyScore < 0.75 &&
+    (singleSource.count ?? 0) >= MIN_SAMPLES_FOR_BUCKET
   ) {
     recs.push(
       "Single-source market evidence has weak pricing accuracy; continue capping confidence when source diversity is low."
     );
   }
+  const thinListings = report.bySourceDepth?.thinListings;
   if (
-    report.bySourceDepth?.thinListings?.marketAccuracyScore != null &&
-    report.bySourceDepth.thinListings.marketAccuracyScore < 0.75
+    thinListings?.marketAccuracyScore != null &&
+    thinListings.marketAccuracyScore < 0.75 &&
+    (thinListings.count ?? 0) >= MIN_SAMPLES_FOR_BUCKET
   ) {
     recs.push(
       "Thin listing sets produce weaker pricing accuracy; keep retrieval expansion and minimum listing depth gates active."

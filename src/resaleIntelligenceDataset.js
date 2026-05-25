@@ -431,9 +431,11 @@ function buildDataQuality({
   outcomes,
   records,
   missingPredictionCount,
-  calibrationReport,
-  marketAccuracyReport,
 }) {
+  // Count records that actually received a non-"unknown" label, not just
+  // records that lived through a build where some report existed — the old
+  // form claimed full label coverage even when every record resolved to
+  // "unknown" (e.g., empty calibration buckets or unsold rows).
   return {
     missingPredictionCount,
     missingOutcomeCount: 0,
@@ -441,8 +443,12 @@ function buildDataQuality({
     unsoldRecordCount: records.filter((r) => r.sold !== true).length,
     recordsWithProfit: records.filter((r) => r.realizedProfit != null).length,
     recordsWithPriceAccuracy: records.filter((r) => r.percentPriceError != null).length,
-    recordsWithCalibration: calibrationReport ? records.length : 0,
-    recordsWithMarketAccuracy: marketAccuracyReport ? records.length : 0,
+    recordsWithCalibration: records.filter(
+      (r) => r.confidenceCalibrationLabel && r.confidenceCalibrationLabel !== "unknown"
+    ).length,
+    recordsWithMarketAccuracy: records.filter(
+      (r) => r.marketAccuracyLabel && r.marketAccuracyLabel !== "unknown"
+    ).length,
     rawOutcomeCount: outcomes.length,
   };
 }
@@ -553,8 +559,6 @@ export async function buildResaleIntelligenceDataset(userId = null) {
       outcomes,
       records,
       missingPredictionCount,
-      calibrationReport,
-      marketAccuracyReport,
     }),
   };
 }
