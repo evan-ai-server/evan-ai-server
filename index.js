@@ -283,6 +283,12 @@ import {
   } from "./src/marketPredictionAccuracyEngine.js";
 
   import {
+    buildResaleIntelligenceDataset,
+    saveResaleIntelligenceDataset,
+    loadLatestResaleIntelligenceDataset,
+  } from "./src/resaleIntelligenceDataset.js";
+
+  import {
     buildArbitrageIntelPayload,
     detectPlatformArbitrage,
     detectBuyOpportunity,
@@ -36265,6 +36271,88 @@ app.post("/api/outcomes/market-accuracy/rebuild", async (req, res) => {
     return res
       .status(500)
       .json({ ok: false, error: "market_accuracy_rebuild_failed" });
+  }
+});
+
+// Phase 4 — Resale intelligence dataset.
+// These routes MUST come before /api/outcomes/:scanId so "dataset" and
+// "dataset/summary" aren't swallowed as scanId params.
+app.get("/api/outcomes/dataset/summary", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let dataset = await loadLatestResaleIntelligenceDataset();
+    if (!dataset || (userId && dataset.userId !== userId)) {
+      dataset = await buildResaleIntelligenceDataset(userId);
+      await saveResaleIntelligenceDataset(dataset);
+    }
+    const summary = {
+      userId: dataset.userId || null,
+      generatedAt: dataset.generatedAt,
+      totalOutcomes: dataset.totalOutcomes,
+      usableRecords: dataset.usableRecords,
+      soldRecordCount: dataset.dataQuality?.soldRecordCount ?? 0,
+      recordsWithProfit: dataset.dataQuality?.recordsWithProfit ?? 0,
+      recordsWithPriceAccuracy: dataset.dataQuality?.recordsWithPriceAccuracy ?? 0,
+      bestCategories: dataset.insights?.bestCategories ?? [],
+      worstCategories: dataset.insights?.worstCategories ?? [],
+      bestPlatforms: dataset.insights?.bestPlatforms ?? [],
+      mostReliableVerdicts: dataset.insights?.mostReliableVerdicts ?? [],
+    };
+    console.log("📊 RESALE_DATASET_SUMMARY_READ", {
+      userId,
+      usableRecords: summary.usableRecords,
+      soldRecordCount: summary.soldRecordCount,
+    });
+    return res.json({ ok: true, summary });
+  } catch (e) {
+    console.warn("⚠️ resale_dataset_summary_failed", {
+      error: e?.message || String(e),
+    });
+    return res.status(500).json({ ok: false, error: "resale_dataset_summary_failed" });
+  }
+});
+
+app.get("/api/outcomes/dataset", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let dataset = await loadLatestResaleIntelligenceDataset();
+    if (!dataset || (userId && dataset.userId !== userId)) {
+      dataset = await buildResaleIntelligenceDataset(userId);
+      await saveResaleIntelligenceDataset(dataset);
+    }
+    console.log("📊 RESALE_DATASET_READ", {
+      userId,
+      usableRecords: dataset?.usableRecords ?? 0,
+      totalOutcomes: dataset?.totalOutcomes ?? 0,
+      soldRecordCount: dataset?.dataQuality?.soldRecordCount ?? 0,
+    });
+    return res.json({ ok: true, dataset });
+  } catch (e) {
+    console.warn("⚠️ resale_dataset_read_failed", {
+      error: e?.message || String(e),
+    });
+    return res.status(500).json({ ok: false, error: "resale_dataset_read_failed" });
+  }
+});
+
+app.post("/api/outcomes/dataset/rebuild", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId || req.query?.userId, 128) || null;
+    const dataset = await buildResaleIntelligenceDataset(userId);
+    await saveResaleIntelligenceDataset(dataset);
+    console.log("📊 RESALE_DATASET_BUILT", {
+      userId,
+      usableRecords: dataset?.usableRecords ?? 0,
+      totalOutcomes: dataset?.totalOutcomes ?? 0,
+      soldRecordCount: dataset?.dataQuality?.soldRecordCount ?? 0,
+      recordsWithProfit: dataset?.dataQuality?.recordsWithProfit ?? 0,
+    });
+    return res.json({ ok: true, dataset });
+  } catch (e) {
+    console.warn("⚠️ resale_dataset_rebuild_failed", {
+      error: e?.message || String(e),
+    });
+    return res.status(500).json({ ok: false, error: "resale_dataset_rebuild_failed" });
   }
 });
 
