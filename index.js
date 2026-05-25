@@ -277,6 +277,12 @@ import {
   } from "./src/confidenceCalibrationEngine.js";
 
   import {
+    buildMarketPredictionAccuracyReport,
+    saveMarketPredictionAccuracyReport,
+    loadLatestMarketPredictionAccuracyReport,
+  } from "./src/marketPredictionAccuracyEngine.js";
+
+  import {
     buildArbitrageIntelPayload,
     detectPlatformArbitrage,
     detectBuyOpportunity,
@@ -36208,6 +36214,57 @@ app.post("/api/outcomes/calibration/rebuild", async (req, res) => {
   } catch (e) {
     console.warn("⚠️ calibration_rebuild_failed", { error: e?.message || String(e) });
     return res.status(500).json({ ok: false, error: "calibration_rebuild_failed" });
+  }
+});
+
+// Phase 3 — Market prediction accuracy.
+// These routes MUST come before /api/outcomes/:scanId so "market-accuracy"
+// isn't swallowed as a scanId param.
+app.get("/api/outcomes/market-accuracy", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let report = await loadLatestMarketPredictionAccuracyReport();
+    if (!report || (userId && report.userId !== userId)) {
+      report = await buildMarketPredictionAccuracyReport(userId);
+      await saveMarketPredictionAccuracyReport(report);
+    }
+    console.log("📊 MARKET_ACCURACY_READ", {
+      userId,
+      usableOutcomes: report?.usableOutcomes ?? 0,
+      marketAccuracyScore: report?.global?.marketAccuracyScore ?? null,
+      pricingBias: report?.pricingBias ?? "unknown",
+    });
+    return res.json({ ok: true, report });
+  } catch (e) {
+    console.warn("⚠️ market_accuracy_read_failed", {
+      error: e?.message || String(e),
+    });
+    return res
+      .status(500)
+      .json({ ok: false, error: "market_accuracy_read_failed" });
+  }
+});
+
+app.post("/api/outcomes/market-accuracy/rebuild", async (req, res) => {
+  try {
+    const userId =
+      safeStr(req.body?.userId || req.query?.userId, 128) || null;
+    const report = await buildMarketPredictionAccuracyReport(userId);
+    await saveMarketPredictionAccuracyReport(report);
+    console.log("📊 MARKET_ACCURACY_BUILT", {
+      userId,
+      usableOutcomes: report?.usableOutcomes ?? 0,
+      marketAccuracyScore: report?.global?.marketAccuracyScore ?? null,
+      pricingBias: report?.pricingBias ?? "unknown",
+    });
+    return res.json({ ok: true, report });
+  } catch (e) {
+    console.warn("⚠️ market_accuracy_rebuild_failed", {
+      error: e?.message || String(e),
+    });
+    return res
+      .status(500)
+      .json({ ok: false, error: "market_accuracy_rebuild_failed" });
   }
 });
 
