@@ -271,6 +271,12 @@ import {
   } from "./src/outcomeStore.js";
 
   import {
+    buildConfidenceCalibrationReport,
+    saveCalibrationReport,
+    loadLatestCalibrationReport,
+  } from "./src/confidenceCalibrationEngine.js";
+
+  import {
     buildArbitrageIntelPayload,
     detectPlatformArbitrage,
     detectBuyOpportunity,
@@ -36052,6 +36058,46 @@ app.get("/api/outcomes", async (req, res) => {
     return res.json({ ok: true, userId, outcomes });
   } catch (e) {
     return res.status(500).json({ ok: false, error: "outcome_list_failed" });
+  }
+});
+
+// Phase 2 — Confidence calibration.
+// These routes MUST come before /api/outcomes/:scanId so "calibration" isn't
+// swallowed as a scanId param.
+app.get("/api/outcomes/calibration", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let report = await loadLatestCalibrationReport();
+    if (!report || (userId && report.userId !== userId)) {
+      report = await buildConfidenceCalibrationReport(userId);
+      await saveCalibrationReport(report);
+    }
+    console.log("📐 CONFIDENCE_CALIBRATION_READ", {
+      userId,
+      usableOutcomes: report?.usableOutcomes ?? 0,
+    });
+    return res.json({ ok: true, report });
+  } catch (e) {
+    console.warn("⚠️ calibration_read_failed", { error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "calibration_read_failed" });
+  }
+});
+
+app.post("/api/outcomes/calibration/rebuild", async (req, res) => {
+  try {
+    const userId =
+      safeStr(req.body?.userId || req.query?.userId, 128) || null;
+    const report = await buildConfidenceCalibrationReport(userId);
+    await saveCalibrationReport(report);
+    console.log("📐 CONFIDENCE_CALIBRATION_BUILT", {
+      userId,
+      usableOutcomes:    report?.usableOutcomes ?? 0,
+      calibrationScore:  report?.calibrationScore ?? null,
+    });
+    return res.json({ ok: true, report });
+  } catch (e) {
+    console.warn("⚠️ calibration_rebuild_failed", { error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "calibration_rebuild_failed" });
   }
 });
 
