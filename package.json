@@ -9,7 +9,8 @@
     "test": "node --test shared/",
     "bench": "node bench/run.js",
     "bench:save": "node bench/run.js --save",
-    "smoke": "node bench/vision-smoke.js"
+    "smoke": "node bench/vision-smoke.js",
+    "flywheel:rebuild": "node tools/rebuildDataFlywheel.js"
   },
   "overrides": {
     "sharp": "^0.34.5"

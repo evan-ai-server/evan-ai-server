@@ -289,6 +289,12 @@ import {
   } from "./src/resaleIntelligenceDataset.js";
 
   import {
+    rebuildDataFlywheel,
+    loadLatestIterationHealth,
+    loadLatestRegressionSnapshot,
+  } from "./src/iterationSpeedEngine.js";
+
+  import {
     buildArbitrageIntelPayload,
     detectPlatformArbitrage,
     detectBuyOpportunity,
@@ -36353,6 +36359,88 @@ app.post("/api/outcomes/dataset/rebuild", async (req, res) => {
       error: e?.message || String(e),
     });
     return res.status(500).json({ ok: false, error: "resale_dataset_rebuild_failed" });
+  }
+});
+
+// These routes MUST come before /api/outcomes/:scanId so "iteration" isn't
+// swallowed as a scanId param.
+app.post("/api/outcomes/iteration/rebuild", async (req, res) => {
+  try {
+    const userId = safeStr(req.body?.userId || req.query?.userId, 128) || null;
+    const result = await rebuildDataFlywheel(userId);
+    console.log("📊 DATA_FLYWHEEL_REBUILT", {
+      userId,
+      durationMs: result.durationMs,
+      status: result.health?.status,
+      score: result.health?.score,
+      totalOutcomes: result.phases?.outcomes?.totalOutcomes ?? 0,
+      soldCount: result.phases?.outcomes?.soldCount ?? 0,
+      usableRecords: result.phases?.dataset?.usableRecords ?? 0,
+    });
+    if (result.regressionComparison?.compared) {
+      console.log("📊 DATA_FLYWHEEL_REGRESSION_COMPARISON", {
+        userId,
+        compared: true,
+        regressions: result.regressionComparison.regressions,
+        improvements: result.regressionComparison.improvements,
+      });
+    }
+    return res.json(result);
+  } catch (e) {
+    console.warn("⚠️ data_flywheel_rebuild_failed", { error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "data_flywheel_rebuild_failed" });
+  }
+});
+
+app.get("/api/outcomes/iteration/health", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let health = await loadLatestIterationHealth();
+    if (
+      !health ||
+      req.query?.rebuild === "true" ||
+      (health.userId ?? null) !== (userId ?? null)
+    ) {
+      const result = await rebuildDataFlywheel(userId);
+      health = result.health;
+    }
+    console.log("📊 DATA_FLYWHEEL_HEALTH_READ", {
+      userId,
+      status: health?.status,
+      score: health?.score,
+      warningCount: Array.isArray(health?.warnings) ? health.warnings.length : 0,
+      blockerCount: Array.isArray(health?.blockers) ? health.blockers.length : 0,
+    });
+    return res.json({ ok: true, userId, health });
+  } catch (e) {
+    console.warn("⚠️ data_flywheel_health_failed", { error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "data_flywheel_health_failed" });
+  }
+});
+
+app.get("/api/outcomes/iteration/regression", async (req, res) => {
+  try {
+    const userId = safeStr(req.query?.userId, 128) || null;
+    let snapshot = await loadLatestRegressionSnapshot();
+    if (
+      !snapshot ||
+      req.query?.rebuild === "true" ||
+      (snapshot.userId ?? null) !== (userId ?? null)
+    ) {
+      const result = await rebuildDataFlywheel(userId);
+      snapshot = result.regressionSnapshot;
+    }
+    console.log("📊 DATA_FLYWHEEL_REGRESSION_READ", {
+      userId,
+      totalOutcomes: snapshot?.metrics?.totalOutcomes ?? 0,
+      soldCount: snapshot?.metrics?.soldCount ?? 0,
+      usableRecords: snapshot?.dataset?.usableRecords ?? 0,
+      status: snapshot?.health?.status,
+    });
+    return res.json({ ok: true, userId, snapshot });
+  } catch (e) {
+    console.warn("⚠️ data_flywheel_regression_failed", { error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: "data_flywheel_regression_failed" });
   }
 });
 
