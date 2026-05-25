@@ -36281,7 +36281,7 @@ app.get("/api/outcomes/dataset/summary", async (req, res) => {
   try {
     const userId = safeStr(req.query?.userId, 128) || null;
     let dataset = await loadLatestResaleIntelligenceDataset();
-    if (!dataset || (userId && dataset.userId !== userId)) {
+    if (!dataset || (dataset.userId ?? null) !== (userId ?? null)) {
       dataset = await buildResaleIntelligenceDataset(userId);
       await saveResaleIntelligenceDataset(dataset);
     }
@@ -36316,7 +36316,7 @@ app.get("/api/outcomes/dataset", async (req, res) => {
   try {
     const userId = safeStr(req.query?.userId, 128) || null;
     let dataset = await loadLatestResaleIntelligenceDataset();
-    if (!dataset || (userId && dataset.userId !== userId)) {
+    if (!dataset || (dataset.userId ?? null) !== (userId ?? null)) {
       dataset = await buildResaleIntelligenceDataset(userId);
       await saveResaleIntelligenceDataset(dataset);
     }

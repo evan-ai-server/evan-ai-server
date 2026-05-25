@@ -376,20 +376,22 @@ function buildInsights(aggregates = {}) {
     .map(([sourceDepth, stats]) => ({ sourceDepth, ...stats }))
     .filter((x) => x.count > 0 && x.directionAccuracy != null);
 
-  const bestCategories = [...categoryRows]
-    .sort(
-      (a, b) =>
-        (b.averageRealizedProfit ?? -Infinity) -
-        (a.averageRealizedProfit ?? -Infinity)
-    )
+  // Only rank categories/platforms that have at least one realized-profit
+  // datapoint. Otherwise nulls coerced to ±Infinity dominate the rankings
+  // and a single sold record can outrank fully-unknown groups.
+  const rankableCategoryRows = categoryRows.filter(
+    (x) => x.averageRealizedProfit != null
+  );
+  const rankablePlatformRows = platformRows.filter(
+    (x) => x.averageRealizedProfit != null && x.platform !== "unknown"
+  );
+
+  const bestCategories = [...rankableCategoryRows]
+    .sort((a, b) => b.averageRealizedProfit - a.averageRealizedProfit)
     .slice(0, 5);
 
-  const worstCategories = [...categoryRows]
-    .sort(
-      (a, b) =>
-        (a.averageRealizedProfit ?? Infinity) -
-        (b.averageRealizedProfit ?? Infinity)
-    )
+  const worstCategories = [...rankableCategoryRows]
+    .sort((a, b) => a.averageRealizedProfit - b.averageRealizedProfit)
     .slice(0, 5);
 
   const highestErrorCategories = [...categoryRows]
@@ -397,12 +399,8 @@ function buildInsights(aggregates = {}) {
     .sort((a, b) => b.averagePercentPriceError - a.averagePercentPriceError)
     .slice(0, 5);
 
-  const bestPlatforms = [...platformRows]
-    .sort(
-      (a, b) =>
-        (b.averageRealizedProfit ?? -Infinity) -
-        (a.averageRealizedProfit ?? -Infinity)
-    )
+  const bestPlatforms = [...rankablePlatformRows]
+    .sort((a, b) => b.averageRealizedProfit - a.averageRealizedProfit)
     .slice(0, 5);
 
   const mostReliableVerdicts = [...verdictRows]
