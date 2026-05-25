@@ -36083,10 +36083,21 @@ app.post("/api/outcomes/:scanId", async (req, res) => {
       scanId,
       userId:           outcome?.userId || null,
       bought:           outcome?.bought,
+      listed:           outcome?.listed,
       sold:             outcome?.sold,
       realizedProfit:   outcome?.realizedProfit,
       directionCorrect: outcome?.predictionError?.directionCorrect,
     });
+    if (outcome?.realizedProfit != null) {
+      console.log("📈 OUTCOME_PROFIT_COMPUTED", {
+        scanId,
+        actualBuyPrice:  outcome.actualBuyPrice,
+        actualSellPrice: outcome.actualSellPrice,
+        actualFees:      outcome.actualFees,
+        shippingCost:    outcome.shippingCost,
+        realizedProfit:  outcome.realizedProfit,
+      });
+    }
 
     return res.json({ ok: true, scanId, outcome, prediction });
   } catch (e) {

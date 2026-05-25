@@ -208,6 +208,9 @@ export async function recordOutcome(scanId, outcome = {}) {
     actualFees: numOrNull(outcome.actualFees ?? existing.actualFees),
     shippingCost: numOrNull(outcome.shippingCost ?? existing.shippingCost),
     daysToSell: numOrNull(outcome.daysToSell ?? existing.daysToSell),
+    listingPrice: numOrNull(outcome.listingPrice ?? existing.listingPrice),
+    listedAt: outcome.listedAt || existing.listedAt || null,
+    soldAt: outcome.soldAt || existing.soldAt || null,
     salePlatform: outcome.salePlatform || existing.salePlatform || null,
     userNotes: outcome.userNotes || existing.userNotes || null,
   };
@@ -260,13 +263,32 @@ export async function computeOutcomeMetrics(userId) {
   let profitErrorCount = 0;
   let directionCorrectCount = 0;
   let directionKnownCount = 0;
+  let daysToSellSum = 0;
+  let daysToSellCount = 0;
 
   for (const o of outcomes) {
-    if (o.sold === true) soldCount++;
+    if (o.sold === true) {
+      soldCount++;
+      if (Number.isFinite(Number(o.realizedProfit))) {
+        const p = Number(o.realizedProfit);
+        if (p > 0) profitableCount++;
+      }
+      // days to sell: explicit field or derived from timestamps
+      const explicit = numOrNull(o.daysToSell);
+      if (explicit != null) {
+        daysToSellSum += explicit;
+        daysToSellCount++;
+      } else if (o.listedAt && o.soldAt) {
+        const listedMs = new Date(o.listedAt).getTime();
+        const soldMs   = new Date(o.soldAt).getTime();
+        if (Number.isFinite(listedMs) && Number.isFinite(soldMs) && soldMs >= listedMs) {
+          daysToSellSum += (soldMs - listedMs) / 86_400_000;
+          daysToSellCount++;
+        }
+      }
+    }
     if (Number.isFinite(Number(o.realizedProfit))) {
-      const p = Number(o.realizedProfit);
-      totalProfit += p;
-      if (p > 0) profitableCount++;
+      totalProfit += Number(o.realizedProfit);
     }
     const pe = o.predictionError || {};
     if (Number.isFinite(Number(pe.profitError))) {
@@ -281,19 +303,33 @@ export async function computeOutcomeMetrics(userId) {
 
   return {
     userId: userId || null,
-    outcomeCount: outcomes.length,
+    totalOutcomes: outcomes.length,
+    outcomeCount:  outcomes.length,
     soldCount,
     profitableCount,
     totalProfit: Number(totalProfit.toFixed(2)),
+    totalRealizedProfit: Number(totalProfit.toFixed(2)),
     averageProfit:
       soldCount > 0 ? Number((totalProfit / soldCount).toFixed(2)) : null,
+    averageRealizedProfit:
+      soldCount > 0 ? Number((totalProfit / soldCount).toFixed(2)) : null,
+    winRate:
+      soldCount > 0 ? Number((profitableCount / soldCount).toFixed(4)) : null,
     meanAbsoluteProfitError:
+      profitErrorCount > 0
+        ? Number((profitErrorAbsSum / profitErrorCount).toFixed(2))
+        : null,
+    averagePredictionError:
       profitErrorCount > 0
         ? Number((profitErrorAbsSum / profitErrorCount).toFixed(2))
         : null,
     directionAccuracy:
       directionKnownCount > 0
         ? Number((directionCorrectCount / directionKnownCount).toFixed(4))
+        : null,
+    averageDaysToSell:
+      daysToSellCount > 0
+        ? Number((daysToSellSum / daysToSellCount).toFixed(1))
         : null,
   };
 }
