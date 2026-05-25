@@ -61,16 +61,21 @@ function numOrNull(v) {
 }
 
 function computeRealized(outcome = {}) {
+  // Only compute after a confirmed sale with a positive sell price.
+  // Bought-only records must stay null — sell=0 or missing sold flag
+  // would otherwise produce a misleadingly negative "realized" value.
+  if (outcome.sold !== true) return { realizedProfit: null, realizedMarginPct: null };
   const buy = numOrNull(outcome.actualBuyPrice);
   const sell = numOrNull(outcome.actualSellPrice);
+  if (sell == null || sell <= 0) return { realizedProfit: null, realizedMarginPct: null };
   const fees = numOrNull(outcome.actualFees) || 0;
   const shipping = numOrNull(outcome.shippingCost) || 0;
   const realizedProfit =
-    buy != null && sell != null
+    buy != null
       ? Number((sell - buy - fees - shipping).toFixed(2))
       : null;
   const realizedMarginPct =
-    realizedProfit != null && sell != null && sell > 0
+    realizedProfit != null
       ? Number((realizedProfit / sell).toFixed(4))
       : null;
   return { realizedProfit, realizedMarginPct };

@@ -36088,7 +36088,7 @@ app.post("/api/outcomes/:scanId", async (req, res) => {
       realizedProfit:   outcome?.realizedProfit,
       directionCorrect: outcome?.predictionError?.directionCorrect,
     });
-    if (outcome?.realizedProfit != null) {
+    if (outcome?.sold === true && outcome?.realizedProfit != null) {
       console.log("📈 OUTCOME_PROFIT_COMPUTED", {
         scanId,
         actualBuyPrice:  outcome.actualBuyPrice,
