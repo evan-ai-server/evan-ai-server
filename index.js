@@ -1462,13 +1462,11 @@ const ENRICH_MODEL = process.env.ENRICH_MODEL || "gpt-4.1";
 // a Hermès vs a knock-off is the kind of error that earns the slower path.
 const FAST_VISION_MODEL              = process.env.FAST_VISION_MODEL || "gpt-4.1-mini";
 const FAST_PASS_ENABLED              = String(process.env.FAST_PASS_ENABLED || "true").toLowerCase() !== "false";
-// Default bumped 3500 → 6000 → 7000ms after two rounds of live-log audit
-// (2026-05-20). gpt-4.1-mini structured JSON output with a downscaled image
-// lands at 5–7s; at 6000ms fast still aborted on most cold-cache scans. The
-// race-aware wait means visual_early no longer blocks on fast — bumping its
-// timeout adds at most some cancelled-pass cost when visual wins first, and
-// gives fast a genuine chance to win the race when it's the faster path.
-const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 7000);
+// Phase A2.5: lowered from 7000 → 3500ms. On warm OpenAI cache gpt-4.1-mini
+// lands in 1.5–3s; 3500ms caps cold-start dead-wait without hurting the
+// common warm case. When fast times out, visual_shape + master (pre-launched
+// at MASTER_LAZY_DELAY_MS) cover the cold-cache fallback path.
+const FAST_PASS_TIMEOUT_MS           = Number(process.env.FAST_PASS_TIMEOUT_MS || 3500);
 const FAST_PASS_CONFIDENCE_THRESHOLD = Number(process.env.FAST_PASS_CONFIDENCE_THRESHOLD || 0.65);
 // Visual_shape historically used VISION_MODEL (gpt-4.1) which lands at 7–11s
 // and was binding the entire scan wall time even when its result was clearly
@@ -1483,12 +1481,12 @@ const VISUAL_SHAPE_MODEL             = process.env.VISUAL_SHAPE_MODEL || "gpt-4.
 // in-flight HTTP request via externalSignal so runVisionPass returns a
 // `{cancelled:true}` stub and — critically — skips the Gemini fallback
 // (`if (process.env.GEMINI_API_KEY && !externalSignal?.aborted)` at the
-// fallback site). Without this clamp, an OpenAI 12s timeout on visual_shape
+// fallback site). Without this clamp, an OpenAI timeout on visual_shape
 // chains into a 9s Gemini retry, blowing the scan to 24s while master has
-// been ready since 8.7s (logged 2026-05-21, rid 80f970693636d85b). 7s gives
-// gpt-4.1-mini room to land on warm-cache scans without ever extending the
-// scan past master's natural landing time.
-const VISUAL_SHAPE_TIMEOUT_MS        = Number(process.env.VISUAL_SHAPE_TIMEOUT_MS || 7000);
+// been ready since 8.7s (logged 2026-05-21, rid 80f970693636d85b).
+// Phase A2.5: lowered from 7000 → 4000ms. earlyMasterTimer (1500ms) ensures
+// master is ready by ~5s on cold cache when visual times out at 4000ms.
+const VISUAL_SHAPE_TIMEOUT_MS        = Number(process.env.VISUAL_SHAPE_TIMEOUT_MS || 4000);
 // When visual_shape returns confidence >= threshold we don't wait on the
 // heavier master pass — saves ~1.5–3 s of wall time on the common case.
 // Threshold is intentionally strict (0.95) so master only short-circuits when
@@ -3225,8 +3223,14 @@ async function objectStoreReadBuffer(key) {
 // untouched when the image is already small, when the env is disabled, or when
 // sharp throws (so we never block a scan on a re-encode error).
 const VISION_MAX_EDGE_PX = Number(process.env.VISION_MAX_EDGE_PX || 800);
+// Mode-specific max-edge overrides. item/prop modes use a smaller edge —
+// 640px is enough for object identification and reduces OpenAI token count,
+// which cuts response time on warm cache. label/barcode/mark modes keep a
+// larger edge so fine text stays readable.
+const VISION_ITEM_MAX_EDGE     = Number(process.env.VISION_ITEM_MAX_EDGE || 640);
+const VISION_TEXT_MAX_EDGE     = Number(process.env.VISION_TEXT_MAX_EDGE || 800);
 const VISION_DOWNSCALE_ENABLED = String(process.env.VISION_DOWNSCALE_ENABLED || "true").toLowerCase() !== "false";
-async function prepareVisionBuffer(buffer, rid = "") {
+async function prepareVisionBuffer(buffer, rid = "", maxEdgePx = VISION_MAX_EDGE_PX) {
   if (!VISION_DOWNSCALE_ENABLED) return buffer;
   if (!Buffer.isBuffer(buffer) || buffer.length < 4000) return buffer;
   try {
@@ -3236,13 +3240,13 @@ async function prepareVisionBuffer(buffer, rid = "") {
     const w = Number(meta?.width || 0);
     const h = Number(meta?.height || 0);
     // Already small enough — skip the re-encode entirely.
-    if (w > 0 && h > 0 && Math.max(w, h) <= VISION_MAX_EDGE_PX && buffer.length <= 200_000) {
+    if (w > 0 && h > 0 && Math.max(w, h) <= maxEdgePx && buffer.length <= 200_000) {
       return buffer;
     }
     const out = await base
       .resize({
-        width:              VISION_MAX_EDGE_PX,
-        height:             VISION_MAX_EDGE_PX,
+        width:              maxEdgePx,
+        height:             maxEdgePx,
         fit:                "inside",
         withoutEnlargement: true,
       })
@@ -3254,7 +3258,7 @@ async function prepareVisionBuffer(buffer, rid = "") {
         from:     buffer.length,
         to:       out.length,
         srcDim:   w && h ? `${w}x${h}` : "?",
-        maxEdge:  VISION_MAX_EDGE_PX,
+        maxEdge:  maxEdgePx,
         savedPct: w && h ? Math.round((1 - out.length / buffer.length) * 100) : null,
       });
       return out;
@@ -16041,13 +16045,27 @@ function shouldAcceptFastVisionResult(result) {
 }
 
 async function runVisionConsensus({ req, file, mode, propContext }) {
-  // Downscale to VISION_MAX_EDGE_PX before encoding — full-res phone photos
-  // (3–8 MB) take 1–3 s longer to upload + decode at OpenAI without improving
-  // identification accuracy at this model class.
+  // Downscale before encoding. Text-sensitive modes (label/barcode/mark) keep
+  // a larger edge for legibility; item/prop use a smaller edge to reduce token
+  // count and OpenAI latency without hurting object identification.
+  const _isTextMode = ["label", "barcode", "mark"].includes(mode);
+  const _visionMaxEdge = _isTextMode ? VISION_TEXT_MAX_EDGE : VISION_ITEM_MAX_EDGE;
   const downscaleFromBytes = Buffer.isBuffer(file.buffer) ? file.buffer.length : 0;
-  const visionBuffer = await prepareVisionBuffer(file.buffer, req.rid);
+  const _vpT0 = Date.now();
+  const visionBuffer = await prepareVisionBuffer(file.buffer, req.rid, _visionMaxEdge);
+  const _vpMs = Date.now() - _vpT0;
   const downscaled = visionBuffer !== file.buffer;
   const downscaleToBytes = downscaled ? visionBuffer.length : downscaleFromBytes;
+  console.log("VISION_PREPROCESS_POLICY", {
+    rid:       req.rid,
+    mode,
+    maxEdge:   _visionMaxEdge,
+    isTextMode: _isTextMode,
+    skipped:   !downscaled,
+    fromBytes: downscaleFromBytes,
+    toBytes:   downscaleToBytes,
+    durationMs: _vpMs,
+  });
   const base64 = visionBuffer.toString("base64");
   // Always emit JPEG after downscale; original mimetype may be HEIC/PNG which
   // sharp's jpeg() encoder has converted.
@@ -16079,6 +16097,10 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   let passes;
   let passLabels;
   let visionTier = "consensus";
+  // Hoisted so visionTimings return + VISION_MASTER_POLICY log can read them
+  // regardless of which FAST_PASS_ENABLED branch runs.
+  let _visionRaceWinner = null;
+  let _visionMasterLaunched = false;
 
   if (FAST_PASS_ENABLED) {
     // fast + visual_shape start at t=0. Master is NOT started immediately —
@@ -16303,6 +16325,57 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       visualResult = await visualPromise; // already settled — instant
       fastPromise.catch(() => null);
     }
+
+    // Capture hoisted vars so visionTimings return + logs outside this block can read them.
+    _visionRaceWinner    = raceWinner;
+    _visionMasterLaunched = masterLaunched;
+
+    console.log("VISION_MASTER_POLICY", {
+      rid:              req.rid,
+      mode,
+      shouldLaunchMaster: masterLaunched,
+      reason:           raceWinner === "fast"         ? "fast_pass_won"
+                      : raceWinner === "visual_early" ? "visual_early_exit"
+                      : "consensus_needed",
+      visualConfidence: visualResult
+        ? Number(visualResult.parsed?.confidence ?? 0)
+        : null,
+      fastConfidence:   fastResult
+        ? Number(fastResult.parsed?.confidence ?? 0)
+        : null,
+      brandCertainty:   visualResult
+        ? Number(visualResult.parsed?.attributeCertainty?.brand ?? 0)
+        : null,
+      category: visualResult
+        ? (String(visualResult.parsed?.identity?.category || "").trim().toLowerCase() || null)
+        : null,
+      highStakes: visualResult
+        ? HIGH_STAKES_CATEGORIES.has(String(visualResult.parsed?.identity?.category || "").trim().toLowerCase())
+        : null,
+    });
+
+    console.log("VISION_FAST_PATH_DECISION", {
+      rid:               req.rid,
+      returnedEarly:     raceWinner === "fast" || raceWinner === "visual_early",
+      reason:            raceWinner,
+      elapsedMs:         Date.now() - passT0,
+      selectedPass:      raceWinner === "fast"         ? "fast"
+                       : raceWinner === "visual_early" ? "visual_shape"
+                       : "consensus",
+      selectedQuery:     raceWinner === "fast"
+                           ? (fastResult?.parsed?.query || null)
+                           : raceWinner === "visual_early"
+                           ? (visualResult?.parsed?.query || null)
+                           : null,
+      selectedConfidence: raceWinner === "fast"
+                            ? Number(fastResult?.parsed?.confidence ?? 0)
+                            : raceWinner === "visual_early"
+                            ? Number(visualResult?.parsed?.confidence ?? 0)
+                            : null,
+      masterLaunched,
+      masterSkipped: !masterLaunched,
+      fallbackUsed:  false,
+    });
 
     const visualConfidence    = Number(visualResult?.parsed?.confidence ?? 0);
     const visualCategory      = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
@@ -16794,6 +16867,16 @@ if (
       ? mergeAttributeCertaintyMaps(rawCertaintyMaps)
       : inferAttributeCertaintyFromIdentity(mergedIdentity, confidence);
 
+    console.log("VISION_QUERY_QUALITY_GATE", {
+      rid:      req.rid,
+      pass:     visionTier,
+      query,
+      accepted: !!query && !isGarbageQuery(query),
+      reason:   !query         ? "null_query"
+              : isGarbageQuery(query) ? "garbage_query"
+              : "accepted",
+    });
+
     return {
       ok: true,
       query,
@@ -16807,7 +16890,10 @@ if (
         fastMs,
         visualMs,
         masterMs,
-        visionWallMs: Date.now() - passT0,
+        visionWallMs:   Date.now() - passT0,
+        raceWinner:     _visionRaceWinner,
+        masterLaunched: _visionMasterLaunched,
+        tier:           visionTier,
       },
       debug: {
         passQueries: rawQueries,
@@ -17470,6 +17556,18 @@ if (!openai) {
           visionTimings: result?.visionTimings || null,
           cacheSource:   "miss",
           debug: result?.debug || null,
+          visionTimingMeta: {
+            preConsensusMs:  (_epT2PreConsensus && _epT1FileAccepted) ? (_epT2PreConsensus - _epT1FileAccepted) : null,
+            consensusMs:     (_epT3PostConsensus && _epT2PreConsensus) ? (_epT3PostConsensus - _epT2PreConsensus) : null,
+            preprocessMs:    _ppSteps?.preprocess || null,
+            selectedPass:    result?.visionTier || null,
+            masterLaunched:  result?.visionTimings?.masterLaunched ?? null,
+            masterSkipped:   result?.visionTimings?.masterLaunched === false,
+            fastMs:          result?.visionTimings?.fastMs ?? null,
+            visualMs:        result?.visionTimings?.visualMs ?? null,
+            masterMs:        result?.visionTimings?.masterMs ?? null,
+            raceWinner:      result?.visionTimings?.raceWinner ?? null,
+          },
         };
 
         // ── Serial parser (non-LLM, from visibleText) ──────────────────────────
