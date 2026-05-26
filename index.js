@@ -8380,30 +8380,54 @@ const AIRCRAFT_TOY_TERMS = [
   "pocket plane", "foam plane", "kids toy",
 ];
 
-// Returns { tier: "premium_model" | "generic_toy" | "unknown_model", reasons }
+// Returns { tier: "premium_model" | "generic_toy" | "unknown_model", reasons, winningTerm }
+// Toy terms are checked FIRST so explicit toy/pullback/playset signals always
+// override generic model terms. "airplane model pullback" → generic_toy, not
+// premium_model. Strong brand signals (GeminiJets, 1:400, diecast) are only
+// premium when no toy terms are present.
 function classifyAircraftModelListing(item) {
   const t = normalizeTitleKey(item?.title || "");
-  const reasons = [];
 
-  for (const term of AIRCRAFT_PREMIUM_TERMS) {
-    if (t.includes(normalizeTitleKey(term))) { reasons.push(`premium:${term}`); break; }
-  }
-  if (reasons.length > 0) return { tier: "premium_model", reasons };
-
-  const isDaron = t.includes("daron");
+  // Pass 1: toy terms win unconditionally (even over diecast/scale brand signals).
   for (const term of AIRCRAFT_TOY_TERMS) {
-    const tn = normalizeTitleKey(term);
-    if (t.includes(tn)) {
-      // Daron is classified as toy only when toy terms are present
-      reasons.push(`toy:${term}`);
-      return { tier: "generic_toy", reasons };
+    if (t.includes(normalizeTitleKey(term))) {
+      return { tier: "generic_toy", reasons: [`toy:${term}`], winningTerm: term };
     }
   }
-  if (isDaron && reasons.length === 0) {
-    // Bare "daron" without toy terms → could be Daron collectible — leave unknown
+
+  // Pass 2: premium brand/scale signals (only reached when no toy term matched).
+  // Separate strong signals (maker brands, scale ratios) from weak generic phrases
+  // ("model airplane", "airplane model") so the logged reason is meaningful.
+  const STRONG_PREMIUM = [
+    "diecast", "die cast", "die-cast",
+    "1/400", "1:400", "1/200", "1:200", "1/300", "1:300", "1/150", "1:150", "1/500", "1:500",
+    "scale 1",
+    "geminijet", "gemini jet", "ng model", "ng models", "herpa", "skymarks",
+    "hogan", "inflight", "jc wings", "phoenix model", "dragon wings",
+    "display stand", "display model", "metal model", "alloy model",
+    "collector model", "collectible model",
+  ];
+  const WEAK_PREMIUM = [
+    "model airplane", "aircraft model", "airplane model",
+  ];
+
+  for (const term of STRONG_PREMIUM) {
+    if (t.includes(normalizeTitleKey(term))) {
+      return { tier: "premium_model", reasons: [`strong_premium:${term}`], winningTerm: term };
+    }
+  }
+  for (const term of WEAK_PREMIUM) {
+    if (t.includes(normalizeTitleKey(term))) {
+      return { tier: "premium_model", reasons: [`weak_premium:${term}`], winningTerm: term };
+    }
   }
 
-  return { tier: "unknown_model", reasons };
+  // Pass 3: Daron alone → unknown (could be Daron collectible or cheap toy without explicit toy terms).
+  if (t.includes("daron")) {
+    return { tier: "unknown_model", reasons: ["daron_no_toy_terms"], winningTerm: "daron" };
+  }
+
+  return { tier: "unknown_model", reasons: ["no_signals"], winningTerm: null };
 }
 
 // Returns true if the normalized query indicates an aircraft/model airplane context.
