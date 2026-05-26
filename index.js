@@ -1543,6 +1543,12 @@ const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_T
 const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
 const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
 
+// A2.8 — Parallel pre-consensus: for item/prop mode, preprocessScanUpload fires
+// at the same time as the CLIP embed race so its ~1000ms Sharp wall time is
+// absorbed rather than paid sequentially. prepareVisionBuffer inside
+// runVisionConsensus handles the final downscale if preprocess hasn't finished.
+const VISION_FAST_PRECONSENSUS_ENABLED = String(process.env.VISION_FAST_PRECONSENSUS_ENABLED || "true").toLowerCase() !== "false";
+
 // SerpAPI request timeout. Dropped from 12 s → 4 s so a slow Google Shopping
 // lane can't anchor the whole scan, but with enough headroom that legitimate
 // 3-4 s responses still land in the merged comp pool. On abort the fetch
@@ -17902,14 +17908,36 @@ if (!openai) {
         return res.status(200).json({ ...cached, cached: true, cacheSource: "exact" });
       }
 
+      const originalHash = imgHash;
+
+      // For item/prop: fire preprocessScanUpload in parallel with the CLIP embed
+      // race so its ~1000ms Sharp wall time is absorbed rather than paid sequentially.
+      // Text modes stay conservative (sequential) — resolution and quality gate
+      // matter more for barcode/label recognition.
+      const _isItemPropForPP = ["item", "prop"].includes(mode);
+      const _useFastPreConsensus = VISION_FAST_PRECONSENSUS_ENABLED && _isItemPropForPP;
+      const _preprocessFallback = {
+        buffer: file.buffer,
+        mimetype: file.mimetype || "image/jpeg",
+        thumbnailBuffer: null,
+        thumbnailMime: null,
+        quality: null,
+        metadata: { transformed: false, size: file.buffer.length, originalSize: file.buffer.length },
+      };
+      let _preprocessSettled = false;
+      let _preprocessResult = _preprocessFallback;
+      const _preprocessPromise = _useFastPreConsensus
+        ? preprocessScanUpload(file).catch(() => _preprocessFallback).then((r) => {
+            _preprocessSettled = true;
+            _preprocessResult = r;
+            return r;
+          })
+        : null;
+
       // Perceptual-similarity early-return — saves the 5–12s vision call when
       // the same item has been scanned recently from a different angle/lighting.
-      // CLIP embedding is now raced behind a 300ms timeout: if the embedding
-      // doesn't return in 300ms we skip the similarity check this scan rather
-      // than block the critical path. The embedding still completes in the
-      // background and can be used later for registration. Live-log audit
-      // (2026-05-21) showed CLIP costing ~1–3s on cold scans, eating most of
-      // the preConsensus wall.
+      // CLIP embedding is raced behind a 300ms timeout; embed and preprocess now
+      // run in parallel for item/prop (A2.8).
       const _t_embed = Date.now();
       let _similarityVec = null;
       let _embedTimedOut = false;
@@ -17927,6 +17955,12 @@ if (!openai) {
             const hit = similarityFindSimilar(_similarityVec);
             if (hit?.payload) {
               visionTierStats.similarityCacheHit++;
+              console.log("VISION_SIMILARITY_POLICY", {
+                rid: req.rid, mode,
+                blocking: !_useFastPreConsensus, timeoutMs: 300,
+                reason: _useFastPreConsensus ? "item_prop_parallel" : "text_mode_conservative",
+                hit: true, timedOut: false, elapsedMs: _ppSteps.embed ?? null,
+              });
               console.log("🎯 SIMILARITY HIT", {
                 rid: req.rid,
                 priorImageHash: hit.imageHash,
@@ -17955,20 +17989,39 @@ if (!openai) {
         }).catch(() => {});
       }
 
-      const originalHash = imgHash;
+      console.log("VISION_SIMILARITY_POLICY", {
+        rid: req.rid, mode,
+        blocking: !_useFastPreConsensus, timeoutMs: 300,
+        reason: _useFastPreConsensus ? "item_prop_parallel" : "text_mode_conservative",
+        hit: false, timedOut: _embedTimedOut, elapsedMs: _ppSteps.embed ?? null,
+      });
 
-      // Preprocess synchronously (needed for vision API call)
-      // Storage writes fire in background — don't block the vision call
+      // Preprocess: for item/prop, use the result if preprocessScanUpload already
+      // finished during the embed race; otherwise fall through to the original
+      // buffer — prepareVisionBuffer inside runVisionConsensus handles the downscale.
       const _t_pp = Date.now();
-      const processed = await preprocessScanUpload(file).catch(() => ({
-        buffer: file.buffer,
-        mimetype: file.mimetype || "image/jpeg",
-        thumbnailBuffer: null,
-        thumbnailMime: null,
-        quality: null,
-        metadata: { transformed: false, size: file.buffer.length, originalSize: file.buffer.length },
-      }));
+      let processed;
+      let _preprocessDeferred = false;
+      if (_useFastPreConsensus) {
+        if (_preprocessSettled) {
+          processed = _preprocessResult;
+        } else {
+          processed = _preprocessFallback;
+          _preprocessDeferred = true;
+        }
+      } else {
+        processed = await preprocessScanUpload(file).catch(() => _preprocessFallback);
+      }
       _stepLog("preprocess", _t_pp);
+
+      console.log("VISION_PREPROCESS_BREAKDOWN", {
+        rid: req.rid,
+        mode,
+        uploadBytes: file.buffer.length,
+        parallelPreprocess: _useFastPreConsensus,
+        preprocessDeferred: _preprocessDeferred,
+        qualityAvailable: processed.quality !== null,
+      });
 
       const preparedFile = {
         ...file,
@@ -18073,6 +18126,16 @@ if (!openai) {
       global.metrics.visionCalls++;
 
       _epT2PreConsensus = Date.now();
+      console.log("VISION_PRECONSENSUS_BREAKDOWN", {
+        rid: req.rid,
+        mode,
+        exactCacheMs: (_ppSteps.sha256 || 0) + (_ppSteps.cacheGet || 0),
+        similarityMs: _ppSteps.embed || 0,
+        preprocessMs: _ppSteps.preprocess || 0,
+        sourceBudgetMs: _ppSteps.sourceBudget || 0,
+        totalPreConsensusMs: _epT2PreConsensus - _epT1FileAccepted,
+        preprocessDeferred: _preprocessDeferred ?? false,
+      });
       const result = await withInflight(cacheKey, async () =>
         distributedSingleflight.run(
           `vision:${mode}:${propContext}:${originalHash}`,
