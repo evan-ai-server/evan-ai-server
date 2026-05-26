@@ -8200,6 +8200,57 @@ function detectModelTokensInQuery(q) {
   return [...tokens];
 }
 
+// Aircraft family token groups. When a specific family appears in the query,
+// tokens from other families are considered "wrong model" and deprioritized.
+const AIRCRAFT_FAMILY_MAP = {
+  "787": ["787", "dreamliner"],
+  "777": ["777"],
+  "747": ["747"],
+  "737": ["737"],
+  "a380": ["a380"],
+  "a350": ["a350"],
+  "a330": ["a330"],
+  "a320": ["a320", "a321"],
+};
+
+// Common airline tokens with their competitor lists.
+// Keys must be safe to search in normalized (lowercased, spaces-only) strings.
+const AIRLINE_COMPETITOR_MAP = {
+  "hawaiian": ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "ana ", "lufthansa", "emirates"],
+  "united":   ["hawaiian", "delta", "american airlines", "southwest", "alaska", "jetblue", "ana "],
+  "delta":    ["hawaiian", "united", "american airlines", "southwest", "alaska", "jetblue"],
+  "southwest":["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue"],
+  "alaska":   ["hawaiian", "united", "delta", "american airlines", "southwest", "jetblue"],
+  "jetblue":  ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska"],
+  "ana ":     ["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue", "korean"],
+  "emirates": ["qatar", "etihad", "lufthansa"],
+  "qatar":    ["emirates", "etihad", "lufthansa"],
+  "lufthansa":["emirates", "qatar", "british"],
+};
+
+// Returns airline lock info if query contains a named airline, else null.
+function detectAirlineLockInQuery(q) {
+  for (const [airline, competitors] of Object.entries(AIRLINE_COMPETITOR_MAP)) {
+    if (!q.includes(airline)) continue;
+
+    // Found required airline. Determine required aircraft family.
+    let requiredFamily = null;
+    let wrongFamilyTokens = [];
+    for (const [family, tokens] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
+      if (tokens.some((t) => q.includes(t))) {
+        requiredFamily = family;
+        for (const [f, toks] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
+          if (f !== family) wrongFamilyTokens.push(...toks);
+        }
+        break;
+      }
+    }
+
+    return { requiredAirline: airline, competitors, requiredFamily, wrongFamilyTokens };
+  }
+  return null;
+}
+
 function filterRelevantListings(query, items) {
   if (!Array.isArray(items)) return [];
 
@@ -8304,6 +8355,45 @@ function filterRelevantListings(query, items) {
       return Number(it.__relevance || 0) >= 0.70;
     });
     if (modelFiltered.length >= 3) preserved = modelFiltered;
+  }
+
+  // Airline identity lock. When the query names a specific airline (e.g.
+  // "Hawaiian Airlines"), competitor-airline listings are filtered out and
+  // wrong-aircraft-family items are deprioritized. Only applied when enough
+  // matching listings survive so we never return an empty pool.
+  const _airlineLock = detectAirlineLockInQuery(q);
+  if (_airlineLock) {
+    const { requiredAirline, competitors, requiredFamily, wrongFamilyTokens } = _airlineLock;
+
+    // Step 1: drop listings that name a competitor without naming the required airline.
+    const _airlineFiltered = preserved.filter((it) => {
+      const t = normalizeTitleKey(it?.title || "");
+      const hasRequired = t.includes(requiredAirline);
+      const hasCompetitor = competitors.some((c) => t.includes(c));
+      if (hasCompetitor && !hasRequired) return false;
+      return true;
+    });
+    if (_airlineFiltered.length >= 2) preserved = _airlineFiltered;
+
+    // Step 2: move wrong-aircraft-family items to the back.
+    if (requiredFamily && wrongFamilyTokens.length) {
+      const _exactFamily = [];
+      const _wrongFamily = [];
+      for (const it of preserved) {
+        const t = normalizeTitleKey(it?.title || "");
+        wrongFamilyTokens.some((tok) => t.includes(tok))
+          ? _wrongFamily.push(it)
+          : _exactFamily.push(it);
+      }
+      if (_exactFamily.length >= 2) preserved = [..._exactFamily, ..._wrongFamily];
+    }
+
+    console.log("IDENTITY_LOCK_SUMMARY", {
+      query: q,
+      requiredAirline,
+      requiredFamily,
+      preservedCount: preserved.length,
+    });
   }
 
   if (!eyewearMode) {
@@ -16343,6 +16433,21 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
   }
 }
 
+// Categories where high brandCertainty is a GOOD signal, not a risk.
+// Visible brand/text (e.g. "Hawaiian Airlines" on a model airplane) is what
+// makes the query specific and searchable. Only auth-sensitive categories need
+// the brand gate to block hallucinated luxury/designer brands.
+function isBrandUsefulCategory(category) {
+  if (!category) return false;
+  const c = String(category).trim().toLowerCase();
+  if (c.includes("model") || c.includes("diecast") || c.includes("die cast")) return true;
+  if (c.includes("toy") || c.includes("collectible") || c.includes("figurine")) return true;
+  if (c.includes("book") || c.includes("dvd") || c.includes("cd") || c.includes("blu")) return true;
+  if (c.includes("game") || c.includes("puzzle")) return true;
+  if (c.includes("tool") || c.includes("camera") || c.includes("appliance")) return true;
+  return false;
+}
+
 // Phase A2.7: Gate for accepting the query_fast result.
 function shouldAcceptQueryFast(result, mode) {
   if (!QUERY_FAST_ENABLED)                          return { accepted: false, reason: "disabled" };
@@ -16359,8 +16464,18 @@ function shouldAcceptQueryFast(result, mode) {
   if (confidence < QUERY_FAST_CONFIDENCE_THRESHOLD) return { accepted: false, reason: "confidence_too_low",      query: q, confidence, category, brandCertainty };
   if (!category)                                    return { accepted: false, reason: "missing_category",        query: q, confidence, category, brandCertainty };
   if (HIGH_STAKES_CATEGORIES.has(category))         return { accepted: false, reason: "high_stakes_category",   query: q, confidence, category, brandCertainty };
-  if (brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX)
-                                                    return { accepted: false, reason: "brand_certainty_too_high", query: q, confidence, category, brandCertainty };
+
+  const highStakes   = HIGH_STAKES_CATEGORIES.has(category);
+  const brandUseful  = isBrandUsefulCategory(category);
+  // Reject high brandCertainty ONLY when category is auth-sensitive or not brand-useful.
+  // For collectibles/toys/models the brand text is visually printed and a strong signal.
+  const brandGateFails = brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX && !brandUseful && !highStakes;
+  console.log("VISION_QUERY_FAST_BRAND_POLICY", {
+    category, brandCertainty, brandUseful, highStakes,
+    accepted: !brandGateFails,
+    reason: brandGateFails ? "brand_certainty_too_high_non_useful" : "brand_ok",
+  });
+  if (brandGateFails) return { accepted: false, reason: "brand_certainty_too_high", query: q, confidence, category, brandCertainty };
 
   return { accepted: true, reason: "accepted", query: q, confidence, category, brandCertainty };
 }
