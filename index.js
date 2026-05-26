@@ -1548,6 +1548,12 @@ const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERT
 // absorbed rather than paid sequentially. prepareVisionBuffer inside
 // runVisionConsensus handles the final downscale if preprocess hasn't finished.
 const VISION_FAST_PRECONSENSUS_ENABLED = String(process.env.VISION_FAST_PRECONSENSUS_ENABLED || "true").toLowerCase() !== "false";
+// Hard budget for the prepareVisionBuffer Sharp call inside runVisionConsensus.
+// On cold Sharp init this can spike to 3+ seconds; if it exceeds the budget we
+// fall through to the original buffer (prepareVisionBuffer still runs but we
+// don't wait for it). Text modes get a longer budget because resolution matters.
+const VISION_DOWNSCALE_TIMEOUT_ITEM_MS = Number(process.env.VISION_DOWNSCALE_TIMEOUT_ITEM_MS || 450);
+const VISION_DOWNSCALE_TIMEOUT_TEXT_MS = Number(process.env.VISION_DOWNSCALE_TIMEOUT_TEXT_MS || 1200);
 
 // SerpAPI request timeout. Dropped from 12 s → 4 s so a slow Google Shopping
 // lane can't anchor the whole scan, but with enough headroom that legitimate
@@ -10609,6 +10615,10 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   // buffered reactively (each Tier B promise pushes into _tierBAccum as it
   // resolves) so the kill never returns [] when real data exists.
   const _partialBudget = { items: [] };
+  // Declared in outer scope so the killTimer .then handler can read counts
+  // without a ReferenceError (the worker IIFE where _tierBAccum was previously
+  // declared is a different closure from the Promise.race .then at the bottom).
+  const _tierBAccum = { amazon: [], resale: [], shop: [] };
   const killTimer = new Promise((resolve) =>
     setTimeout(() => resolve("__timeout__"), Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500))
   );
@@ -10825,7 +10835,6 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   // and the orchestrating Promise.all is still pending. Without this,
   // the prior "snapshot after await" logic always returned [] on timeout
   // because the await itself was what got cancelled.
-  const _tierBAccum = { amazon: [], resale: [], shop: [] };
   const _refreshPartialBuffer = () => {
     try {
       const _snap = dedupeSmart(
@@ -16380,26 +16389,44 @@ function shouldAcceptFastVisionResult(result) {
   return true;
 }
 
+async function prepareVisionBufferWithBudget(buffer, rid, maxEdgePx, budgetMs) {
+  let _timedOut = false;
+  const _timeoutP = new Promise((resolve) => {
+    const t = setTimeout(() => { _timedOut = true; resolve(buffer); }, budgetMs);
+    if (typeof t.unref === "function") t.unref();
+  });
+  const result = await Promise.race([
+    prepareVisionBuffer(buffer, rid, maxEdgePx).catch(() => buffer),
+    _timeoutP,
+  ]);
+  return { buffer: result, timedOut: _timedOut };
+}
+
 async function runVisionConsensus({ req, file, mode, propContext }) {
   // Downscale before encoding. Text-sensitive modes (label/barcode/mark) keep
   // a larger edge for legibility; item/prop use a smaller edge to reduce token
   // count and OpenAI latency without hurting object identification.
   const _isTextMode = ["label", "barcode", "mark"].includes(mode);
   const _visionMaxEdge = _isTextMode ? VISION_TEXT_MAX_EDGE : VISION_ITEM_MAX_EDGE;
+  const _visionDownscaleBudgetMs = _isTextMode ? VISION_DOWNSCALE_TIMEOUT_TEXT_MS : VISION_DOWNSCALE_TIMEOUT_ITEM_MS;
   const downscaleFromBytes = Buffer.isBuffer(file.buffer) ? file.buffer.length : 0;
   const _vpT0 = Date.now();
-  const visionBuffer = await prepareVisionBuffer(file.buffer, req.rid, _visionMaxEdge);
+  const { buffer: visionBuffer, timedOut: _downscaleTimedOut } = await prepareVisionBufferWithBudget(
+    file.buffer, req.rid, _visionMaxEdge, _visionDownscaleBudgetMs
+  );
   const _vpMs = Date.now() - _vpT0;
   const downscaled = visionBuffer !== file.buffer;
   const downscaleToBytes = downscaled ? visionBuffer.length : downscaleFromBytes;
-  console.log("VISION_PREPROCESS_POLICY", {
-    rid:       req.rid,
+  console.log("VISION_DOWNSCALE_POLICY", {
+    rid:        req.rid,
     mode,
-    maxEdge:   _visionMaxEdge,
+    maxEdge:    _visionMaxEdge,
+    budgetMs:   _visionDownscaleBudgetMs,
     isTextMode: _isTextMode,
-    skipped:   !downscaled,
-    fromBytes: downscaleFromBytes,
-    toBytes:   downscaleToBytes,
+    timedOut:   _downscaleTimedOut,
+    skipped:    !downscaled,
+    fromBytes:  downscaleFromBytes,
+    toBytes:    downscaleToBytes,
     durationMs: _vpMs,
   });
   const base64 = visionBuffer.toString("base64");
