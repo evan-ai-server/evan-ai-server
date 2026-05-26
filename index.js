@@ -1512,6 +1512,26 @@ const MASTER_LAZY_DELAY_MS                    = Number(process.env.MASTER_LAZY_D
 // onto the timing entry as `cohort` so /debug/timings can A/B the two paths.
 // Use 50 for a real A/B test during validation, 100 when shipping the win.
 const SKIP_MASTER_ROLLOUT_PCT                 = Math.max(0, Math.min(100, Number(process.env.SKIP_MASTER_ROLLOUT_PCT || 100)));
+
+// Phase A2.6: Per-pass output token caps. The lean fast/visual schema generates
+// ~150-220 tokens; capping tightly prevents the model from padding the response
+// and reduces OpenAI generation time on cold cache by 1-2s for gpt-4.1-mini.
+const FAST_VISION_MAX_OUTPUT_TOKENS   = Number(process.env.FAST_VISION_MAX_OUTPUT_TOKENS  || 220);
+const VISUAL_SHAPE_MAX_OUTPUT_TOKENS  = Number(process.env.VISUAL_SHAPE_MAX_OUTPUT_TOKENS || 260);
+const MASTER_VISION_MAX_OUTPUT_TOKENS = Number(process.env.MASTER_VISION_MAX_OUTPUT_TOKENS || 600);
+
+// Phase A2.6: Mode-aware master lazy delay. Item/prop scans push master to
+// 2500ms so fast/visual have more wall budget to return before the heavier
+// model is launched. Text-sensitive modes (label/barcode/mark) keep the
+// original 1500ms because fast/visual are unreliable there.
+const MASTER_LAZY_DELAY_ITEM_MS = Number(process.env.MASTER_LAZY_DELAY_ITEM_MS || 2500);
+const MASTER_LAZY_DELAY_TEXT_MS = Number(process.env.MASTER_LAZY_DELAY_TEXT_MS || MASTER_LAZY_DELAY_MS);
+
+// Phase A2.6: Hard return ceiling for item/prop mode. If master is still
+// pending after this many ms (from passT0) and we have a usable seed query
+// from fast/visual, return the seed rather than blocking further.
+const ITEM_VISION_HARD_RETURN_MS = Number(process.env.ITEM_VISION_HARD_RETURN_MS || 5500);
+
 // SerpAPI request timeout. Dropped from 12 s → 4 s so a slow Google Shopping
 // lane can't anchor the whole scan, but with enough headroom that legitimate
 // 3-4 s responses still land in the merged comp pool. On abort the fetch
@@ -3730,6 +3750,17 @@ function isGarbageQuery(q) {
   ]);
 
   return junk.has(s);
+}
+
+// Phase A2.6: Checks if a query is usable as a seed for vision recovery.
+// Stricter than just "not garbage" — requires at least 3 words and a letter.
+function isUsableVisionQuery(query) {
+  if (!query || typeof query !== "string") return false;
+  const trimmed = query.trim();
+  if (!trimmed || isGarbageQuery(trimmed)) return false;
+  if (trimmed.split(/\s+/).length < 3) return false;
+  if (!/[a-zA-Z]/.test(trimmed)) return false;
+  return true;
 }
 
 function inferVisionCategory(q) {
@@ -14306,6 +14337,49 @@ function buildVisionConsensusSchema() {
     };
   }
 
+// Phase A2.6: Lean schema for fast/visual_shape passes on item/prop mode.
+// Removes institutionalIds, authenticityFlags, conditionFlags, and simplifies
+// identity from 14 fields to 7. Saves ~150-250 output tokens → 1-2s faster
+// cold-cache gpt-4.1-mini response. Master still uses the full schema.
+function buildFastVisionSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["query", "variants", "confidence", "attributeCertainty", "identity"],
+    properties: {
+      query: { anyOf: [{ type: "string" }, { type: "null" }] },
+      variants: { type: "array", items: { type: "string" } },
+      confidence: { type: "number" },
+      attributeCertainty: {
+        type: "object",
+        additionalProperties: false,
+        required: ["brand", "model", "category", "condition", "authenticity"],
+        properties: {
+          brand:        { type: "number" },
+          model:        { type: "number" },
+          category:     { type: "number" },
+          condition:    { type: "number" },
+          authenticity: { type: "number" },
+        },
+      },
+      identity: {
+        type: "object",
+        additionalProperties: false,
+        required: ["itemType", "category", "brand", "model", "colors", "material", "style"],
+        properties: {
+          itemType: { anyOf: [{ type: "string" }, { type: "null" }] },
+          category: { anyOf: [{ type: "string" }, { type: "null" }] },
+          brand:    { anyOf: [{ type: "string" }, { type: "null" }] },
+          model:    { anyOf: [{ type: "string" }, { type: "null" }] },
+          colors:   { type: "array", items: { type: "string" } },
+          material: { anyOf: [{ type: "string" }, { type: "null" }] },
+          style:    { anyOf: [{ type: "string" }, { type: "null" }] },
+        },
+      },
+    },
+  };
+}
+
 function buildVisionPassPrompt(passLabel, mode, propContext) {
   const header = modeHeader(mode, propContext);
 
@@ -14375,6 +14449,28 @@ confidence = how confidently you identified the item type and visual attributes 
 ID: logos/text/marks first → silhouette/colors/materials second → synthesize.
 Legible text beats logo guesses. Logo beats visual shape. Be specific, not generic.
 Output the single best resale search query + 8 ranked variants (specific→broad).`;
+  }
+
+  // Phase A2.6: Lean fast-pass prompt for item/prop mode. Avoids SKU/institutional
+  // ID extraction so the model produces fewer tokens and returns faster.
+  if (passLabel === "fast") {
+    return `${header}
+
+PASS: QUICK VISUAL IDENTIFICATION FOR RESALE
+Identify this item so a buyer can find it on the resale market.
+
+1. ITEM TYPE → exact functional category (e.g. "sunglasses", "sneaker", "crossbody bag", "analog watch")
+2. BRAND → only if text/logo is clearly readable. If uncertain, set brand to null.
+3. COLOR → primary color, then secondary colors
+4. MATERIAL → dominant material (plastic, leather, metal, fabric, acetate, rubber)
+5. STYLE → key visual descriptors buyers use (oval, oversized, slim, vintage, y2k, structured)
+
+query = most specific resale search term:
+  If brand confirmed: "[brand] [color] [style] [item type]"
+  If no brand: "[color] [material] [style] [item type]"
+Examples: "black oval plastic sunglasses orange lens", "Nike white leather low-top sneaker", "tan leather crossbody bag gold hardware"
+
+confidence = 0.0-1.0, how certain you are of the item type and visual attributes`;
   }
 
   return `${header}
@@ -14513,6 +14609,31 @@ async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid, model
   const mimeType = dataUrl.startsWith("data:") ? dataUrl.split(";")[0].slice(5) : "image/jpeg";
   const passStartTime = Date.now();
 
+  // Phase A2.6: lean schema for fast/visual_shape on item/prop mode.
+  // Removes institutionalIds, authenticityFlags, conditionFlags, and simplifies
+  // identity to 7 fields — saves ~150-250 output tokens, cuts cold-cache
+  // gpt-4.1-mini latency by 1-2s. Master and text-sensitive modes keep the
+  // full schema. Cache key bumped to v6 so the new schema doesn't serve
+  // stale cached responses built against the old v5 schema shape.
+  const _isLeanPass = (passLabel === "fast" || passLabel === "visual_shape")
+    && !["label", "barcode", "mark"].includes(mode);
+  const _maxOutputTokens = passLabel === "fast"        ? FAST_VISION_MAX_OUTPUT_TOKENS
+                         : passLabel === "visual_shape" ? VISUAL_SHAPE_MAX_OUTPUT_TOKENS
+                         : MASTER_VISION_MAX_OUTPUT_TOKENS;
+  const _schema     = _isLeanPass ? buildFastVisionSchema() : buildVisionConsensusSchema();
+  const _schemaName = _isLeanPass ? `evan_ai_vision_${passLabel}_lean` : `evan_ai_vision_${passLabel}`;
+  const _cacheKey   = _isLeanPass ? `evan-ai-vision-${passLabel}-v6` : `evan-ai-vision-${passLabel}-v5`;
+
+  console.log("VISION_REQUEST_PROFILE", {
+    rid:            rid || "",
+    pass:           passLabel,
+    model:          visionModel,
+    timeoutMs:      openaiCutoffMs,
+    maxOutputTokens: _maxOutputTokens,
+    promptProfile:  _isLeanPass ? "lean" : "full",
+    mode,
+  });
+
   let openaiResult = null;
   let openaiUsage  = null;
   try {
@@ -14525,15 +14646,15 @@ const response = await withModelServing(
         {
           model: visionModel,
           temperature: 0.1,
-          max_output_tokens: 600,
-          prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
+          max_output_tokens: _maxOutputTokens,
+          prompt_cache_key: _cacheKey,
           prompt_cache_retention: "24h",
           text: {
             format: {
               type: "json_schema",
-              name: `evan_ai_vision_${passLabel}`,
+              name: _schemaName,
               strict: true,
-              schema: buildVisionConsensusSchema(),
+              schema: _schema,
             },
           },
           input: [
@@ -16157,13 +16278,19 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         (ms) => { masterMs = ms; }
       ).catch(() => null).then(_masterResolve, () => _masterResolve(null));
     };
-    // Early master launch: fires at MASTER_LAZY_DELAY_MS (default 1500ms) so
-    // master is racing in parallel rather than waiting until visual_shape fails
-    // at 7s. gpt-4.1-mini can take >7s cold, making lazy launch cost 7s before
-    // master even starts. With an early timer, total vision wall = delay + master
-    // duration (~1.5s + ~3.4s = ~5s) instead of 7s + master_duration (~10.4s).
-    // If fast or visual_shape win before master finishes, we cancel master.
-    const earlyMasterTimer = setTimeout(launchMasterNow, MASTER_LAZY_DELAY_MS);
+    // Phase A2.6: Mode-aware master lazy delay. Item/prop pushes master to
+    // 2500ms so fast/visual have a wider window to return. Text-sensitive
+    // modes (label/barcode/mark) keep the original 1500ms since fast/visual
+    // are unreliable for OCR-heavy identification.
+    const _isTextModeMaster = ["label", "barcode", "mark"].includes(mode);
+    const _masterLazyDelayMs = _isTextModeMaster ? MASTER_LAZY_DELAY_TEXT_MS : MASTER_LAZY_DELAY_ITEM_MS;
+    console.log("VISION_MASTER_LAUNCH_TIMER", {
+      rid:     req.rid,
+      mode,
+      delayMs: _masterLazyDelayMs,
+      reason:  _isTextModeMaster ? "text_mode_early_launch" : "item_mode_delayed_launch",
+    });
+    const earlyMasterTimer = setTimeout(launchMasterNow, _masterLazyDelayMs);
     if (typeof earlyMasterTimer.unref === "function") earlyMasterTimer.unref();
     // Safety-net: if the early timer somehow misfires, ensure master launches
     // before visual_shape's full deadline + buffer.
@@ -16430,24 +16557,126 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         category:         visualResult.parsed?.identity?.category || null,
       });
     } else {
-      // Visual was not confident enough — wait for master to chime in. Master
-      // has been racing since t=0 so we usually don't add fresh wall time here.
-      const master = await masterPromise;
-      const consensusPasses = [master, visualResult].filter(Boolean);
-      passes     = fastResult ? [fastResult, ...consensusPasses] : consensusPasses;
-      passLabels = fastResult ? ["fast", "master", "visual_shape"].slice(0, passes.length)
-                              : ["master", "visual_shape"].slice(0, passes.length);
-      visionTier = fastResult ? "consensus_with_fast_seed" : "consensus";
-      if (fastResult) visionTierStats.fastEscalated++;
-      else            visionTierStats.consensusOnly++;
-      if (fastResult) {
-        console.log("📈 FAST VISION ESCALATED", {
-          rid:           req.rid,
-          fastConfidence: Number(fastResult.parsed?.confidence ?? 0).toFixed(2),
-          category:      fastResult.parsed?.identity?.category || null,
-          reason:        Number(fastResult.parsed?.confidence ?? 0) < FAST_PASS_CONFIDENCE_THRESHOLD
-                            ? "low_confidence" : "high_stakes_category",
-        });
+      // Phase A2.6 — Part 3: Seed recovery. Before blocking on master, check
+      // whether fast or visual_shape returned a usable query at a relaxed
+      // confidence threshold. Applies only to item/prop mode (not text modes).
+      const _isItemPropMode = ["item", "prop"].includes(mode);
+      let _seedResult = null;
+
+      if (_isItemPropMode) {
+        const _seedCandidates = [
+          { r: visualResult, sourcePass: "visual_shape", minConf: 0.70 },
+          { r: fastResult,   sourcePass: "fast",         minConf: 0.72 },
+        ];
+        for (const { r, sourcePass, minConf } of _seedCandidates) {
+          if (!r || r.cancelled) continue;
+          const q     = r?.parsed?.query;
+          const conf  = Number(r?.parsed?.confidence ?? 0);
+          const cat   = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
+          const brand = Number(r?.parsed?.attributeCertainty?.brand ?? 0);
+          const acceptable =
+            isUsableVisionQuery(q) &&
+            conf >= minConf &&
+            brand <= 0.2 &&
+            cat && !HIGH_STAKES_CATEGORIES.has(cat);
+          if (acceptable) {
+            _seedResult = { r, sourcePass, q, conf, cat };
+            console.log("VISION_SEED_RECOVERY_USED", {
+              rid: req.rid, sourcePass, query: q, confidence: conf, category: cat,
+              reason: "confidence_above_recovery_threshold",
+            });
+            break;
+          } else {
+            console.log("VISION_SEED_RECOVERY_REJECTED", {
+              rid: req.rid, sourcePass, query: q || null, confidence: conf, category: cat || null,
+              reason: !isUsableVisionQuery(q)      ? "unusable_query"
+                    : conf < minConf               ? "confidence_too_low"
+                    : brand > 0.2                  ? "brand_detected"
+                    : !cat                         ? "no_category"
+                    : HIGH_STAKES_CATEGORIES.has(cat) ? "high_stakes_category"
+                    : "unknown",
+            });
+          }
+        }
+      }
+
+      if (_seedResult) {
+        // Seed recovery succeeded — cancel master and use what we have.
+        try { masterAbortCtrl.abort(); } catch {}
+        passes     = [_seedResult.r];
+        passLabels = [_seedResult.sourcePass];
+        visionTier = "seed_recovery";
+      } else {
+        // No usable seed — wait for master. For item/prop mode race against a
+        // hard ceiling so a slow master doesn't block indefinitely if the
+        // ceiling fires with a last-chance seed available.
+        let master;
+        if (_isItemPropMode) {
+          const _elapsedMs    = Date.now() - passT0;
+          const _remainingMs  = Math.max(200, ITEM_VISION_HARD_RETURN_MS - _elapsedMs);
+          const _ceilingP     = new Promise((res) => {
+            const t = setTimeout(() => res("ceiling"), _remainingMs);
+            if (typeof t.unref === "function") t.unref();
+          });
+          const _raceResult   = await Promise.race([masterPromise.then(() => "master"), _ceilingP]);
+          master = await masterPromise; // instant if master already settled
+          if (_raceResult === "ceiling" && !master) {
+            // Ceiling fired and master hasn't returned. Check one last time
+            // for any passable seed (lower bar: just isUsableVisionQuery).
+            const _hardCandidates = [
+              { r: visualResult, sourcePass: "visual_shape" },
+              { r: fastResult,   sourcePass: "fast" },
+            ];
+            let _hardSeed = null;
+            for (const { r, sourcePass } of _hardCandidates) {
+              if (r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)) {
+                _hardSeed = { r, sourcePass };
+                break;
+              }
+            }
+            if (_hardSeed) {
+              try { masterAbortCtrl.abort(); } catch {}
+              console.log("VISION_HARD_RETURN_USED", {
+                rid:       req.rid,
+                elapsedMs: Date.now() - passT0,
+                source:    _hardSeed.sourcePass,
+                query:     _hardSeed.r?.parsed?.query,
+                confidence: Number(_hardSeed.r?.parsed?.confidence ?? 0),
+              });
+              passes     = [_hardSeed.r];
+              passLabels = [_hardSeed.sourcePass];
+              visionTier = "hard_return";
+              master = null; // skip normal consensus assembly
+            } else {
+              console.log("VISION_HARD_RETURN_SKIPPED", {
+                rid:       req.rid,
+                elapsedMs: Date.now() - passT0,
+                reason:    "no_usable_seed_at_ceiling",
+              });
+            }
+          }
+        } else {
+          master = await masterPromise;
+        }
+
+        if (visionTier !== "hard_return") {
+          const consensusPasses = [master, visualResult].filter(Boolean);
+          passes     = fastResult ? [fastResult, ...consensusPasses] : consensusPasses;
+          passLabels = fastResult ? ["fast", "master", "visual_shape"].slice(0, passes.length)
+                                  : ["master", "visual_shape"].slice(0, passes.length);
+          visionTier = fastResult ? "consensus_with_fast_seed" : "consensus";
+          if (fastResult) visionTierStats.fastEscalated++;
+          else            visionTierStats.consensusOnly++;
+          if (fastResult) {
+            console.log("📈 FAST VISION ESCALATED", {
+              rid:           req.rid,
+              fastConfidence: Number(fastResult.parsed?.confidence ?? 0).toFixed(2),
+              category:      fastResult.parsed?.identity?.category || null,
+              reason:        Number(fastResult.parsed?.confidence ?? 0) < FAST_PASS_CONFIDENCE_THRESHOLD
+                                ? "low_confidence" : "high_stakes_category",
+            });
+          }
+        }
       }
     }
 
@@ -16504,7 +16733,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       visualCancelled:  !!visualResult?.cancelled,
       masterCancelled:  !!settledMaster?.cancelled,
       masterLaunched,
-      masterLaunchedEarlyMs: masterLaunched ? MASTER_LAZY_DELAY_MS : null,
+      masterLaunchedEarlyMs: masterLaunched ? _masterLazyDelayMs : null,
     });
 
     recordVisionTiming({
@@ -33992,20 +34221,22 @@ if (OPENAI_API_KEY && openai) {
       // per model, so a gpt-4.1 warmup doesn't help a gpt-4.1-mini call even
       // with the same cache key. visual_shape now uses VISUAL_SHAPE_MODEL
       // (mini by default) and fast uses FAST_VISION_MODEL — warm both.
+      // Phase A2.6: fast/visual_shape now use lean schema (v6 cache key).
+      // master/brand_model keep full schema (v5 cache key).
       const warmupPasses = [
-        { passLabel: "master",       model: VISION_MODEL },
-        { passLabel: "brand_model",  model: VISION_MODEL },
-        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL },
-        { passLabel: "fast",         model: FAST_VISION_MODEL },
+        { passLabel: "master",       model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-master-v5",       schemaName: "evan_ai_vision_master" },
+        { passLabel: "brand_model",  model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-brand_model-v5",   schemaName: "evan_ai_vision_brand_model" },
+        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL, schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-visual_shape-v6",  schemaName: "evan_ai_vision_visual_shape_lean" },
+        { passLabel: "fast",         model: FAST_VISION_MODEL,  schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-fast-v6",          schemaName: "evan_ai_vision_fast_lean" },
       ];
-      for (const { passLabel, model } of warmupPasses) {
+      for (const { passLabel, model, schema, cacheKey, schemaName } of warmupPasses) {
         openai.responses.create({
           model,
           temperature: 0.1,
           max_output_tokens: 10,
-          prompt_cache_key: `evan-ai-vision-${passLabel}-v5`,
+          prompt_cache_key: cacheKey,
           prompt_cache_retention: "24h",
-          text: { format: { type: "json_schema", name: `evan_ai_vision_${passLabel}`, strict: true, schema: buildVisionConsensusSchema() } },
+          text: { format: { type: "json_schema", name: schemaName, strict: true, schema } },
           input: [
             { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
             { role: "user", content: [{ type: "input_text", text: buildVisionPassPrompt(passLabel, "item", "") }, { type: "input_image", image_url: warmDataUrl }] },
