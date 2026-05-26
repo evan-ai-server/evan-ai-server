@@ -1532,6 +1532,17 @@ const MASTER_LAZY_DELAY_TEXT_MS = Number(process.env.MASTER_LAZY_DELAY_TEXT_MS |
 // from fast/visual, return the seed rather than blocking further.
 const ITEM_VISION_HARD_RETURN_MS = Number(process.env.ITEM_VISION_HARD_RETURN_MS || 5500);
 
+// Phase A2.7: Ultra-lean vision query fast path. Runs a dedicated tiny-schema
+// pass (query+variants+confidence+category+brandCertainty only) at t=0 alongside
+// fast/visual_shape. If it returns an accepted result before any other pass,
+// we use it immediately — skipping master entirely for common items.
+const QUERY_FAST_ENABLED = String(process.env.QUERY_FAST_ENABLED || "true").toLowerCase() !== "false";
+const QUERY_FAST_MODEL   = process.env.QUERY_FAST_MODEL || FAST_VISION_MODEL || "gpt-4.1-mini";
+const QUERY_FAST_TIMEOUT_MS         = Number(process.env.QUERY_FAST_TIMEOUT_MS         || 4500);
+const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_TOKENS  || 160);
+const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
+const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
+
 // SerpAPI request timeout. Dropped from 12 s → 4 s so a slow Google Shopping
 // lane can't anchor the whole scan, but with enough headroom that legitimate
 // 3-4 s responses still land in the merged comp pool. On abort the fetch
@@ -14380,6 +14391,58 @@ function buildFastVisionSchema() {
   };
 }
 
+// Phase A2.7: Ultra-lean 5-field schema for the query_fast pass.
+// No nested objects — just the fields needed to produce and gate a search query.
+// Generates ~80-130 tokens vs ~200-600 for the lean/full schemas.
+function buildUltraLeanVisionSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["query", "variants", "confidence", "category", "brandCertainty"],
+    properties: {
+      query:         { anyOf: [{ type: "string" }, { type: "null" }] },
+      variants:      { type: "array", items: { type: "string" } },
+      confidence:    { type: "number" },
+      category:      { anyOf: [{ type: "string" }, { type: "null" }] },
+      brandCertainty: { type: "number" },
+    },
+  };
+}
+
+// Phase A2.7: Focused prompt for the query_fast pass. Asks for only what's
+// needed to produce a good resale search query — no SKU, no condition, no auth.
+function buildUltraLeanVisionPrompt(mode, propContext) {
+  const header = modeHeader(mode, propContext);
+  return `${header}
+
+You are identifying a resale item from an image.
+Return ONLY the best marketplace search query.
+
+Rules:
+1. Identify the physical item type first (sunglasses, sneaker, handbag, watch, etc.).
+2. Include visible color, material, and style descriptors.
+3. Include brand ONLY if it is clearly readable from text or logo on the item. Never guess brand from shape alone.
+4. Do not include condition, price, authenticity, or explanation.
+5. Query must be something a buyer would type on eBay or Google Shopping.
+6. Prefer concise but specific queries over generic ones.
+
+Examples:
+- "black oval plastic sunglasses orange lens"
+- "white leather Nike low top sneakers"
+- "tan leather crossbody bag gold hardware"
+- "blue denim Levi's trucker jacket"
+- "black digital watch plastic strap"
+
+Output:
+- query: best resale search query (or null if item unclear)
+- variants: 3-5 alternate queries ordered specific → broad
+- confidence: 0.0-1.0 confidence in item type and visual descriptors
+- category: simple noun like "sunglasses", "shoes", "jacket", "bag", "watch"
+- brandCertainty: 0.0-1.0 certainty that brand is clearly readable (0 if not visible)
+
+Keep response short.`;
+}
+
 function buildVisionPassPrompt(passLabel, mode, propContext) {
   const header = modeHeader(mode, propContext);
 
@@ -16141,6 +16204,152 @@ function buildResaleFallbackQuery(identity = null) {
   return null;
 }
 
+// Phase A2.7: Ultra-lean vision pass that only asks for a search query + 4 fields.
+// Generates ~80-130 tokens, returns in ~2-3s on gpt-4.1-mini warm cache.
+// Used only for item/prop mode — text modes (label/barcode/mark) still use the
+// full pipeline. Runs at t=0 alongside fast/visual_shape; whichever returns an
+// accepted result first wins.
+async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externalSignal }) {
+  const model = QUERY_FAST_MODEL;
+  const openaiCutoffMs = QUERY_FAST_TIMEOUT_MS;
+  const timeout = withTimeout(openaiCutoffMs);
+  const combinedSignal = externalSignal
+    ? AbortSignal.any([timeout.signal, externalSignal])
+    : timeout.signal;
+  const passStartTime = Date.now();
+
+  console.log("VISION_QUERY_FAST_PROFILE", {
+    rid, mode, model,
+    timeoutMs: openaiCutoffMs,
+    maxOutputTokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
+  });
+
+  try {
+    const response = await withModelServing(
+      "vision_pass:query_fast",
+      () =>
+        withHardTimeout(
+          openai.responses.create(
+            {
+              model,
+              temperature: 0.1,
+              max_output_tokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
+              prompt_cache_key: "evan-ai-vision-query-fast-v1",
+              prompt_cache_retention: "24h",
+              text: {
+                format: {
+                  type: "json_schema",
+                  name: "evan_ai_vision_query_fast_v1",
+                  strict: true,
+                  schema: buildUltraLeanVisionSchema(),
+                },
+              },
+              input: [
+                {
+                  role: "system",
+                  content: [{ type: "input_text", text: VISION_SYSTEM }],
+                },
+                {
+                  role: "user",
+                  content: [
+                    { type: "input_text", text: buildUltraLeanVisionPrompt(mode, propContext) },
+                    { type: "input_image", image_url: dataUrl },
+                  ],
+                },
+              ],
+              metadata: { rid: rid || "", mode, pass: "query_fast" },
+            },
+            { signal: combinedSignal }
+          ),
+          openaiCutoffMs + 500,
+          "vision_pass_timeout:query_fast"
+        ),
+      { provider: "openai", model, maxConsecutiveFailures: 4, circuitMs: 60_000 }
+    );
+
+    timeout.cancel();
+
+    const rawText =
+      typeof response?.output_text === "string" && response.output_text.trim()
+        ? response.output_text
+        : Array.isArray(response?.output)
+        ? response.output
+            .flatMap((block) => (Array.isArray(block?.content) ? block.content : []))
+            .map((part) => (typeof part?.text === "string" ? part.text : ""))
+            .find((x) => x && x.trim()) || ""
+        : "";
+
+    const parsedRaw = safeJsonParse(rawText, null) || extractFirstJsonObject(rawText) || null;
+
+    const parsed = {
+      query:          typeof parsedRaw?.query === "string" ? parsedRaw.query.trim() : null,
+      variants:       Array.isArray(parsedRaw?.variants) ? uniqueQueries(parsedRaw.variants) : [],
+      confidence:     Number.isFinite(Number(parsedRaw?.confidence)) ? clamp01(Number(parsedRaw.confidence)) : 0,
+      category:       typeof parsedRaw?.category === "string" ? parsedRaw.category.trim().toLowerCase() : null,
+      brandCertainty: Number.isFinite(Number(parsedRaw?.brandCertainty)) ? clamp01(Number(parsedRaw.brandCertainty)) : 0,
+    };
+
+    console.log("VISION_QUERY_FAST_RAW", {
+      rid,
+      parsedQuery:     parsed.query,
+      parsedConfidence: parsed.confidence,
+      parsedCategory:  parsed.category,
+      brandCertainty:  parsed.brandCertainty,
+      rawPreview:      String(rawText || "").slice(0, 200),
+    });
+
+    const elapsedMs = Date.now() - passStartTime;
+    console.log("VISION_QUERY_FAST_TIMING", { rid, elapsedMs, timedOut: false, cancelled: false, ok: true });
+
+    return { rawText, parsed, source: "openai", model, usage: response?.usage || null };
+
+  } catch (err) {
+    timeout.cancel?.();
+    const isAbort =
+      err?.name === "AbortError" ||
+      err?.name === "APIUserAbortError" ||
+      /aborted/i.test(String(err?.message || ""));
+    const elapsedMs = Date.now() - passStartTime;
+
+    console.log("VISION_QUERY_FAST_TIMING", {
+      rid, elapsedMs,
+      timedOut:  isAbort && !externalSignal?.aborted,
+      cancelled: !!externalSignal?.aborted,
+      ok: false,
+    });
+
+    return {
+      rawText: "",
+      parsed: { query: null, variants: [], confidence: 0, category: null, brandCertainty: 0 },
+      source: "openai",
+      model,
+      cancelled: !!externalSignal?.aborted,
+    };
+  }
+}
+
+// Phase A2.7: Gate for accepting the query_fast result.
+function shouldAcceptQueryFast(result, mode) {
+  if (!QUERY_FAST_ENABLED)                          return { accepted: false, reason: "disabled" };
+  if (!["item", "prop"].includes(mode))             return { accepted: false, reason: "unsupported_mode" };
+  if (!result)                                      return { accepted: false, reason: "missing_result" };
+  if (result.cancelled)                             return { accepted: false, reason: "cancelled" };
+
+  const q             = result?.parsed?.query;
+  const confidence    = Number(result?.parsed?.confidence ?? 0);
+  const category      = String(result?.parsed?.category || "").trim().toLowerCase();
+  const brandCertainty = Number(result?.parsed?.brandCertainty ?? 0);
+
+  if (!isUsableVisionQuery(q))                      return { accepted: false, reason: "unusable_query",           query: q, confidence, category, brandCertainty };
+  if (confidence < QUERY_FAST_CONFIDENCE_THRESHOLD) return { accepted: false, reason: "confidence_too_low",      query: q, confidence, category, brandCertainty };
+  if (!category)                                    return { accepted: false, reason: "missing_category",        query: q, confidence, category, brandCertainty };
+  if (HIGH_STAKES_CATEGORIES.has(category))         return { accepted: false, reason: "high_stakes_category",   query: q, confidence, category, brandCertainty };
+  if (brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX)
+                                                    return { accepted: false, reason: "brand_certainty_too_high", query: q, confidence, category, brandCertainty };
+
+  return { accepted: true, reason: "accepted", query: q, confidence, category, brandCertainty };
+}
+
 // Layer 3: gate for accepting the fast pre-pass result without escalating.
 // Skips heavy consensus when the fast pass is confidently sure AND the
 // inferred category isn't one where misidentification is expensive (luxury,
@@ -16197,7 +16406,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
   // at which it actually resolves (vs when we await it), so master's true wall
   // time is captured even if we don't end up using its result.
   const passT0 = Date.now();
-  let fastMs = null, visualMs = null, masterMs = null;
+  let fastMs = null, visualMs = null, masterMs = null, queryFastMs = null;
   const timed = (p, on) => p.then((v) => { on(Date.now() - passT0); return v; }, (e) => { on(Date.now() - passT0); throw e; });
 
   // Per-scan cohort assignment for the master-skip rollout. The dice roll is
@@ -16231,9 +16440,24 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     // On the uncertain path (visual_shape fails confidence), the consensus
     // fallback adds ~MASTER_LAZY_DELAY_MS - master_time wall time vs eager
     // parallel (~500ms with defaults since master ≈ 4s, visual ≈ 5s).
-    const fastAbortCtrl   = new AbortController();
-    const masterAbortCtrl = new AbortController();
-    const visualAbortCtrl = new AbortController();
+    const fastAbortCtrl      = new AbortController();
+    const masterAbortCtrl    = new AbortController();
+    const visualAbortCtrl    = new AbortController();
+    const queryFastAbortCtrl = new AbortController();
+
+    // Phase A2.7: Ultra-lean query_fast pass — runs at t=0 for item/prop only.
+    // Flat 5-field schema generates ~80-130 tokens; target return <3s warm cache.
+    const _runQueryFast = QUERY_FAST_ENABLED && ["item", "prop"].includes(mode);
+    const queryFastPromise = _runQueryFast
+      ? timed(
+          runUltraLeanVisionPass({
+            dataUrl, mode, propContext, rid: req.rid,
+            externalSignal: queryFastAbortCtrl.signal,
+          }),
+          (ms) => { queryFastMs = ms; }
+        ).catch(() => null)
+      : Promise.resolve(null);
+
     const fastPromise   = timed(
       runVisionPass({
         dataUrl,
@@ -16315,7 +16539,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     // Resolve immediately when fast is acceptable OR visual_shape clears the
     // master-skip threshold. Falls through to Promise.all(fast, visual) when
     // neither pass is individually decisive.
-    let raceWinner = null; // 'fast' | 'visual_early' | 'consensus'
+    let raceWinner = null; // 'query_fast' | 'fast' | 'visual_early' | 'consensus'
     await new Promise((resolve) => {
       let done = false;
       const finish = (winner) => {
@@ -16324,6 +16548,14 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         raceWinner = winner;
         resolve();
       };
+
+      // Phase A2.7: query_fast is the earliest possible winner — flat schema,
+      // no nested JSON. Accepted if it returns a usable non-brand non-high-stakes
+      // query at or above QUERY_FAST_CONFIDENCE_THRESHOLD.
+      queryFastPromise.then((r) => {
+        const acc = shouldAcceptQueryFast(r, mode);
+        if (acc.accepted) finish("query_fast");
+      }).catch(() => {});
 
       fastPromise.then((r) => {
         if (r && shouldAcceptFastVisionResult(r)) finish("fast");
@@ -16401,19 +16633,138 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     clearTimeout(earlyMasterTimer);
     clearTimeout(masterLaunchTimer);
 
+    // Phase A2.7: query_fast early return — cancel every in-flight pass and
+    // return immediately without running the merge pipeline.
+    if (raceWinner === "query_fast") {
+      try { queryFastAbortCtrl.abort(); } catch {} // no-op: already settled
+      try { fastAbortCtrl.abort(); } catch {}
+      try { visualAbortCtrl.abort(); } catch {}
+      try { masterAbortCtrl.abort(); } catch {} // pre-launch: prevents OpenAI request
+
+      const qfResult     = await queryFastPromise; // instant — already settled
+      const qfAcceptance = shouldAcceptQueryFast(qfResult, mode);
+      const qfQuery      = qfResult?.parsed?.query || null;
+      const qfVariants   = uniqueQueries(Array.isArray(qfResult?.parsed?.variants) ? qfResult.parsed.variants : []);
+      const qfConf       = clamp01(Number(qfResult?.parsed?.confidence ?? 0));
+      const qfCategory   = qfResult?.parsed?.category || null;
+      const qfBrand      = clamp01(Number(qfResult?.parsed?.brandCertainty ?? 0));
+      const qfWallMs     = Date.now() - passT0;
+
+      console.log("VISION_QUERY_FAST_ACCEPTED", {
+        rid: req.rid, query: qfQuery, confidence: qfConf,
+        category: qfCategory, brandCertainty: qfBrand, elapsedMs: qfWallMs,
+      });
+
+      console.log("VISION_MASTER_POLICY", {
+        rid: req.rid, mode, shouldLaunchMaster: false, reason: "query_fast_won",
+        visualConfidence: 0, fastConfidence: 0, brandCertainty: qfBrand,
+        category: qfCategory, highStakes: false,
+      });
+
+      console.log("VISION_FAST_PATH_DECISION", {
+        rid: req.rid, returnedEarly: true, reason: "query_fast",
+        elapsedMs: qfWallMs, selectedPass: "query_fast",
+        selectedQuery: qfQuery, selectedConfidence: qfConf,
+        masterLaunched: false, masterSkipped: true, fallbackUsed: false,
+      });
+
+      console.log("VISION_QUERY_QUALITY_GATE", {
+        rid: req.rid, pass: "query_fast", query: qfQuery,
+        accepted: !!qfQuery && !isGarbageQuery(qfQuery),
+        reason: !qfQuery ? "null_query" : isGarbageQuery(qfQuery) ? "garbage_query" : "accepted",
+      });
+
+      console.log("⏱️ VISION PASS TIMINGS", {
+        rid: req.rid, tier: "query_fast", raceWinner: "query_fast",
+        queryFastMs, fastMs, visualMs, masterMs,
+        visionWallMs: qfWallMs, visualConfidence: null,
+        fastCancelled: false, visualCancelled: false,
+        masterCancelled: false, masterLaunched: false, masterLaunchedEarlyMs: null,
+      });
+
+      recordVisionTiming({
+        rid:                req.rid,
+        tier:               "query_fast",
+        cohort,
+        masterSkipped:      true,
+        downscaled,
+        downscaleFromBytes,
+        downscaleToBytes,
+        fastMs:             null,
+        visualMs:           null,
+        masterMs:           null,
+        visionWallMs:       qfWallMs,
+        visualConfidence:   NaN,
+        costUsd:            0,
+        costBreakdown:      { fast: 0, visual: 0, master: 0, masterCancelled: false },
+      });
+
+      // Build minimal identity compatible with the downstream shaped builder.
+      const qfIdentity = {
+        itemType:             qfCategory,
+        category:             qfCategory,
+        brand:                null,
+        model:                null,
+        colors:               [],
+        materials:            [],
+        patterns:             [],
+        styleWords:           [],
+        visibleText:          [],
+        condition:            null,
+        conditionNotes:       null,
+        sizeHint:             null,
+        exactQuery:           qfQuery,
+        searchQueries:        qfVariants,
+        substituteCandidates: [],
+        marketSegment:        null,
+      };
+
+      return {
+        ok:         true,
+        query:      qfQuery,
+        variants:   qfVariants.filter((v) => v !== qfQuery).slice(0, 8),
+        confidence: qfConf,
+        identity:   qfIdentity,
+        attributeCertainty: {
+          brand:            qfBrand,
+          model:            0,
+          category:         qfConf,
+          condition:        0,
+          authenticity:     0,
+          resaleConfidence: qfConf,
+        },
+        visionSource: qfResult?.source || "openai",
+        visionTier:   "query_fast",
+        visionTimings: {
+          queryFastMs,
+          fastMs:        null,
+          visualMs:      null,
+          masterMs:      null,
+          visionWallMs:  qfWallMs,
+          raceWinner:    "query_fast",
+          masterLaunched: false,
+          tier:          "query_fast",
+        },
+        debug: { passQueries: [qfQuery], passLabels: ["query_fast"] },
+      };
+    }
+
     // Cancel the losers in-flight. Aborting masterAbortCtrl before master
     // launches → abort event fires → masterPromise resolves(null) immediately
     // (no OpenAI request sent). Aborting after launch → real in-flight cancel.
     if (raceWinner === "fast") {
+      try { queryFastAbortCtrl.abort(); } catch {}
       try { masterAbortCtrl.abort(); } catch {}
       try { visualAbortCtrl.abort(); } catch {}
     } else if (raceWinner === "visual_early") {
+      try { queryFastAbortCtrl.abort(); } catch {}
       try { fastAbortCtrl.abort(); } catch {}
       try { masterAbortCtrl.abort(); } catch {} // real cancel if in-flight; skip if pre-launch
     } else if (raceWinner === "consensus") {
       // Consensus winner: master is ready (or resolving), visual may have deadline-aborted.
       // Cancel fast if it's still in-flight so we don't pay the Gemini-fallback
       // tax on a result we're about to discard.
+      try { queryFastAbortCtrl.abort(); } catch {}
       try { fastAbortCtrl.abort(); } catch {}
       // Visual deadline timer above has already aborted if it fired; this is
       // a safety no-op for the case where visual settled naturally.
@@ -34235,15 +34586,17 @@ if (OPENAI_API_KEY && openai) {
       // per model, so a gpt-4.1 warmup doesn't help a gpt-4.1-mini call even
       // with the same cache key. visual_shape now uses VISUAL_SHAPE_MODEL
       // (mini by default) and fast uses FAST_VISION_MODEL — warm both.
-      // Phase A2.6: fast/visual_shape now use lean schema (v6 cache key).
+      // Phase A2.7: query_fast uses ultra-lean schema + dedicated cache key.
+      // Phase A2.6: fast/visual_shape use lean schema (v6 cache key).
       // master/brand_model keep full schema (v5 cache key).
       const warmupPasses = [
-        { passLabel: "master",       model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-master-v5",       schemaName: "evan_ai_vision_master" },
-        { passLabel: "brand_model",  model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-brand_model-v5",   schemaName: "evan_ai_vision_brand_model" },
-        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL, schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-visual_shape-v6",  schemaName: "evan_ai_vision_visual_shape_lean" },
-        { passLabel: "fast",         model: FAST_VISION_MODEL,  schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-fast-v6",          schemaName: "evan_ai_vision_fast_lean" },
+        { passLabel: "master",       model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-master-v5",       schemaName: "evan_ai_vision_master",          promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+        { passLabel: "brand_model",  model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-brand_model-v5",   schemaName: "evan_ai_vision_brand_model",     promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL, schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-visual_shape-v6",  schemaName: "evan_ai_vision_visual_shape_lean", promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+        { passLabel: "fast",         model: FAST_VISION_MODEL,  schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-fast-v6",          schemaName: "evan_ai_vision_fast_lean",       promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+        { passLabel: "query_fast",   model: QUERY_FAST_MODEL,   schema: buildUltraLeanVisionSchema(), cacheKey: "evan-ai-vision-query-fast-v1",    schemaName: "evan_ai_vision_query_fast_v1",  promptFn: () => buildUltraLeanVisionPrompt("item", "") },
       ];
-      for (const { passLabel, model, schema, cacheKey, schemaName } of warmupPasses) {
+      for (const { passLabel, model, schema, cacheKey, schemaName, promptFn } of warmupPasses) {
         openai.responses.create({
           model,
           temperature: 0.1,
@@ -34253,7 +34606,7 @@ if (OPENAI_API_KEY && openai) {
           text: { format: { type: "json_schema", name: schemaName, strict: true, schema } },
           input: [
             { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
-            { role: "user", content: [{ type: "input_text", text: buildVisionPassPrompt(passLabel, "item", "") }, { type: "input_image", image_url: warmDataUrl }] },
+            { role: "user", content: [{ type: "input_text", text: promptFn(passLabel) }, { type: "input_image", image_url: warmDataUrl }] },
           ],
         }).catch(() => {});
       }
