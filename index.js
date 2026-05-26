@@ -8205,39 +8205,56 @@ function detectModelTokensInQuery(q) {
 const AIRCRAFT_FAMILY_MAP = {
   "787": ["787", "dreamliner"],
   "777": ["777"],
-  "747": ["747"],
+  "747": ["747", "jumbo"],
   "737": ["737"],
   "a380": ["a380"],
   "a350": ["a350"],
   "a330": ["a330"],
   "a320": ["a320", "a321"],
+  "a319": ["a319"],
+  "concorde": ["concorde"],
 };
 
-// Common airline tokens with their competitor lists.
-// Keys must be safe to search in normalized (lowercased, spaces-only) strings.
+// Airline identity tokens with their competitor lists.
+// Keys and competitor tokens are matched with word-boundary safety via titleHasToken().
 const AIRLINE_COMPETITOR_MAP = {
-  "hawaiian": ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "ana ", "lufthansa", "emirates"],
-  "united":   ["hawaiian", "delta", "american airlines", "southwest", "alaska", "jetblue", "ana "],
-  "delta":    ["hawaiian", "united", "american airlines", "southwest", "alaska", "jetblue"],
-  "southwest":["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue"],
-  "alaska":   ["hawaiian", "united", "delta", "american airlines", "southwest", "jetblue"],
-  "jetblue":  ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska"],
-  "ana ":     ["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue", "korean"],
-  "emirates": ["qatar", "etihad", "lufthansa"],
-  "qatar":    ["emirates", "etihad", "lufthansa"],
-  "lufthansa":["emirates", "qatar", "british"],
+  "hawaiian":        ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal", "lufthansa", "emirates", "british airways", "air france", "klm"],
+  "united":          ["hawaiian", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal"],
+  "delta":           ["hawaiian", "united", "american airlines", "southwest", "alaska", "jetblue", "spirit"],
+  "american airlines":["hawaiian", "united", "delta", "southwest", "alaska", "jetblue", "spirit"],
+  "southwest":       ["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue"],
+  "alaska":          ["hawaiian", "united", "delta", "american airlines", "southwest", "jetblue"],
+  "jetblue":         ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska"],
+  "spirit":          ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "frontier"],
+  "frontier":        ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit"],
+  "ana":             ["united", "delta", "american airlines", "alaska", "jetblue", "korean air", "jal", "lufthansa"],
+  "jal":             ["ana", "united", "delta", "american airlines", "alaska", "korean air", "lufthansa"],
+  "korean air":      ["ana", "jal", "united", "delta", "american airlines", "lufthansa"],
+  "emirates":        ["qatar", "etihad", "lufthansa", "british airways", "air france", "klm"],
+  "qatar":           ["emirates", "etihad", "lufthansa", "british airways", "air france"],
+  "etihad":          ["emirates", "qatar", "lufthansa", "british airways", "air france"],
+  "lufthansa":       ["emirates", "qatar", "etihad", "british airways", "air france", "klm"],
+  "british airways": ["emirates", "qatar", "etihad", "lufthansa", "air france", "klm"],
+  "air france":      ["emirates", "qatar", "etihad", "lufthansa", "british airways", "klm"],
+  "klm":             ["emirates", "qatar", "etihad", "lufthansa", "british airways", "air france"],
 };
 
-// Returns airline lock info if query contains a named airline, else null.
+// Whole-word / phrase boundary match on normalizeTitleKey output.
+// Wrapping both strings with spaces means "ana" won't match inside "banana"
+// and "american airlines" works as a two-word phrase.
+function titleHasToken(titleKey, token) {
+  return (` ${titleKey} `).includes(` ${token.trim()} `);
+}
+
+// Returns airline lock info if the query (normalized) names a specific airline.
 function detectAirlineLockInQuery(q) {
   for (const [airline, competitors] of Object.entries(AIRLINE_COMPETITOR_MAP)) {
-    if (!q.includes(airline)) continue;
+    if (!titleHasToken(q, airline)) continue;
 
-    // Found required airline. Determine required aircraft family.
     let requiredFamily = null;
     let wrongFamilyTokens = [];
     for (const [family, tokens] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
-      if (tokens.some((t) => q.includes(t))) {
+      if (tokens.some((tok) => titleHasToken(q, tok))) {
         requiredFamily = family;
         for (const [f, toks] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
           if (f !== family) wrongFamilyTokens.push(...toks);
@@ -8357,42 +8374,87 @@ function filterRelevantListings(query, items) {
     if (modelFiltered.length >= 3) preserved = modelFiltered;
   }
 
-  // Airline identity lock. When the query names a specific airline (e.g.
-  // "Hawaiian Airlines"), competitor-airline listings are filtered out and
-  // wrong-aircraft-family items are deprioritized. Only applied when enough
-  // matching listings survive so we never return an empty pool.
+  // Airline identity lock. When the query names a specific airline, competitor-airline
+  // listings are removed and wrong-aircraft-family items are rejected (not just sorted
+  // lower) when enough correct-family items remain. ≥2 floor on all operations prevents
+  // an empty comp pool.
   const _airlineLock = detectAirlineLockInQuery(q);
   if (_airlineLock) {
     const { requiredAirline, competitors, requiredFamily, wrongFamilyTokens } = _airlineLock;
+    const _rawCount = preserved.length;
+    let _rejectedCompetitor = 0;
+    let _rejectedModel = 0;
+    let _penalizedModel = 0;
 
-    // Step 1: drop listings that name a competitor without naming the required airline.
-    const _airlineFiltered = preserved.filter((it) => {
+    // Step 1: annotate each item with identity lock metadata.
+    for (const it of preserved) {
       const t = normalizeTitleKey(it?.title || "");
-      const hasRequired = t.includes(requiredAirline);
-      const hasCompetitor = competitors.some((c) => t.includes(c));
-      if (hasCompetitor && !hasRequired) return false;
-      return true;
-    });
-    if (_airlineFiltered.length >= 2) preserved = _airlineFiltered;
-
-    // Step 2: move wrong-aircraft-family items to the back.
-    if (requiredFamily && wrongFamilyTokens.length) {
-      const _exactFamily = [];
-      const _wrongFamily = [];
-      for (const it of preserved) {
-        const t = normalizeTitleKey(it?.title || "");
-        wrongFamilyTokens.some((tok) => t.includes(tok))
-          ? _wrongFamily.push(it)
-          : _exactFamily.push(it);
-      }
-      if (_exactFamily.length >= 2) preserved = [..._exactFamily, ..._wrongFamily];
+      const airlineMatch       = titleHasToken(t, requiredAirline);
+      const competitorMismatch = competitors.some((c) => titleHasToken(t, c)) && !airlineMatch;
+      const aircraftFamilyMatch = requiredFamily
+        ? (AIRCRAFT_FAMILY_MAP[requiredFamily]?.some((tok) => titleHasToken(t, tok)) ?? false)
+        : true;
+      const aircraftFamilyMismatch = requiredFamily && wrongFamilyTokens.length > 0
+        ? wrongFamilyTokens.some((tok) => titleHasToken(t, tok)) && !aircraftFamilyMatch
+        : false;
+      it.__identityLock = { airlineMatch, competitorMismatch, aircraftFamilyMatch, aircraftFamilyMismatch, relaxed: false };
     }
+
+    // Step 2: drop competitor-airline listings (≥2 survivor floor).
+    const _noCompetitor = preserved.filter((it) => !it.__identityLock.competitorMismatch);
+    if (_noCompetitor.length >= 2) {
+      for (const it of preserved) {
+        if (it.__identityLock.competitorMismatch) {
+          _rejectedCompetitor++;
+          console.log("IDENTITY_LOCK_REJECTED", { title: it?.title, reason: "competitor_airline", requiredAirline });
+        }
+      }
+      preserved = _noCompetitor;
+    } else {
+      for (const it of preserved) if (it.__identityLock.competitorMismatch) it.__identityLock.relaxed = true;
+    }
+
+    // Step 3: handle wrong-aircraft-family items.
+    if (requiredFamily && wrongFamilyTokens.length) {
+      const _exactFamily = preserved.filter((it) => !it.__identityLock.aircraftFamilyMismatch);
+      const _wrongFamily = preserved.filter((it) =>  it.__identityLock.aircraftFamilyMismatch);
+      if (_exactFamily.length >= 2) {
+        // Enough correct-family — reject wrong-family entirely.
+        for (const it of _wrongFamily) {
+          _rejectedModel++;
+          console.log("IDENTITY_LOCK_REJECTED", { title: it?.title, reason: "wrong_aircraft_family", requiredFamily });
+        }
+        preserved = _exactFamily;
+      } else if (_wrongFamily.length > 0) {
+        // Too few correct-family — keep wrong-family at the back (penalized).
+        for (const it of _wrongFamily) {
+          _penalizedModel++;
+          it.__identityLock.relaxed = true;
+          console.log("IDENTITY_LOCK_PENALIZED", { title: it?.title, reason: "wrong_aircraft_family_relaxed", requiredFamily });
+        }
+        preserved = [..._exactFamily, ..._wrongFamily];
+      }
+    }
+
+    console.log("IDENTITY_LOCK_TOKEN_MATCH_POLICY", {
+      requiredAirline,
+      competitors,
+      requiredMatchedCount: preserved.filter((it) => it.__identityLock?.airlineMatch).length,
+      competitorRejectedCount: _rejectedCompetitor,
+    });
 
     console.log("IDENTITY_LOCK_SUMMARY", {
       query: q,
       requiredAirline,
       requiredFamily,
-      preservedCount: preserved.length,
+      rawCount: _rawCount,
+      afterCompetitorFilterCount: _rawCount - _rejectedCompetitor,
+      strongFamilyCount: preserved.filter((it) => it.__identityLock?.aircraftFamilyMatch).length,
+      rejectedCompetitorCount: _rejectedCompetitor,
+      rejectedModelMismatchCount: _rejectedModel,
+      penalizedModelMismatchCount: _penalizedModel,
+      relaxed: _noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0),
+      finalTopTitles: preserved.slice(0, 3).map((it) => it?.title),
     });
   }
 
@@ -16463,21 +16525,30 @@ function shouldAcceptQueryFast(result, mode) {
   if (!isUsableVisionQuery(q))                      return { accepted: false, reason: "unusable_query",           query: q, confidence, category, brandCertainty };
   if (confidence < QUERY_FAST_CONFIDENCE_THRESHOLD) return { accepted: false, reason: "confidence_too_low",      query: q, confidence, category, brandCertainty };
   if (!category)                                    return { accepted: false, reason: "missing_category",        query: q, confidence, category, brandCertainty };
-  if (HIGH_STAKES_CATEGORIES.has(category))         return { accepted: false, reason: "high_stakes_category",   query: q, confidence, category, brandCertainty };
 
-  const highStakes   = HIGH_STAKES_CATEGORIES.has(category);
-  const brandUseful  = isBrandUsefulCategory(category);
-  // Reject high brandCertainty ONLY when category is auth-sensitive or not brand-useful.
-  // For collectibles/toys/models the brand text is visually printed and a strong signal.
-  const brandGateFails = brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX && !brandUseful && !highStakes;
+  // Compute all policy flags before logging so the log always reflects the full decision.
+  const highStakes     = HIGH_STAKES_CATEGORIES.has(category);
+  const brandUseful    = isBrandUsefulCategory(category);
+  // High brandCertainty is rejected when: (a) category is auth-sensitive/high-stakes, OR
+  // (b) category is not brand-useful (generic goods where brand auth matters at consensus).
+  // Brand-useful categories (models, collectibles, toys, books) visually display brand as
+  // identity — high brandCertainty is a signal, not a trust problem.
+  const brandGateFails = brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX && !brandUseful;
+
+  const accepted = !highStakes && !brandGateFails;
+  const reason   = highStakes
+    ? "high_stakes_category"
+    : brandGateFails
+      ? "brand_certainty_too_high"
+      : "accepted";
+
   console.log("VISION_QUERY_FAST_BRAND_POLICY", {
     category, brandCertainty, brandUseful, highStakes,
-    accepted: !brandGateFails,
-    reason: brandGateFails ? "brand_certainty_too_high_non_useful" : "brand_ok",
+    accepted,
+    reason,
   });
-  if (brandGateFails) return { accepted: false, reason: "brand_certainty_too_high", query: q, confidence, category, brandCertainty };
 
-  return { accepted: true, reason: "accepted", query: q, confidence, category, brandCertainty };
+  return { accepted, reason, query: q, confidence, category, brandCertainty };
 }
 
 // Layer 3: gate for accepting the fast pre-pass result without escalating.
@@ -26486,16 +26557,32 @@ app.get("/analytics/summary", async (req, res) => {
 
 app.get("/precompute/query", async (req, res) => {
   try {
-    const query = normalizeQuery(safeStr(req.query?.q, 220));
+    const query  = normalizeQuery(safeStr(req.query?.q, 220));
+    // Optional scanId lets the server log which scan triggered this call,
+    // making stale speculative fetches visible in server logs.
+    const scanId = safeStr(req.query?.scanId, 64) || null;
+
     if (!query) {
       return res.status(200).json({ ok: false, error: "missing_query" });
     }
+
+    // Server has no active-scan session concept; we cannot reject stale queries
+    // server-side without introducing per-user state. Log for visibility only.
+    // The frontend must guard against firing precompute for the previous scan's query.
+    console.log("SPECULATIVE_QUERY_POLICY", {
+      query,
+      scanId,
+      activeScanId: null,
+      accepted: true,
+      reason: scanId ? "scanId_present_no_server_guard" : "no_scanId_frontend_must_guard",
+    });
 
     const snapshot = await getPrecomputeSnapshot(query);
 
     return res.status(200).json({
       ok: true,
       query,
+      scanId: scanId || null,
       snapshot: snapshot || null,
     });
   } catch (err) {
