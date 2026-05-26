@@ -16607,22 +16607,31 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         passLabels = [_seedResult.sourcePass];
         visionTier = "seed_recovery";
       } else {
-        // No usable seed — wait for master. For item/prop mode race against a
-        // hard ceiling so a slow master doesn't block indefinitely if the
-        // ceiling fires with a last-chance seed available.
+        // No usable seed — wait for master. For item/prop mode, race against a
+        // hard ceiling so a slow master can't block indefinitely when a seed
+        // becomes usable. The ceiling must resolve BEFORE awaiting masterPromise
+        // so the hard-return branch is actually reachable.
         let master;
         if (_isItemPropMode) {
-          const _elapsedMs    = Date.now() - passT0;
-          const _remainingMs  = Math.max(200, ITEM_VISION_HARD_RETURN_MS - _elapsedMs);
-          const _ceilingP     = new Promise((res) => {
-            const t = setTimeout(() => res("ceiling"), _remainingMs);
+          const _elapsedMs   = Date.now() - passT0;
+          const _remainingMs = Math.max(200, ITEM_VISION_HARD_RETURN_MS - _elapsedMs);
+          const _ceilingP    = new Promise((res) => {
+            const t = setTimeout(() => res({ type: "ceiling" }), _remainingMs);
             if (typeof t.unref === "function") t.unref();
           });
-          const _raceResult   = await Promise.race([masterPromise.then(() => "master"), _ceilingP]);
-          master = await masterPromise; // instant if master already settled
-          if (_raceResult === "ceiling" && !master) {
-            // Ceiling fired and master hasn't returned. Check one last time
-            // for any passable seed (lower bar: just isUsableVisionQuery).
+          // Tag each outcome so we know which arm won without checking the value.
+          const _raceResult = await Promise.race([
+            masterPromise.then((m) => ({ type: "master", master: m })),
+            _ceilingP,
+          ]);
+
+          if (_raceResult.type === "master") {
+            // Master returned before the ceiling — use it normally.
+            master = _raceResult.master;
+          } else {
+            // Ceiling fired. Do NOT await masterPromise here — that would
+            // block until master finishes and defeat the entire ceiling.
+            // Instead, look for a usable seed from fast/visual_shape.
             const _hardCandidates = [
               { r: visualResult, sourcePass: "visual_shape" },
               { r: fastResult,   sourcePass: "fast" },
@@ -16630,29 +16639,34 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             let _hardSeed = null;
             for (const { r, sourcePass } of _hardCandidates) {
               if (r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)) {
-                _hardSeed = { r, sourcePass };
-                break;
+                const _cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
+                if (!_cat || !HIGH_STAKES_CATEGORIES.has(_cat)) {
+                  _hardSeed = { r, sourcePass };
+                  break;
+                }
               }
             }
             if (_hardSeed) {
               try { masterAbortCtrl.abort(); } catch {}
               console.log("VISION_HARD_RETURN_USED", {
-                rid:       req.rid,
-                elapsedMs: Date.now() - passT0,
-                source:    _hardSeed.sourcePass,
-                query:     _hardSeed.r?.parsed?.query,
+                rid:        req.rid,
+                elapsedMs:  Date.now() - passT0,
+                source:     _hardSeed.sourcePass,
+                query:      _hardSeed.r?.parsed?.query,
                 confidence: Number(_hardSeed.r?.parsed?.confidence ?? 0),
               });
               passes     = [_hardSeed.r];
               passLabels = [_hardSeed.sourcePass];
               visionTier = "hard_return";
-              master = null; // skip normal consensus assembly
+              master     = null; // skip normal consensus assembly
             } else {
+              // No usable seed — ceiling can't help us. Await master now.
               console.log("VISION_HARD_RETURN_SKIPPED", {
                 rid:       req.rid,
                 elapsedMs: Date.now() - passT0,
                 reason:    "no_usable_seed_at_ceiling",
               });
+              master = await masterPromise;
             }
           }
         } else {
