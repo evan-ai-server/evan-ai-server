@@ -8359,6 +8359,155 @@ function detectAirlineLockInQuery(q, context = {}) {
   return null;
 }
 
+// ── Aircraft Model Listing Tier Classification ─────────────────────────────────
+// Separates precision collectible/display models (GeminiJets, NG Models, scale
+// 1:400, diecast) from cheap toy/pullback listings (Daron pullback, playset) so
+// that toy comps cannot anchor the price median for a $150+ display model.
+
+const AIRCRAFT_PREMIUM_TERMS = [
+  "diecast", "die cast", "die-cast",
+  "scale 1", "1/400", "1:400", "1/200", "1:200", "1/300", "1:300", "1/150", "1:150", "1/500", "1:500",
+  "geminijet", "gemini jet", "ng model", "ng models", "herpa", "skymarks",
+  "hogan", "inflight", "jc wings", "phoenix model", "dragon wings",
+  "model airplane", "aircraft model", "airplane model", "display stand", "display model",
+  "collector model", "collectible model", "metal model", "alloy model",
+];
+
+const AIRCRAFT_TOY_TERMS = [
+  "pullback", "pull back", "playset", "single plane", "single prop",
+  "toy plane", "kids plane", "jumbo pullback", "plastic toy", "pencil topper",
+  "party favor", "airport playset", "snap fit", "snap-fit", "friction toy",
+  "pocket plane", "foam plane", "kids toy",
+];
+
+// Returns { tier: "premium_model" | "generic_toy" | "unknown_model", reasons }
+function classifyAircraftModelListing(item) {
+  const t = normalizeTitleKey(item?.title || "");
+  const reasons = [];
+
+  for (const term of AIRCRAFT_PREMIUM_TERMS) {
+    if (t.includes(normalizeTitleKey(term))) { reasons.push(`premium:${term}`); break; }
+  }
+  if (reasons.length > 0) return { tier: "premium_model", reasons };
+
+  const isDaron = t.includes("daron");
+  for (const term of AIRCRAFT_TOY_TERMS) {
+    const tn = normalizeTitleKey(term);
+    if (t.includes(tn)) {
+      // Daron is classified as toy only when toy terms are present
+      reasons.push(`toy:${term}`);
+      return { tier: "generic_toy", reasons };
+    }
+  }
+  if (isDaron && reasons.length === 0) {
+    // Bare "daron" without toy terms → could be Daron collectible — leave unknown
+  }
+
+  return { tier: "unknown_model", reasons };
+}
+
+// Returns true if the normalized query indicates an aircraft/model airplane context.
+function isAircraftModelQuery(q) {
+  const aircraftWords = ["airplane", "aircraft", "diecast", "die cast", "aviation",
+    "boeing", "airbus", "model plane", "model airplane", "aircraft model"];
+  if (aircraftWords.some((w) => q.includes(w))) return true;
+  // Airline name + "model" or "plane" or "toy" also qualifies
+  const hasAirline = Object.keys(AIRLINE_COMPETITOR_MAP).some((a) => titleHasToken(q, a));
+  return hasAirline && (q.includes("model") || q.includes("plane") || q.includes("toy"));
+}
+
+// Infers what tier the SCANNED item is, using query keywords + scannedPrice hint.
+function inferScanTierFromQuery(q, scannedPrice = null) {
+  const premNorm = AIRCRAFT_PREMIUM_TERMS.map(normalizeTitleKey);
+  if (premNorm.some((t) => q.includes(t))) return { tier: "premium_model", reason: "query_premium_term" };
+
+  const toyNorm = AIRCRAFT_TOY_TERMS.map(normalizeTitleKey);
+  if (toyNorm.some((t) => q.includes(t))) return { tier: "generic_toy", reason: "query_toy_term" };
+
+  const price = Number.isFinite(scannedPrice) ? scannedPrice : null;
+  if (price != null && price >= 50) return { tier: "premium_model", reason: "scanned_price_ge_50" };
+  if (price != null && price < 25)  return { tier: "generic_toy",   reason: "scanned_price_lt_25" };
+
+  return { tier: "unknown_model", reason: "no_clear_signals" };
+}
+
+// Post-filter that applies aircraft comp tiering to an assembled items array.
+// Called at route level where scannedPrice is available. Complements the
+// family-based toy rejection inside filterRelevantListings (which only fires
+// when requiredFamily is non-null). This handles the requiredFamily=null case.
+function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  const q = normalizeTitleKey(query || "");
+  if (!isAircraftModelQuery(q)) return items;
+
+  const { tier: scanTier, reason: tierReason } = inferScanTierFromQuery(q, scannedPrice);
+
+  const classified = items.map((it) => ({
+    ...it,
+    __aircraftTier: classifyAircraftModelListing(it),
+  }));
+
+  const premium = classified.filter((it) => it.__aircraftTier.tier === "premium_model");
+  const toy     = classified.filter((it) => it.__aircraftTier.tier === "generic_toy");
+  const unknown = classified.filter((it) => it.__aircraftTier.tier === "unknown_model");
+
+  console.log("AIRCRAFT_MODEL_TIER_POLICY", {
+    query, scannedPrice, inferredScanTier: scanTier, reason: tierReason,
+  });
+
+  let result = classified;
+  const _rawCount = classified.length;
+  let _rejectedCount = 0;
+  let _penalizedCount = 0;
+
+  if (scanTier === "premium_model" || (scanTier === "unknown_model" && scannedPrice != null && scannedPrice >= 50)) {
+    const nonToy = classified.filter((it) => it.__aircraftTier.tier !== "generic_toy");
+    if (toy.length > 0) {
+      if (nonToy.length >= 2) {
+        for (const it of toy) {
+          _rejectedCount++;
+          console.log("AIRCRAFT_MODEL_TIER_REJECTED", {
+            title: it?.title, reason: "generic_toy_excluded", scanTier,
+          });
+        }
+        result = nonToy;
+      } else {
+        // Floor: keep toys at the back so comp pool isn't empty.
+        for (const it of toy) {
+          _penalizedCount++;
+          console.log("AIRCRAFT_MODEL_TIER_PENALIZED", {
+            title: it?.title, reason: "generic_toy_penalized_floor", scanTier,
+          });
+        }
+        result = [...nonToy, ...toy];
+      }
+    }
+  } else if (scanTier === "unknown_model") {
+    // Unknown tier without price: sort premium first, then unknown, then toy.
+    // No hard rejection — we don't know enough to discard anything.
+    if (premium.length > 0 || toy.length > 0) {
+      result = [...premium, ...unknown, ...toy];
+    }
+  }
+  // generic_toy scanTier: allow toys, push expensive premium behind toy comps.
+  else if (scanTier === "generic_toy" && premium.length > 0) {
+    result = [...toy, ...unknown, ...premium];
+  }
+
+  console.log("AIRCRAFT_MODEL_TIER_SUMMARY", {
+    query, inferredScanTier: scanTier, tierReason, scannedPrice,
+    rawCount: _rawCount,
+    premiumCount: premium.length,
+    genericToyCount: toy.length,
+    unknownCount: unknown.length,
+    rejectedGenericToyCount: _rejectedCount,
+    penalizedGenericToyCount: _penalizedCount,
+    finalTopTitles: result.slice(0, 3).map((it) => it?.title),
+  });
+
+  return result;
+}
+
 function filterRelevantListings(query, items) {
   if (!Array.isArray(items)) return [];
 
@@ -23869,6 +24018,16 @@ if (!_oracleOnlyResult && Array.isArray(items)) {
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Aircraft model comp tiering: separate display/diecast models from cheap
+// toy/pullback listings so a $10 Daron pullback can't anchor the median when
+// the scanned item is a $150+ GeminiJets precision model. Runs after the full
+// market assembly (live + cache + oracle + result-aware refinement) so it sees
+// the complete comp pool. scannedPrice (declared at route-request parse level)
+// upgrades "unknown_model" to "premium_model" when price ≥ $50.
+if (Array.isArray(items) && items.length > 0) {
+  items = applyAircraftModelTierFilter(query, items, scannedPrice);
+}
 
 // Feature 4 + 5: fire eBay sold comps + local comps in parallel with payload build
 const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
