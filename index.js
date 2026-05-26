@@ -1543,6 +1543,12 @@ const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_T
 const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
 const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
 
+// A2.10 — Aircraft family refinement: when query_fast wins on an aircraft collectible
+// but its query lacks an aircraft family token (787/777/A320/etc.), wait briefly for
+// visual_shape or master to supply a more specific query before returning.
+const AIRCRAFT_IDENTITY_REFINE_ENABLED = String(process.env.AIRCRAFT_IDENTITY_REFINE_ENABLED || "true").toLowerCase() !== "false";
+const AIRCRAFT_IDENTITY_REFINE_MS      = Number(process.env.AIRCRAFT_IDENTITY_REFINE_MS || 2200);
+
 // A2.8 — Parallel pre-consensus: for item/prop mode, preprocessScanUpload fires
 // at the same time as the CLIP embed race so its ~1000ms Sharp wall time is
 // absorbed rather than paid sequentially. prepareVisionBuffer inside
@@ -8246,20 +8252,105 @@ function titleHasToken(titleKey, token) {
   return (` ${titleKey} `).includes(` ${token.trim()} `);
 }
 
+// Family token groups ordered most-specific first (for unambiguous lookup).
+// Tokens are pre-normalized (alphanumeric + spaces only) to match normalizeTitleKey output.
+const AIRCRAFT_FAMILY_MATCH = [
+  { family: "787", tokens: ["787 9", "787", "dreamliner", "boeing 787"] },
+  { family: "777", tokens: ["777", "boeing 777"] },
+  { family: "747", tokens: ["747", "jumbo jet", "boeing 747"] },
+  { family: "737", tokens: ["737", "boeing 737"] },
+  { family: "a321", tokens: ["a321neo", "a321", "airbus a321"] },
+  { family: "a320", tokens: ["a320", "airbus a320"] },
+  { family: "a350", tokens: ["a350", "airbus a350"] },
+  { family: "a330", tokens: ["a330", "airbus a330"] },
+  { family: "a380", tokens: ["a380", "airbus a380"] },
+  { family: "a319", tokens: ["a319", "airbus a319"] },
+  { family: "concorde", tokens: ["concorde"] },
+];
+
+// Scans query, variants, and identity for a recognizable aircraft family.
+// Returns { family, source, matchedToken } or null.
+// Only fires when text strongly suggests an aircraft/model context.
+function inferAircraftFamilyFromVisionResultOrQuery(q, variants = [], identity = {}) {
+  const identityText = [
+    identity?.exactQuery || "",
+    ...(Array.isArray(identity?.searchQueries) ? identity.searchQueries : []),
+    ...(Array.isArray(identity?.visibleText)   ? identity.visibleText   : []),
+  ].join(" ");
+
+  const allNorm = normalizeTitleKey([q, ...variants, identityText].join(" "));
+
+  // Require aircraft context before inferring to avoid false family matches.
+  const _aircraftCtx = ["airplane", "aircraft", "diecast", "aviation", "boeing", "airbus",
+    "dreamliner", "787", "777", "747", "737", "a380", "a350", "a330", "a320", "a321",
+    "a319", "model plane", "model airplane"].some((tok) => allNorm.includes(tok));
+  if (!_aircraftCtx) return null;
+
+  // Check each source in priority order: query → variants → identity
+  const sources = [
+    { text: normalizeTitleKey(q), name: "query" },
+    ...variants.map((v, i) => ({ text: normalizeTitleKey(v), name: `variant_${i}` })),
+    { text: normalizeTitleKey(identityText), name: "identity" },
+  ];
+
+  for (const { family, tokens } of AIRCRAFT_FAMILY_MATCH) {
+    for (const { text, name } of sources) {
+      for (const tok of tokens) {
+        if (text.includes(tok)) {
+          return { family, source: name, matchedToken: tok };
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 // Returns airline lock info if the query (normalized) names a specific airline.
-function detectAirlineLockInQuery(q) {
+// Optional context = { variants, identity, category } enables aircraft family
+// inference from additional text sources when the query alone lacks the family.
+function detectAirlineLockInQuery(q, context = {}) {
   for (const [airline, competitors] of Object.entries(AIRLINE_COMPETITOR_MAP)) {
     if (!titleHasToken(q, airline)) continue;
 
     let requiredFamily = null;
     let wrongFamilyTokens = [];
+
+    // First: scan q directly for a family token.
     for (const [family, tokens] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
-      if (tokens.some((tok) => titleHasToken(q, tok))) {
+      if (tokens.some((tok) => q.includes(tok))) {
         requiredFamily = family;
         for (const [f, toks] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
           if (f !== family) wrongFamilyTokens.push(...toks);
         }
         break;
+      }
+    }
+
+    // Second: if no family in q, try to infer from variants / identity context.
+    if (!requiredFamily && (context.variants?.length || context.identity || context.category)) {
+      const _catStr = String(context.category || "").toLowerCase();
+      const _isAircraftCtx = _catStr.includes("airplane") || _catStr.includes("aircraft") ||
+        _catStr.includes("model") || _catStr.includes("diecast") || _catStr.includes("aviation") ||
+        (context.variants?.length > 0);
+
+      if (_isAircraftCtx) {
+        const inferred = inferAircraftFamilyFromVisionResultOrQuery(
+          q, context.variants || [], context.identity || {}
+        );
+        if (inferred) {
+          requiredFamily = inferred.family;
+          for (const [f, toks] of Object.entries(AIRCRAFT_FAMILY_MAP)) {
+            if (f !== requiredFamily) wrongFamilyTokens.push(...toks);
+          }
+          console.log("AIRCRAFT_FAMILY_INFERRED", {
+            query: q,
+            inferredFamily: inferred.family,
+            source: inferred.source,
+            matchedToken: inferred.matchedToken,
+            confidenceReason: `matched '${inferred.matchedToken}' in ${inferred.source}`,
+          });
+        }
       }
     }
 
@@ -8382,6 +8473,14 @@ function filterRelevantListings(query, items) {
   if (_airlineLock) {
     const { requiredAirline, competitors, requiredFamily, wrongFamilyTokens } = _airlineLock;
     const _rawCount = preserved.length;
+
+    // Early exit when there is nothing to filter (e.g. precompute cache warmup with 0 items).
+    if (_rawCount === 0) {
+      console.log("IDENTITY_LOCK_SUMMARY", {
+        query: q, requiredAirline, requiredFamily,
+        phase: "empty_precheck", rawCount: 0,
+      });
+    } else {
     let _rejectedCompetitor = 0;
     let _rejectedModel = 0;
     let _penalizedModel = 0;
@@ -8392,10 +8491,10 @@ function filterRelevantListings(query, items) {
       const airlineMatch       = titleHasToken(t, requiredAirline);
       const competitorMismatch = competitors.some((c) => titleHasToken(t, c)) && !airlineMatch;
       const aircraftFamilyMatch = requiredFamily
-        ? (AIRCRAFT_FAMILY_MAP[requiredFamily]?.some((tok) => titleHasToken(t, tok)) ?? false)
+        ? (AIRCRAFT_FAMILY_MAP[requiredFamily]?.some((tok) => t.includes(tok)) ?? false)
         : true;
       const aircraftFamilyMismatch = requiredFamily && wrongFamilyTokens.length > 0
-        ? wrongFamilyTokens.some((tok) => titleHasToken(t, tok)) && !aircraftFamilyMatch
+        ? wrongFamilyTokens.some((tok) => t.includes(tok)) && !aircraftFamilyMatch
         : false;
       it.__identityLock = { airlineMatch, competitorMismatch, aircraftFamilyMatch, aircraftFamilyMismatch, relaxed: false };
     }
@@ -8436,6 +8535,38 @@ function filterRelevantListings(query, items) {
       }
     }
 
+    // Step 4: reject generic toy/pullback items when exact-family non-toy comps exist.
+    // Generic toys (Daron pullback, playset, single-plane toy) sell at $10-15 and
+    // skew the median when the actual item is a precision diecast model at $50-200+.
+    if (requiredFamily) {
+      const _toyTerms = ["pullback", "pull back", "playset", "single plane", "single prop",
+        "toy plane", "kids plane", "jumbo pullback", "snap fit", "snap-fit", "pencil top"];
+      const _isToy = (it) => {
+        const t = normalizeTitleKey(it?.title || "");
+        return _toyTerms.some((term) => t.includes(term));
+      };
+      const _nonToy  = preserved.filter((it) => !_isToy(it));
+      const _toyPool = preserved.filter((it) =>  _isToy(it));
+      if (_toyPool.length > 0) {
+        if (_nonToy.length >= 2) {
+          for (const it of _toyPool) {
+            console.log("IDENTITY_LOCK_GENERIC_TOY_REJECTED", {
+              title: it?.title, reason: "generic_toy_comp_excluded", requiredFamily,
+            });
+          }
+          preserved = _nonToy;
+        } else {
+          // Floor: keep toys but penalize to back.
+          for (const it of _toyPool) {
+            console.log("IDENTITY_LOCK_GENERIC_TOY_PENALIZED", {
+              title: it?.title, reason: "generic_toy_kept_as_fallback", requiredFamily,
+            });
+          }
+          preserved = [..._nonToy, ..._toyPool];
+        }
+      }
+    }
+
     console.log("IDENTITY_LOCK_TOKEN_MATCH_POLICY", {
       requiredAirline,
       competitors,
@@ -8447,6 +8578,7 @@ function filterRelevantListings(query, items) {
       query: q,
       requiredAirline,
       requiredFamily,
+      phase: "post_serp_filter",
       rawCount: _rawCount,
       afterCompetitorFilterCount: _rawCount - _rejectedCompetitor,
       strongFamilyCount: preserved.filter((it) => it.__identityLock?.aircraftFamilyMatch).length,
@@ -8456,6 +8588,7 @@ function filterRelevantListings(query, items) {
       relaxed: _noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0),
       finalTopTitles: preserved.slice(0, 3).map((it) => it?.title),
     });
+    } // end else (_rawCount > 0)
   }
 
   if (!eyewearMode) {
@@ -14586,12 +14719,23 @@ You are identifying a resale item from an image.
 Return ONLY the best marketplace search query.
 
 Rules:
-1. Identify the physical item type first (sunglasses, sneaker, handbag, watch, etc.).
+1. Identify the physical item type first (sunglasses, sneaker, handbag, watch, model airplane, etc.).
 2. Include visible color, material, and style descriptors.
 3. Include brand ONLY if it is clearly readable from text or logo on the item. Never guess brand from shape alone.
 4. Do not include condition, price, authenticity, or explanation.
 5. Query must be something a buyer would type on eBay or Google Shopping.
 6. Prefer concise but specific queries over generic ones.
+
+Special case — model airplane / aircraft collectible:
+If the item is a model airplane, diecast aircraft, or airplane toy:
+- Include the airline livery if text or markings are visible (Hawaiian Airlines, United, Delta, ANA, Emirates, etc.).
+- Include the aircraft family/type if visible or recognizable from body markings or text: 787, 787-9, 777, 747, 737, A321, A320, A350, A330, A380.
+- If the fuselage or tail text includes "787", "Dreamliner", "777", etc., include it in the query.
+- Include the word "Dreamliner" if clearly marked or visually recognizable.
+- Include scale if visible: 1:400, 1:200, 1:300.
+- Include maker/brand if text is visible on packaging or base: GeminiJets, NG Models, Herpa, Daron, Skymarks.
+- If BOTH airline and aircraft type are visible, you MUST include both in the query.
+- If airline livery is visible but aircraft type is ambiguous, include airline only and set confidence lower.
 
 Examples:
 - "black oval plastic sunglasses orange lens"
@@ -14599,12 +14743,16 @@ Examples:
 - "tan leather crossbody bag gold hardware"
 - "blue denim Levi's trucker jacket"
 - "black digital watch plastic strap"
+- "Hawaiian Airlines Boeing 787-9 Dreamliner diecast model airplane"
+- "Hawaiian Airlines 787-9 model airplane 1:400 GeminiJets"
+- "Daron Hawaiian Airlines single plane toy pullback"
+- "United Airlines Boeing 777 diecast model airplane"
 
 Output:
 - query: best resale search query (or null if item unclear)
 - variants: 3-5 alternate queries ordered specific → broad
 - confidence: 0.0-1.0 confidence in item type and visual descriptors
-- category: simple noun like "sunglasses", "shoes", "jacket", "bag", "watch"
+- category: simple noun like "sunglasses", "shoes", "jacket", "bag", "watch", "model airplane", "diecast model"
 - brandCertainty: 0.0-1.0 certainty that brand is clearly readable (0 if not visible)
 
 Keep response short.`;
@@ -16542,13 +16690,28 @@ function shouldAcceptQueryFast(result, mode) {
       ? "brand_certainty_too_high"
       : "accepted";
 
+  // Aircraft family refinement flag: when query_fast wins on an aircraft collectible
+  // but the query doesn't include an aircraft family token (787/777/A320/etc.), the
+  // caller can opt to wait briefly for visual/master to supply a more specific query.
+  const _qNorm = normalizeTitleKey(q || "");
+  const _isAircraftCategory =
+    category.includes("airplane") || category.includes("aircraft") ||
+    category.includes("diecast") || category.includes("model plane") ||
+    category.includes("aviation");
+  const _hasAirlineInQuery = Object.keys(AIRLINE_COMPETITOR_MAP).some((a) => titleHasToken(_qNorm, a));
+  const _hasFamilyInQuery  = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) =>
+    tokens.some((tok) => _qNorm.includes(tok))
+  );
+  const needsAircraftFamilyRefinement = accepted && _isAircraftCategory && _hasAirlineInQuery && !_hasFamilyInQuery;
+
   console.log("VISION_QUERY_FAST_BRAND_POLICY", {
     category, brandCertainty, brandUseful, highStakes,
     accepted,
     reason,
+    needsAircraftFamilyRefinement,
   });
 
-  return { accepted, reason, query: q, confidence, category, brandCertainty };
+  return { accepted, reason, query: q, confidence, category, brandCertainty, needsAircraftFamilyRefinement };
 }
 
 // Layer 3: gate for accepting the fast pre-pass result without escalating.
@@ -16852,14 +17015,12 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
     clearTimeout(earlyMasterTimer);
     clearTimeout(masterLaunchTimer);
 
-    // Phase A2.7: query_fast early return — cancel every in-flight pass and
-    // return immediately without running the merge pipeline.
+    // Phase A2.7 / A2.10: query_fast early return.
+    // A2.10: before aborting other passes, check if aircraft family refinement is
+    // needed. If query_fast identified an airline but no aircraft family, try to
+    // obtain the family from (a) query_fast variants, or (b) a brief wait for
+    // visual_shape / master. Only then abort remaining passes and return.
     if (raceWinner === "query_fast") {
-      try { queryFastAbortCtrl.abort(); } catch {} // no-op: already settled
-      try { fastAbortCtrl.abort(); } catch {}
-      try { visualAbortCtrl.abort(); } catch {}
-      try { masterAbortCtrl.abort(); } catch {} // pre-launch: prevents OpenAI request
-
       const qfResult     = await queryFastPromise; // instant — already settled
       const qfAcceptance = shouldAcceptQueryFast(qfResult, mode);
       const qfQuery      = qfResult?.parsed?.query || null;
@@ -16867,11 +17028,92 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       const qfConf       = clamp01(Number(qfResult?.parsed?.confidence ?? 0));
       const qfCategory   = qfResult?.parsed?.category || null;
       const qfBrand      = clamp01(Number(qfResult?.parsed?.brandCertainty ?? 0));
-      const qfWallMs     = Date.now() - passT0;
+
+      // ── Aircraft family refinement (A2.10) ──────────────────────────────────
+      let _finalQuery       = qfQuery;
+      let _refinementSource = "query_fast";
+      let _refinementApplied = false;
+      let _refinementMs      = 0;
+
+      if (qfAcceptance.needsAircraftFamilyRefinement && AIRCRAFT_IDENTITY_REFINE_ENABLED) {
+        console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_NEEDED", {
+          rid: req.rid, query: qfQuery, category: qfCategory,
+        });
+
+        // Step 1: try variants from query_fast itself (free — already have them).
+        const _qNorm = normalizeTitleKey(qfQuery || "");
+        const _lockWithContext = detectAirlineLockInQuery(_qNorm, {
+          variants: qfVariants.map((v) => normalizeTitleKey(v)),
+          category: qfCategory,
+        });
+
+        if (_lockWithContext?.requiredFamily) {
+          // Family found in a variant — pick the most specific variant that contains it.
+          const _bestVariant = qfVariants.find((v) => {
+            const vLock = detectAirlineLockInQuery(normalizeTitleKey(v));
+            return vLock?.requiredFamily === _lockWithContext.requiredFamily;
+          });
+          _finalQuery        = _bestVariant || qfQuery;
+          _refinementSource  = "query_fast_variant";
+          _refinementApplied = true;
+          console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_USED", {
+            rid: req.rid, originalQuery: qfQuery, refinedQuery: _finalQuery,
+            source: "query_fast_variant", familyFound: _lockWithContext.requiredFamily,
+          });
+        } else {
+          // Step 2: wait up to AIRCRAFT_IDENTITY_REFINE_MS for visual_shape / master.
+          const _refineT0 = Date.now();
+          launchMasterNow();
+
+          try {
+            const _hasAircraftFamily = (r) => {
+              const rq = normalizeTitleKey(r?.parsed?.query || r?.parsed?.identity?.exactQuery || "");
+              return AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => rq.includes(tok)));
+            };
+            const _ceiling = new Promise((res) => {
+              const t = setTimeout(res, AIRCRAFT_IDENTITY_REFINE_MS);
+              if (typeof t.unref === "function") t.unref();
+            });
+            const _betterResult = await Promise.race([
+              visualPromise.then((r) => (!r || r.cancelled || !_hasAircraftFamily(r)) ? null : r).catch(() => null),
+              masterPromise.then((r) => (!r || r.cancelled || !_hasAircraftFamily(r)) ? null : r).catch(() => null),
+              _ceiling,
+            ]);
+            _refinementMs = Date.now() - _refineT0;
+
+            if (_betterResult && typeof _betterResult === "object" && _betterResult.parsed) {
+              const _bq = _betterResult?.parsed?.query || _betterResult?.parsed?.identity?.exactQuery || null;
+              if (_bq) {
+                _finalQuery        = _bq;
+                _refinementSource  = "visual_or_master";
+                _refinementApplied = true;
+                console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_USED", {
+                  rid: req.rid, originalQuery: qfQuery, refinedQuery: _finalQuery,
+                  source: _refinementSource, refinedInMs: _refinementMs,
+                });
+              }
+            } else {
+              console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_SKIPPED", {
+                rid: req.rid, query: qfQuery, reason: "no_family_found_in_refine_window",
+                refinedInMs: _refinementMs,
+              });
+            }
+          } catch {}
+        }
+      }
+
+      // Now cancel everything still in flight.
+      try { queryFastAbortCtrl.abort(); } catch {} // no-op: already settled
+      try { fastAbortCtrl.abort(); } catch {}
+      try { visualAbortCtrl.abort(); } catch {}
+      try { masterAbortCtrl.abort(); } catch {}
+
+      const qfWallMs = Date.now() - passT0;
 
       console.log("VISION_QUERY_FAST_ACCEPTED", {
-        rid: req.rid, query: qfQuery, confidence: qfConf,
+        rid: req.rid, query: _finalQuery, originalQuery: qfQuery, confidence: qfConf,
         category: qfCategory, brandCertainty: qfBrand, elapsedMs: qfWallMs,
+        refinementApplied: _refinementApplied, refinementSource: _refinementSource,
       });
 
       console.log("VISION_MASTER_POLICY", {
@@ -16883,22 +17125,26 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       console.log("VISION_FAST_PATH_DECISION", {
         rid: req.rid, returnedEarly: true, reason: "query_fast",
         elapsedMs: qfWallMs, selectedPass: "query_fast",
-        selectedQuery: qfQuery, selectedConfidence: qfConf,
-        masterLaunched: false, masterSkipped: true, fallbackUsed: false,
+        selectedQuery: _finalQuery, selectedConfidence: qfConf,
+        masterLaunched: _refinementApplied && _refinementSource === "visual_or_master",
+        masterSkipped: !(_refinementApplied && _refinementSource === "visual_or_master"),
+        fallbackUsed: false,
       });
 
       console.log("VISION_QUERY_QUALITY_GATE", {
-        rid: req.rid, pass: "query_fast", query: qfQuery,
-        accepted: !!qfQuery && !isGarbageQuery(qfQuery),
-        reason: !qfQuery ? "null_query" : isGarbageQuery(qfQuery) ? "garbage_query" : "accepted",
+        rid: req.rid, pass: "query_fast", query: _finalQuery,
+        accepted: !!_finalQuery && !isGarbageQuery(_finalQuery),
+        reason: !_finalQuery ? "null_query" : isGarbageQuery(_finalQuery) ? "garbage_query" : "accepted",
       });
 
       console.log("⏱️ VISION PASS TIMINGS", {
         rid: req.rid, tier: "query_fast", raceWinner: "query_fast",
         queryFastMs, fastMs, visualMs, masterMs,
         visionWallMs: qfWallMs, visualConfidence: null,
-        fastCancelled: false, visualCancelled: false,
-        masterCancelled: false, masterLaunched: false, masterLaunchedEarlyMs: null,
+        fastCancelled: true, visualCancelled: true,
+        masterCancelled: !(_refinementApplied && _refinementSource === "visual_or_master"),
+        masterLaunched: _refinementApplied && _refinementSource === "visual_or_master",
+        masterLaunchedEarlyMs: null,
       });
 
       recordVisionTiming({
@@ -16932,16 +17178,16 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         condition:            null,
         conditionNotes:       null,
         sizeHint:             null,
-        exactQuery:           qfQuery,
-        searchQueries:        qfVariants,
+        exactQuery:           _finalQuery,
+        searchQueries:        [qfQuery, ...qfVariants].filter(Boolean),
         substituteCandidates: [],
         marketSegment:        null,
       };
 
       return {
         ok:         true,
-        query:      qfQuery,
-        variants:   qfVariants.filter((v) => v !== qfQuery).slice(0, 8),
+        query:      _finalQuery,
+        variants:   uniqueQueries([qfQuery, ...qfVariants]).filter((v) => v !== _finalQuery).slice(0, 8),
         confidence: qfConf,
         identity:   qfIdentity,
         attributeCertainty: {
@@ -16964,7 +17210,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
           masterLaunched: false,
           tier:          "query_fast",
         },
-        debug: { passQueries: [qfQuery], passLabels: ["query_fast"] },
+        debug: { passQueries: [_finalQuery, qfQuery].filter(Boolean), passLabels: ["query_fast"] },
       };
     }
 
