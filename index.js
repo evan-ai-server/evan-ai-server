@@ -8542,6 +8542,67 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
   return result;
 }
 
+// Cache gate for aircraft queries in /market/search/stream.
+// Returns:
+//   { action: "non_aircraft_passthrough", items }  — not an aircraft query, use as-is
+//   { action: "filtered_snapshot",        items }  — aircraft, filter kept clean items
+//   { action: "bypass_stale_cache"               }  — aircraft + premium + empty after filter → skip this cache layer
+function resolveAircraftCachePolicy(query, items, scannedPrice, cacheKind) {
+  const q = normalizeTitleKey(query || "");
+  const isAircraft = isAircraftModelQuery(q) || !!detectAirlineLockInQuery(q);
+
+  if (!isAircraft) {
+    console.log("AIRCRAFT_STALE_CACHE_POLICY", {
+      query, scannedPrice, isAircraft: false,
+      beforeCount: Array.isArray(items) ? items.length : 0,
+      afterCount:  Array.isArray(items) ? items.length : 0,
+      action: "non_aircraft_passthrough", reason: "not_aircraft_query",
+    });
+    return { action: "non_aircraft_passthrough", items };
+  }
+
+  const beforeCount = Array.isArray(items) ? items.length : 0;
+  if (beforeCount === 0) {
+    return { action: "non_aircraft_passthrough", items: [] };
+  }
+
+  // Run the same filter chain as the stream path.
+  let filtered = filterRelevantListings(query, items);
+  filtered = applyAircraftModelTierFilter(query, filtered, scannedPrice);
+  const afterCount = filtered.length;
+  const isPremium  = Number.isFinite(scannedPrice) && scannedPrice >= 50;
+
+  if (afterCount === 0 && isPremium) {
+    console.log("AIRCRAFT_STALE_CACHE_POLICY", {
+      query, scannedPrice, isAircraft: true,
+      beforeCount, afterCount, action: "bypass_stale_cache",
+      reason: "premium_aircraft_cache_filter_empty_or_unsafe",
+    });
+    console.log("AIRCRAFT_STALE_CACHE_BYPASSED", {
+      query, scannedPrice,
+      reason: "premium_aircraft_cache_filter_empty_or_unsafe",
+    });
+    return { action: "bypass_stale_cache" };
+  }
+
+  if (afterCount === 0) {
+    // Non-premium: fall back to original so scan isn't unnecessarily degraded.
+    console.log("AIRCRAFT_STALE_CACHE_POLICY", {
+      query, scannedPrice, isAircraft: true,
+      beforeCount, afterCount: beforeCount, action: "filtered_snapshot",
+      reason: "non_premium_filter_empty_fallback_to_original",
+    });
+    return { action: "filtered_snapshot", items };
+  }
+
+  console.log("AIRCRAFT_STALE_CACHE_POLICY", {
+    query, scannedPrice, isAircraft: true,
+    beforeCount, afterCount, action: "filtered_snapshot",
+    reason: "aircraft_cache_filtered_clean",
+  });
+  return { action: "filtered_snapshot", items: filtered };
+}
+
 // Pre-payload guard: runs airline identity lock + aircraft tier filter BEFORE
 // provisional / live_refresh payloads are built in /market/search/stream.
 // Only engages for aircraft/airline queries; no-ops for everything else.
@@ -24716,25 +24777,30 @@ app.post("/market/search/stream", async (req, res) => {
     // ── L0: enriched tuple cache (items + comps, 5-min TTL) ──────────────
     const enrichedHit = ENRICHED_SCAN_CACHE.get(cacheKey);
     if (enrichedHit) {
-      _recordStreamMetric("cacheHits", 1);
-      scanLog("cache_hit", scanId, { layer: "enriched", query });
-      const payload = await _buildPayload(enrichedHit.items, { source: "enriched_cache", kind: "cache_hit" });
-      if (enrichedHit.ebaySoldComps) payload.ebaySoldComps = enrichedHit.ebaySoldComps;
-      if (enrichedHit.localComps)    payload.localComps    = enrichedHit.localComps;
-      const _totalMs = Date.now() - _t0;
-      const _cacheVerdict =
-        normalizeVerdict(payload?.buyOrPass?.verdict) ||
-        normalizeVerdict(payload?.profitIntel?.verdict) ||
-        "HOLD";
-      send("complete", {
-        ...payload,
-        verdict: _cacheVerdict,   // canonical-only top-level verdict
-        status: "complete", enriching: false,
-        dataDepth: enrichedHit.items.length < 3 ? "thin" : "normal",
-        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
-      });
-      _recordStreamMetric("totalCompleted", 1);
-      endStream(); return;
+      const _enrichedPolicy = resolveAircraftCachePolicy(query, enrichedHit.items, scannedPrice, "enriched");
+      if (_enrichedPolicy.action !== "bypass_stale_cache") {
+        _recordStreamMetric("cacheHits", 1);
+        scanLog("cache_hit", scanId, { layer: "enriched", query });
+        const _enrichedItems = _enrichedPolicy.items;
+        const payload = await _buildPayload(_enrichedItems, { source: "enriched_cache", kind: "cache_hit" });
+        if (enrichedHit.ebaySoldComps) payload.ebaySoldComps = enrichedHit.ebaySoldComps;
+        if (enrichedHit.localComps)    payload.localComps    = enrichedHit.localComps;
+        const _totalMs = Date.now() - _t0;
+        const _cacheVerdict =
+          normalizeVerdict(payload?.buyOrPass?.verdict) ||
+          normalizeVerdict(payload?.profitIntel?.verdict) ||
+          "HOLD";
+        send("complete", {
+          ...payload,
+          verdict: _cacheVerdict,   // canonical-only top-level verdict
+          status: "complete", enriching: false,
+          dataDepth: _enrichedItems.length < 3 ? "thin" : "normal",
+          _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+        });
+        _recordStreamMetric("totalCompleted", 1);
+        endStream(); return;
+      }
+      // bypass_stale_cache: fall through to fresh market search
     }
 
     // ── L1: internal snapshot + SERP_CACHE ───────────────────────────────
@@ -24742,57 +24808,67 @@ app.post("/market/search/stream", async (req, res) => {
     const serpCached  = SERP_CACHE.get(cacheKey);
 
     if (internalHit?.hit && Array.isArray(internalHit.items) && internalHit.items.length >= 4) {
-      _recordStreamMetric("cacheHits", 1);
-      scanLog("cache_hit", scanId, { layer: "internal", query });
-      const [payload, ebaySold, localC] = await Promise.all([
-        _buildPayload(internalHit.items, { source: internalHit.source, kind: internalHit.kind }),
-        serpEbaySold(query).catch(() => null),
-        userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
-      ]);
-      if (ebaySold) payload.ebaySoldComps = ebaySold;
-      if (localC)   payload.localComps    = localC;
-      ENRICHED_SCAN_CACHE.set(cacheKey, { items: internalHit.items, ebaySoldComps: ebaySold || null, localComps: localC || null });
-      const _totalMs = Date.now() - _t0;
-      const _cacheVerdict =
-        normalizeVerdict(payload?.buyOrPass?.verdict) ||
-        normalizeVerdict(payload?.profitIntel?.verdict) ||
-        "HOLD";
-      send("complete", {
-        ...payload,
-        verdict: _cacheVerdict,   // canonical-only top-level verdict
-        status: "complete", enriching: false,
-        dataDepth: internalHit.items.length < 3 ? "thin" : "normal",
-        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
-      });
-      _recordStreamMetric("totalCompleted", 1);
-      endStream(); return;
+      const _internalPolicy = resolveAircraftCachePolicy(query, internalHit.items, scannedPrice, internalHit.kind || "internal");
+      if (_internalPolicy.action !== "bypass_stale_cache") {
+        _recordStreamMetric("cacheHits", 1);
+        scanLog("cache_hit", scanId, { layer: "internal", query, kind: internalHit.kind });
+        const _internalItems = _internalPolicy.items;
+        const [payload, ebaySold, localC] = await Promise.all([
+          _buildPayload(_internalItems, { source: internalHit.source, kind: internalHit.kind }),
+          serpEbaySold(query).catch(() => null),
+          userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
+        ]);
+        if (ebaySold) payload.ebaySoldComps = ebaySold;
+        if (localC)   payload.localComps    = localC;
+        ENRICHED_SCAN_CACHE.set(cacheKey, { items: _internalItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
+        const _totalMs = Date.now() - _t0;
+        const _cacheVerdict =
+          normalizeVerdict(payload?.buyOrPass?.verdict) ||
+          normalizeVerdict(payload?.profitIntel?.verdict) ||
+          "HOLD";
+        send("complete", {
+          ...payload,
+          verdict: _cacheVerdict,   // canonical-only top-level verdict
+          status: "complete", enriching: false,
+          dataDepth: _internalItems.length < 3 ? "thin" : "normal",
+          _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+        });
+        _recordStreamMetric("totalCompleted", 1);
+        endStream(); return;
+      }
+      // bypass_stale_cache: fall through to fresh market search
     }
 
     if (Array.isArray(serpCached) && serpCached.length >= 4) {
-      _recordStreamMetric("cacheHits", 1);
-      scanLog("cache_hit", scanId, { layer: "serp", query });
-      const [payload, ebaySold, localC] = await Promise.all([
-        _buildPayload(serpCached, { source: "l1_route_cache", kind: "route_cache_hit" }),
-        serpEbaySold(query).catch(() => null),
-        userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
-      ]);
-      if (ebaySold) payload.ebaySoldComps = ebaySold;
-      if (localC)   payload.localComps    = localC;
-      ENRICHED_SCAN_CACHE.set(cacheKey, { items: serpCached, ebaySoldComps: ebaySold || null, localComps: localC || null });
-      const _totalMs = Date.now() - _t0;
-      const _cacheVerdict =
-        normalizeVerdict(payload?.buyOrPass?.verdict) ||
-        normalizeVerdict(payload?.profitIntel?.verdict) ||
-        "HOLD";
-      send("complete", {
-        ...payload,
-        verdict: _cacheVerdict,   // canonical-only top-level verdict
-        status: "complete", enriching: false,
-        dataDepth: serpCached.length < 3 ? "thin" : "normal",
-        _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
-      });
-      _recordStreamMetric("totalCompleted", 1);
-      endStream(); return;
+      const _serpPolicy = resolveAircraftCachePolicy(query, serpCached, scannedPrice, "serp_cache");
+      if (_serpPolicy.action !== "bypass_stale_cache") {
+        _recordStreamMetric("cacheHits", 1);
+        scanLog("cache_hit", scanId, { layer: "serp", query });
+        const _serpItems = _serpPolicy.items;
+        const [payload, ebaySold, localC] = await Promise.all([
+          _buildPayload(_serpItems, { source: "l1_route_cache", kind: "route_cache_hit" }),
+          serpEbaySold(query).catch(() => null),
+          userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
+        ]);
+        if (ebaySold) payload.ebaySoldComps = ebaySold;
+        if (localC)   payload.localComps    = localC;
+        ENRICHED_SCAN_CACHE.set(cacheKey, { items: _serpItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
+        const _totalMs = Date.now() - _t0;
+        const _cacheVerdict =
+          normalizeVerdict(payload?.buyOrPass?.verdict) ||
+          normalizeVerdict(payload?.profitIntel?.verdict) ||
+          "HOLD";
+        send("complete", {
+          ...payload,
+          verdict: _cacheVerdict,   // canonical-only top-level verdict
+          status: "complete", enriching: false,
+          dataDepth: _serpItems.length < 3 ? "thin" : "normal",
+          _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+        });
+        _recordStreamMetric("totalCompleted", 1);
+        endStream(); return;
+      }
+      // bypass_stale_cache: fall through to fresh market search
     }
 
     // ── PHASE 1: marketplace fanout, no oracle, in-flight dedup ──────────
