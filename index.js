@@ -8565,11 +8565,25 @@ function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind) {
     scannedPrice,
   });
 
-  // Safety: if filter zeroed the pool (only-toys case or very tight lock), fall back
-  // to the pre-filter list so the scan isn't degraded due to filter aggressiveness.
+  // If the filter zeroed the pool, decide whether to fall back or stay empty.
   if (afterCount === 0 && beforeCount > 0) {
+    const isPremiumPrice = Number.isFinite(scannedPrice) && scannedPrice >= 50;
+    if (isPremiumPrice) {
+      // Premium aircraft scan: never reintroduce the dirty pool.
+      // Return [] so the scan shows insufficient comps rather than anchoring
+      // to toys / wrong-airline items.
+      console.log("AIRCRAFT_FILTER_BEFORE_PAYLOAD_DEGRADED", {
+        kind,
+        beforeCount,
+        afterCount,
+        scannedPrice,
+        reason: "premium_aircraft_filter_emptied_pool_no_fallback",
+      });
+      return [];
+    }
+    // Non-premium or no price: fall back so scan isn't unnecessarily degraded.
     console.log("AIRCRAFT_FILTER_BEFORE_PAYLOAD_FALLBACK", {
-      kind, beforeCount, reason: "filter_emptied_pool_safety_fallback",
+      kind, beforeCount, scannedPrice, reason: "filter_emptied_pool_safety_fallback",
     });
     return items;
   }
