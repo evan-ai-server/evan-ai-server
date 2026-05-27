@@ -8224,15 +8224,15 @@ const AIRCRAFT_FAMILY_MAP = {
 // Airline identity tokens with their competitor lists.
 // Keys and competitor tokens are matched with word-boundary safety via titleHasToken().
 const AIRLINE_COMPETITOR_MAP = {
-  "hawaiian":        ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal", "lufthansa", "emirates", "british airways", "air france", "klm"],
-  "united":          ["hawaiian", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal"],
-  "delta":           ["hawaiian", "united", "american airlines", "southwest", "alaska", "jetblue", "spirit"],
-  "american airlines":["hawaiian", "united", "delta", "southwest", "alaska", "jetblue", "spirit"],
-  "southwest":       ["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue"],
-  "alaska":          ["hawaiian", "united", "delta", "american airlines", "southwest", "jetblue"],
-  "jetblue":         ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska"],
-  "spirit":          ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "frontier"],
-  "frontier":        ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit"],
+  "hawaiian":        ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal", "lufthansa", "emirates", "british airways", "air france", "klm", "aeromexico"],
+  "united":          ["hawaiian", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "frontier", "ana", "jal", "aeromexico"],
+  "delta":           ["hawaiian", "united", "american airlines", "southwest", "alaska", "jetblue", "spirit", "aeromexico"],
+  "american airlines":["hawaiian", "united", "delta", "southwest", "alaska", "jetblue", "spirit", "aeromexico"],
+  "southwest":       ["hawaiian", "united", "delta", "american airlines", "alaska", "jetblue", "aeromexico"],
+  "alaska":          ["hawaiian", "united", "delta", "american airlines", "southwest", "jetblue", "aeromexico"],
+  "jetblue":         ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "aeromexico"],
+  "spirit":          ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "frontier", "aeromexico"],
+  "frontier":        ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "jetblue", "spirit", "aeromexico"],
   "ana":             ["united", "delta", "american airlines", "alaska", "jetblue", "korean air", "jal", "lufthansa"],
   "jal":             ["ana", "united", "delta", "american airlines", "alaska", "korean air", "lufthansa"],
   "korean air":      ["ana", "jal", "united", "delta", "american airlines", "lufthansa"],
@@ -8253,6 +8253,7 @@ const COMPETITOR_AIRCRAFT_ALIASES = {
   "jal":               ["japan airlines"],
   "korean air":        ["korean"],
   "british airways":   ["british"],
+  "aeromexico":        ["mexican air", "aero mexico"],
 };
 
 // Whole-word / phrase boundary match on normalizeTitleKey output.
@@ -8384,6 +8385,14 @@ const AIRCRAFT_PREMIUM_TERMS = [
 ];
 
 const AIRCRAFT_TOY_TERMS = [
+  // Explicit toy phrases — checked FIRST, override all premium signals
+  "toy airplane", "airplane toy", "model airplane toy",
+  "die-cast metal model airplane toy", "die cast metal model airplane toy",
+  "toy with plastic parts", "plastic parts for kids",
+  "for kids", "kids ages", "ages 3",
+  "children", "child",
+  "play toy",
+  // Legacy toy phrases
   "pullback", "pull back", "playset", "single plane", "single prop",
   "toy plane", "kids plane", "jumbo pullback", "plastic toy", "pencil topper",
   "party favor", "airport playset", "snap fit", "snap-fit", "friction toy",
@@ -8438,6 +8447,18 @@ function classifyAircraftModelListing(item) {
   }
 
   return { tier: "unknown_model", reasons: ["no_signals"], winningTerm: null };
+}
+
+// Startup smoke-test: verify toy classifier and aeromexico competitor catch known bad cases.
+try {
+  const _daronResult = classifyAircraftModelListing({ title: "Daron Toy Airplane – Boeing 787 – Die-Cast Metal Model Airplane Toy with Plastic Parts for Kids Ages 3+" });
+  if (_daronResult.tier !== "generic_toy") {
+    console.warn("AIRCRAFT_CLASSIFIER_SELFTEST_FAIL", { case: "daron_toy_airplane", expected: "generic_toy", got: _daronResult.tier, winningTerm: _daronResult.winningTerm });
+  } else {
+    console.log("AIRCRAFT_CLASSIFIER_SELFTEST_PASS", { case: "daron_toy_airplane", tier: _daronResult.tier, winningTerm: _daronResult.winningTerm });
+  }
+} catch (_e) {
+  console.warn("AIRCRAFT_CLASSIFIER_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // Returns true if the normalized query indicates an aircraft/model airplane context.
