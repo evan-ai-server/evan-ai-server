@@ -20700,6 +20700,12 @@ async function buildMarketSearchResponsePayload({
   );
   _bmLog("buildFinalUiItemsWithIntelligence", _t_finalUi);
 
+  try {
+    const _pfTop5src = (sourceItems || []).slice(0, 5).map((i) => ({ title: i?.title, price: i?.price, source: i?.source }));
+    const _pfTop5ui  = (uiItems     || []).slice(0, 5).map((i) => ({ title: i?.title, price: i?.price, source: i?.source }));
+    console.log("PAYLOAD_FINAL_ITEMS_BEFORE_SEND", { sourceCount: (sourceItems||[]).length, uiCount: (uiItems||[]).length, top5source: _pfTop5src, top5ui: _pfTop5ui });
+  } catch {}
+
   const soldPool = uiItems.filter(
     (i) => i?.sold === true || String(i?.status || "").toLowerCase() === "sold"
   );
@@ -24790,6 +24796,7 @@ app.post("/market/search/stream", async (req, res) => {
           normalizeVerdict(payload?.buyOrPass?.verdict) ||
           normalizeVerdict(payload?.profitIntel?.verdict) ||
           "HOLD";
+        try { console.log("SSE_SEND_ITEMS", { cacheLayer: "enriched", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
         send("complete", {
           ...payload,
           verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -24826,6 +24833,7 @@ app.post("/market/search/stream", async (req, res) => {
           normalizeVerdict(payload?.buyOrPass?.verdict) ||
           normalizeVerdict(payload?.profitIntel?.verdict) ||
           "HOLD";
+        try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
         send("complete", {
           ...payload,
           verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -24858,6 +24866,7 @@ app.post("/market/search/stream", async (req, res) => {
           normalizeVerdict(payload?.buyOrPass?.verdict) ||
           normalizeVerdict(payload?.profitIntel?.verdict) ||
           "HOLD";
+        try { console.log("SSE_SEND_ITEMS", { cacheLayer: "serp", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
         send("complete", {
           ...payload,
           verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -25139,6 +25148,7 @@ app.post("/market/search/stream", async (req, res) => {
     };
 
     const _totalMs = Date.now() - _t0;
+    try { console.log("SSE_SEND_ITEMS", { cacheLayer: "fresh", status: "complete", count: (finalPayload?.items||[]).length, top5: (finalPayload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
     send("complete", {
       ...finalPayload,
       verdict: _finalVerdictKey,   // canonical-only top-level verdict
