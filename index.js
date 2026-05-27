@@ -8245,6 +8245,16 @@ const AIRLINE_COMPETITOR_MAP = {
   "klm":             ["emirates", "qatar", "etihad", "lufthansa", "british airways", "air france"],
 };
 
+// In aircraft/model context, bare short-names that imply a full airline name.
+// Only consulted when the listing title contains aircraft-context terms.
+const COMPETITOR_AIRCRAFT_ALIASES = {
+  "american airlines": ["american"],
+  "ana":               ["all nippon"],
+  "jal":               ["japan airlines"],
+  "korean air":        ["korean"],
+  "british airways":   ["british"],
+};
+
 // Whole-word / phrase boundary match on normalizeTitleKey output.
 // Wrapping both strings with spaces means "ana" won't match inside "banana"
 // and "american airlines" works as a two-word phrase.
@@ -8487,7 +8497,8 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
   if (scanTier === "premium_model" || (scanTier === "unknown_model" && scannedPrice != null && scannedPrice >= 50)) {
     const nonToy = classified.filter((it) => it.__aircraftTier.tier !== "generic_toy");
     if (toy.length > 0) {
-      if (nonToy.length >= 2) {
+      if (nonToy.length >= 1) {
+        // At least 1 premium/unknown comp exists — reject all toys.
         for (const it of toy) {
           _rejectedCount++;
           console.log("AIRCRAFT_MODEL_TIER_REJECTED", {
@@ -8496,14 +8507,13 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
         }
         result = nonToy;
       } else {
-        // Floor: keep toys at the back so comp pool isn't empty.
+        // Only toys remain — return empty rather than anchoring a premium scan to a toy price.
         for (const it of toy) {
-          _penalizedCount++;
-          console.log("AIRCRAFT_MODEL_TIER_PENALIZED", {
-            title: it?.title, reason: "generic_toy_penalized_floor", scanTier,
+          console.log("AIRCRAFT_MODEL_TIER_TOY_ONLY_REJECTED", {
+            title: it?.title, reason: "only_toys_in_pool_degraded", scanTier, scannedPrice,
           });
         }
-        result = [...nonToy, ...toy];
+        result = [];
       }
     }
   } else if (scanTier === "unknown_model") {
@@ -8530,6 +8540,41 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
   });
 
   return result;
+}
+
+// Pre-payload guard: runs airline identity lock + aircraft tier filter BEFORE
+// provisional / live_refresh payloads are built in /market/search/stream.
+// Only engages for aircraft/airline queries; no-ops for everything else.
+function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  const q = normalizeTitleKey(query || "");
+  if (!isAircraftModelQuery(q) && !detectAirlineLockInQuery(q)) return items;
+
+  const beforeCount = items.length;
+
+  let filtered = filterRelevantListings(query, items);
+  filtered = applyAircraftModelTierFilter(query, filtered, scannedPrice);
+
+  const afterCount = filtered.length;
+  console.log("AIRCRAFT_FILTER_APPLIED_BEFORE_PAYLOAD", {
+    route: "/market/search/stream",
+    kind,
+    beforeCount,
+    afterCount,
+    query,
+    scannedPrice,
+  });
+
+  // Safety: if filter zeroed the pool (only-toys case or very tight lock), fall back
+  // to the pre-filter list so the scan isn't degraded due to filter aggressiveness.
+  if (afterCount === 0 && beforeCount > 0) {
+    console.log("AIRCRAFT_FILTER_BEFORE_PAYLOAD_FALLBACK", {
+      kind, beforeCount, reason: "filter_emptied_pool_safety_fallback",
+    });
+    return items;
+  }
+
+  return filtered;
 }
 
 function filterRelevantListings(query, items) {
@@ -8662,7 +8707,17 @@ function filterRelevantListings(query, items) {
     for (const it of preserved) {
       const t = normalizeTitleKey(it?.title || "");
       const airlineMatch       = titleHasToken(t, requiredAirline);
-      const competitorMismatch = competitors.some((c) => titleHasToken(t, c)) && !airlineMatch;
+      const _titleAircraftCtx  = isAircraftModelQuery(t);
+      const competitorMismatch = competitors.some((c) => {
+        if (titleHasToken(t, c)) return true;
+        // In aircraft/model context, bare short-names match full-name competitors.
+        // "American 787 diecast" → matches competitor "american airlines".
+        if (_titleAircraftCtx) {
+          const aliases = COMPETITOR_AIRCRAFT_ALIASES[c] || [];
+          if (aliases.some((alias) => titleHasToken(t, alias))) return true;
+        }
+        return false;
+      }) && !airlineMatch;
       const aircraftFamilyMatch = requiredFamily
         ? (AIRCRAFT_FAMILY_MAP[requiredFamily]?.some((tok) => t.includes(tok)) ?? false)
         : true;
@@ -24745,7 +24800,8 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _onEarlyItems = async (earlyRaw) => {
       if (clientClosed || _earlyProvSent) return;
-      _earlyItems    = assignItemIds(earlyRaw);
+      const _earlyFiltered = applyPrePayloadAircraftFilter(query, assignItemIds(earlyRaw), scannedPrice, "fast_provisional");
+      _earlyItems    = _earlyFiltered;
       _earlyProvSent = true;
       _recordStreamMetric("earlyProvisionalSent", 1);
       _recordStreamMetric("provisionalSent", 1);
@@ -24845,7 +24901,8 @@ app.post("/market/search/stream", async (req, res) => {
     if (!_earlyProvSent && phase1Items.length >= 2 && !clientClosed) {
       _recordStreamMetric("provisionalSent", 1);
       const _tProvBuild = Date.now();
-      const provPayload = await _buildPayload(phase1Items, {
+      const _provItems = applyPrePayloadAircraftFilter(query, phase1Items, scannedPrice, "provisional");
+      const provPayload = await _buildPayload(_provItems, {
         source: "live_market", kind: "provisional", isOracleOnly: false,
       });
       // Canonical-first read (same rule as early_provisional). Anything not
@@ -24861,11 +24918,11 @@ app.post("/market/search/stream", async (req, res) => {
         ...provPayload,
         verdict: _provVerdictKey,   // canonical-only top-level verdict
         status: "provisional", enriching: true, needsOracle,
-        dataDepth: phase1Items.length < 3 ? "thin" : "normal",
+        dataDepth: _provItems.length < 3 ? "thin" : "normal",
         _timing: { phase1Ms: _phase1Ms, buildMs: Date.now() - _tProvBuild },
         _scanPhase1Ms: _phase1Ms,
       });
-      scanLog("provisional_sent", scanId, { itemCount: phase1Items.length, verdict: _provVerdictKey });
+      scanLog("provisional_sent", scanId, { itemCount: _provItems.length, verdict: _provVerdictKey });
     }
 
     if (clientClosed) { endStream(); return; }
@@ -24940,6 +24997,9 @@ app.post("/market/search/stream", async (req, res) => {
     // Dedupe + outlier trim (always — applies to both oracle and non-oracle paths)
     enrichedItems = dedupeSmart(enrichedItems);
     enrichedItems = trimPriceOutliers(enrichedItems);
+
+    // Apply aircraft identity lock + tier filter before live_refresh/complete payload.
+    enrichedItems = applyPrePayloadAircraftFilter(query, enrichedItems, scannedPrice, "live_refresh");
 
     if (!enrichedItems.length) {
       _degraded       = true;
