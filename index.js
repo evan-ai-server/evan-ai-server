@@ -9122,8 +9122,141 @@ function shouldExpandRetrievalForCleanPool({ query, cleanCount, rawCount, minTar
   return expand;
 }
 
+// ── Sneaker identity lock ─────────────────────────────────────────────────────
+// Extracts brand/line/generation signals from a sneaker query or listing title.
+// Returns { brand, line, subline, generation, colorTokens, modelCode, isSneakerQuery }.
+// isSneakerQuery is true only when both brand and line are detected.
+function extractSneakerIdentitySignals(text) {
+  const empty = { brand: null, line: null, subline: null, generation: null, colorTokens: [], modelCode: null, isSneakerQuery: false };
+  if (!text) return empty;
+  const t = text.toLowerCase();
+
+  const SNEAKER_BRANDS = ["nike", "adidas", "new balance", "asics", "brooks", "hoka", "saucony", "on running", "salomon", "puma", "reebok", "under armour", "jordan", "vans", "converse"];
+  // More specific lines listed before shorter/partial matches to prevent substring collisions
+  const SNEAKER_LINES  = [
+    "vaporfly", "alphafly", "zoom fly", "superfly",
+    "pegasus", "air max", "air force", "react",
+    "ultraboost", "adizero", "yeezy", "samba", "gazelle", "stan smith", "nmd",
+    "fresh foam", "fuel cell",
+    "gel nimbus", "gel cumulus", "gel kayano",
+    "glycerin", "ghost",
+    "clifton", "bondi", "speedgoat",
+    "adrenaline", "metaspeed",
+  ];
+
+  let brand = null;
+  for (const b of SNEAKER_BRANDS) { if (t.includes(b)) { brand = b; break; } }
+
+  let line = null;
+  for (const l of SNEAKER_LINES)  { if (t.includes(l)) { line = l; break; } }
+
+  const subline = (t.includes("next%") || t.includes("next percent")) ? "next%" : null;
+
+  // Generation: first digit sequence after the line name in the text
+  let generation = null;
+  if (line) {
+    const afterLine = t.slice(t.indexOf(line) + line.length);
+    const m = afterLine.match(/^[\s\w%]*?(\d+)/);
+    if (m) generation = m[1];
+  }
+
+  const codeMatch = text.match(/\b([A-Z]{2,}\d{2,}[A-Z0-9]*|\d{2,}[A-Z]{2,}[A-Z0-9]*)\b/);
+  const modelCode = codeMatch ? codeMatch[1] : null;
+
+  const COLOR_WORDS = ["white", "black", "red", "blue", "green", "orange", "yellow", "pink", "purple", "grey", "gray", "gold", "silver", "cheetah", "multicolor", "volt", "crimson", "teal", "coral"];
+  const colorTokens = COLOR_WORDS.filter(c => t.includes(c));
+
+  return { brand, line, subline, generation, colorTokens, modelCode, isSneakerQuery: !!(brand && line) };
+}
+
+// Filters out listings that don't match the sneaker line/generation in the query.
+// No-op when query has no clear line or is not a sneaker query.
+// Only rejects items where we can CONFIRM wrong family or wrong generation —
+// items with no detectable line pass through (let other filters handle them).
+function applySneakerIdentityLock(query, items, context = {}) {
+  if (!Array.isArray(items) || !items.length) return items;
+
+  const qSig = extractSneakerIdentitySignals(query);
+  if (!qSig.isSneakerQuery || !qSig.line) return items;
+
+  const kept = [], rejected = [];
+
+  for (const it of items) {
+    const title = it?.title || it?.name || "";
+    const iSig  = extractSneakerIdentitySignals(title);
+
+    // If item has no detectable line we cannot confirm it is wrong — pass through
+    if (!iSig.line) { kept.push(it); continue; }
+
+    if (iSig.line !== qSig.line) {
+      console.log("SNEAKER_IDENTITY_REJECTED", {
+        title:    title.slice(0, 80),
+        reason:   "wrong_line",
+        required: qSig.line,
+        found:    iSig.line,
+        ...(context.scanId ? { scanId: context.scanId } : {}),
+      });
+      rejected.push(it);
+      continue;
+    }
+
+    // Enforce generation only when both query and item have one
+    if (qSig.generation && iSig.generation && iSig.generation !== qSig.generation) {
+      console.log("SNEAKER_IDENTITY_REJECTED", {
+        title:    title.slice(0, 80),
+        reason:   "wrong_generation",
+        required: qSig.generation,
+        found:    iSig.generation,
+        ...(context.scanId ? { scanId: context.scanId } : {}),
+      });
+      rejected.push(it);
+      continue;
+    }
+
+    kept.push(it);
+  }
+
+  console.log("SNEAKER_IDENTITY_SUMMARY", {
+    query:         (query || "").slice(0, 80),
+    line:          qSig.line,
+    generation:    qSig.generation,
+    rawCount:      items.length,
+    keptCount:     kept.length,
+    rejectedCount: rejected.length,
+    ...(context.scanId ? { scanId: context.scanId } : {}),
+  });
+
+  return kept;
+}
+
+// Self-tests for sneaker identity signal extraction and identity lock
+try {
+  const _sneakerTests = [
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Men's Road Racing Shoes",  expectKeep: true  },
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 4 Men's Road Racing Shoes",  expectKeep: false },
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike Zoom Fly 6 Men's Running Shoes",                  expectKeep: false },
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Superfly Elite 2 Track Spike",              expectKeep: false },
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Road Racing Shoes Size 9", expectKeep: true  },
+  ];
+  let _snkPass = 0;
+  for (const tc of _sneakerTests) {
+    const result = applySneakerIdentityLock(tc.query, [{ title: tc.title }]);
+    const kept   = result.length === 1;
+    if (kept !== tc.expectKeep) {
+      console.warn("SNEAKER_IDENTITY_SELFTEST_FAIL", {
+        title: tc.title.slice(0, 70), expected: tc.expectKeep ? "keep" : "reject", got: kept ? "keep" : "reject",
+      });
+    } else {
+      _snkPass++;
+    }
+  }
+  console.log("SNEAKER_IDENTITY_SELFTEST_PASS", { passed: _snkPass, total: _sneakerTests.length });
+} catch (_e) {
+  console.warn("SNEAKER_IDENTITY_SELFTEST_ERROR", { error: String(_e) });
+}
+
 // Shared clean-pool measurement used by cache bypass + fanout stop condition.
-// Runs the full filter chain: relevance → aircraft identity → trim → variant.
+// Runs the full filter chain: relevance → aircraft identity → sneaker identity → trim → variant.
 // Returns { items, cleanCount, rawCount, variantCleanCount, kind }.
 // Items are NOT mutated; the returned .items is the filtered copy.
 function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "unknown") {
@@ -9138,8 +9271,11 @@ function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "un
   // Step 2: aircraft identity lock + tier filter (no-op for non-aircraft)
   const afterIdentity = applyPrePayloadAircraftFilter(query, afterRelevance, scannedPrice, kind);
 
+  // Step 2b: sneaker identity lock (no-op for non-sneaker queries)
+  const afterSneaker = applySneakerIdentityLock(query, afterIdentity);
+
   // Step 3: price outlier trim
-  const afterTrim = trimPriceOutliers(afterIdentity);
+  const afterTrim = trimPriceOutliers(afterSneaker);
 
   // Step 4: generic variant quality filter (no-op when query has no variant signals)
   const afterVariant = applyGenericVariantQualityFilter(query, afterTrim, scannedPrice, { kind });
@@ -9147,9 +9283,10 @@ function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "un
   console.log("CLEAN_RETRIEVAL_POOL_CHECK", {
     kind,
     rawCount,
-    afterIdentityCount: afterIdentity.length,
-    cleanCount:         afterVariant.length,
-    query:              (query || "").slice(0, 80),
+    afterIdentityCount:  afterIdentity.length,
+    afterSneakerCount:   afterSneaker.length,
+    cleanCount:          afterVariant.length,
+    query:               (query || "").slice(0, 80),
     scannedPrice,
   });
 
@@ -9168,7 +9305,7 @@ function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "un
 function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) {
   if (!Array.isArray(rawItems) || !rawItems.length) return [];
 
-  let droppedUrl = 0, droppedBad = 0, droppedNoPrice = 0;
+  let pricingOnly = 0, droppedBad = 0, droppedNoPrice = 0;
   const out = [];
 
   for (const it of rawItems) {
@@ -9177,7 +9314,22 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
     if (isBadListing(it.title, originalQuery)) { droppedBad++; continue; }
 
     const cleanUrl = sanitizeListingUrl(it);
-    if (!cleanUrl) { droppedUrl++; continue; }
+    if (!cleanUrl) {
+      // Keep as non-clickable pricing evidence — title + price + source are valid
+      // but no direct merchant URL exists (common for eBay/Poshmark/GOAT/farfetch).
+      pricingOnly++;
+      out.push({
+        ...it,
+        directUrl:      null,
+        link:           null,
+        url:            null,
+        urlQuality:     "missing_direct_url",
+        clickable:      false,
+        __fanoutQuery:  fanoutQuery.query,
+        __fanoutReason: fanoutQuery.reason,
+      });
+      continue;
+    }
 
     out.push({
       ...it,
@@ -9185,6 +9337,7 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
       link:           cleanUrl,
       url:            cleanUrl,
       urlQuality:     it.urlQuality || "merchant_resolved",
+      clickable:      true,
       __fanoutQuery:  fanoutQuery.query,
       __fanoutReason: fanoutQuery.reason,
     });
@@ -9192,10 +9345,11 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
 
   console.log("SERP_FANOUT_NORMALIZED", {
     scanId,
-    fanoutQuery:     fanoutQuery.query,
-    rawCount:        rawItems.length,
-    keptCount:       out.length,
-    droppedUrl,
+    fanoutQuery:       fanoutQuery.query,
+    rawCount:          rawItems.length,
+    keptCount:         out.length,
+    keptClickable:     out.filter(x => x.clickable !== false).length,
+    keptPricingOnly:   pricingOnly,
     droppedBadListing: droppedBad,
     droppedNoPrice,
   });
@@ -21266,8 +21420,9 @@ async function buildMarketSearchResponsePayload({
 
   const baseQuery = normalizeQuery(query || "");
   const _rawSourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
+  const _sneakerLocked  = applySneakerIdentityLock(baseQuery, _rawSourceItems);
   const sourceItems = applyGenericVariantQualityFilter(
-    baseQuery, _rawSourceItems, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
+    baseQuery, _sneakerLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
   );
   console.log("RESULT_POOL_SIZE_POLICY", {
     beforeFiltering: _rawSourceItems.length,
@@ -26052,16 +26207,15 @@ app.post("/market/search/stream", async (req, res) => {
             const _qFiltered = _qResults
               .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
               .filter(it => !isBadListing(it.title, query))
-              .filter(it => {
-                // URL validation mirrors the main merge pipeline: reject
-                // search pages, redirect wrappers, and category URLs so
-                // background expansion never reintroduces invalid product
-                // links. Canonical URL is stamped back onto the item.
+              .map(it => {
+                // Stamp URL fields. Items without a clean direct URL are kept as
+                // non-clickable pricing evidence (title + price + source are valid).
                 const clean = sanitizeListingUrl(it);
-                if (!clean) { _bgUrlDropped++; return false; }
-                it.directUrl = clean;
-                it.link      = clean;
-                return true;
+                if (!clean) {
+                  _bgUrlDropped++;
+                  return { ...it, directUrl: null, link: null, url: null, urlQuality: "missing_direct_url", clickable: false };
+                }
+                return { ...it, directUrl: clean, link: clean, urlQuality: it.urlQuality || "merchant_resolved", clickable: true };
               });
 
             _bgAccumulated.push(..._qFiltered);
@@ -26087,7 +26241,7 @@ app.post("/market/search/stream", async (req, res) => {
           const _bgDurationMs  = Date.now() - _bgT0;
 
           if (_bgUrlDropped > 0) {
-            console.log("🔗 BACKGROUND_EXPANSION_URL_DROPPED", {
+            console.log("🔗 BACKGROUND_EXPANSION_NO_URL", {
               scanId, count: _bgUrlDropped,
             });
           }
