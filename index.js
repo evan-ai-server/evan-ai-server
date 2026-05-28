@@ -11803,19 +11803,24 @@ CRITICAL RULES:
     const items = [];
 
     // Normalize exact listings
+    // Oracle items are AI-generated pricing estimates — not real individual
+    // listings. They must never open a search page pretending to be a product.
+    // directUrl/url/link/buyLink are null; urlQuality marks them for the UI.
     for (const listing of (parsed.exactListings || [])) {
       const price = finitePrice(listing?.price);
       if (!price || !listing?.title) continue;
       const platform = String(listing.platform || "eBay").trim();
-      const searchUrl = buildOracleSearchUrl(platform, query);
       items.push({
         title: String(listing.title).trim(),
         source: platform,
         price,
         totalPrice: price,
-        url: searchUrl,
-        link: searchUrl,
-        buyLink: searchUrl,
+        directUrl:  null,
+        url:        null,
+        link:       null,
+        buyLink:    null,
+        clickable:  false,
+        urlQuality: "oracle_pricing_estimate",
         image: null,
         rating: null,
         reviews: null,
@@ -11839,15 +11844,17 @@ CRITICAL RULES:
       const price = finitePrice(alt?.price);
       if (!price || !alt?.title) continue;
       const altPlatform = String(alt.platform || "eBay").trim();
-      const altUrl = buildOracleSearchUrl(altPlatform, alt.title);
       items.push({
         title: String(alt.title).trim(),
         source: altPlatform,
         price,
         totalPrice: price,
-        url: altUrl,
-        link: altUrl,
-        buyLink: altUrl,
+        directUrl:  null,
+        url:        null,
+        link:       null,
+        buyLink:    null,
+        clickable:  false,
+        urlQuality: "oracle_pricing_estimate",
         image: null,
         rating: null,
         reviews: null,
@@ -12523,35 +12530,50 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
     (it) => !isBadListing(it.title, normalizedQuery)
   );
 
-  // URL resolution: items with no resolvable merchant URL are kept as non-clickable
-  // pricing evidence rather than dropped. Null out ALL link fields so Google URLs
-  // cannot leak through buyLink/url/link into the frontend.
+  // URL resolution: items whose directUrl is not a real product page are handled
+  // in two ways:
+  //   • Items explicitly marked clickable:false by the SERP resolver (urlQuality
+  //     set by normalizeItem) → kept as non-clickable pricing evidence with all
+  //     link fields nulled.
+  //   • Items with no URL provenance (API-sourced, no urlQuality) → dropped to
+  //     avoid accumulating items whose data quality is unknown.
   const _urlNoDirectBySource = {};
-  const stageValidUrl = stageNotBad.map(it => {
-    const clean = sanitizeListingUrl(it);
-    if (!clean) {
-      const src = String(it?.source || "unknown").toLowerCase().split(/\s+/)[0];
-      _urlNoDirectBySource[src] = (_urlNoDirectBySource[src] || 0) + 1;
+  const _urlDropsBySource    = {};
+  const stageValidUrl = stageNotBad
+    .map(it => {
+      const clean = sanitizeListingUrl(it);
+      if (!clean) {
+        const src = String(it?.source || "unknown").toLowerCase().split(/\s+/)[0];
+        // Keep items that went through the hardened resolver (urlQuality set) as
+        // non-clickable pricing evidence; drop everything else.
+        if (it.clickable === false || (it.urlQuality && it.urlQuality !== "unresolved")) {
+          _urlNoDirectBySource[src] = (_urlNoDirectBySource[src] || 0) + 1;
+          return {
+            ...it,
+            directUrl: null,
+            link:      null,
+            url:       null,
+            buyLink:   null,
+            clickable:  false,
+          };
+        }
+        _urlDropsBySource[src] = (_urlDropsBySource[src] || 0) + 1;
+        return null; // drop
+      }
       return {
         ...it,
-        directUrl: null,
-        link:      null,
-        url:       null,
-        buyLink:   null,
-        clickable:  false,
-        urlQuality: it.urlQuality || "unresolved",
+        directUrl: clean,
+        link:      clean,
+        url:       clean,
+        buyLink:   clean,
       };
-    }
-    return {
-      ...it,
-      directUrl: clean,
-      link:      clean,
-      url:       clean,
-      buyLink:   clean,
-    };
-  });
+    })
+    .filter(Boolean);
   if (Object.keys(_urlNoDirectBySource).length > 0) {
     console.log("🔗 LISTING_NO_DIRECT_URL", { query: normalizedQuery, bySource: _urlNoDirectBySource });
+  }
+  if (Object.keys(_urlDropsBySource).length > 0) {
+    console.log("🔗 INVALID_URL_DROPPED", { query: normalizedQuery, bySource: _urlDropsBySource });
   }
 
   const stageDeduped = dedupeSmart(stageValidUrl);
@@ -12832,13 +12854,18 @@ merged = [...merged].sort((a, b) => {
     const backupStageNotBad = backupStageWithPrice.filter(
       (it) => !isBadListing(it.title, normalizedQuery)
     );
-    const backupStageValidUrl = backupStageNotBad.map(it => {
-      const clean = sanitizeListingUrl(it);
-      if (!clean) {
-        return { ...it, directUrl: null, link: null, url: null, buyLink: null, clickable: false, urlQuality: it.urlQuality || "unresolved" };
-      }
-      return { ...it, directUrl: clean, link: clean, url: clean, buyLink: clean };
-    });
+    const backupStageValidUrl = backupStageNotBad
+      .map(it => {
+        const clean = sanitizeListingUrl(it);
+        if (!clean) {
+          if (it.clickable === false || (it.urlQuality && it.urlQuality !== "unresolved")) {
+            return { ...it, directUrl: null, link: null, url: null, buyLink: null, clickable: false };
+          }
+          return null; // drop API-sourced items with no URL provenance
+        }
+        return { ...it, directUrl: clean, link: clean, url: clean, buyLink: clean };
+      })
+      .filter(Boolean);
     const backupStageDeduped = dedupeSmart(backupStageValidUrl);
 
     const fallbackPool = backupStageDeduped
