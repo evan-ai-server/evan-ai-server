@@ -1416,8 +1416,11 @@ const ebayRenderConcurrency = pLimit(
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
-const MIN_CLEAN_RESULTS_TARGET = Number(process.env.MIN_CLEAN_RESULTS_TARGET || 8);
-const MAX_RESULTS_TO_CLIENT    = Number(process.env.MAX_RESULTS_TO_CLIENT    || 24);
+const MIN_CLEAN_RESULTS_TARGET  = Number(process.env.MIN_CLEAN_RESULTS_TARGET  || 8);
+const MAX_RESULTS_TO_CLIENT     = Number(process.env.MAX_RESULTS_TO_CLIENT     || 24);
+const SERP_FANOUT_CONCURRENCY   = Number(process.env.SERP_FANOUT_CONCURRENCY   || 3);
+const SERP_FANOUT_TIMEOUT_MS    = Number(process.env.SERP_FANOUT_TIMEOUT_MS    || 4500);
+const SERP_FANOUT_MAX_QUERIES   = Number(process.env.SERP_FANOUT_MAX_QUERIES   || 7);
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
@@ -8969,111 +8972,141 @@ try {
 }
 
 // ── SERP fanout query builder ─────────────────────────────────────────────────
-// Generates controlled SERP query variants for retrieval expansion.
-// Returns array of { query, reason, priority } ordered by priority.
-// Always includes original first; caps total at 7.
+// Generates safe, category-aware SERP query variants for retrieval expansion.
+// NEVER invents product facts (size, color, storage, gender) not in original.
+// Returns array of { query, reason, priority, categoryGuess }.
+// Always includes original first; caps total at SERP_FANOUT_MAX_QUERIES.
 function buildSerpFanoutQueries(query, context = {}) {
   const q = (query || "").toLowerCase().trim();
-  if (!q) return [{ query: query || "", reason: "original", priority: 0 }];
+  if (!q) return [{ query: query || "", reason: "original", priority: 0, categoryGuess: "general" }];
 
-  const out = [{ query, reason: "original", priority: 0 }];
+  const out = [{ query, reason: "original", priority: 0, categoryGuess: "general" }];
   const seen = new Set([q]);
+
+  let categoryGuess = "general";
 
   const addQ = (qStr, reason, priority) => {
     const norm = (qStr || "").trim().toLowerCase();
     if (!norm || norm.length < 4 || seen.has(norm)) return;
     seen.add(norm);
-    out.push({ query: qStr.trim(), reason, priority });
+    out.push({ query: qStr.trim(), reason, priority, categoryGuess });
   };
 
-  const isAircraft = /\b(airplane|aircraft|boeing|airbus|diecast|model airplane|dreamliner|787|777|747|737|a350|a380|airline model|aviation model)\b/.test(q);
+  const isAircraft = /\b(airplane|aircraft|boeing|airbus|diecast|model airplane|dreamliner|787|777|747|737|a350|a380|airline model|aviation model|1:400|1:200|1:500)\b/.test(q);
   const isShoe     = /\b(shoe|sneaker|boot|jordan|nike|adidas|new balance|running shoe|trainer|footwear)\b/.test(q);
   const isElec     = /\b(iphone|samsung|pixel|galaxy|laptop|macbook|ipad|tablet|headphone|earphone|speaker|camera|gpu|cpu|ssd|monitor)\b/.test(q);
   const isClothing = /\b(shirt|jacket|hoodie|pants|jeans|dress|coat|sweater|blazer|shorts|skirt|vest)\b/.test(q);
   const isWatch    = /\b(watch|rolex|omega|casio|seiko|timepiece)\b/.test(q);
   const isBag      = /\b(bag|backpack|purse|wallet|luggage|handbag|tote|satchel)\b/.test(q);
-
-  let categoryGuess = "general";
+  const isLuxury   = /\b(rolex|omega|patek|cartier|chanel|hermes|gucci|louis vuitton|prada|burberry|goyard)\b/.test(q);
 
   if (isAircraft) {
     categoryGuess = "aircraft";
-    const airlineM = q.match(/\b(hawaiian|united|delta|american|ana\b|emirates|lufthansa|qantas|southwest|alaska|jetblue|virgin|singapore|cathay|korean air|japan airlines)\b/);
+    out[0].categoryGuess = "aircraft";
+
+    const airlineM = q.match(/\b(hawaiian|united|delta|american|ana\b|emirates|lufthansa|qantas|southwest|alaska|jetblue|virgin|singapore|cathay|korean air|japan airlines|air canada|air france|klm)\b/);
     const airline  = airlineM ? airlineM[1] : null;
-    const familyM  = q.match(/\b(787-?9?|787-?3?|dreamliner|777-?[23]00\w{0,3}|747-?[48]?|737-?(?:max)?\d{0,3}|a350-?\d{0,4}|a380|a320|a321|a330|757|767)\b/);
+    const familyM  = q.match(/\b(787-?9?|787-?3?|dreamliner|777-?[23]00\w{0,3}|747-?[48]?|737-?(?:max)?\d{0,3}|a350-?\d{0,4}|a380|a320|a321|a330|a319|757|767)\b/);
     const family   = familyM ? familyM[1] : null;
 
-    const makers = ["Herpa", "PPC", "NG Models", "GeminiJets"];
-    let makerCount = 0;
-    for (const maker of makers) {
-      if (q.includes(maker.toLowerCase())) continue;
-      const parts = [maker, airline, family, "model airplane"].filter(Boolean);
-      if (parts.length >= 3) {
-        addQ(parts.join(" "), `aircraft_maker_${maker.toLowerCase().replace(/\s+/g, "_")}`, 1);
-        if (++makerCount >= 3) break;
-      }
-    }
-    if (family && /^787$/.test(family) && !q.includes("787-9")) {
-      addQ(query.replace(/\b787\b/, "787-9"), "aircraft_family_787_9_variant", 2);
-    }
+    // Extract scale if present — preserve it, never invent
+    const scaleM   = q.match(/\b1\s*[:\/]\s*(200|400|500|600)\b/);
+    const scale    = scaleM ? `1:${scaleM[1]}` : null;
+
+    // Maker variants: require BOTH airline AND family to avoid junk
     if (airline && family) {
-      addQ(`${airline} ${family} diecast airplane`, "aircraft_direct_diecast", 2);
+      const makers = ["Herpa", "NG Models", "GeminiJets", "PPC", "Aviation 400"];
+      let makerCount = 0;
+      for (const maker of makers) {
+        if (q.includes(maker.toLowerCase())) continue;
+        const parts = [maker, airline, family];
+        if (scale) parts.push(scale);
+        addQ(parts.join(" "), `aircraft_maker_${maker.toLowerCase().replace(/\s+/g, "_")}`, 1);
+        if (++makerCount >= 4) break;
+      }
+      // 787 → 787-9 variant (common listing form), only for aircraft
+      if (family && /^787$/.test(family) && !q.includes("787-9")) {
+        addQ(query.replace(/\b787\b/, "787-9"), "aircraft_family_787_9_variant", 2);
+      }
+    } else if (airline || family) {
+      // Partial: at least add a "diecast model" suffix variant
+      const parts = [airline, family, "diecast model"].filter(Boolean);
+      addQ(parts.join(" "), "aircraft_partial_variant", 2);
     }
 
   } else if (isShoe) {
     categoryGuess = "shoe";
-    addQ(`${query} for sale`, "shoe_sale", 1);
-    addQ(`buy ${query}`, "shoe_buy", 2);
-    if (!q.includes("deadstock")) addQ(`${query} deadstock`, "shoe_deadstock", 3);
+    out[0].categoryGuess = "shoe";
+    // Safe shoe variants — never invent size/color/gender
+    addQ(`${query} new`, "shoe_new", 1);
+    addQ(`${query} used`, "shoe_used", 2);
+    // Gender variants only if already present in original query
+    if (/\b(men.?s|mens)\b/.test(q)) addQ(`${query} men`, "shoe_mens_explicit", 3);
+    if (/\b(women.?s|womens)\b/.test(q)) addQ(`${query} women`, "shoe_womens_explicit", 3);
 
   } else if (isElec) {
     categoryGuess = "electronics";
-    addQ(`${query} for sale`, "electronics_sale", 1);
-    addQ(`buy ${query}`, "electronics_buy", 2);
-    if (!q.includes("unlocked") && /iphone|samsung|pixel|galaxy/.test(q)) {
-      addQ(`${query} unlocked`, "electronics_unlocked", 3);
-    }
+    out[0].categoryGuess = "electronics";
+    // Safe electronics variants — NEVER add unlocked, storage, or specs not in original
+    addQ(`${query} used`, "electronics_used", 1);
+    addQ(`${query} renewed`, "electronics_renewed", 2);
+    addQ(`${query} refurbished`, "electronics_refurbished", 3);
 
   } else if (isClothing) {
     categoryGuess = "clothing";
-    addQ(`${query} for sale`, "clothing_sale", 1);
-    addQ(`buy ${query}`, "clothing_buy", 2);
+    out[0].categoryGuess = "clothing";
+    addQ(`${query} used`, "clothing_used", 1);
+    addQ(`${query} pre owned`, "clothing_preowned", 2);
+    addQ(`${query} new`, "clothing_new", 3);
 
   } else if (isWatch) {
     categoryGuess = "watch";
-    addQ(`${query} authentic`, "watch_authentic", 1);
-    addQ(`${query} for sale`, "watch_sale", 2);
+    out[0].categoryGuess = "watch";
+    if (isLuxury) addQ(`${query} authentic`, "watch_authentic", 1);
+    addQ(`${query} used`, "watch_used", 2);
+    addQ(`${query} pre owned`, "watch_preowned", 3);
 
   } else if (isBag) {
     categoryGuess = "bag";
-    addQ(`${query} for sale`, "bag_sale", 1);
-    addQ(`${query} authentic`, "bag_authentic", 2);
+    out[0].categoryGuess = "bag";
+    if (isLuxury) addQ(`${query} authentic`, "bag_authentic", 1);
+    addQ(`${query} used`, "bag_used", 2);
+    addQ(`${query} pre owned`, "bag_preowned", 3);
 
   } else {
     categoryGuess = "general";
-    addQ(`${query} for sale`, "general_sale", 1);
-    addQ(`buy ${query}`, "general_buy", 2);
+    // Conservative general variants — no invented facts
+    addQ(`${query} used`, "general_used", 1);
+    addQ(`${query} new`, "general_new", 2);
     const tokens = q.split(/\s+/).filter(Boolean);
-    if (tokens.length >= 3) addQ(tokens.slice(0, -1).join(" "), "general_shorter", 3);
+    if (tokens.length >= 4) {
+      // Drop last generic word only if it's a filler, not a brand/model token
+      const lastToken = tokens[tokens.length - 1];
+      const safeToShorten = /^(item|thing|product|stuff|set|kit|pack|bundle)$/.test(lastToken);
+      if (safeToShorten) addQ(tokens.slice(0, -1).join(" "), "general_shorter", 3);
+    }
   }
 
-  const capped = out.slice(0, 7);
+  const capped = out.slice(0, SERP_FANOUT_MAX_QUERIES);
   console.log("SERP_FANOUT_QUERIES_BUILT", {
     originalQuery: query,
     queryCount:    capped.length,
     queries:       capped.map(x => x.query),
     reasons:       capped.map(x => x.reason),
     categoryGuess,
-    capped:        out.length > 7,
+    capped:        out.length > SERP_FANOUT_MAX_QUERIES,
   });
   return capped;
 }
 
 function shouldExpandRetrievalForCleanPool({ query, cleanCount, rawCount, minTarget, cacheKind, elapsedMs, reason }) {
-  const expand =
-    cleanCount < minTarget &&
+  const serpAvail =
     !!SERPAPI_KEY &&
     process.env.DISABLE_SERP !== "true" &&
+    process.env.DISABLE_SERP_FANOUT !== "true" &&
     !isSourceCoolingDown("serpapi");
+
+  const expand = cleanCount < minTarget && serpAvail;
 
   console.log("RETRIEVAL_EXPANSION_POLICY", {
     query:      (query || "").slice(0, 80),
@@ -9082,10 +9115,92 @@ function shouldExpandRetrievalForCleanPool({ query, cleanCount, rawCount, minTar
     minTarget,
     cacheKind:  cacheKind || null,
     elapsedMs:  elapsedMs || null,
+    serpAvail,
     expand,
-    reason:     expand ? "below_min_target" : (reason || "conditions_not_met"),
+    reason:     expand ? "below_min_target" : (!serpAvail ? "serp_unavailable" : (reason || "conditions_not_met")),
   });
   return expand;
+}
+
+// Shared clean-pool measurement used by cache bypass + fanout stop condition.
+// Runs the full filter chain: relevance → aircraft identity → trim → variant.
+// Returns { items, cleanCount, rawCount, variantCleanCount, kind }.
+// Items are NOT mutated; the returned .items is the filtered copy.
+function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "unknown") {
+  if (!Array.isArray(items)) {
+    return { items: [], cleanCount: 0, rawCount: 0, variantCleanCount: 0, kind };
+  }
+  const rawCount = items.length;
+
+  // Step 1: relevance (removes wrong-category/wrong-brand junk)
+  const afterRelevance = filterRelevantListings(query, items);
+
+  // Step 2: aircraft identity lock + tier filter (no-op for non-aircraft)
+  const afterIdentity = applyPrePayloadAircraftFilter(query, afterRelevance, scannedPrice, kind);
+
+  // Step 3: price outlier trim
+  const afterTrim = trimPriceOutliers(afterIdentity);
+
+  // Step 4: generic variant quality filter (no-op when query has no variant signals)
+  const afterVariant = applyGenericVariantQualityFilter(query, afterTrim, scannedPrice, { kind });
+
+  console.log("CLEAN_RETRIEVAL_POOL_CHECK", {
+    kind,
+    rawCount,
+    afterIdentityCount: afterIdentity.length,
+    cleanCount:         afterVariant.length,
+    query:              (query || "").slice(0, 80),
+    scannedPrice,
+  });
+
+  return {
+    items:             afterVariant,
+    cleanCount:        afterVariant.length,
+    rawCount,
+    variantCleanCount: afterVariant.length,
+    kind,
+  };
+}
+
+// Normalizes raw serpShopping results from a fanout query.
+// Validates URLs, drops bad listings, stamps directUrl/urlQuality/__fanout* fields.
+// Never mutates the input array; returns a fresh filtered array.
+function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) {
+  if (!Array.isArray(rawItems) || !rawItems.length) return [];
+
+  let droppedUrl = 0, droppedBad = 0, droppedNoPrice = 0;
+  const out = [];
+
+  for (const it of rawItems) {
+    if (!it?.title) continue;
+    if (!Number.isFinite(it?.totalPrice) && !Number.isFinite(it?.price)) { droppedNoPrice++; continue; }
+    if (isBadListing(it.title, originalQuery)) { droppedBad++; continue; }
+
+    const cleanUrl = sanitizeListingUrl(it);
+    if (!cleanUrl) { droppedUrl++; continue; }
+
+    out.push({
+      ...it,
+      directUrl:      cleanUrl,
+      link:           cleanUrl,
+      url:            cleanUrl,
+      urlQuality:     it.urlQuality || "merchant_resolved",
+      __fanoutQuery:  fanoutQuery.query,
+      __fanoutReason: fanoutQuery.reason,
+    });
+  }
+
+  console.log("SERP_FANOUT_NORMALIZED", {
+    scanId,
+    fanoutQuery:     fanoutQuery.query,
+    rawCount:        rawItems.length,
+    keptCount:       out.length,
+    droppedUrl,
+    droppedBadListing: droppedBad,
+    droppedNoPrice,
+  });
+
+  return out;
 }
 
 function filterRelevantListings(query, items) {
@@ -25282,9 +25397,11 @@ app.post("/market/search/stream", async (req, res) => {
       const _enrichedPolicy = resolveAircraftCachePolicy(query, enrichedHit.items, scannedPrice, "enriched");
       if (_enrichedPolicy.action !== "bypass_stale_cache") {
         const _enrichedItems = _enrichedPolicy.items;
-        const _enrichedCleanCount = applyGenericVariantQualityFilter(query, _enrichedItems, scannedPrice, { kind: "enriched_cache_check" }).length;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "enriched", kind: "cache_hit", beforeCount: _enrichedItems.length, cleanCount: _enrichedCleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, action: _enrichedCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "return_cache" : "bypass_for_fresh_fanout", reason: _enrichedCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "below_min_target" });
-        if (_enrichedCleanCount >= MIN_CLEAN_RESULTS_TARGET) {
+        const _enrichedClean  = computeCleanRetrievalPool(query, _enrichedItems, scannedPrice, "enriched_cache_check");
+        const _enrichedSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
+        const _enrichedReturn = _enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_enrichedSerpOk;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "enriched", kind: "cache_hit", beforeCount: _enrichedItems.length, cleanCount: _enrichedClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _enrichedSerpOk, action: _enrichedReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _enrichedReturn ? (_enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        if (_enrichedReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "enriched", query });
           const payload = await _buildPayload(_enrichedItems, { source: "enriched_cache", kind: "cache_hit" });
@@ -25319,9 +25436,11 @@ app.post("/market/search/stream", async (req, res) => {
       const _internalPolicy = resolveAircraftCachePolicy(query, internalHit.items, scannedPrice, internalHit.kind || "internal");
       if (_internalPolicy.action !== "bypass_stale_cache") {
         const _internalItems = _internalPolicy.items;
-        const _internalCleanCount = applyGenericVariantQualityFilter(query, _internalItems, scannedPrice, { kind: "internal_cache_check" }).length;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "internal", kind: internalHit.kind, beforeCount: _internalItems.length, cleanCount: _internalCleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, action: _internalCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "return_cache" : "bypass_for_fresh_fanout", reason: _internalCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "below_min_target" });
-        if (_internalCleanCount >= MIN_CLEAN_RESULTS_TARGET) {
+        const _internalClean  = computeCleanRetrievalPool(query, _internalItems, scannedPrice, "internal_cache_check");
+        const _internalSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
+        const _internalReturn = _internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_internalSerpOk;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "internal", kind: internalHit.kind, beforeCount: _internalItems.length, cleanCount: _internalClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _internalSerpOk, action: _internalReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _internalReturn ? (_internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        if (_internalReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "internal", query, kind: internalHit.kind });
           const [payload, ebaySold, localC] = await Promise.all([
@@ -25357,9 +25476,11 @@ app.post("/market/search/stream", async (req, res) => {
       const _serpPolicy = resolveAircraftCachePolicy(query, serpCached, scannedPrice, "serp_cache");
       if (_serpPolicy.action !== "bypass_stale_cache") {
         const _serpItems = _serpPolicy.items;
-        const _serpCleanCount = applyGenericVariantQualityFilter(query, _serpItems, scannedPrice, { kind: "serp_cache_check" }).length;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "serp", kind: "route_cache_hit", beforeCount: _serpItems.length, cleanCount: _serpCleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, action: _serpCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "return_cache" : "bypass_for_fresh_fanout", reason: _serpCleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "below_min_target" });
-        if (_serpCleanCount >= MIN_CLEAN_RESULTS_TARGET) {
+        const _serpClean  = computeCleanRetrievalPool(query, _serpItems, scannedPrice, "serp_cache_check");
+        const _serpSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
+        const _serpReturn = _serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_serpSerpOk;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "serp", kind: "route_cache_hit", beforeCount: _serpItems.length, cleanCount: _serpClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _serpSerpOk, action: _serpReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _serpReturn ? (_serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        if (_serpReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "serp", query });
           const [payload, ebaySold, localC] = await Promise.all([
@@ -25633,12 +25754,12 @@ app.post("/market/search/stream", async (req, res) => {
       });
     }
 
-    // ── In-band SERP fanout: expand pool if below MIN_CLEAN_RESULTS_TARGET ──
+    // ── In-band SERP fanout: bounded parallel expansion pre-payload ─────────
     if (!_degraded && !clientClosed && !_oracleOnlyResult) {
-      const _preCleanCount = applyGenericVariantQualityFilter(query, enrichedItems, scannedPrice, { kind: "pre_fanout_check" }).length;
-      const _shouldFanout  = shouldExpandRetrievalForCleanPool({
+      const _preClean     = computeCleanRetrievalPool(query, enrichedItems, scannedPrice, "pre_fanout_check");
+      const _shouldFanout = shouldExpandRetrievalForCleanPool({
         query,
-        cleanCount: _preCleanCount,
+        cleanCount: _preClean.cleanCount,
         rawCount:   enrichedItems.length,
         minTarget:  MIN_CLEAN_RESULTS_TARGET,
         cacheKind:  "live_refresh",
@@ -25647,70 +25768,93 @@ app.post("/market/search/stream", async (req, res) => {
       });
 
       if (_shouldFanout) {
-        const _fanoutT0    = Date.now();
-        const _fanoutQs    = buildSerpFanoutQueries(query).slice(1); // skip original
-        const _MAX_FANOUT  = Number(process.env.FANOUT_TIMEOUT_MS || 6000);
-        const _fanoutUsed  = [];
-        let   _fanoutAdded = 0;
+        // Items from computeCleanRetrievalPool already went through the full
+        // filter chain — use them as the starting pool so we don't double-run
+        // filterRelevantListings + aircraft filter on already-filtered items.
+        enrichedItems = _preClean.items;
 
-        for (let _fi = 0; _fi < _fanoutQs.length; _fi++) {
-          if (Date.now() - _fanoutT0 > _MAX_FANOUT || clientClosed) break;
+        const _fanoutT0       = Date.now();
+        const _allFanoutQs    = buildSerpFanoutQueries(query);
+        const _fanoutQs       = _allFanoutQs.slice(1, SERP_FANOUT_MAX_QUERIES); // skip original
+        let   _fanoutRawAdded = 0;
+        let   _fanoutNormAdd  = 0;
+        let   _fanoutAttempted = 0;
+        let   _fanoutSucceeded = 0;
+        const _fanoutUsed     = [];
+        let   _stoppedReason  = "fanout_exhausted";
 
-          const _fq   = _fanoutQs[_fi];
-          const _fqT0 = Date.now();
-          console.log("SERP_FANOUT_CALL_START", { scanId, query: _fq.query, fanoutIndex: _fi, reason: _fq.reason });
+        // Process in parallel batches of SERP_FANOUT_CONCURRENCY
+        for (let _bi = 0; _bi < _fanoutQs.length; _bi += SERP_FANOUT_CONCURRENCY) {
+          if (Date.now() - _fanoutT0 > SERP_FANOUT_TIMEOUT_MS) { _stoppedReason = "timeout_budget_exhausted"; break; }
+          if (clientClosed) { _stoppedReason = "client_closed"; break; }
 
-          const _fqRaw = await marketSearchConcurrency(
-            () => serpShopping(_fq.query, { softFail: true })
-          ).catch(() => []);
+          const _batch = _fanoutQs.slice(_bi, _bi + SERP_FANOUT_CONCURRENCY);
+          _fanoutAttempted += _batch.length;
 
-          const _fqMs = Date.now() - _fqT0;
-
-          if (!Array.isArray(_fqRaw) || !_fqRaw.length) {
-            console.log("SERP_FANOUT_CALL_RESULT", { scanId, query: _fq.query, fanoutIndex: _fi, rawCount: 0, normalizedCount: 0, keptCount: 0, durationMs: _fqMs });
-            continue;
+          // Log batch starts
+          for (let _bj = 0; _bj < _batch.length; _bj++) {
+            console.log("SERP_FANOUT_CALL_START", { scanId, query: _batch[_bj].query, fanoutIndex: _bi + _bj, reason: _batch[_bj].reason });
           }
 
-          const _fqNorm = _fqRaw
-            .filter(it => it?.title && (Number.isFinite(it?.totalPrice) || Number.isFinite(it?.price)))
-            .filter(it => !isBadListing(it.title, query))
-            .filter(it => {
-              const clean = sanitizeListingUrl(it);
-              if (!clean) return false;
-              it.directUrl = clean;
-              it.link      = clean;
-              return true;
+          // Fire batch in parallel
+          const _batchTs = Date.now();
+          const _batchResults = await Promise.all(
+            _batch.map(async (_bq) => {
+              const _raw = await marketSearchConcurrency(
+                () => serpShopping(_bq.query, { softFail: true })
+              ).catch(() => []);
+              return { q: _bq, raw: Array.isArray(_raw) ? _raw : [] };
+            })
+          );
+          const _batchMs = Date.now() - _batchTs;
+
+          // Normalize each batch result + log
+          const _batchNorm = [];
+          for (let _bj = 0; _bj < _batchResults.length; _bj++) {
+            const { q: _bq, raw: _fqRaw } = _batchResults[_bj];
+            const _norm = normalizeFanoutSerpItems(_fqRaw, query, _bq, scanId);
+            console.log("SERP_FANOUT_CALL_RESULT", {
+              scanId, query: _bq.query, fanoutIndex: _bi + _bj,
+              rawCount: _fqRaw.length, normalizedCount: _norm.length, keptCount: _norm.length, durationMs: _batchMs,
             });
+            if (_norm.length > 0) {
+              _fanoutSucceeded++;
+              _fanoutRawAdded += _fqRaw.length;
+              _fanoutNormAdd  += _norm.length;
+              _fanoutUsed.push(_bq.query);
+              _batchNorm.push(..._norm);
+            }
+          }
 
-          console.log("SERP_FANOUT_CALL_RESULT", { scanId, query: _fq.query, fanoutIndex: _fi, rawCount: _fqRaw.length, normalizedCount: _fqNorm.length, keptCount: _fqNorm.length, durationMs: _fqMs });
-
-          if (!_fqNorm.length) continue;
-
-          _fanoutAdded += _fqNorm.length;
-          _fanoutUsed.push(_fq.query);
-
-          // Merge + filter to protect against junk introduced by fanout
-          const _merged    = dedupeSmart([...enrichedItems, ..._fqNorm]);
-          const _fFiltered = filterRelevantListings(query, _merged);
-          enrichedItems    = trimPriceOutliers(applyPrePayloadAircraftFilter(query, _fFiltered, scannedPrice, "fanout_filter"));
-
-          // Early stop: enough raw items to meet target after variant filter
-          if (enrichedItems.length >= MIN_CLEAN_RESULTS_TARGET) break;
+          // Merge batch into pool + run full clean chain
+          if (_batchNorm.length > 0) {
+            const _merged    = dedupeSmart([...enrichedItems, ..._batchNorm]);
+            const _cleanCheck = computeCleanRetrievalPool(query, _merged, scannedPrice, "fanout_merge");
+            enrichedItems = _cleanCheck.items;
+            if (_cleanCheck.cleanCount >= MIN_CLEAN_RESULTS_TARGET) {
+              _stoppedReason = "clean_target_met";
+              break;
+            }
+          }
         }
 
-        const _fanoutFinalCount = applyGenericVariantQualityFilter(query, enrichedItems, scannedPrice, { kind: "fanout_final" }).length;
+        const _fanoutFinal = computeCleanRetrievalPool(query, enrichedItems, scannedPrice, "fanout_final");
         console.log("SERP_FANOUT_MERGE_SUMMARY", {
           scanId,
-          originalCount:      _preCleanCount,
-          fanoutRawAdded:     _fanoutAdded,
-          mergedAfterDedupe:  enrichedItems.length,
-          cleanAfterFilters:  _fanoutFinalCount,
-          minTarget:          MIN_CLEAN_RESULTS_TARGET,
-          queriesUsed:        _fanoutUsed,
-          topTitles:          enrichedItems.slice(0, 5).map(i => (i?.title || "").slice(0, 50)),
+          originalCleanCount:      _preClean.cleanCount,
+          fanoutQueriesAttempted:  _fanoutAttempted,
+          fanoutQueriesSucceeded:  _fanoutSucceeded,
+          fanoutRawAdded:          _fanoutRawAdded,
+          fanoutNormalizedAdded:   _fanoutNormAdd,
+          mergedAfterDedupe:       enrichedItems.length,
+          cleanAfterFilters:       _fanoutFinal.cleanCount,
+          minTarget:               MIN_CLEAN_RESULTS_TARGET,
+          stoppedReason:           _stoppedReason,
+          queriesUsed:             _fanoutUsed,
+          topTitles:               enrichedItems.slice(0, 5).map(i => (i?.title || "").slice(0, 50)),
         });
 
-        // Refresh caches with expanded pool if we improved
+        // Refresh caches with expanded pool
         if (enrichedItems.length > 0) {
           SERP_CACHE.set(cacheKey, enrichedItems);
           ENRICHED_SCAN_CACHE.set(cacheKey, {
