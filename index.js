@@ -8461,6 +8461,52 @@ try {
   console.warn("AIRCRAFT_CLASSIFIER_SELFTEST_ERROR", { error: String(_e) });
 }
 
+// Returns true when a listing title has at least one strong signal proving it matches
+// the specific aircraft variant being scanned (family/maker/scale/registration).
+// Generic phrases like "model airplane", "collection", "gift" are intentionally excluded.
+function hasAircraftSpecificitySignal(title, requiredFamily = null) {
+  const t = normalizeTitleKey(title || "");
+
+  const makerSignals = [
+    "herpa", "ppc", "ng model", "ng models", "geminijets", "gemini jets",
+    "skymarks", "hogan", "jc wings", "phoenix", "aviation 400",
+  ];
+  if (makerSignals.some((s) => t.includes(normalizeTitleKey(s)))) return true;
+
+  // Scale ratios: 1:400 / 1/400 → both normalize to "1 400"
+  const scaleNorm = ["1 400", "1 200", "1 300", "1 500", "1 150"];
+  if (scaleNorm.some((s) => t.includes(s))) return true;
+
+  // Registration / paint-scheme signals
+  if (t.includes("n781ha") || t.includes("kapuahi")) return true;
+
+  if (requiredFamily) {
+    const familyEntry = AIRCRAFT_FAMILY_MATCH.find((e) => e.family === requiredFamily);
+    const familyTokens = familyEntry ? familyEntry.tokens : [];
+    if (familyTokens.some((tok) => t.includes(normalizeTitleKey(tok)))) return true;
+  }
+
+  return false;
+}
+
+try {
+  const _specTests = [
+    { title: "Model Airplane Hawaiian Planes Model Aircraft Suitable for Collection and Christmas, Birthday Gifts", family: "787", expected: false },
+    { title: "Herpa Hawaiian Airlines Boeing 787-9 Dreamliner", family: "787", expected: true },
+    { title: "PPC Hawaiian Airlines Boeing 787-9 Aircraft Model", family: "787", expected: true },
+    { title: "Herpa Wings Hawaiian Airlines Boeing 787-9 Dreamliner N781HA 614405", family: "787", expected: true },
+  ];
+  for (const tc of _specTests) {
+    const got = hasAircraftSpecificitySignal(tc.title, tc.family);
+    if (got !== tc.expected) {
+      console.warn("AIRCRAFT_SPECIFICITY_SELFTEST_FAIL", { title: tc.title.slice(0, 60), expected: tc.expected, got });
+    }
+  }
+  console.log("AIRCRAFT_SPECIFICITY_SELFTEST_PASS", { cases: _specTests.length });
+} catch (_e) {
+  console.warn("AIRCRAFT_SPECIFICITY_SELFTEST_ERROR", { error: String(_e) });
+}
+
 // Returns true if the normalized query indicates an aircraft/model airplane context.
 function isAircraftModelQuery(q) {
   const aircraftWords = ["airplane", "aircraft", "diecast", "die cast", "aviation",
@@ -8799,6 +8845,7 @@ function filterRelevantListings(query, items) {
     let _rejectedModel = 0;
     let _penalizedModel = 0;
     let _rejectedAirlineMissing = 0;
+    let _rejectedWeakAirlineGeneric = 0;
 
     // Step 1: annotate each item with identity lock metadata.
     for (const it of preserved) {
@@ -8914,6 +8961,29 @@ function filterRelevantListings(query, items) {
       }
     }
 
+    // Step 6: aircraft specificity gate.
+    // When >= 2 surviving items have a strong family/maker/scale signal, reject
+    // airline-matched items that are only generic SEO listings (no 787/Herpa/scale/etc.).
+    if (requiredAirline && requiredFamily) {
+      const _specific = preserved.filter((it) => hasAircraftSpecificitySignal(it?.title, requiredFamily));
+      if (_specific.length >= 2) {
+        for (const it of preserved) {
+          if (!hasAircraftSpecificitySignal(it?.title, requiredFamily)) {
+            _rejectedWeakAirlineGeneric++;
+            console.log("IDENTITY_LOCK_REJECTED", { title: it?.title, reason: "weak_airline_generic_no_specificity", requiredAirline, requiredFamily });
+          }
+        }
+        preserved = _specific;
+      } else {
+        console.log("IDENTITY_LOCK_SPECIFICITY_RELAXED", {
+          requiredAirline,
+          requiredFamily,
+          specificMatchedCount: _specific.length,
+          reason: "insufficient_specific_airline_matches",
+        });
+      }
+    }
+
     console.log("IDENTITY_LOCK_TOKEN_MATCH_POLICY", {
       requiredAirline,
       competitors,
@@ -8933,6 +9003,7 @@ function filterRelevantListings(query, items) {
       rejectedModelMismatchCount: _rejectedModel,
       penalizedModelMismatchCount: _penalizedModel,
       rejectedMissingAirlineCount: _rejectedAirlineMissing,
+      rejectedWeakAirlineGenericCount: _rejectedWeakAirlineGeneric,
       relaxed: _noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0),
       finalTopTitles: preserved.slice(0, 3).map((it) => it?.title),
     });
