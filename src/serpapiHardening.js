@@ -237,30 +237,9 @@ export function resolveDirectProductUrl(rawItem = {}) {
     }
   }
 
-  // Pass 3: allow Google Shopping aggregator pages (/shopping/product/…) as
-  // a low-confidence fallback. The aggregator lists merchant offers — not
-  // ideal, but strictly better than returning null and forcing the frontend
-  // to fall back to an eBay search built from the title. The frontend can
-  // surface the lower confidence with a "via Google" badge if it wants.
-  // The blocked patterns (/url, /search, /aclk, googleadservices,
-  // googlesyndication, doubleclick) are still rejected — those are pure
-  // redirect/ad wrappers, not browsable pages.
-  for (const c of candidates) {
-    if (!/^https?:\/\//i.test(c)) continue;
-    let u;
-    try { u = new URL(c); } catch { continue; }
-    const host = String(u.hostname || "").toLowerCase();
-    const path = String(u.pathname || "").toLowerCase();
-    if (_isGoogleHost(host) && path.startsWith("/shopping/product")) {
-      return {
-        directUrl: c,
-        originalUrl: original,
-        source: "google_product",
-        confidence: 0.4,
-        reason: "google_shopping_aggregator_fallback",
-      };
-    }
-  }
+  // Pass 3 removed: google.com/shopping/product/ pages are NOT direct merchant
+  // URLs — sending users there opens Google, not the merchant's listing page.
+  // Items with no resolvable merchant URL are non-clickable pricing evidence.
 
   return {
     directUrl: null,
@@ -268,6 +247,89 @@ export function resolveDirectProductUrl(rawItem = {}) {
     source: "rejected",
     confidence: 0,
     reason: "only_google_wrappers",
+  };
+}
+
+/**
+ * resolveListingDirectUrl — frontend-safe URL decision for a raw listing item.
+ *
+ * Returns:
+ *   {
+ *     directUrl:  string | null,  // safe merchant URL to open; null = not clickable
+ *     displayUrl: string | null,  // same as directUrl (for UI)
+ *     googleUrl:  string | null,  // original Google URL preserved for audit
+ *     clickable:  boolean,        // true = open directUrl; false = pricing evidence only
+ *     urlQuality: string,         // "merchant_direct" | "google_redirect_unwrapped" |
+ *                                 // "google_unresolved" | "missing_direct_url"
+ *     urlHost:    string | null,  // hostname of directUrl
+ *     reason:     string,         // why this decision was made
+ *   }
+ *
+ * Rules:
+ *   A. Direct merchant URL            → clickable, urlQuality "merchant_direct"
+ *   B. Google redirect unwrapped      → clickable, urlQuality "google_redirect_unwrapped"
+ *   C. Google URL (unresolvable)      → !clickable, directUrl null, "google_unresolved"
+ *   D. No URL at all                  → !clickable, "missing_direct_url"
+ *   E. Malformed / javascript:        → !clickable
+ *
+ * Never sets directUrl to any google.com / googleadservices / doubleclick URL.
+ */
+export function resolveListingDirectUrl(item = {}, context = {}) {
+  const resolved = resolveDirectProductUrl(item);
+
+  // Collect the first Google-looking candidate URL (for audit purposes)
+  const _allCandidates = [
+    item.product_link, item.product_page_url, item.offer_page_url,
+    item.offer_link, item.merchant_link, item.product_url,
+    item.seller_link, item.link, item.url,
+    item.shopping_result_link, item.google_product_link,
+    item.google_shopping_product_link, item.serpapi_link,
+  ].filter(v => v && typeof v === "string");
+
+  const googleUrl = _allCandidates.find(c => {
+    try { return _isGoogleHost(_hostOf(c)) || c.includes("serpapi."); }
+    catch { return false; }
+  }) || null;
+
+  if (resolved.source === "direct") {
+    const urlHost = _hostOf(resolved.directUrl);
+    return {
+      directUrl:  resolved.directUrl,
+      displayUrl: resolved.directUrl,
+      googleUrl,
+      clickable:  true,
+      urlQuality: "merchant_direct",
+      urlHost,
+      reason:     "merchant_url",
+    };
+  }
+
+  if (resolved.source === "extracted") {
+    const urlHost = _hostOf(resolved.directUrl);
+    return {
+      directUrl:  resolved.directUrl,
+      displayUrl: resolved.directUrl,
+      googleUrl:  googleUrl || resolved.originalUrl || null,
+      clickable:  true,
+      urlQuality: "google_redirect_unwrapped",
+      urlHost,
+      reason:     "unwrapped_google_redirect",
+    };
+  }
+
+  // source: "rejected" | "missing" | "google_product" (legacy, never written now)
+  const urlQuality = (resolved.source === "missing" || resolved.reason === "no_url_fields")
+    ? "missing_direct_url"
+    : "google_unresolved";
+
+  return {
+    directUrl:  null,
+    displayUrl: null,
+    googleUrl:  googleUrl || resolved.originalUrl || null,
+    clickable:  false,
+    urlQuality,
+    urlHost:    null,
+    reason:     resolved.source === "missing" ? "missing_url" : "google_url_not_direct",
   };
 }
 
@@ -734,4 +796,70 @@ export function resetSerpDebug() {
       for (const kk of Object.keys(_telemetry[k])) delete _telemetry[k][kk];
     }
   }
+}
+
+// ── Self-tests for resolveListingDirectUrl ────────────────────────────────────
+try {
+  const _urlTests = [
+    // Case 1: Direct merchant URL
+    {
+      item:           { link: "https://poshmark.com/listing/example" },
+      expectClickable: true,
+      expectHost:      "poshmark.com",
+      expectQuality:   "merchant_direct",
+    },
+    // Case 2: Google redirect with q= param → unwrap Poshmark
+    {
+      item:           { link: "https://www.google.com/url?q=https%3A%2F%2Fposhmark.com%2Flisting%2Fabc" },
+      expectClickable: true,
+      expectHost:      "poshmark.com",
+      expectQuality:   "google_redirect_unwrapped",
+    },
+    // Case 3: Google aclk with adurl= → unwrap eBay
+    {
+      item:           { link: "https://www.google.com/aclk?adurl=https%3A%2F%2Fwww.ebay.com%2Fitm%2F123" },
+      expectClickable: true,
+      expectHost:      "www.ebay.com",
+      expectQuality:   "google_redirect_unwrapped",
+    },
+    // Case 4: Google Shopping aggregator — not clickable
+    {
+      item:           { link: "https://www.google.com/shopping/product/123" },
+      expectClickable: false,
+      expectQuality:   "google_unresolved",
+    },
+    // Case 5: No URL at all
+    {
+      item:           {},
+      expectClickable: false,
+      expectQuality:   "missing_direct_url",
+    },
+    // Case 6: javascript: URI — malformed, not clickable
+    {
+      item:           { link: "javascript:alert(1)" },
+      expectClickable: false,
+    },
+  ];
+  let _urlPass = 0;
+  for (const tc of _urlTests) {
+    const r = resolveListingDirectUrl(tc.item);
+    let ok = r.clickable === tc.expectClickable;
+    if (ok && tc.expectHost  && r.urlHost   !== tc.expectHost)   ok = false;
+    if (ok && tc.expectQuality && r.urlQuality !== tc.expectQuality) ok = false;
+    if (ok) { _urlPass++; }
+    else {
+      console.warn("URL_RESOLVER_SELFTEST_FAIL", {
+        item:            JSON.stringify(tc.item).slice(0, 80),
+        expectClickable: tc.expectClickable,
+        gotClickable:    r.clickable,
+        expectHost:      tc.expectHost || null,
+        gotHost:         r.urlHost,
+        expectQuality:   tc.expectQuality || null,
+        gotQuality:      r.urlQuality,
+      });
+    }
+  }
+  console.log("URL_RESOLVER_SELFTEST_PASS", { passed: _urlPass, total: _urlTests.length });
+} catch (_e) {
+  console.warn("URL_RESOLVER_SELFTEST_ERROR", { error: String(_e) });
 }

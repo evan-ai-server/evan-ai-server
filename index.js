@@ -478,6 +478,7 @@ import {
   isGoogleRedirect            as isGoogleRedirectHardened,
   extractFromGoogleRedirect,
   resolveDirectProductUrl,
+  resolveListingDirectUrl,
   sanitizeListingUrl,
   filterAndRankSerpItems,
   computeMarketEvidence,
@@ -7090,17 +7091,45 @@ function isGoogleShoppingProductUrl(value) {
   }
 }
 
-function chooseBestListingUrl(it = {}) {
-  // Delegate to the hardened resolver — single source of truth for what is
-  // safe to open. Rejects google.com/search, /url, /aclk, /shopping/product/,
-  // googleadservices, doubleclick, and extracts the inner destination from
-  // Google redirect wrappers when one exists.
-  const resolved = resolveDirectProductUrl(it);
-  recordUrlOutcome(resolved.source);
+// Sanitizes a stale cached item: if directUrl is a Google host, clear all link
+// fields and mark non-clickable. Applied to SERP_HARDENED_CACHE reads so old
+// google.com/shopping/product/ entries don't reach the frontend.
+function _sanitizeCachedUrl(item) {
+  if (!item?.directUrl) return item;
+  try {
+    const host = new URL(item.directUrl).hostname.toLowerCase();
+    if (
+      /(^|\.)google\./i.test(host) ||
+      /(^|\.)googleadservices\./i.test(host) ||
+      /(^|\.)doubleclick\.net$/i.test(host) ||
+      host.includes("serpapi.")
+    ) {
+      return {
+        ...item,
+        directUrl: null, link: null, url: null, buyLink: null,
+        googleUrl:  item.directUrl,
+        clickable:  false,
+        urlQuality: "google_unresolved_stale_cache",
+      };
+    }
+  } catch { /* invalid URL — leave as-is, sanitizeListingUrl will reject later */ }
+  return item;
+}
 
-  // Legacy fields kept so downstream callers that read googleProductLink /
-  // merchantLink directly keep working. These are *informational* — `link`
-  // below is always the hardened directUrl (or null).
+function chooseBestListingUrl(it = {}) {
+  // Single source of truth for URL safety. resolveListingDirectUrl wraps
+  // resolveDirectProductUrl and classifies the result into clickable/non-clickable.
+  // Never returns google.com/shopping/product/ or any other Google wrapper as directUrl.
+  const resolved = resolveListingDirectUrl(it);
+  recordUrlOutcome(
+    resolved.urlQuality === "merchant_direct"          ? "direct"    :
+    resolved.urlQuality === "google_redirect_unwrapped"? "extracted" :
+    resolved.clickable === false                        ? "rejected"  : "missing"
+  );
+
+  // Legacy informational fields kept for callers that read googleProductLink /
+  // merchantLink directly. These are NEVER opened — `directUrl` is the only
+  // field the frontend should use.
   const googleProductLinkRaw = unwrapGoogleishUrl(
     it.product_link ||
       it.product_page_url ||
@@ -7119,27 +7148,28 @@ function chooseBestListingUrl(it = {}) {
       null
   ) || null;
 
-  const linkVerified = !!resolved.directUrl;
-  const linkKind = !linkVerified
-    ? "none"
-    : resolved.source === "extracted"
-      ? "extracted_merchant"
-      : "merchant";
-  const linkHost = resolved.directUrl ? urlHost(resolved.directUrl) : null;
-
   return {
+    // Safe-to-open URL (null when not clickable)
     link:              resolved.directUrl,
     googleProductLink: googleProductLinkRaw,
     merchantLink:      merchantLinkRaw,
-    linkVerified,
-    linkKind,
-    linkHost,
+    linkVerified:      resolved.clickable,
+    linkKind:          resolved.clickable
+      ? (resolved.urlQuality === "google_redirect_unwrapped" ? "extracted_merchant" : "merchant")
+      : "none",
+    linkHost:          resolved.urlHost,
 
-    // Hardened fields (Phase 2). Frontend opens `directUrl` only.
+    // Full hardened field set — frontend opens directUrl only
     directUrl:     resolved.directUrl,
-    originalUrl:   resolved.originalUrl,
-    urlSource:     resolved.source,      // direct | extracted | rejected | missing
-    urlConfidence: resolved.confidence,  // 0..1
+    googleUrl:     resolved.googleUrl,
+    urlQuality:    resolved.urlQuality,
+    urlHost:       resolved.urlHost,
+    clickable:     resolved.clickable,
+    originalUrl:   resolved.googleUrl || null,
+    urlSource:     resolved.reason,
+    urlConfidence: resolved.clickable
+      ? (resolved.urlQuality === "google_redirect_unwrapped" ? 0.7 : 0.95)
+      : 0,
   };
 }
 
@@ -7198,6 +7228,22 @@ if (typeof totalPrice === "number" && Number.isFinite(totalPrice)) {
     link: it.link,
   });
 
+  // When not clickable, null out ALL link fields so no Google URL can leak
+  // into url/buyLink/link and mislead the frontend into opening Google.
+  const _clickableUrl = bestLink.clickable !== false ? (bestLink.directUrl || null) : null;
+
+  // Log source/URL mismatch: merchant-looking source but no clickable URL
+  if (!bestLink.clickable && source && !/google/i.test(source)) {
+    console.log("LISTING_URL_TRUST_POLICY", {
+      title:        (it.title || "").slice(0, 60),
+      source,
+      urlQuality:   bestLink.urlQuality || "unknown",
+      googleUrl:    bestLink.googleUrl || null,
+      reason:       bestLink.urlSource || "unknown",
+      clickable:    false,
+    });
+  }
+
 return {
   title: it.title || null,
   __trustScore: moatTrustScore(it),
@@ -7210,17 +7256,23 @@ return {
     price_display: it.price || it.price_string || null,
     source,
 
-    link: bestLink.link || null,
-    url: bestLink.link || null,
-    buyLink: bestLink.link || null,
+    // link/url/buyLink are null when not clickable — prevents Google URLs from
+    // leaking through the fallback chain url || buyLink || link in the frontend.
+    link:    _clickableUrl,
+    url:     _clickableUrl,
+    buyLink: _clickableUrl,
     googleProductLink: bestLink.googleProductLink || null,
     merchantLink: bestLink.merchantLink || null,
     linkVerified: !!bestLink.linkVerified,
     linkKind: bestLink.linkKind || "none",
     linkHost: bestLink.linkHost || null,
 
-    // Hardened URL trio — frontend opens `directUrl` only.
-    directUrl:     bestLink.directUrl     || null,
+    // Full hardened URL field set — frontend opens directUrl only.
+    directUrl:     _clickableUrl,
+    googleUrl:     bestLink.googleUrl     || null,
+    urlQuality:    bestLink.urlQuality    || "missing_direct_url",
+    urlHost:       bestLink.urlHost       || null,
+    clickable:     bestLink.clickable !== false,
     originalUrl:   bestLink.originalUrl   || null,
     urlSource:     bestLink.urlSource     || "missing",
     urlConfidence: bestLink.urlConfidence ?? 0,
@@ -9317,13 +9369,15 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
     if (!cleanUrl) {
       // Keep as non-clickable pricing evidence — title + price + source are valid
       // but no direct merchant URL exists (common for eBay/Poshmark/GOAT/farfetch).
+      // Null out ALL link fields so no Google URL survives in buyLink/url/link.
       pricingOnly++;
       out.push({
         ...it,
         directUrl:      null,
         link:           null,
         url:            null,
-        urlQuality:     "missing_direct_url",
+        buyLink:        null,
+        urlQuality:     it.urlQuality || "missing_direct_url",
         clickable:      false,
         __fanoutQuery:  fanoutQuery.query,
         __fanoutReason: fanoutQuery.reason,
@@ -9336,6 +9390,7 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
       directUrl:      cleanUrl,
       link:           cleanUrl,
       url:            cleanUrl,
+      buyLink:        cleanUrl,
       urlQuality:     it.urlQuality || "merchant_resolved",
       clickable:      true,
       __fanoutQuery:  fanoutQuery.query,
@@ -12468,23 +12523,35 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
     (it) => !isBadListing(it.title, normalizedQuery)
   );
 
-  // URL filter — drop listings whose directUrl is not a real product page
-  // (Amazon search pages, eBay /sch/ pages, Google wrappers, etc.). Stamps
-  // canonicalized URL back onto passing items so downstream links are clean.
-  const _urlDropsBySource = {};
-  const stageValidUrl = stageNotBad.filter(it => {
+  // URL resolution: items with no resolvable merchant URL are kept as non-clickable
+  // pricing evidence rather than dropped. Null out ALL link fields so Google URLs
+  // cannot leak through buyLink/url/link into the frontend.
+  const _urlNoDirectBySource = {};
+  const stageValidUrl = stageNotBad.map(it => {
     const clean = sanitizeListingUrl(it);
     if (!clean) {
       const src = String(it?.source || "unknown").toLowerCase().split(/\s+/)[0];
-      _urlDropsBySource[src] = (_urlDropsBySource[src] || 0) + 1;
-      return false;
+      _urlNoDirectBySource[src] = (_urlNoDirectBySource[src] || 0) + 1;
+      return {
+        ...it,
+        directUrl: null,
+        link:      null,
+        url:       null,
+        buyLink:   null,
+        clickable:  false,
+        urlQuality: it.urlQuality || "unresolved",
+      };
     }
-    it.directUrl = clean;
-    it.link      = clean;
-    return true;
+    return {
+      ...it,
+      directUrl: clean,
+      link:      clean,
+      url:       clean,
+      buyLink:   clean,
+    };
   });
-  if (Object.keys(_urlDropsBySource).length > 0) {
-    console.log("🔗 INVALID_URL_DROPPED", { query: normalizedQuery, bySource: _urlDropsBySource });
+  if (Object.keys(_urlNoDirectBySource).length > 0) {
+    console.log("🔗 LISTING_NO_DIRECT_URL", { query: normalizedQuery, bySource: _urlNoDirectBySource });
   }
 
   const stageDeduped = dedupeSmart(stageValidUrl);
@@ -12765,12 +12832,12 @@ merged = [...merged].sort((a, b) => {
     const backupStageNotBad = backupStageWithPrice.filter(
       (it) => !isBadListing(it.title, normalizedQuery)
     );
-    const backupStageValidUrl = backupStageNotBad.filter(it => {
+    const backupStageValidUrl = backupStageNotBad.map(it => {
       const clean = sanitizeListingUrl(it);
-      if (!clean) return false;
-      it.directUrl = clean;
-      it.link      = clean;
-      return true;
+      if (!clean) {
+        return { ...it, directUrl: null, link: null, url: null, buyLink: null, clickable: false, urlQuality: it.urlQuality || "unresolved" };
+      }
+      return { ...it, directUrl: clean, link: clean, url: clean, buyLink: clean };
     });
     const backupStageDeduped = dedupeSmart(backupStageValidUrl);
 
@@ -20290,27 +20357,29 @@ async function serpShopping(query, opts = {}) {
   if (!bypassHardenedCache) {
     const cached = SERP_HARDENED_CACHE.get(_cacheKey);
     if (cached.fresh) {
+      const _freshItems = cached.entry.items.map(_sanitizeCachedUrl);
       recordSerpFetch({
         cacheStatus:    "fresh",
         latencyMs:      0,
         rawCount:       cached.entry.rawCount,
-        usableCount:    cached.entry.items.length,
+        usableCount:    _freshItems.length,
         directUrlCount: cached.entry.directUrlCount,
       });
-      return cached.entry.items;
+      return _freshItems;
     }
     if (cached.stale) {
       setImmediate(() => {
         serpShopping(query, { ...opts, bypassHardenedCache: true, softFail: true }).catch(() => {});
       });
+      const _staleItems = cached.entry.items.map(_sanitizeCachedUrl);
       recordSerpFetch({
         cacheStatus:    "stale",
         latencyMs:      0,
         rawCount:       cached.entry.rawCount,
-        usableCount:    cached.entry.items.length,
+        usableCount:    _staleItems.length,
         directUrlCount: cached.entry.directUrlCount,
       });
-      return cached.entry.items;
+      return _staleItems;
     }
   }
 
@@ -20460,7 +20529,7 @@ async function serpShopping(query, opts = {}) {
       const fallback = SERP_HARDENED_CACHE.get(_cacheKey);
       if (fallback.stale || fallback.fresh) {
         console.warn("⚠️ SerpAPI timeout — stale-cache fallback", { query, stale: fallback.stale, fresh: fallback.fresh });
-        return fallback.entry.items;
+        return fallback.entry.items.map(_sanitizeCachedUrl);
       }
     }
 
@@ -21424,6 +21493,33 @@ async function buildMarketSearchResponsePayload({
   const sourceItems = applyGenericVariantQualityFilter(
     baseQuery, _sneakerLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
   );
+
+  // URL trust summary: counts across the incoming item pool (before final filter)
+  {
+    const _urlTotal         = _rawSourceItems.length;
+    const _urlClickable     = _rawSourceItems.filter(x => x?.clickable !== false && x?.directUrl).length;
+    const _urlPricingOnly   = _rawSourceItems.filter(x => x?.clickable === false).length;
+    const _urlGoogleUnres   = _rawSourceItems.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length;
+    const _urlGoogleUnwrap  = _rawSourceItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length;
+    const _urlMissing       = _rawSourceItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length;
+    const _urlMerchDirect   = _rawSourceItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length;
+    const _topPricingTitles = _rawSourceItems
+      .filter(x => x?.clickable === false && x?.title)
+      .slice(0, 3)
+      .map(x => (x.title || "").slice(0, 50));
+    console.log("URL_RESOLUTION_SUMMARY", {
+      kind:             retrievalMeta?.kind || null,
+      total:            _urlTotal,
+      clickable:        _urlClickable,
+      pricingOnly:      _urlPricingOnly,
+      googleUnresolved: _urlGoogleUnres,
+      googleUnwrapped:  _urlGoogleUnwrap,
+      missingUrl:       _urlMissing,
+      merchantDirect:   _urlMerchDirect,
+      topPricingOnlyTitles: _topPricingTitles,
+    });
+  }
+
   console.log("RESULT_POOL_SIZE_POLICY", {
     beforeFiltering: _rawSourceItems.length,
     afterFiltering:  sourceItems.length,
@@ -26210,12 +26306,13 @@ app.post("/market/search/stream", async (req, res) => {
               .map(it => {
                 // Stamp URL fields. Items without a clean direct URL are kept as
                 // non-clickable pricing evidence (title + price + source are valid).
+                // ALL link fields are nulled so no Google URL leaks through buyLink.
                 const clean = sanitizeListingUrl(it);
                 if (!clean) {
                   _bgUrlDropped++;
-                  return { ...it, directUrl: null, link: null, url: null, urlQuality: "missing_direct_url", clickable: false };
+                  return { ...it, directUrl: null, link: null, url: null, buyLink: null, urlQuality: it.urlQuality || "missing_direct_url", clickable: false };
                 }
-                return { ...it, directUrl: clean, link: clean, urlQuality: it.urlQuality || "merchant_resolved", clickable: true };
+                return { ...it, directUrl: clean, link: clean, url: clean, buyLink: clean, urlQuality: it.urlQuality || "merchant_resolved", clickable: true };
               });
 
             _bgAccumulated.push(..._qFiltered);
