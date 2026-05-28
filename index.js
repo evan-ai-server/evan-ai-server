@@ -1416,6 +1416,9 @@ const ebayRenderConcurrency = pLimit(
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 const HOST = process.env.HOST || "0.0.0.0";
 
+const MIN_CLEAN_RESULTS_TARGET = Number(process.env.MIN_CLEAN_RESULTS_TARGET || 8);
+const MAX_RESULTS_TO_CLIENT    = Number(process.env.MAX_RESULTS_TO_CLIENT    || 24);
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 // keep this only for legacy routes you still have in the file
@@ -8719,6 +8722,252 @@ function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind) {
   return filtered;
 }
 
+// ─── Generic variant / size / scale quality filter ───────────────────────────
+// Applies to ALL item categories (shoes, clothing, electronics, aircraft, bags,
+// watches, collectibles). Runs AFTER category-specific filters as an additional
+// quality layer. No-ops when the query has no useful variant signals.
+
+function extractVariantSignalsFromText(text) {
+  const t = (text || "").toLowerCase();
+  const out = {
+    shoeSizes:     [],  // "us 10", "eu 44", "size 9", "32x30"
+    clothingSizes: [],  // "xs", "small", "large", "xl", "xxl"
+    genders:       [],  // "mens", "womens", "boys", "girls", "unisex"
+    scales:        [],  // "1:400", "1:200"
+    capacities:    [],  // "64gb", "256gb", "1tb"
+    modelCodes:    [],  // "wh-1000xm5", "rtx-3090" (letter+digit codes, 4+ chars)
+    isAccessory:   false,
+  };
+
+  // Shoe sizes: "size 9", "us 10.5", "eu 44", "uk 8", "32x30"
+  for (const m of t.matchAll(/\b(size\s+\d+(?:\.\d)?|us\s+\d+(?:\.\d)?|eu\s+\d+|uk\s+\d+(?:\.\d)?|\d{2}x\d{2})\b/g)) {
+    out.shoeSizes.push(m[1].replace(/\s+/g, " ").trim());
+  }
+
+  // Clothing sizes (standalone keywords)
+  for (const m of t.matchAll(/\b(xs|xxl|2xl|3xl|xl|small|medium|large)\b/g)) {
+    out.clothingSizes.push(m[1]);
+  }
+
+  // Gender
+  for (const m of t.matchAll(/\b(men.?s|mens|womens?|women.?s|boys|girls|unisex)\b/g)) {
+    const g = m[1].replace(/['.]/g, "").replace(/s$/, "");
+    if (!out.genders.includes(g)) out.genders.push(g);
+  }
+
+  // Scale ratios: "1:400", "1/400", "1: 200"
+  for (const m of t.matchAll(/\b1\s*[:\/]\s*(18|24|32|43|48|64|72|100|144|150|200|300|400|500|600)\b/g)) {
+    out.scales.push(`1:${m[1]}`);
+  }
+
+  // Storage/capacity: "64gb", "256 gb", "1tb", "512mb"
+  for (const m of t.matchAll(/\b(\d+)\s*(gb|tb|mb)\b/g)) {
+    out.capacities.push(`${m[1]}${m[2]}`);
+  }
+
+  // Model/variant codes: 1-5 letters + optional dash + 2+ digits + optional suffix
+  // Catches: wh-1000xm5, rtx-3090, a321neo; skips pure-digit or pure-letter tokens
+  for (const m of t.matchAll(/\b([a-z]{1,5}[\-]?\d{2,}[\-]?[a-z0-9]{0,8})\b/g)) {
+    const tok = m[1];
+    if (tok.length >= 4 && /\d/.test(tok) && /[a-z]/.test(tok) &&
+        !/^(size|inch|feet|type|form|mini|nano|mega|giga|base|pure|edge)/.test(tok)) {
+      out.modelCodes.push(tok);
+    }
+  }
+
+  // Accessory detection: listing is an accessory, not the main product
+  const accTerms = ["phone case", " case", "charger", " cable", "strap", "replacement",
+                    "screen protector", "lens cap", " mount", "bumper", "cover for"];
+  out.isAccessory = accTerms.some(a => t.includes(a));
+
+  return out;
+}
+
+// Returns conflict info when BOTH query and listing have the same signal type
+// but the values differ. Absence of a signal on either side is NOT a conflict.
+function hasVariantConflict(qSig, lSig) {
+  // Shoe size
+  if (qSig.shoeSizes.length && lSig.shoeSizes.length) {
+    const qSet = new Set(qSig.shoeSizes);
+    if (![...qSet].some(s => lSig.shoeSizes.includes(s))) {
+      return { conflict: true, reason: "shoe_size_mismatch" };
+    }
+  }
+
+  // Gender (men's vs women's; unisex never conflicts)
+  if (qSig.genders.length && lSig.genders.length) {
+    const qG = new Set(qSig.genders);
+    const lG = new Set(lSig.genders);
+    if (!lG.has("unisex") && !qG.has("unisex")) {
+      if (![...qG].some(g => lG.has(g))) {
+        return { conflict: true, reason: "gender_mismatch" };
+      }
+    }
+  }
+
+  // Scale (1:400 vs 1:200)
+  if (qSig.scales.length && lSig.scales.length) {
+    const qS = new Set(qSig.scales);
+    if (![...qS].some(s => lSig.scales.includes(s))) {
+      return { conflict: true, reason: "scale_mismatch" };
+    }
+  }
+
+  // Capacity (256gb vs 64gb)
+  if (qSig.capacities.length && lSig.capacities.length) {
+    const qC = new Set(qSig.capacities);
+    if (![...qC].some(c => lSig.capacities.includes(c))) {
+      return { conflict: true, reason: "capacity_mismatch" };
+    }
+  }
+
+  // Accessory: listing is an accessory but query is not
+  if (lSig.isAccessory && !qSig.isAccessory) {
+    return { conflict: true, reason: "accessory_mismatch" };
+  }
+
+  return { conflict: false, reason: null };
+}
+
+// Returns count of strong signal types that match between query and listing.
+function countVariantMatches(qSig, lSig) {
+  let matches = 0;
+  if (qSig.shoeSizes.length && lSig.shoeSizes.length &&
+      qSig.shoeSizes.some(s => lSig.shoeSizes.includes(s))) matches++;
+  if (qSig.clothingSizes.length && lSig.clothingSizes.length &&
+      qSig.clothingSizes.some(s => lSig.clothingSizes.includes(s))) matches++;
+  if (qSig.genders.length && lSig.genders.length) {
+    const qG = new Set(qSig.genders);
+    if (lSig.genders.some(g => qG.has(g) || g === "unisex")) matches++;
+  }
+  if (qSig.scales.length && lSig.scales.length &&
+      qSig.scales.some(s => lSig.scales.includes(s))) matches++;
+  if (qSig.capacities.length && lSig.capacities.length &&
+      qSig.capacities.some(c => lSig.capacities.includes(c))) matches++;
+  if (qSig.modelCodes.length && lSig.modelCodes.length &&
+      qSig.modelCodes.some(m => lSig.modelCodes.includes(m))) matches++;
+  return matches;
+}
+
+// General result quality filter. Runs on every query after category-specific
+// filters. When query has no useful variant signals → no-op.
+// When ≥ 3 strong-match items exist → reject conflicts; demote neutrals.
+// When < 3 strong matches → keep all but rank conflicts last.
+function applyGenericVariantQualityFilter(query, items, scannedPrice = null, options = {}) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+
+  const qSig = extractVariantSignalsFromText(query || "");
+  const hasUsefulSignals = (
+    qSig.shoeSizes.length > 0 ||
+    qSig.clothingSizes.length > 0 ||
+    qSig.genders.length > 0 ||
+    qSig.scales.length > 0 ||
+    qSig.capacities.length > 0 ||
+    qSig.modelCodes.length > 0
+  );
+
+  console.log("GENERIC_VARIANT_SIGNAL_QUERY", {
+    query: (query || "").slice(0, 120),
+    shoeSizes:       qSig.shoeSizes,
+    clothingSizes:   qSig.clothingSizes,
+    genders:         qSig.genders,
+    scales:          qSig.scales,
+    capacities:      qSig.capacities,
+    modelCodes:      qSig.modelCodes.slice(0, 6),
+    hasUsefulSignals,
+    kind:            options.kind || null,
+  });
+
+  if (!hasUsefulSignals) return items;
+
+  const scored = items.map(it => {
+    const lSig = extractVariantSignalsFromText(it?.title || "");
+    const conflictResult = hasVariantConflict(qSig, lSig);
+    const matchCount     = countVariantMatches(qSig, lSig);
+    const score = conflictResult.conflict ? -2 : matchCount >= 2 ? 2 : matchCount === 1 ? 1 : 0;
+
+    if (conflictResult.conflict || score > 0) {
+      console.log("GENERIC_VARIANT_ITEM_SCORED", {
+        title:      (it?.title || "").slice(0, 80),
+        score,
+        conflict:   conflictResult.reason || null,
+        matchCount,
+      });
+    }
+
+    return { ...it, __variantScore: score, __variantConflict: conflictResult.conflict };
+  });
+
+  const strong    = scored.filter(it => it.__variantScore > 0);
+  const neutral   = scored.filter(it => it.__variantScore === 0);
+  const conflicts = scored.filter(it => it.__variantScore < 0);
+
+  let result;
+  if (strong.length >= 3) {
+    for (const it of conflicts) {
+      console.log("GENERIC_VARIANT_REJECTED", {
+        title:          (it?.title || "").slice(0, 80),
+        reason:         "explicit_conflict",
+        conflictReason: it.__variantConflict,
+      });
+    }
+    if (neutral.length) {
+      for (const it of neutral) {
+        console.log("GENERIC_VARIANT_DEMOTED", { title: (it?.title || "").slice(0, 80) });
+      }
+    }
+    result = [...strong, ...neutral];
+  } else {
+    result = [...strong, ...neutral, ...conflicts];
+  }
+
+  console.log("GENERIC_VARIANT_SUMMARY", {
+    query:            (query || "").slice(0, 100),
+    scannedPrice,
+    beforeCount:      items.length,
+    afterCount:       result.length,
+    strongMatchCount: strong.length,
+    demotedCount:     strong.length >= 3 ? neutral.length : 0,
+    rejectedCount:    strong.length >= 3 ? conflicts.length : 0,
+    topTitles:        result.slice(0, 5).map(i => i?.title),
+  });
+
+  return result;
+}
+
+// Self-tests for variant signal extraction and conflict detection
+try {
+  const _varTests = [
+    { qText: "Hawaiian Airlines Boeing 787 diecast 1:400 scale",  lTitle: "Herpa Hawaiian Airlines Boeing 787-9 1:200 scale",      expectConflict: true,  expectReason: "scale_mismatch" },
+    { qText: "Hawaiian Airlines Boeing 787 diecast 1:400 scale",  lTitle: "PPC Hawaiian Airlines Boeing 787-9 1:400 scale model", expectConflict: false, expectReason: null },
+    { qText: "Nike Vaporfly 3 men's size 10 white",               lTitle: "Nike Vaporfly 3 women's size 6 pink",                  expectConflict: true,  expectReason: "shoe_size_mismatch" },
+    { qText: "iPhone 13 Pro 256GB graphite unlocked",             lTitle: "iPhone 13 case silicone clear",                       expectConflict: true,  expectReason: "accessory_mismatch" },
+    { qText: "iPhone 13 Pro 256GB graphite unlocked",             lTitle: "iPhone 13 Pro 64GB graphite unlocked",                expectConflict: true,  expectReason: "capacity_mismatch" },
+    { qText: "Patagonia fleece jacket men's large blue",          lTitle: "Patagonia fleece jacket men's L blue",                 expectConflict: false, expectReason: null },
+  ];
+  let _varPass = 0;
+  for (const tc of _varTests) {
+    const qSig = extractVariantSignalsFromText(tc.qText);
+    const lSig = extractVariantSignalsFromText(tc.lTitle);
+    const got  = hasVariantConflict(qSig, lSig);
+    if (got.conflict !== tc.expectConflict) {
+      console.warn("GENERIC_VARIANT_SELFTEST_FAIL", {
+        qText: tc.qText.slice(0, 60), lTitle: tc.lTitle.slice(0, 60),
+        expectedConflict: tc.expectConflict, gotConflict: got.conflict, gotReason: got.reason,
+      });
+    } else if (tc.expectConflict && tc.expectReason && got.reason !== tc.expectReason) {
+      console.warn("GENERIC_VARIANT_SELFTEST_WRONG_REASON", {
+        lTitle: tc.lTitle.slice(0, 60), expected: tc.expectReason, got: got.reason,
+      });
+    } else {
+      _varPass++;
+    }
+  }
+  console.log("GENERIC_VARIANT_SELFTEST_PASS", { passed: _varPass, total: _varTests.length });
+} catch (_e) {
+  console.warn("GENERIC_VARIANT_SELFTEST_ERROR", { error: String(_e) });
+}
+
 function filterRelevantListings(query, items) {
   if (!Array.isArray(items)) return [];
 
@@ -10930,7 +11179,7 @@ async function buildFinalUiItemsWithIntelligence(
   { scannedPrice = null, visionConfidence = 0.5 } = {}
 ) {
   const ranked = Array.isArray(items)
-    ? rankVisualComps(query, items).slice(0, Math.min(items.length, 32))
+    ? rankVisualComps(query, items).slice(0, Math.min(items.length, MAX_RESULTS_TO_CLIENT))
     : [];
 
   const baseUiItems = ranked.map((it) => ({
@@ -20781,7 +21030,18 @@ async function buildMarketSearchResponsePayload({
   const _bmLog = (name, fromTs) => { _bmSteps[name] = Date.now() - fromTs; };
 
   const baseQuery = normalizeQuery(query || "");
-  const sourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
+  const _rawSourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
+  const sourceItems = applyGenericVariantQualityFilter(
+    baseQuery, _rawSourceItems, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
+  );
+  console.log("RESULT_POOL_SIZE_POLICY", {
+    beforeFiltering: _rawSourceItems.length,
+    afterFiltering:  sourceItems.length,
+    minTarget:       MIN_CLEAN_RESULTS_TARGET,
+    maxClient:       MAX_RESULTS_TO_CLIENT,
+    kind:            retrievalMeta?.kind || null,
+    reason:          sourceItems.length < MIN_CLEAN_RESULTS_TARGET ? "below_min_target" : "ok",
+  });
 
   // Hoisted (TDZ-safe): bracket-median shift applied by the dealComparator
   // call below. Default 0 means "no learned adjustment". Computed from the
