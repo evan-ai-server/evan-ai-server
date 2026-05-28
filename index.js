@@ -8798,6 +8798,7 @@ function filterRelevantListings(query, items) {
     let _rejectedCompetitor = 0;
     let _rejectedModel = 0;
     let _penalizedModel = 0;
+    let _rejectedAirlineMissing = 0;
 
     // Step 1: annotate each item with identity lock metadata.
     for (const it of preserved) {
@@ -8891,6 +8892,28 @@ function filterRelevantListings(query, items) {
       }
     }
 
+    // Step 5: required-airline presence gate.
+    // When >= 2 items already carry the required airline name, generic/no-airline
+    // listings are not meaningful comps for this scan — reject them.
+    {
+      const _airlineMatched = preserved.filter((it) => it.__identityLock?.airlineMatch);
+      if (_airlineMatched.length >= 2) {
+        for (const it of preserved) {
+          if (!it.__identityLock?.airlineMatch) {
+            _rejectedAirlineMissing++;
+            console.log("IDENTITY_LOCK_REJECTED", { title: it?.title, reason: "missing_required_airline", requiredAirline });
+          }
+        }
+        preserved = _airlineMatched;
+      } else {
+        console.log("IDENTITY_LOCK_REQUIRED_AIRLINE_RELAXED", {
+          requiredAirline,
+          airlineMatchedCount: _airlineMatched.length,
+          reason: "insufficient_required_airline_matches",
+        });
+      }
+    }
+
     console.log("IDENTITY_LOCK_TOKEN_MATCH_POLICY", {
       requiredAirline,
       competitors,
@@ -8909,6 +8932,7 @@ function filterRelevantListings(query, items) {
       rejectedCompetitorCount: _rejectedCompetitor,
       rejectedModelMismatchCount: _rejectedModel,
       penalizedModelMismatchCount: _penalizedModel,
+      rejectedMissingAirlineCount: _rejectedAirlineMissing,
       relaxed: _noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0),
       finalTopTitles: preserved.slice(0, 3).map((it) => it?.title),
     });
