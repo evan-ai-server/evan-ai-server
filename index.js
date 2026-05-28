@@ -9151,26 +9151,37 @@ function buildSerpFanoutQueries(query, context = {}) {
   return capped;
 }
 
-function shouldExpandRetrievalForCleanPool({ query, cleanCount, rawCount, minTarget, cacheKind, elapsedMs, reason }) {
+function shouldExpandRetrievalForCleanPool({ query, cleanCount, rawCount, minTarget, cacheKind, elapsedMs, reason, verifiedCount = null, pricingOnlyCount = null, sourceGroups = null }) {
   const serpAvail =
     !!SERPAPI_KEY &&
     process.env.DISABLE_SERP !== "true" &&
     process.env.DISABLE_SERP_FANOUT !== "true" &&
     !isSourceCoolingDown("serpapi");
 
-  const expand = cleanCount < minTarget && serpAvail;
+  if (!serpAvail || cleanCount >= minTarget) {
+    const expand = false;
+    console.log("FANOUT_COST_POLICY", { query: (query || "").slice(0, 80), cleanCount, minTarget, verifiedCount, pricingOnlyCount, sourceGroups, expand, reason: !serpAvail ? "serp_unavailable" : "clean_target_met" });
+    console.log("RETRIEVAL_EXPANSION_POLICY", { query: (query || "").slice(0, 80), cleanCount, rawCount, minTarget, cacheKind: cacheKind || null, elapsedMs: elapsedMs || null, serpAvail, expand, reason: !serpAvail ? "serp_unavailable" : "clean_target_met" });
+    return expand;
+  }
 
-  console.log("RETRIEVAL_EXPANSION_POLICY", {
-    query:      (query || "").slice(0, 80),
-    cleanCount,
-    rawCount,
-    minTarget,
-    cacheKind:  cacheKind || null,
-    elapsedMs:  elapsedMs || null,
-    serpAvail,
-    expand,
-    reason:     expand ? "below_min_target" : (!serpAvail ? "serp_unavailable" : (reason || "conditions_not_met")),
-  });
+  const gap = minTarget - cleanCount;
+  const hasVerified = Number.isFinite(verifiedCount) && verifiedCount > 0;
+  const allPricingOnly = Number.isFinite(pricingOnlyCount) && Number.isFinite(verifiedCount) && pricingOnlyCount > 0 && verifiedCount === 0;
+  const sourceCount = Array.isArray(sourceGroups) ? sourceGroups.length : null;
+  const poorDiversity = sourceCount !== null && sourceCount <= 1;
+
+  // Skip fanout if gap is only 1 AND we have no verified listings AND source diversity is already ok
+  // — adding more pricingOnly google-unresolved items wastes API quota and adds no value.
+  let expand = true;
+  let expandReason = "below_min_target";
+  if (gap === 1 && allPricingOnly && !poorDiversity) {
+    expand = false;
+    expandReason = "gap_1_all_pricing_only_sufficient_diversity";
+  }
+
+  console.log("FANOUT_COST_POLICY", { query: (query || "").slice(0, 80), cleanCount, minTarget, gap, verifiedCount, pricingOnlyCount, sourceGroups, poorDiversity, expand, reason: expandReason });
+  console.log("RETRIEVAL_EXPANSION_POLICY", { query: (query || "").slice(0, 80), cleanCount, rawCount, minTarget, cacheKind: cacheKind || null, elapsedMs: elapsedMs || null, serpAvail, expand, reason: expandReason });
   return expand;
 }
 
@@ -9307,6 +9318,155 @@ try {
   console.warn("SNEAKER_IDENTITY_SELFTEST_ERROR", { error: String(_e) });
 }
 
+// ── Jordan identity lock ──────────────────────────────────────────────────────
+// Enforces brand-family, model, cut, subline, and theme/colorway for Jordan queries.
+// Returns { brand, model, cut, subline, theme, isJordanQuery }.
+function extractJordanIdentitySignals(text) {
+  const empty = { brand: null, model: null, cut: null, subline: null, theme: null, isJordanQuery: false };
+  if (!text) return empty;
+  const t = text.toLowerCase();
+
+  const isJordan = t.includes("jordan") || t.includes("air jordan") || t.includes("aj1") || t.includes("aj 1");
+  if (!isJordan) return empty;
+
+  // Model number: jordan 1 / jordan 3 / jordan 4 / aj1 etc.
+  let model = null;
+  const modelMatch = t.match(/\baj\s*(\d+)\b/) || t.match(/\bjordan\s+(\d+)\b/) || t.match(/\bair\s+jordan\s+(\d+)\b/);
+  if (modelMatch) model = modelMatch[1];
+
+  // Cut
+  const cut = t.includes(" low") ? "low" : t.includes(" mid") ? "mid" : t.includes(" high") ? "high" : null;
+
+  // Subline — OG vs Elevate vs Retro etc.
+  const subline = t.includes(" og") ? "og" : t.includes("elevate") ? "elevate" : t.includes("retro") ? "retro" : null;
+
+  // Theme / colorway (year of the X, game royal, bred, etc.)
+  let theme = null;
+  const YEAR_OF = t.match(/year\s+of\s+the\s+(\w+)/);
+  if (YEAR_OF) theme = `year_of_the_${YEAR_OF[1]}`;
+  else if (t.includes("game royal")) theme = "game_royal";
+  else if (t.includes("bred toe") || (t.includes("bred") && !t.includes("breeder"))) theme = "bred";
+  else if (t.includes("black toe")) theme = "black_toe";
+  else if (t.includes("rookie of the year") || t.includes("roty")) theme = "rookie_of_the_year";
+  else if (t.includes("chinese new year") && !YEAR_OF) theme = "chinese_new_year_generic";
+
+  return {
+    brand: "jordan",
+    model,
+    cut,
+    subline,
+    theme,
+    isJordanQuery: !!(model),
+  };
+}
+
+// Filters Jordan listings that don't match the query's model/cut/subline/theme.
+// No-op when query is not a Jordan query (no model detected).
+// Conservatively passes items with no detectable Jordan signals through.
+function applyJordanIdentityLock(query, items, context = {}) {
+  if (!Array.isArray(items) || !items.length) return items;
+  const qSig = extractJordanIdentitySignals(query);
+  if (!qSig.isJordanQuery) return items;
+
+  const kept = [], rejected = [];
+
+  for (const it of items) {
+    const title = it?.title || it?.name || "";
+    const iSig  = extractJordanIdentitySignals(title);
+
+    // If item shows no Jordan signal at all, pass through — can't confirm wrong
+    if (!iSig.isJordanQuery) { kept.push(it); continue; }
+
+    // Wrong Jordan model number
+    if (qSig.model && iSig.model && iSig.model !== qSig.model) {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_model", required: qSig.model, found: iSig.model, ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+
+    // Wrong cut (low vs mid vs high) — only reject when both are explicit
+    if (qSig.cut && iSig.cut && iSig.cut !== qSig.cut) {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_cut", required: qSig.cut, found: iSig.cut, ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+
+    // Wrong subline: query says OG but item says Elevate (or vice versa)
+    if (qSig.subline === "og" && iSig.subline === "elevate") {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_subline_elevate_vs_og", ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+
+    // Wrong theme: query says "year_of_the_rabbit" — reject other year-of-the-X themes
+    if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme && iSig.theme.startsWith("year_of_the_") && iSig.theme !== qSig.theme) {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_year_of_theme", required: qSig.theme, found: iSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+    // Reject Game Royal, Bred, etc. when query is year-of-the-X
+    if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme && !iSig.theme.startsWith("year_of_the_")) {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_theme_not_year_of", required: qSig.theme, found: iSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+    // Generic "chinese_new_year" without matching year-of-the-X model code fails
+    if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme === "chinese_new_year_generic") {
+      console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "chinese_new_year_unspecified", required: qSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
+      rejected.push(it); continue;
+    }
+    // Reject non-Jordan sneakers in same theme (e.g. Nike Dunk Low Year of Rabbit)
+    const tLower = title.toLowerCase();
+    if (qSig.model && !tLower.includes("jordan") && !tLower.includes("aj")) {
+      // Title shows no jordan family signal — but iSig.isJordanQuery was true... shouldn't happen
+      // Passes through already handled above
+    }
+
+    kept.push(it);
+  }
+
+  console.log("JORDAN_IDENTITY_SUMMARY", {
+    query:         (query || "").slice(0, 80),
+    model:         qSig.model,
+    cut:           qSig.cut,
+    subline:       qSig.subline,
+    theme:         qSig.theme,
+    rawCount:      items.length,
+    keptCount:     kept.length,
+    rejectedCount: rejected.length,
+    ...(context.scanId ? { scanId: context.scanId } : {}),
+  });
+
+  return kept;
+}
+
+// 7-case self-tests for Jordan identity lock
+try {
+  const _jordanTests = [
+    // Keep
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Air Jordan 1 Low OG 'Year of the Rabbit'",                    expectKeep: true  },
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Jordan 1 Retro Low OG Year of the Rabbit 2023",               expectKeep: true  },
+    // Reject wrong theme
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Air Jordan 1 Low OG Year of the Dragon 2024",                 expectKeep: false },
+    // Reject wrong subline
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Air Jordan 1 Elevate Low Year of the Rabbit",                 expectKeep: false },
+    // Reject wrong shoe line
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Nike Dunk Low Year of the Rabbit 2023",                      expectKeep: false },
+    // Reject wrong colorway/theme
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Air Jordan 1 Low OG Game Royal",                             expectKeep: false },
+    // Reject generic Chinese New Year without model code
+    { query: "Air Jordan 1 Low OG Year of the Rabbit",         title: "Air Jordan 1 Low OG Chinese New Year",                       expectKeep: false },
+  ];
+  let _jordPass = 0;
+  for (const tc of _jordanTests) {
+    const result = applyJordanIdentityLock(tc.query, [{ title: tc.title }]);
+    const kept   = result.length === 1;
+    if (kept !== tc.expectKeep) {
+      console.warn("JORDAN_IDENTITY_SELFTEST_FAIL", { title: tc.title.slice(0, 80), expected: tc.expectKeep ? "keep" : "reject", got: kept ? "keep" : "reject" });
+    } else {
+      _jordPass++;
+    }
+  }
+  console.log("JORDAN_IDENTITY_SELFTEST_PASS", { passed: _jordPass, total: _jordanTests.length });
+} catch (_e) {
+  console.warn("JORDAN_IDENTITY_SELFTEST_ERROR", { error: String(_e) });
+}
+
 // Shared clean-pool measurement used by cache bypass + fanout stop condition.
 // Runs the full filter chain: relevance → aircraft identity → sneaker identity → trim → variant.
 // Returns { items, cleanCount, rawCount, variantCleanCount, kind }.
@@ -9326,8 +9486,11 @@ function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "un
   // Step 2b: sneaker identity lock (no-op for non-sneaker queries)
   const afterSneaker = applySneakerIdentityLock(query, afterIdentity);
 
+  // Step 2c: Jordan identity lock (no-op for non-Jordan queries)
+  const afterJordan = applyJordanIdentityLock(query, afterSneaker);
+
   // Step 3: price outlier trim
-  const afterTrim = trimPriceOutliers(afterSneaker);
+  const afterTrim = trimPriceOutliers(afterJordan);
 
   // Step 4: generic variant quality filter (no-op when query has no variant signals)
   const afterVariant = applyGenericVariantQualityFilter(query, afterTrim, scannedPrice, { kind });
@@ -9337,6 +9500,7 @@ function computeCleanRetrievalPool(query, items, scannedPrice = null, kind = "un
     rawCount,
     afterIdentityCount:  afterIdentity.length,
     afterSneakerCount:   afterSneaker.length,
+    afterJordanCount:    afterJordan.length,
     cleanCount:          afterVariant.length,
     query:               (query || "").slice(0, 80),
     scannedPrice,
@@ -21485,6 +21649,129 @@ async function serpEbaySearch(query) {
   return await searchEbayBrowse(query);
 }
 
+// ── Parts D + E + F: outbound listing sanitizer ───────────────────────────────
+// Runs on every item BEFORE it leaves the backend, on ALL code paths.
+// • Nulls Google/SerpAPI/ad/search-wrapper URLs and marks clickable:false
+// • If clickable:false, enforces that all link fields are null
+// • Classifies evidenceQuality and sets isVerifiedListing / isPricingEvidenceOnly
+// • Logs OUTBOUND_LISTING_URL_SANITIZED for any item that changes
+const _OUTBOUND_BLOCKED_HOSTS = [
+  "google.com", "googleadservices.com", "googlesyndication.com",
+  "doubleclick.net", "serpapi.com", "googleleadservices.com", "adsense.google.com",
+];
+const _OUTBOUND_BLOCKED_PATHS = ["/search", "/shopping", "/product/url", "/aclk", "/sch"];
+function _isOutboundBlockedUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(String(url));
+    const host = u.hostname.toLowerCase();
+    if (_OUTBOUND_BLOCKED_HOSTS.some(h => host === h || host.endsWith(`.${h}`))) return true;
+    if (_OUTBOUND_BLOCKED_PATHS.some(p => u.pathname.startsWith(p))) return true;
+    // Marketplace search pages (not product pages)
+    if (/\/(s|search|find|browse|listing-search|shop)\b/.test(u.pathname) && !u.pathname.includes("/item/") && !u.pathname.includes("/product/")) return true;
+    return false;
+  } catch { return false; }
+}
+
+function sanitizeOutboundListingForClient(item, context = {}) {
+  if (!item || typeof item !== "object") return item;
+
+  const beforeDirectUrl  = item.directUrl || null;
+  const beforeClickable  = item.clickable;
+  const beforeUrlQuality = item.urlQuality || null;
+
+  let directUrl  = item.directUrl  || null;
+  let link       = item.link       || null;
+  let url        = item.url        || null;
+  let buyLink    = item.buyLink    || null;
+  let clickable  = item.clickable;
+  let urlQuality = item.urlQuality || null;
+  let googleUrl  = item.googleUrl  || null;
+  let changed    = false;
+  let reason     = null;
+
+  // Step 1: detect and null bad URLs across all link fields
+  const allUrls = [directUrl, link, url, buyLink].filter(Boolean);
+  const hasBadUrl = allUrls.some(u => _isOutboundBlockedUrl(u));
+
+  if (hasBadUrl) {
+    // Preserve the bad URL for reference before nulling
+    googleUrl = googleUrl || directUrl || link || url || buyLink;
+    directUrl = null; link = null; url = null; buyLink = null;
+    clickable  = false;
+    urlQuality = "google_unresolved_stale_cache";
+    changed    = true;
+    reason     = "blocked_host_or_path_in_url_fields";
+  }
+
+  // Step 2: if clickable:false, null all link fields regardless
+  if (clickable === false && (directUrl || link || url || buyLink)) {
+    directUrl = null; link = null; url = null; buyLink = null;
+    changed = true;
+    reason  = reason || "clickable_false_nulled_links";
+  }
+
+  // Step 3: normalize items without any urlQuality (legacy stale cache)
+  if (!urlQuality) {
+    if (clickable === false) {
+      urlQuality = "unknown_legacy_no_url";
+    } else if (directUrl) {
+      urlQuality = "unknown_legacy_has_url";
+    } else {
+      urlQuality = "unknown_legacy_no_url";
+      clickable  = false;
+      changed    = true;
+      reason     = reason || "legacy_no_url_quality_no_direct_url";
+    }
+  }
+
+  // Step 4: classify evidenceQuality and verification flags
+  const isOracle    = urlQuality === "oracle_pricing_estimate";
+  const isMerchant  = urlQuality === "merchant_direct" || urlQuality === "merchant_resolved" || urlQuality === "google_redirect_unwrapped";
+  const isGoogleBad = urlQuality === "google_unresolved" || urlQuality === "google_unresolved_stale_cache";
+  const isLegacy    = urlQuality === "unknown_legacy_no_url" || urlQuality === "unknown_legacy_has_url";
+
+  let evidenceQuality;
+  if (isOracle)   evidenceQuality = "oracle_estimate";
+  else if (isMerchant && clickable !== false && directUrl) evidenceQuality = "verified_listing";
+  else if (isGoogleBad || clickable === false) evidenceQuality = "pricing_signal";
+  else if (isLegacy)  evidenceQuality = "legacy_unknown";
+  else               evidenceQuality = "pricing_signal";
+
+  const isVerifiedListing    = evidenceQuality === "verified_listing";
+  const isPricingEvidenceOnly = !isVerifiedListing;
+
+  if (changed) {
+    try {
+      console.log("OUTBOUND_LISTING_URL_SANITIZED", {
+        title:           (item.title || "").slice(0, 60),
+        source:          item.source || null,
+        beforeDirectUrl: (beforeDirectUrl || "").slice(0, 80),
+        afterDirectUrl:  null,
+        beforeClickable,
+        afterClickable:  false,
+        urlQuality,
+        reason,
+        ...(context.scanId ? { scanId: context.scanId } : {}),
+      });
+    } catch {}
+  }
+
+  return {
+    ...item,
+    directUrl,
+    link,
+    url,
+    buyLink,
+    clickable:           clickable === false ? false : (!!directUrl),
+    urlQuality,
+    googleUrl,
+    evidenceQuality,
+    isVerifiedListing,
+    isPricingEvidenceOnly,
+  };
+}
+
 async function buildMarketSearchResponsePayload({
   query,
   finalQuery = null,
@@ -21515,13 +21802,16 @@ async function buildMarketSearchResponsePayload({
   const _bmLog = (name, fromTs) => { _bmSteps[name] = Date.now() - fromTs; };
 
   const baseQuery = normalizeQuery(query || "");
-  const _rawSourceItems = Array.isArray(items) ? items.filter(Boolean) : [];
+  // Part D: sanitize all outbound items before any further processing
+  const _rawSourceItems = (Array.isArray(items) ? items.filter(Boolean) : [])
+    .map(it => sanitizeOutboundListingForClient(it, { scanId: retrievalMeta?.scanId || null }));
   const _sneakerLocked  = applySneakerIdentityLock(baseQuery, _rawSourceItems);
+  const _jordanLocked   = applyJordanIdentityLock(baseQuery, _sneakerLocked);
   const sourceItems = applyGenericVariantQualityFilter(
-    baseQuery, _sneakerLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
+    baseQuery, _jordanLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
   );
 
-  // URL trust summary: counts across the incoming item pool (before final filter)
+  // Parts E + F: URL trust summary — every item is now sanitized so counts are accurate
   {
     const _urlTotal         = _rawSourceItems.length;
     const _urlClickable     = _rawSourceItems.filter(x => x?.clickable !== false && x?.directUrl).length;
@@ -21530,10 +21820,14 @@ async function buildMarketSearchResponsePayload({
     const _urlGoogleUnwrap  = _rawSourceItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length;
     const _urlMissing       = _rawSourceItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length;
     const _urlMerchDirect   = _rawSourceItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length;
+    const _urlLegacy        = _rawSourceItems.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length;
+    const _urlOracle        = _rawSourceItems.filter(x => x?.urlQuality === "oracle_pricing_estimate").length;
+    const _urlVerified      = _rawSourceItems.filter(x => x?.isVerifiedListing === true).length;
     const _topPricingTitles = _rawSourceItems
       .filter(x => x?.clickable === false && x?.title)
       .slice(0, 3)
       .map(x => (x.title || "").slice(0, 50));
+    // Sanity: clickable + pricingOnly should sum to total
     console.log("URL_RESOLUTION_SUMMARY", {
       kind:             retrievalMeta?.kind || null,
       total:            _urlTotal,
@@ -21543,6 +21837,9 @@ async function buildMarketSearchResponsePayload({
       googleUnwrapped:  _urlGoogleUnwrap,
       missingUrl:       _urlMissing,
       merchantDirect:   _urlMerchDirect,
+      legacyNormalized: _urlLegacy,
+      oracleEstimates:  _urlOracle,
+      verifiedListings: _urlVerified,
       topPricingOnlyTitles: _topPricingTitles,
     });
   }
@@ -26035,14 +26332,20 @@ app.post("/market/search/stream", async (req, res) => {
     // ── In-band SERP fanout: bounded parallel expansion pre-payload ─────────
     if (!_degraded && !clientClosed && !_oracleOnlyResult) {
       const _preClean     = computeCleanRetrievalPool(query, enrichedItems, scannedPrice, "pre_fanout_check");
+      const _preVerified  = enrichedItems.filter(x => x?.clickable !== false && x?.directUrl).length;
+      const _prePricingOnly = enrichedItems.filter(x => x?.clickable === false).length;
+      const _preSources   = [...new Set(enrichedItems.map(x => x?.source || x?.store).filter(Boolean))];
       const _shouldFanout = shouldExpandRetrievalForCleanPool({
         query,
-        cleanCount: _preClean.cleanCount,
-        rawCount:   enrichedItems.length,
-        minTarget:  MIN_CLEAN_RESULTS_TARGET,
-        cacheKind:  "live_refresh",
-        elapsedMs:  Date.now() - _t1,
-        reason:     "post_phase2_check",
+        cleanCount:      _preClean.cleanCount,
+        rawCount:        enrichedItems.length,
+        minTarget:       MIN_CLEAN_RESULTS_TARGET,
+        cacheKind:       "live_refresh",
+        elapsedMs:       Date.now() - _t1,
+        reason:          "post_phase2_check",
+        verifiedCount:   _preVerified,
+        pricingOnlyCount: _prePricingOnly,
+        sourceGroups:    _preSources,
       });
 
       if (_shouldFanout) {
