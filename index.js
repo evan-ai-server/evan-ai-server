@@ -9370,12 +9370,26 @@ function applyJordanIdentityLock(query, items, context = {}) {
 
   const kept = [], rejected = [];
 
+  // Non-Jordan sneaker lines to reject when the query is a Jordan query
+  const NON_JORDAN_LINES = ["dunk", "air force", "vaporfly", "zoom fly", "alphafly", "yeezy", "samba", "ultraboost", "adizero", "pegasus", "air max", "stan smith", "gazelle", "nmd", "fresh foam", "gel nimbus", "clifton", "bondi"];
+
   for (const it of items) {
     const title = it?.title || it?.name || "";
+    const tLow  = title.toLowerCase();
     const iSig  = extractJordanIdentitySignals(title);
 
-    // If item shows no Jordan signal at all, pass through — can't confirm wrong
-    if (!iSig.isJordanQuery) { kept.push(it); continue; }
+    // Reject known non-Jordan sneaker lines when query is Jordan
+    // (e.g. Nike Dunk Low, Vaporfly, Yeezy — clearly wrong family)
+    if (!iSig.isJordanQuery) {
+      const hasNonJordanLine = NON_JORDAN_LINES.some(l => tLow.includes(l));
+      if (hasNonJordanLine) {
+        const matchedLine = NON_JORDAN_LINES.find(l => tLow.includes(l));
+        console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "non_jordan_sneaker_line", found: matchedLine, ...(context.scanId ? { scanId: context.scanId } : {}) });
+        rejected.push(it); continue;
+      }
+      // No Jordan signal and no competing sneaker line — pass through (can't confirm wrong)
+      kept.push(it); continue;
+    }
 
     // Wrong Jordan model number
     if (qSig.model && iSig.model && iSig.model !== qSig.model) {
@@ -21827,7 +21841,7 @@ async function buildMarketSearchResponsePayload({
       .filter(x => x?.clickable === false && x?.title)
       .slice(0, 3)
       .map(x => (x.title || "").slice(0, 50));
-    // Sanity: clickable + pricingOnly should sum to total
+
     console.log("URL_RESOLUTION_SUMMARY", {
       kind:             retrievalMeta?.kind || null,
       total:            _urlTotal,
@@ -21842,6 +21856,23 @@ async function buildMarketSearchResponsePayload({
       verifiedListings: _urlVerified,
       topPricingOnlyTitles: _topPricingTitles,
     });
+
+    // CHECK 5: reconciliation — clickable + pricingOnly must equal total
+    if (_urlClickable + _urlPricingOnly !== _urlTotal) {
+      const _offenders = _rawSourceItems
+        .filter(x => x?.clickable !== false && !x?.directUrl)
+        .slice(0, 3)
+        .map(x => ({ title: (x?.title || "").slice(0, 50), clickable: x?.clickable, directUrl: x?.directUrl || null, urlQuality: x?.urlQuality }));
+      console.warn("URL_RESOLUTION_SUMMARY_MISMATCH", {
+        kind:       retrievalMeta?.kind || null,
+        total:      _urlTotal,
+        clickable:  _urlClickable,
+        pricingOnly: _urlPricingOnly,
+        sum:        _urlClickable + _urlPricingOnly,
+        diff:       _urlTotal - (_urlClickable + _urlPricingOnly),
+        offenders:  _offenders,
+      });
+    }
   }
 
   console.log("RESULT_POOL_SIZE_POLICY", {
