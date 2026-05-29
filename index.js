@@ -7291,6 +7291,10 @@ return {
         : typeof it.review_count === "number"
         ? it.review_count
         : null,
+
+    // Preserved for async merchant URL recovery (never sent to frontend)
+    _productId: it.product_id || null,
+    _serpapiProductApiUrl: it.serpapi_immersive_product_api || null,
   };
 }
 
@@ -9195,15 +9199,25 @@ function extractSneakerIdentitySignals(text) {
   const t = text.toLowerCase();
 
   const SNEAKER_BRANDS = ["nike", "adidas", "new balance", "asics", "brooks", "hoka", "saucony", "on running", "salomon", "puma", "reebok", "under armour", "jordan", "vans", "converse"];
-  // More specific lines listed before shorter/partial matches to prevent substring collisions
+  // More specific lines listed before shorter/partial matches to prevent substring collisions.
+  // Nike racing spike/road lines must all be listed so the lock can distinguish them.
   const SNEAKER_LINES  = [
-    "vaporfly", "alphafly", "zoom fly", "superfly",
+    // Nike road-racing / track lines (listed most specific first)
+    "vaporfly", "alphafly", "streakfly", "dragonfly", "victoryfly",
+    "zoom fly", "superfly", "rivalja", "matumbo",
+    // Nike road
     "pegasus", "air max", "air force", "react",
+    // Adidas
     "ultraboost", "adizero", "yeezy", "samba", "gazelle", "stan smith", "nmd",
+    // New Balance
     "fresh foam", "fuel cell",
+    // ASICS
     "gel nimbus", "gel cumulus", "gel kayano",
+    // Brooks
     "glycerin", "ghost",
+    // Hoka
     "clifton", "bondi", "speedgoat",
+    // Others
     "adrenaline", "metaspeed",
   ];
 
@@ -9295,11 +9309,24 @@ function applySneakerIdentityLock(query, items, context = {}) {
 // Self-tests for sneaker identity signal extraction and identity lock
 try {
   const _sneakerTests = [
-    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Men's Road Racing Shoes",  expectKeep: true  },
-    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 4 Men's Road Racing Shoes",  expectKeep: false },
-    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike Zoom Fly 6 Men's Running Shoes",                  expectKeep: false },
-    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Superfly Elite 2 Track Spike",              expectKeep: false },
-    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Road Racing Shoes Size 9", expectKeep: true  },
+    // Keep — exact match
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Men's Road Racing Shoes",   expectKeep: true  },
+    // Keep — same line+gen, different colorway
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 2 Road Racing Shoes Size 9",  expectKeep: true  },
+    // Reject — wrong generation (4 ≠ 2)
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 4 Men's Road Racing Shoes",   expectKeep: false },
+    // Reject — wrong generation (3 ≠ 2)
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Vaporfly Next% 3",                           expectKeep: false },
+    // Reject — wrong line: zoom fly
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike Zoom Fly 6 Men's Running Shoes",                   expectKeep: false },
+    // Reject — wrong line: streakfly
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX StreakFly 2 Proto Sail Total Orange White",   expectKeep: false },
+    // Reject — wrong line: dragonfly
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Dragonfly 2 Track Spike",                    expectKeep: false },
+    // Reject — wrong line: superfly
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Superfly Elite 2 Track Spike",               expectKeep: false },
+    // Reject — wrong line: alphafly
+    { query: "nike zoomx vaporfly next% 2 white orange cheetah", title: "Nike ZoomX Alphafly Next% 3",                           expectKeep: false },
   ];
   let _snkPass = 0;
   for (const tc of _sneakerTests) {
@@ -20544,6 +20571,98 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
 
 
 
+// ── Phase 2C: direct merchant URL recovery via google_product engine ──────────
+// Attempts to recover real merchant offer URLs by calling SerpAPI's
+// google_product engine with each item's product_id. Budget-gated (max 3 per
+// search). Circuit-breaks permanently on 401 (plan doesn't include engine).
+// Requires SerpAPI plan that includes google_product engine access.
+
+let _googleProductApiAvailable = true; // set false on first 401 or engine error
+
+const _RECOVERY_SEARCH_PATHS = ["/search", "/s/", "/sch/", "/shop", "/catalog", "/collections/all", "/category", "/find", "/browse"];
+
+function _isMerchantSearchPage(url) {
+  try {
+    const u = new URL(url);
+    const p = u.pathname.toLowerCase().replace(/\/$/, "");
+    return _RECOVERY_SEARCH_PATHS.some(sp => p === sp.replace(/\/$/, "") || p.startsWith(sp + "/") || p.startsWith(sp + "?") || p.startsWith(sp + "&"));
+  } catch { return false; }
+}
+
+function _isValidMerchantUrl(url) {
+  if (!url || typeof url !== "string") return false;
+  if (!/^https?:\/\//i.test(url)) return false;
+  if (isGoogleRedirect(url)) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (!host || host.includes("serpapi.") || /(^|\.)google\./i.test(host) ||
+        /(^|\.)googleadservices\./i.test(host) || /(^|\.)doubleclick\.net$/i.test(host)) return false;
+  } catch { return false; }
+  if (_isMerchantSearchPage(url)) return false;
+  return true;
+}
+
+async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) {
+  if (!serpApiKey || budget <= 0 || !_googleProductApiAvailable) return {};
+  const candidates = items
+    .filter(it => !it.clickable && it._productId)
+    .slice(0, budget);
+  if (!candidates.length) return {};
+
+  const results = await Promise.allSettled(
+    candidates.map(async (it) => {
+      // Prefer the pre-signed serpapi_immersive_product_api URL; fall back to
+      // constructing a google_product engine URL with the product_id.
+      const apiUrl = it._serpapiProductApiUrl ||
+        `https://serpapi.com/search.json?${new URLSearchParams({ engine: "google_product", product_id: it._productId, api_key: serpApiKey })}`;
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 2500);
+      try {
+        const r = await fetch(apiUrl, { signal: ctrl.signal });
+        clearTimeout(t);
+        const data = await r.json();
+        if (!r.ok) {
+          if (r.status === 401 || (r.status === 400 && String(data?.error || "").includes("Unsupported"))) {
+            _googleProductApiAvailable = false;
+            console.warn("DIRECT_URL_RECOVERY_PLAN_LIMIT", { status: r.status, error: (data?.error || "unknown").slice(0, 120), note: "google_product engine not in SerpAPI plan — recovery disabled. Upgrade plan to enable direct merchant URL recovery." });
+          } else {
+            console.log("DIRECT_URL_RECOVERY_API_ERR", { productId: it._productId, status: r.status, error: (data?.error || "unknown").slice(0, 80) });
+          }
+          return null;
+        }
+        // SerpAPI google_product returns sellers in sellers_results.online_sellers
+        const sellers = data?.sellers_results?.online_sellers || [];
+        console.log("DIRECT_URL_RECOVERY_API_OK", { productId: it._productId, sellersCount: sellers.length, firstSellerLink: (sellers[0]?.link || "").slice(0, 80) });
+        const valid = sellers
+          .filter(s => _isValidMerchantUrl(s.link))
+          .sort((a, b) => (Number(a.extracted_total_price) || 9999) - (Number(b.extracted_total_price) || 9999));
+        if (!valid.length) return null;
+        const best = valid[0];
+        return {
+          _productId: it._productId,
+          directUrl: best.link,
+          source: best.name || it.source,
+          price: Number(best.extracted_total_price) || null,
+        };
+      } catch (err) {
+        clearTimeout(t);
+        console.log("DIRECT_URL_RECOVERY_CATCH", { productId: it._productId, err: String(err).slice(0, 80) });
+        return null;
+      }
+    })
+  );
+
+  const recovered = {};
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value) {
+      recovered[r.value._productId] = r.value;
+    }
+  }
+  return recovered;
+}
+
+// ── End Phase 2C resolver ─────────────────────────────────────────────────────
+
 // -------------------- SERP: google shopping --------------------
 async function serpShopping(query, opts = {}) {
   const { bypassCooldown = false, softFail = false, bypassHardenedCache = false } = opts || {};
@@ -20690,6 +20809,53 @@ async function serpShopping(query, opts = {}) {
       );
 
     items = dedupeSmart(items);
+
+    // Phase 2C: recover direct merchant URLs for google_unresolved items.
+    // Uses SerpAPI google_shopping_product engine (budget-gated, parallel).
+    const _recoveredUrls = await _resolveGoogleShoppingProductUrls(items, SERPAPI_KEY, 3);
+    let _recoveryCount = 0;
+    let _blockedCount  = 0;
+    if (Object.keys(_recoveredUrls).length > 0) {
+      items = items.map(it => {
+        const rec = it._productId ? _recoveredUrls[it._productId] : null;
+        if (!rec) return it;
+        if (!_isValidMerchantUrl(rec.directUrl)) { _blockedCount++; return it; }
+        let _recHost;
+        try { _recHost = new URL(rec.directUrl).hostname.toLowerCase(); } catch { _blockedCount++; return it; }
+        console.log("DIRECT_URL_RECOVERED", {
+          title: (it.title || "").slice(0, 60),
+          host:  _recHost,
+          productId: it._productId,
+        });
+        _recoveryCount++;
+        return {
+          ...it,
+          directUrl: rec.directUrl,
+          link: rec.directUrl,
+          url:  rec.directUrl,
+          buyLink: rec.directUrl,
+          clickable: true,
+          urlQuality: "merchant_direct",
+          urlHost: _recHost,
+          urlConfidence: 0.95,
+        };
+      });
+    }
+
+    const _unresolvedForSummary  = items.filter(it => !it.clickable && it._productId);
+    const _blockedForSummary     = items.filter(it => !it.clickable && !it._productId);
+    const _topRecoveredHosts     = [...new Set(items.filter(it => it.clickable && it.urlQuality === "merchant_direct").map(it => it.urlHost).filter(Boolean))].slice(0, 5);
+    const _topPricingOnlySources = [...new Set(items.filter(it => !it.clickable).map(it => it.source || "unknown"))].slice(0, 5);
+    console.log("DIRECT_URL_RECOVERY_SUMMARY", {
+      query:              (query || "").slice(0, 80),
+      total:              items.length,
+      recoveredDirect:    _recoveryCount,
+      pricingOnly:        items.filter(it => !it.clickable).length,
+      blockedGoogle:      _blockedForSummary.length,
+      blockedSearchPage:  _blockedCount,
+      topRecoveredHosts:  _topRecoveredHosts,
+      topPricingOnlySources: _topPricingOnlySources,
+    });
 
     console.log("🛒 SERP NORMALIZED COUNT", {
       query,
