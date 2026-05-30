@@ -4807,24 +4807,60 @@ function emitSerpBudgetSummary(finalItemCount = null) {
 /**
  * MARKET_SCAN_RESULT_CACHE helpers — short-lived cross-route cache. When
  * /market/search/stream finishes a search, it stores the payload here so
- * a follow-up /market/search for the SAME scan returns the same pool
+ * follow-up /market/search calls for the SAME scan return the same pool
  * without firing SerpAPI again.
+ *
+ * Phase 2C.10 — multi-key lookup AND multi-key store. A single scan's
+ * payload is now indexed under every identity it has (scanId, imageHash,
+ * normalized base query+user). Follow-up calls (enriched / brand-refined /
+ * collector / vision-enrich-driven queries) may arrive with a DIFFERENT
+ * query than the one that produced the original result, but they still
+ * carry the same scanId or imageHash. Any one matching = cache hit.
+ *
+ * This fixes the production leak where:
+ *   • stream stored under "scan:c.xxx"
+ *   • follow-up /market/search seeded the lookup with only an enriched
+ *     query (e.g. "geminijets ..."), missing the scan key, firing a new
+ *     paid call even though the scan's result pool already existed.
  */
+function _makeAllBudgetKeys(ctxSeed) {
+  const keys = [];
+  if (ctxSeed.scanId) keys.push(`scan:${ctxSeed.scanId}`);
+  if (ctxSeed.imageHash) keys.push(`img:${ctxSeed.imageHash}`);
+  const q = String(ctxSeed.query || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 120);
+  const u = String(ctxSeed.userId || "anon").slice(0, 48);
+  if (q) keys.push(`q:${q}|${u}`);
+  return keys;
+}
+
 function getMarketScanResult(ctxSeed) {
   _evictStaleBudgetEntries(Date.now());
-  const key = _makeBudgetKey(ctxSeed);
-  const entry = MARKET_SCAN_RESULT_CACHE.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > MARKET_SCAN_RESULT_TTL_MS) {
-    MARKET_SCAN_RESULT_CACHE.delete(key);
-    return null;
+  const candidateKeys = _makeAllBudgetKeys(ctxSeed);
+  for (const key of candidateKeys) {
+    const entry = MARKET_SCAN_RESULT_CACHE.get(key);
+    if (!entry) continue;
+    if (Date.now() - entry.ts > MARKET_SCAN_RESULT_TTL_MS) {
+      MARKET_SCAN_RESULT_CACHE.delete(key);
+      continue;
+    }
+    return { ...entry, hitKey: key };
   }
-  return entry;
+  return null;
 }
 
 function setMarketScanResult(ctxSeed, payload) {
-  const key = _makeBudgetKey(ctxSeed);
-  MARKET_SCAN_RESULT_CACHE.set(key, { ...payload, ts: Date.now(), key });
+  const keys = _makeAllBudgetKeys(ctxSeed);
+  const ts = Date.now();
+  // Pin the original query on the entry so a later cross-route hit can
+  // detect when an enriched/refined follow-up query lands on the same
+  // pool and log ENRICHED_QUERY_MARKET_CALL_BLOCKED.
+  const originalQuery = (payload?.payload?.finalQuery)
+    || (payload?.payload?.query)
+    || ctxSeed?.query
+    || null;
+  for (const key of keys) {
+    MARKET_SCAN_RESULT_CACHE.set(key, { ...payload, ts, key, originalQuery });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9401,6 +9437,63 @@ try {
   });
 } catch (_e) {
   console.warn("CROSS_ROUTE_KEY_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 2C.10 — Multi-key MARKET_SCAN_RESULT_CACHE self-test ───────────────
+// Asserts that a scan's result pool is found via ANY of its identities — the
+// production leak was: stream stored under scan:c.xxx, follow-up search lookup
+// missed because it only seeded with the (enriched, different) query, missing
+// the scan key. Now the lookup tries scanId / imageHash / query+user in order
+// and returns the entry from any match.
+try {
+  let _mkPass = 0;
+  let _mkTotal = 0;
+
+  // Stash a payload under scanId + imageHash + base query.
+  setMarketScanResult(
+    { scanId: "MK1", imageHash: "imhash1", query: "original base query", userId: "u1" },
+    { payload: { items: [{ title: "found", price: 1 }], finalQuery: "original base query" } },
+  );
+
+  // Lookup by scanId only → hit
+  _mkTotal++;
+  const h1 = getMarketScanResult({ scanId: "MK1", query: "totally different enriched query", userId: "u1" });
+  if (h1 && Array.isArray(h1.payload?.items) && h1.payload.items.length === 1 && h1.hitKey === "scan:MK1") _mkPass++;
+  else console.warn("MULTI_KEY_CACHE_SELFTEST_FAIL", { case: "lookup_by_scanId_with_enriched_query", h1 });
+
+  // Lookup by imageHash only → hit
+  _mkTotal++;
+  const h2 = getMarketScanResult({ imageHash: "imhash1", query: "yet another enriched query", userId: "u1" });
+  if (h2 && Array.isArray(h2.payload?.items) && h2.payload.items.length === 1 && h2.hitKey === "img:imhash1") _mkPass++;
+  else console.warn("MULTI_KEY_CACHE_SELFTEST_FAIL", { case: "lookup_by_imageHash_with_enriched_query", h2 });
+
+  // Lookup by query+user → hit (legacy path)
+  _mkTotal++;
+  const h3 = getMarketScanResult({ query: "original base query", userId: "u1" });
+  if (h3 && Array.isArray(h3.payload?.items) && h3.payload.items.length === 1 && h3.hitKey === "q:original base query|u1") _mkPass++;
+  else console.warn("MULTI_KEY_CACHE_SELFTEST_FAIL", { case: "lookup_by_query_user", h3 });
+
+  // originalQuery is pinned on the entry → enriched-query detection works
+  _mkTotal++;
+  if (h1 && (h1.originalQuery === "original base query")) _mkPass++;
+  else console.warn("MULTI_KEY_CACHE_SELFTEST_FAIL", { case: "originalQuery_pinned", got: h1?.originalQuery });
+
+  // Total miss → null
+  _mkTotal++;
+  const miss = getMarketScanResult({ scanId: "MK_unknown", query: "nothing here", userId: "u_other" });
+  if (miss === null) _mkPass++;
+  else console.warn("MULTI_KEY_CACHE_SELFTEST_FAIL", { case: "total_miss_returns_null", miss });
+
+  console.log("MULTI_KEY_CACHE_SELFTEST_PASS", { passed: _mkPass, total: _mkTotal });
+
+  // Cleanup
+  for (const k of Array.from(MARKET_SCAN_RESULT_CACHE.keys())) {
+    if (k === "scan:MK1" || k === "img:imhash1" || k === "q:original base query|u1") {
+      MARKET_SCAN_RESULT_CACHE.delete(k);
+    }
+  }
+} catch (_e) {
+  console.warn("MULTI_KEY_CACHE_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // Returns true when a listing title has at least one strong signal proving it matches
@@ -26209,9 +26302,17 @@ res.on("finish", () => {
   } catch {}
 });
 
-// Cross-route cache: when /market/search/stream already produced a result
-// pool for this scan, return it here without firing any SerpAPI. Pre-cache
-// hits cost zero budget by design (cache check runs before consume).
+// Cross-route cache: when ANY prior route in this scan (stream or earlier
+// /market/search) produced a result pool, return it here without firing
+// SerpAPI. Phase 2C.10 — getMarketScanResult now matches the scan via
+// scanId / imageHash / query+user, so an "enriched" follow-up query (e.g.
+// the post-vision-enrich collector pass) lands on the same cached entry
+// the stream populated. Pre-cache hits cost zero budget by design.
+//
+// When the inbound query differs from the originally-cached query (the
+// classic enriched / brand-refined / collector case), emit a dedicated
+// ENRICHED_QUERY_MARKET_CALL_BLOCKED log alongside SERP_BUDGET_REUSED_CACHE
+// so it's grep-friendly when triaging cost leaks in production.
 const _crossRouteCache = getMarketScanResult({
   scanId: _budgetScanIdEarly,
   imageHash: _budgetImageHashEarly,
@@ -26221,19 +26322,32 @@ const _crossRouteCache = getMarketScanResult({
 if (_crossRouteCache && _crossRouteCache.payload) {
   const _ctx = getCurrentSerpBudgetCtx();
   if (_ctx) _ctx.cacheHit = true;
+  const _origQ = _crossRouteCache.originalQuery
+    || _crossRouteCache.payload?.finalQuery
+    || _crossRouteCache.payload?.query
+    || null;
+  const _itemCount = Array.isArray(_crossRouteCache.payload?.items)
+    ? _crossRouteCache.payload.items.length
+    : null;
   console.log("SERP_BUDGET_REUSED_CACHE", {
     scanId: _budgetScanIdEarly,
     route: "/market/search",
     query: rawQuery,
-    finalItemCount: Array.isArray(_crossRouteCache.payload?.items)
-      ? _crossRouteCache.payload.items.length
-      : null,
+    hitKey: _crossRouteCache.hitKey,
+    finalItemCount: _itemCount,
   });
-  emitSerpBudgetSummary(
-    Array.isArray(_crossRouteCache.payload?.items)
-      ? _crossRouteCache.payload.items.length
-      : null
-  );
+  if (_origQ && _origQ.toLowerCase().trim() !== rawQuery.toLowerCase().trim()) {
+    console.warn("ENRICHED_QUERY_MARKET_CALL_BLOCKED", {
+      route: "/market/search",
+      scanId: _budgetScanIdEarly,
+      imageHash: _budgetImageHashEarly ? _budgetImageHashEarly.slice(0, 12) : null,
+      originalQuery: _origQ,
+      enrichedQuery: rawQuery,
+      reason: "scan_pool_already_cached_no_paid_call_needed",
+      finalItemCount: _itemCount,
+    });
+  }
+  emitSerpBudgetSummary(_itemCount);
   return res.status(200).json(_crossRouteCache.payload);
 }
 
