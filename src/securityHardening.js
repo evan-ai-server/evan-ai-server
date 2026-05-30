@@ -411,6 +411,22 @@ function _isBenchBypassHeader(req) {
   }
 }
 
+// Private / loopback ranges exempt from the scan-burst counter.
+// These are developer phones and local tools — legitimate high-frequency
+// callers that should never be blocked mid-session.
+function _isPrivateIp(ip) {
+  if (!ip) return false;
+  const s = String(ip);
+  return (
+    s === "::1" ||
+    s === "127.0.0.1" ||
+    s.startsWith("::ffff:127.") ||
+    s.startsWith("10.")  ||
+    s.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(s)
+  );
+}
+
 export function abuseTrackerMiddleware({ limitPaths = ["/market/search", "/api/vision/analyze", "/upload/presign"] } = {}) {
   return (req, res, next) => {
     const path = req.path;
@@ -418,6 +434,8 @@ export function abuseTrackerMiddleware({ limitPaths = ["/market/search", "/api/v
     if (_isBenchBypassHeader(req)) return next();
 
     const ip = _getIp(req);
+    // Private-network IPs (developer devices on LAN) are never abuse-blocked.
+    if (_isPrivateIp(ip)) return next();
     const now = Date.now();
 
     // Check if blocked
