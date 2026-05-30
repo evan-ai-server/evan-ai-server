@@ -2194,6 +2194,14 @@ function pushOpsAlert(code, payload = {}, cooldownMs = ALERT_COOLDOWN_MS) {
 function shouldSkipInfraGuard(req) {
   if (req.path === "/health" || req.path === "/ready") return true;
   if (isBenchBypass(req)) return true;
+  // Private LAN IPs (developer devices) bypass all infra-guard rate limits.
+  // Mirrors the same exemption in abuseTrackerMiddleware so a dev phone
+  // never hits a 429 from our own rate limiters during rapid test scanning.
+  const ip = getClientIp(req);
+  if (ip === "::1" || ip === "127.0.0.1" || ip?.startsWith("::ffff:127.")) return true;
+  if (ip?.startsWith("10.")) return true;
+  if (ip?.startsWith("192.168.")) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip || "")) return true;
   return false;
 }
 
