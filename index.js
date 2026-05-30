@@ -6431,17 +6431,45 @@ app.use((req, res, next) => {
 });
 
 // -------------------- Health --------------------
-app.get("/health", (_req, res) => {
-  const global = getGlobalHealthSnapshot();
+// Per-IP response cache: any IP that checked health within the last 10s
+// gets the same cached JSON back with no logic re-run. This caps the
+// server cost of rapid-polling clients (e.g. Expo Fast Refresh cycles)
+// without returning 429s, which would confuse the app's scan flow.
+// Cache is module-level (plain Map) — no Redis needed, survives restarts
+// poorly but is only a dev-aid so that's fine.
+const _healthCache = new Map(); // ip → { ts, body }
+const HEALTH_CACHE_S = 10;
 
-  return res.status(200).json({
+app.get("/health", (req, res) => {
+  const ip  = req.ip || "unknown";
+  const now = Date.now();
+
+  // Log the User-Agent once per 30s per IP so we can identify the flood source.
+  const uaKey = `${ip}_ua`;
+  if (!_healthCache.has(uaKey) || now - _healthCache.get(uaKey).ts > 30_000) {
+    const ua = req.headers["user-agent"] || "(none)";
+    console.log("[HEALTH_CLIENT]", ip, ua.slice(0, 120));
+    _healthCache.set(uaKey, { ts: now });
+  }
+
+  const cached = _healthCache.get(ip);
+  if (cached && now - cached.ts < HEALTH_CACHE_S * 1000) {
+    res.setHeader("Cache-Control", `max-age=${HEALTH_CACHE_S}`);
+    return res.status(200).json(cached.body);
+  }
+
+  const global = getGlobalHealthSnapshot();
+  const body = {
     ok: true,
     region: global.currentRegion,
     activeRegion: global.activeRegion,
     activeRegionStatus: global.activeRegionStatus,
     activeRegionHealthScore: global.activeRegionHealthScore,
     failoverCount: global.failoverCount,
-  });
+  };
+  _healthCache.set(ip, { ts: now, body });
+  res.setHeader("Cache-Control", `max-age=${HEALTH_CACHE_S}`);
+  return res.status(200).json(body);
 });
 
 app.get("/ready", async (_req, res) => {
