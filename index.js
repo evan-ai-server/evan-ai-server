@@ -12,6 +12,7 @@ import rateLimit from "express-rate-limit";
 import pLimit from "p-limit";
 import fs from "fs/promises";
 import path from "path";
+import { AsyncLocalStorage } from "async_hooks";
 
 // Lazy-load heavy native modules — avoids 17s+ blocking startup cost.
 // sharp (libvips) and playwright (browser binaries) are only needed at
@@ -4575,6 +4576,228 @@ async function runBudgetedSourceLane(
     return [];
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 2C.8 — Per-scan SerpAPI budget
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Hard cap: ONE paid SerpAPI call per uncached scan. Cached scans use zero.
+// The order is critical:
+//   1. Vision builds the best query it can.
+//   2. Routes check existing SERP_CACHE / internal cache (zero-cost, always
+//      allowed regardless of budget).
+//   3. If cache misses, the route consumes its single SerpAPI unit.
+//   4. All correctness work (identity locks, merch rejection, sneaker / Jordan
+//      filters, generic-query guard, clean-retrieval-pool check, verdict math)
+//      runs locally on that one returned pool.
+//   5. Any extra SerpAPI call after the first is blocked with a structured
+//      SERP_BUDGET_BLOCKED log, unless DEV_BYPASS_SERP_BUDGET is set.
+//
+// The budget context is threaded through the request via AsyncLocalStorage
+// so leaf functions (serpShopping / serpAmazon / serpScopedSearch / result-
+// aware refresh / direct URL recovery) can consult it without changing every
+// signature in the dispatch graph.
+const SERP_BUDGET_STORE = new AsyncLocalStorage();
+const SERP_BUDGET_MAX = Number(process.env.SERP_BUDGET_PER_SCAN || 1);
+const SERP_BUDGET_TTL_MS = 10 * 60 * 1000; // 10 min per-scan eviction
+const SERP_BUDGET_DEV_BYPASS = String(process.env.DEV_BYPASS_SERP_BUDGET || "").trim() === "1";
+
+// Cross-route reuse: when /market/search/stream computes a result pool, store
+// it here keyed by scanId / imageHash / normalizedQuery+userId so a subsequent
+// /market/search for the SAME scan returns the same pool without re-billing.
+// Stream + regular calls cannot double-bill the same scan.
+const MARKET_SCAN_RESULT_CACHE = new Map();
+const MARKET_SCAN_RESULT_TTL_MS = 5 * 60 * 1000; // 5 min
+
+function _makeBudgetKey({ scanId, imageHash, query, userId }) {
+  if (scanId) return `scan:${scanId}`;
+  if (imageHash) return `img:${imageHash}`;
+  const q = String(query || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 120);
+  const u = String(userId || "anon").slice(0, 48);
+  return `q:${q}|${u}`;
+}
+
+// Map keyed by budget-key → { consumed, ts, route, query, scanId, history[] }.
+const _SERP_BUDGET_REGISTRY = new Map();
+
+function _evictStaleBudgetEntries(now) {
+  for (const [k, entry] of _SERP_BUDGET_REGISTRY) {
+    if (now - entry.ts > SERP_BUDGET_TTL_MS) _SERP_BUDGET_REGISTRY.delete(k);
+  }
+  for (const [k, entry] of MARKET_SCAN_RESULT_CACHE) {
+    if (now - entry.ts > MARKET_SCAN_RESULT_TTL_MS) MARKET_SCAN_RESULT_CACHE.delete(k);
+  }
+}
+
+/**
+ * Public helper — return the current scan's budget context, or null when
+ * called outside any request (e.g. background jobs, internal scripts). When
+ * null, all SerpAPI calls bypass the budget (legacy behavior preserved).
+ */
+function getCurrentSerpBudgetCtx() {
+  return SERP_BUDGET_STORE.getStore() || null;
+}
+
+/**
+ * Public helper — check whether a SerpAPI call can be issued under the
+ * current request's budget. Cheap, no side effects. Returns true when no
+ * budget context exists (legacy caller).
+ */
+function canUseSerpBudget(ctx = null) {
+  if (SERP_BUDGET_DEV_BYPASS) return true;
+  const c = ctx || getCurrentSerpBudgetCtx();
+  if (!c) return true; // no context = bypass (back-compat)
+  const key = c.key;
+  const entry = _SERP_BUDGET_REGISTRY.get(key);
+  if (!entry) return true;
+  return entry.consumed < (c.max || SERP_BUDGET_MAX);
+}
+
+/**
+ * Public helper — atomically attempt to consume one SerpAPI unit on the
+ * current scan's budget. Returns true on success, false on refusal (and
+ * logs SERP_BUDGET_BLOCKED with the offending route / query). Cache layers
+ * MUST NOT call this — only paid network call sites.
+ */
+function consumeSerpBudget(reason, callDescriptor = {}) {
+  const c = getCurrentSerpBudgetCtx();
+  if (!c) return true; // no context = bypass
+  if (SERP_BUDGET_DEV_BYPASS) {
+    // Still account in summary so logs are accurate, but do not block.
+    const entry = _SERP_BUDGET_REGISTRY.get(c.key) || {
+      consumed: 0, ts: Date.now(), route: c.route, query: c.query, scanId: c.scanId, history: [],
+    };
+    entry.consumed += 1;
+    entry.ts = Date.now();
+    entry.history.push({ reason, ts: Date.now(), bypassed: true, ...callDescriptor });
+    _SERP_BUDGET_REGISTRY.set(c.key, entry);
+    c.callsUsed = (c.callsUsed || 0) + 1;
+    console.log("SERP_BUDGET_CONSUMED", {
+      scanId: c.scanId, route: c.route, reason, consumed: entry.consumed,
+      max: c.max || SERP_BUDGET_MAX, devBypass: true, ...callDescriptor,
+    });
+    return true;
+  }
+  const max = c.max || SERP_BUDGET_MAX;
+  const existing = _SERP_BUDGET_REGISTRY.get(c.key);
+  const current = existing?.consumed || 0;
+  if (current >= max) {
+    c.blockedExtraCalls = (c.blockedExtraCalls || 0) + 1;
+    console.warn("SERP_BUDGET_BLOCKED", {
+      scanId: c.scanId,
+      route: c.route,
+      query: callDescriptor.query || c.query,
+      reason,
+      alreadyConsumedBy: existing?.history?.[0]?.reason || null,
+      alreadyConsumedQuery: existing?.history?.[0]?.query || existing?.query || null,
+      consumed: current,
+      max,
+    });
+    return false;
+  }
+  const entry = existing || {
+    consumed: 0, ts: Date.now(), route: c.route, query: c.query, scanId: c.scanId, history: [],
+  };
+  entry.consumed += 1;
+  entry.ts = Date.now();
+  entry.history.push({ reason, ts: Date.now(), ...callDescriptor });
+  _SERP_BUDGET_REGISTRY.set(c.key, entry);
+  c.callsUsed = (c.callsUsed || 0) + 1;
+  console.log("SERP_BUDGET_CONSUMED", {
+    scanId: c.scanId, route: c.route, reason, consumed: entry.consumed, max, ...callDescriptor,
+  });
+  return true;
+}
+
+/**
+ * Public helper — current budget status for the active scan (or a passed
+ * ctx). Read-only.
+ */
+function getSerpBudgetStatus(ctx = null) {
+  const c = ctx || getCurrentSerpBudgetCtx();
+  if (!c) return { key: null, consumed: 0, max: SERP_BUDGET_MAX, available: SERP_BUDGET_MAX, devBypass: SERP_BUDGET_DEV_BYPASS };
+  const entry = _SERP_BUDGET_REGISTRY.get(c.key);
+  const consumed = entry?.consumed || 0;
+  const max = c.max || SERP_BUDGET_MAX;
+  return {
+    key: c.key,
+    consumed,
+    max,
+    available: Math.max(0, max - consumed),
+    devBypass: SERP_BUDGET_DEV_BYPASS,
+    history: entry?.history || [],
+  };
+}
+
+/**
+ * Public helper — wrap a route handler body so all nested SerpAPI calls
+ * see the same budget context. Builds the canonical key from scanId /
+ * imageHash / query+user. Returns the result of `fn()`.
+ */
+function withSerpBudget(ctxSeed, fn) {
+  _evictStaleBudgetEntries(Date.now());
+  const ctx = {
+    scanId: ctxSeed.scanId || null,
+    imageHash: ctxSeed.imageHash || null,
+    query: ctxSeed.query || null,
+    userId: ctxSeed.userId || null,
+    route: ctxSeed.route || null,
+    max: ctxSeed.max || SERP_BUDGET_MAX,
+    callsUsed: 0,
+    blockedExtraCalls: 0,
+    cacheHit: false,
+    key: _makeBudgetKey(ctxSeed),
+  };
+  return SERP_BUDGET_STORE.run(ctx, () => fn(ctx));
+}
+
+/**
+ * Public helper — emit a one-line audit summary at the end of a route.
+ * Always call this so production logs have a single grep target per scan.
+ */
+function emitSerpBudgetSummary(finalItemCount = null) {
+  const c = getCurrentSerpBudgetCtx();
+  if (!c) return;
+  const status = getSerpBudgetStatus(c);
+  console.log("SERP_BUDGET_SUMMARY", {
+    scanId: c.scanId,
+    normalizedQuery: String(c.query || "").toLowerCase().slice(0, 120),
+    route: c.route,
+    serpCallsUsed: status.consumed,
+    maxAllowed: status.max,
+    cacheHit: !!c.cacheHit,
+    blockedExtraCalls: c.blockedExtraCalls || 0,
+    finalItemCount,
+    devBypass: status.devBypass,
+  });
+}
+
+/**
+ * MARKET_SCAN_RESULT_CACHE helpers — short-lived cross-route cache. When
+ * /market/search/stream finishes a search, it stores the payload here so
+ * a follow-up /market/search for the SAME scan returns the same pool
+ * without firing SerpAPI again.
+ */
+function getMarketScanResult(ctxSeed) {
+  _evictStaleBudgetEntries(Date.now());
+  const key = _makeBudgetKey(ctxSeed);
+  const entry = MARKET_SCAN_RESULT_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > MARKET_SCAN_RESULT_TTL_MS) {
+    MARKET_SCAN_RESULT_CACHE.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function setMarketScanResult(ctxSeed, payload) {
+  const key = _makeBudgetKey(ctxSeed);
+  MARKET_SCAN_RESULT_CACHE.set(key, { ...payload, ts: Date.now(), key });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// End Phase 2C.8 budget block
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function shouldRunQueueWorkers() {
   return QUEUE_ENABLED && QUEUE_WORKERS_ENABLED && SERVER_ROLE !== "api";
@@ -9474,6 +9697,144 @@ try {
   });
 } catch (_e) {
   console.warn("GENERIC_QUERY_GUARD_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 2C.8 — Per-scan SerpAPI budget self-test ───────────────────────────
+// Asserts the budget enforces exactly one SerpAPI call per scan and blocks
+// every extra. Tests the AsyncLocalStorage propagation, the cache-first
+// order (cache hits cost zero budget), the dev-bypass flag, and the cross-
+// route cache key collapse (same scanId ⇒ shared budget).
+try {
+  let _budgetPass = 0;
+  let _budgetTotal = 0;
+
+  // Helper to run a fn inside a fresh budget context for tests.
+  const _runInBudget = (seed, fn) => {
+    return new Promise((resolve) => {
+      const ctx = {
+        scanId: seed.scanId || null,
+        imageHash: seed.imageHash || null,
+        query: seed.query || null,
+        userId: seed.userId || null,
+        route: seed.route || "/test",
+        max: seed.max || SERP_BUDGET_MAX,
+        callsUsed: 0,
+        blockedExtraCalls: 0,
+        cacheHit: false,
+        key: _makeBudgetKey({
+          scanId: seed.scanId, imageHash: seed.imageHash,
+          query: seed.query, userId: seed.userId,
+        }),
+      };
+      SERP_BUDGET_STORE.run(ctx, () => {
+        Promise.resolve(fn(ctx)).then(resolve);
+      });
+    });
+  };
+
+  // Case 1 — first consume succeeds, second is blocked.
+  _budgetTotal++;
+  _runInBudget({ scanId: "self_test_1" }, async (ctx) => {
+    const first  = consumeSerpBudget("test_primary",   { query: "test query" });
+    const second = consumeSerpBudget("test_secondary", { query: "test query" });
+    if (first === true && second === false && ctx.callsUsed === 1 && ctx.blockedExtraCalls === 1) {
+      _budgetPass++;
+    } else {
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "first_then_block", first, second, calls: ctx.callsUsed, blocked: ctx.blockedExtraCalls });
+    }
+  });
+
+  // Case 2 — canUseSerpBudget reflects state.
+  _budgetTotal++;
+  _runInBudget({ scanId: "self_test_2" }, async (ctx) => {
+    const beforeOk = canUseSerpBudget(ctx);
+    consumeSerpBudget("test_primary", { query: "case2" });
+    const afterOk = canUseSerpBudget(ctx);
+    if (beforeOk === true && afterOk === false) {
+      _budgetPass++;
+    } else {
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "canUse_state", beforeOk, afterOk });
+    }
+  });
+
+  // Case 3 — no context = legacy bypass.
+  _budgetTotal++;
+  {
+    const before = canUseSerpBudget(null);
+    const consumed = consumeSerpBudget("no_ctx", { query: "anywhere" });
+    if (before === true && consumed === true) {
+      _budgetPass++;
+    } else {
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "no_ctx_legacy", before, consumed });
+    }
+  }
+
+  // Case 4 — different scanIds get separate budgets.
+  _budgetTotal++;
+  Promise.all([
+    _runInBudget({ scanId: "self_test_4a" }, async () => consumeSerpBudget("a", { query: "a" })),
+    _runInBudget({ scanId: "self_test_4b" }, async () => consumeSerpBudget("b", { query: "b" })),
+  ]).then(([a, b]) => {
+    if (a === true && b === true) {
+      _budgetPass++;
+    } else {
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "separate_scans", a, b });
+    }
+  });
+
+  // Case 5 — same scanId shares budget across two enterWith calls.
+  _budgetTotal++;
+  const _sharedKey = _makeBudgetKey({ scanId: "self_test_5_shared" });
+  _runInBudget({ scanId: "self_test_5_shared", route: "/stream" }, async () =>
+    consumeSerpBudget("stream_first", { query: "shared" })
+  ).then(async () => {
+    const second = await _runInBudget(
+      { scanId: "self_test_5_shared", route: "/regular" },
+      async () => consumeSerpBudget("regular_second", { query: "shared" })
+    );
+    const entry = _SERP_BUDGET_REGISTRY.get(_sharedKey);
+    if (second === false && entry && entry.consumed === 1) {
+      _budgetPass++;
+    } else {
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "shared_scanId", second, entryConsumed: entry?.consumed });
+    }
+  });
+
+  // Case 6 — MARKET_SCAN_RESULT_CACHE roundtrip.
+  _budgetTotal++;
+  const _ctxSeed = { scanId: "self_test_6_cache" };
+  setMarketScanResult(_ctxSeed, { payload: { items: [{ title: "test" }, { title: "test2" }] } });
+  const _cached = getMarketScanResult(_ctxSeed);
+  if (_cached && Array.isArray(_cached.payload?.items) && _cached.payload.items.length === 2) {
+    _budgetPass++;
+  } else {
+    console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "cache_roundtrip", cached: _cached });
+  }
+
+  // Case 7 — budget-key derivation prefers scanId > imageHash > query+user.
+  _budgetTotal++;
+  const _kScan  = _makeBudgetKey({ scanId: "X", imageHash: "Y", query: "q", userId: "u" });
+  const _kImg   = _makeBudgetKey({ imageHash: "Y", query: "q", userId: "u" });
+  const _kQuery = _makeBudgetKey({ query: "q", userId: "u" });
+  if (_kScan.startsWith("scan:X") && _kImg.startsWith("img:Y") && _kQuery.startsWith("q:")) {
+    _budgetPass++;
+  } else {
+    console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "key_derivation", _kScan, _kImg, _kQuery });
+  }
+
+  // Defer the final summary log to the next tick so async cases above settle.
+  setImmediate(() => {
+    console.log("SERP_BUDGET_SELFTEST_PASS", { passed: _budgetPass, total: _budgetTotal });
+    // Clean up self-test entries so they never leak into a production scan.
+    for (const k of Array.from(_SERP_BUDGET_REGISTRY.keys())) {
+      if (k.startsWith("scan:self_test_")) _SERP_BUDGET_REGISTRY.delete(k);
+    }
+    for (const k of Array.from(MARKET_SCAN_RESULT_CACHE.keys())) {
+      if (k.startsWith("scan:self_test_")) MARKET_SCAN_RESULT_CACHE.delete(k);
+    }
+  });
+} catch (_e) {
+  console.warn("SERP_BUDGET_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // ── SERP fanout query builder ─────────────────────────────────────────────────
@@ -21053,6 +21414,23 @@ function _isValidMerchantUrl(url) {
 
 async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) {
   if (!serpApiKey || budget <= 0 || !_googleProductApiAvailable) return {};
+  // ── Phase 2C.8: direct URL recovery is an EXTRA paid call per item. Block
+  // it entirely unless DEV_BYPASS_SERP_BUDGET is set OR no scan context is
+  // active (e.g. background batch job). Production scan context always has
+  // already consumed its one allowed call on serpShopping above this point.
+  const _ctx = getCurrentSerpBudgetCtx();
+  if (_ctx && !SERP_BUDGET_DEV_BYPASS) {
+    console.warn("SERP_BUDGET_BLOCKED", {
+      scanId: _ctx.scanId,
+      route: _ctx.route,
+      query: _ctx.query,
+      reason: "direct_url_recovery_google_product",
+      alreadyConsumedBy: "serpShopping_primary",
+      candidates: items.filter(it => !it.clickable && it._productId).length,
+    });
+    _ctx.blockedExtraCalls = (_ctx.blockedExtraCalls || 0) + 1;
+    return {};
+  }
   const candidates = items
     .filter(it => !it.clickable && it._productId)
     .slice(0, budget);
@@ -21154,6 +21532,15 @@ async function serpShopping(query, opts = {}) {
       });
       return _staleItems;
     }
+  }
+
+  // ── Phase 2C.8: per-scan SerpAPI budget gate ─────────────────────────────────
+  // Cache hits above this point are free (no budget consumed). A real network
+  // call beyond this point requires the scan to have at least 1 unit left.
+  // If budget is spent, return [] and log SERP_BUDGET_BLOCKED with the route /
+  // query that triggered the would-be call.
+  if (!consumeSerpBudget("serpShopping", { engine: "google_shopping", query })) {
+    return [];
   }
 
   const startedAt = Date.now();
@@ -21666,6 +22053,11 @@ async function serpAmazon(query, opts = {}) {
     }
   }
 
+  // ── Phase 2C.8: per-scan SerpAPI budget gate (Amazon engine) ────────────────
+  if (!consumeSerpBudget("serpAmazon", { engine: "amazon", query })) {
+    return [];
+  }
+
   const startedAt = Date.now();
 
   const params = new URLSearchParams({
@@ -21802,6 +22194,13 @@ async function serpScopedSearch(query, site, opts = {}) {
       });
       return cached.entry.items;
     }
+  }
+
+  // ── Phase 2C.8: per-scan SerpAPI budget gate (scoped resale search) ─────────
+  // Scoped marketplace searches (Poshmark / Mercari / StockX / Depop) are an
+  // extra paid call per site. Block them all after the primary call lands.
+  if (!consumeSerpBudget("serpScopedSearch", { engine: "google_shopping", site, label, query })) {
+    return [];
   }
 
   const startedAt = Date.now();
@@ -25400,6 +25799,84 @@ app.post("/market/search", bodySchemaMiddleware(SCHEMAS.marketSearch), async (re
 const _routeT0 = Date.now();
 const rawQuery = safeStr(req.body?.query, 220);
 let query = normalizeQuery(rawQuery);
+
+// ── Phase 2C.8: per-scan SerpAPI budget context ──────────────────────────────
+// Set up the budget BEFORE any downstream work so every SerpAPI call site
+// inside this request inherits the same 1-unit allowance. The key prefers
+// scanId, then imageHash, then a normalized query + user fallback. The
+// MARKET_SCAN_RESULT_CACHE check below this returns a previously-computed
+// result pool (when the stream route already ran for the same scan) so we
+// never double-bill.
+const _budgetScanIdEarly = safeStr(req.body?.scanId, 64) || null;
+const _budgetImageHashEarly =
+  safeStr(req.body?.imageHash || req.body?.scanAsset?.hash || req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128) || null;
+const _budgetUserIdEarly = safeStr(req.body?.userId || req.query?.userId, 64) || null;
+SERP_BUDGET_STORE.enterWith({
+  scanId: _budgetScanIdEarly,
+  imageHash: _budgetImageHashEarly,
+  query: rawQuery,
+  userId: _budgetUserIdEarly,
+  route: "/market/search",
+  max: SERP_BUDGET_MAX,
+  callsUsed: 0,
+  blockedExtraCalls: 0,
+  cacheHit: false,
+  key: _makeBudgetKey({
+    scanId: _budgetScanIdEarly,
+    imageHash: _budgetImageHashEarly,
+    query: rawQuery,
+    userId: _budgetUserIdEarly,
+  }),
+});
+// Capture a reference so the response-finish handler can emit the summary
+// regardless of which exit path the route takes (success, error, early return).
+const _budgetCtxRef_search = getCurrentSerpBudgetCtx();
+res.on("finish", () => {
+  try {
+    if (!_budgetCtxRef_search) return;
+    const status = getSerpBudgetStatus(_budgetCtxRef_search);
+    console.log("SERP_BUDGET_SUMMARY", {
+      scanId: _budgetCtxRef_search.scanId,
+      normalizedQuery: String(_budgetCtxRef_search.query || "").toLowerCase().slice(0, 120),
+      route: _budgetCtxRef_search.route,
+      serpCallsUsed: status.consumed,
+      maxAllowed: status.max,
+      cacheHit: !!_budgetCtxRef_search.cacheHit,
+      blockedExtraCalls: _budgetCtxRef_search.blockedExtraCalls || 0,
+      finalItemCount: _budgetCtxRef_search._finalItemCount ?? null,
+      devBypass: status.devBypass,
+    });
+  } catch {}
+});
+
+// Cross-route cache: when /market/search/stream already produced a result
+// pool for this scan, return it here without firing any SerpAPI. Pre-cache
+// hits cost zero budget by design (cache check runs before consume).
+const _crossRouteCache = getMarketScanResult({
+  scanId: _budgetScanIdEarly,
+  imageHash: _budgetImageHashEarly,
+  query: rawQuery,
+  userId: _budgetUserIdEarly,
+});
+if (_crossRouteCache && _crossRouteCache.payload) {
+  const _ctx = getCurrentSerpBudgetCtx();
+  if (_ctx) _ctx.cacheHit = true;
+  console.log("SERP_BUDGET_REUSED_CACHE", {
+    scanId: _budgetScanIdEarly,
+    route: "/market/search",
+    query: rawQuery,
+    finalItemCount: Array.isArray(_crossRouteCache.payload?.items)
+      ? _crossRouteCache.payload.items.length
+      : null,
+  });
+  emitSerpBudgetSummary(
+    Array.isArray(_crossRouteCache.payload?.items)
+      ? _crossRouteCache.payload.items.length
+      : null
+  );
+  return res.status(200).json(_crossRouteCache.payload);
+}
+
 query = bestHistoricalQuery(query);
 query = canonicalizeQuery(query);
 
@@ -26268,6 +26745,17 @@ storeSignalSnapshot(redis, _scanIdC, { userId: _userId, signal: _finalSignalC, t
 if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalC, scanId: _scanIdC, itemName: responsePayload.itemName || null }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 harnessRecordScan(req, responsePayload).catch(() => {});
+// ── Phase 2C.8: cross-route cache populate (/market/search success) ──────────
+// Stash the final payload so a follow-up /market/search/stream for the same
+// scan can read this cached pool instead of re-firing SerpAPI. Also record
+// the final item count on the budget context for the summary log.
+try {
+  const _ctxFinal = getCurrentSerpBudgetCtx();
+  if (_ctxFinal) {
+    _ctxFinal._finalItemCount = Array.isArray(responsePayload?.items) ? responsePayload.items.length : null;
+    setMarketScanResult(_ctxFinal, { payload: responsePayload, route: "/market/search" });
+  }
+} catch {}
 return res.status(200).json(responsePayload);
 
   } catch (err) {
@@ -26405,6 +26893,51 @@ app.post("/market/search/stream", async (req, res) => {
     // ── Parse request ─────────────────────────────────────────────────────
     const rawQuery = safeStr(req.body?.query, 220);
     let query = normalizeQuery(rawQuery);
+
+    // ── Phase 2C.8: per-scan SerpAPI budget context (stream variant) ────────
+    // Prefer client-provided scanId so /market/search and the stream share a
+    // budget when the client uses one scanId across both calls. Fall back to
+    // the locally-generated scanId above otherwise.
+    const _budgetScanIdStream = safeStr(req.body?.scanId, 64) || scanId;
+    const _budgetImageHashStream =
+      safeStr(req.body?.imageHash || req.body?.scanAsset?.hash || req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128) || null;
+    const _budgetUserIdStream = safeStr(req.body?.userId || req.query?.userId, 64) || null;
+    SERP_BUDGET_STORE.enterWith({
+      scanId: _budgetScanIdStream,
+      imageHash: _budgetImageHashStream,
+      query: rawQuery,
+      userId: _budgetUserIdStream,
+      route: "/market/search/stream",
+      max: SERP_BUDGET_MAX,
+      callsUsed: 0,
+      blockedExtraCalls: 0,
+      cacheHit: false,
+      key: _makeBudgetKey({
+        scanId: _budgetScanIdStream,
+        imageHash: _budgetImageHashStream,
+        query: rawQuery,
+        userId: _budgetUserIdStream,
+      }),
+    });
+    const _budgetCtxRef_stream = getCurrentSerpBudgetCtx();
+    res.on("finish", () => {
+      try {
+        if (!_budgetCtxRef_stream) return;
+        const status = getSerpBudgetStatus(_budgetCtxRef_stream);
+        console.log("SERP_BUDGET_SUMMARY", {
+          scanId: _budgetCtxRef_stream.scanId,
+          normalizedQuery: String(_budgetCtxRef_stream.query || "").toLowerCase().slice(0, 120),
+          route: _budgetCtxRef_stream.route,
+          serpCallsUsed: status.consumed,
+          maxAllowed: status.max,
+          cacheHit: !!_budgetCtxRef_stream.cacheHit,
+          blockedExtraCalls: _budgetCtxRef_stream.blockedExtraCalls || 0,
+          finalItemCount: _budgetCtxRef_stream._finalItemCount ?? null,
+          devBypass: status.devBypass,
+        });
+      } catch {}
+    });
+
     query = bestHistoricalQuery(query);
     query = canonicalizeQuery(query);
     query = categoryAdapter(query, req.body?.category || req.body?.visionIdentity?.category || null);
@@ -26749,6 +27282,15 @@ app.post("/market/search/stream", async (req, res) => {
             normalizeVerdict(payload?.profitIntel?.verdict) ||
             "HOLD";
           try { console.log("SSE_SEND_ITEMS", { cacheLayer: "enriched", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+          // ── Phase 2C.8: mark cacheHit + populate cross-route cache ────────
+          try {
+            const _ctxCache = getCurrentSerpBudgetCtx();
+            if (_ctxCache) {
+              _ctxCache.cacheHit = true;
+              _ctxCache._finalItemCount = Array.isArray(payload?.items) ? payload.items.length : null;
+              setMarketScanResult(_ctxCache, { payload, route: "/market/search/stream", layer: "enriched" });
+            }
+          } catch {}
           send("complete", {
             ...payload,
             verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -26793,6 +27335,15 @@ app.post("/market/search/stream", async (req, res) => {
             normalizeVerdict(payload?.profitIntel?.verdict) ||
             "HOLD";
           try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+          // ── Phase 2C.8: mark cacheHit + populate cross-route cache ────────
+          try {
+            const _ctxCache = getCurrentSerpBudgetCtx();
+            if (_ctxCache) {
+              _ctxCache.cacheHit = true;
+              _ctxCache._finalItemCount = Array.isArray(payload?.items) ? payload.items.length : null;
+              setMarketScanResult(_ctxCache, { payload, route: "/market/search/stream", layer: "internal" });
+            }
+          } catch {}
           send("complete", {
             ...payload,
             verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -26833,6 +27384,15 @@ app.post("/market/search/stream", async (req, res) => {
             normalizeVerdict(payload?.profitIntel?.verdict) ||
             "HOLD";
           try { console.log("SSE_SEND_ITEMS", { cacheLayer: "serp", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+          // ── Phase 2C.8: mark cacheHit + populate cross-route cache ────────
+          try {
+            const _ctxCache = getCurrentSerpBudgetCtx();
+            if (_ctxCache) {
+              _ctxCache.cacheHit = true;
+              _ctxCache._finalItemCount = Array.isArray(payload?.items) ? payload.items.length : null;
+              setMarketScanResult(_ctxCache, { payload, route: "/market/search/stream", layer: "serp" });
+            }
+          } catch {}
           send("complete", {
             ...payload,
             verdict: _cacheVerdict,   // canonical-only top-level verdict
@@ -27236,6 +27796,17 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _totalMs = Date.now() - _t0;
     try { console.log("SSE_SEND_ITEMS", { cacheLayer: "fresh", status: "complete", count: (finalPayload?.items||[]).length, top5: (finalPayload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+    // ── Phase 2C.8: cross-route cache populate (stream success) ─────────────
+    // Stash the final payload so a follow-up /market/search for the SAME
+    // scan returns it directly without firing another SerpAPI call. Also
+    // record the final item count on the budget context for the summary log.
+    try {
+      const _ctxFinal = getCurrentSerpBudgetCtx();
+      if (_ctxFinal) {
+        _ctxFinal._finalItemCount = Array.isArray(finalPayload?.items) ? finalPayload.items.length : null;
+        setMarketScanResult(_ctxFinal, { payload: finalPayload, route: "/market/search/stream" });
+      }
+    } catch {}
     send("complete", {
       ...finalPayload,
       verdict: _finalVerdictKey,   // canonical-only top-level verdict
