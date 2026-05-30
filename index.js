@@ -4654,6 +4654,22 @@ function canUseSerpBudget(ctx = null) {
 }
 
 /**
+ * Phase 2C.9 — primary-source priority enforcement.
+ *
+ * The single allowed-primary SerpAPI lane is serpShopping (google_shopping
+ * engine). serpAmazon, serpScopedSearch (Poshmark / Mercari / etc.), and
+ * direct URL recovery via google_product are NEVER allowed to consume the
+ * one paid unit when a route-level scan context exists — they can only run
+ * as legacy fallbacks (no context, e.g. background scripts) or when a
+ * route opts in with `ctx.allowNonShoppingPrimary = true`.
+ *
+ * This fixes the live-log race where the parallel Tier B fanout had
+ * serpAmazon win the consume coin-flip first, blocking the better-fit
+ * google_shopping query for the rest of the scan.
+ */
+const SERP_PRIMARY_REASONS = new Set(["serpShopping"]);
+
+/**
  * Public helper — atomically attempt to consume one SerpAPI unit on the
  * current scan's budget. Returns true on success, false on refusal (and
  * logs SERP_BUDGET_BLOCKED with the offending route / query). Cache layers
@@ -4662,6 +4678,22 @@ function canUseSerpBudget(ctx = null) {
 function consumeSerpBudget(reason, callDescriptor = {}) {
   const c = getCurrentSerpBudgetCtx();
   if (!c) return true; // no context = bypass
+
+  // Phase 2C.9: route-level priority gate. serpShopping is the only allowed
+  // primary source unless the route explicitly opted into Amazon-primary.
+  if (!SERP_PRIMARY_REASONS.has(reason) && !c.allowNonShoppingPrimary) {
+    c.blockedExtraCalls = (c.blockedExtraCalls || 0) + 1;
+    console.warn("SERP_BUDGET_BLOCKED", {
+      scanId: c.scanId,
+      route: c.route,
+      query: callDescriptor.query || c.query,
+      reason,
+      reasonForBlock: "non_primary_source_blocked_by_priority",
+      primaryReserved: "serpShopping",
+      ...callDescriptor,
+    });
+    return false;
+  }
   if (SERP_BUDGET_DEV_BYPASS) {
     // Still account in summary so logs are accurate, but do not block.
     const entry = _SERP_BUDGET_REGISTRY.get(c.key) || {
@@ -8747,6 +8779,180 @@ const AIRCRAFT_FAMILY_MATCH = [
   { family: "concorde", tokens: ["concorde"] },
 ];
 
+// ── Phase 2C.9: aircraft manufacturer + family lock ──────────────────────────
+// A380 ≠ 747. Airbus ≠ Boeing. The existing AIRCRAFT_FAMILY_MATCH detects the
+// family but not the manufacturer, so a query like "ANA A380" still got mixed
+// up with Boeing 747 results in production. This map plus FAMILY_TO_MANUFACTURER
+// below produces a clean two-axis lock: manufacturer AND family must match for
+// a listing to enter the comp pool. Tokens are normalizeTitleKey-friendly.
+const AIRCRAFT_MANUFACTURER_MAP = {
+  airbus:    ["airbus", "a380", "a350", "a330", "a321", "a320", "a319", "a318", "a300", "a310", "a340"],
+  boeing:    ["boeing", "b7", "747", "777", "787", "737", "767", "757", "707", "727", "717", "dreamliner", "jumbo jet"],
+  embraer:   ["embraer", "erj", "e jet", "e175", "e190", "e195"],
+  bombardier:["bombardier", "crj", "dash 8", "q400"],
+  atr:       ["atr 42", "atr 72", "atr72", "atr42"],
+  lockheed:  ["lockheed", "constellation", "tristar", "l 1011", "l1011"],
+  mcdonnell: ["mcdonnell", "md 11", "md 80", "md 90", "dc 10", "dc 9", "dc 8"],
+};
+
+const FAMILY_TO_MANUFACTURER = {
+  "787":      "boeing",
+  "777":      "boeing",
+  "747":      "boeing",
+  "737":      "boeing",
+  "767":      "boeing",
+  "757":      "boeing",
+  "a380":     "airbus",
+  "a350":     "airbus",
+  "a330":     "airbus",
+  "a321":     "airbus",
+  "a320":     "airbus",
+  "a319":     "airbus",
+  "a300":     "airbus",
+  "a310":     "airbus",
+  "a340":     "airbus",
+  "concorde": "airbus",
+};
+
+function _detectManufacturerInText(text) {
+  const t = normalizeTitleKey(text || "");
+  for (const [maker, tokens] of Object.entries(AIRCRAFT_MANUFACTURER_MAP)) {
+    if (tokens.some((tok) => t.includes(tok))) return maker;
+  }
+  return null;
+}
+
+// Detect multi-airline / conflicting identity in a vision-emitted query.
+// "ANA Hawaiian Airlines Boeing 747" lists two airline names that are
+// competitors of each other — vision drifted between two readings. Returns
+// { conflict: true, airlines: [...] } when 2+ airlines are present, else null.
+function detectAircraftIdentityConflict(query, identity, variants) {
+  const allText = normalizeTitleKey([
+    query || "",
+    identity?.exactQuery || "",
+    ...(Array.isArray(identity?.searchQueries) ? identity.searchQueries : []),
+    ...(Array.isArray(variants) ? variants : []),
+  ].join(" "));
+  const matched = [];
+  for (const airline of Object.keys(AIRLINE_COMPETITOR_MAP)) {
+    if (titleHasToken(allText, airline)) matched.push(airline);
+  }
+  if (matched.length >= 2) {
+    return { conflict: true, airlines: matched, normalizedText: allText.slice(0, 200) };
+  }
+  return null;
+}
+
+// Build the canonical lock for an aircraft scan. Combines manufacturer, family,
+// scale, and surfaces a conflict flag when the source text is mixed.
+function buildAircraftFamilyLock(query, identity, variants, category) {
+  const ctx = { variants: Array.isArray(variants) ? variants : [], identity: identity || {}, category };
+  const allText = normalizeTitleKey([
+    query || "",
+    identity?.exactQuery || "",
+    ...(Array.isArray(identity?.searchQueries) ? identity.searchQueries : []),
+    ...(Array.isArray(variants) ? variants : []),
+  ].join(" "));
+
+  let family = null;
+  for (const { family: fam, tokens } of AIRCRAFT_FAMILY_MATCH) {
+    if (tokens.some((t) => allText.includes(t))) { family = fam; break; }
+  }
+  const manufacturer = FAMILY_TO_MANUFACTURER[family] || _detectManufacturerInText(allText) || null;
+
+  const conflict = detectAircraftIdentityConflict(query, identity, variants);
+  if (conflict) {
+    console.warn("AIRCRAFT_IDENTITY_CONFLICT", {
+      reason: "multiple_airlines_in_query",
+      airlines: conflict.airlines,
+      query,
+    });
+  }
+
+  // Scale: 1:200, 1/200, 1:400, etc.
+  let scale = null;
+  const scaleMatch = allText.match(/\b1[\s:/](\d{2,4})\b/);
+  if (scaleMatch) scale = `1:${scaleMatch[1]}`;
+
+  return {
+    manufacturer,
+    family,
+    scale,
+    conflict: !!conflict,
+    conflictAirlines: conflict?.airlines || [],
+  };
+}
+
+// Reject listings whose manufacturer OR family disagrees with the scan lock.
+// Cross-manufacturer mismatches (Airbus query → Boeing listing) are ALWAYS
+// rejected. Same-manufacturer cross-family mismatches (Boeing 747 query →
+// Boeing 787 listing) are also rejected. The function never relaxes the
+// family to fill the pool — the user explicitly said better thin-but-honest
+// than padded with wrong family.
+function applyAircraftFamilyLock(items, lock, ctx = {}) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  if (!lock || (!lock.manufacturer && !lock.family)) return items;
+
+  const requiredManufacturer = lock.manufacturer || null;
+  const requiredFamily = lock.family || null;
+  const kept = [];
+  const rejected = [];
+
+  for (const it of items) {
+    const t = normalizeTitleKey(it?.title || "");
+    const listingManufacturer = _detectManufacturerInText(t);
+
+    // Check manufacturer first (the higher-level invariant).
+    if (requiredManufacturer && listingManufacturer && listingManufacturer !== requiredManufacturer) {
+      rejected.push({ item: it, reason: "manufacturer_mismatch", found: listingManufacturer, required: requiredManufacturer });
+      console.warn("AIRCRAFT_FAMILY_LOCK_REJECTED", {
+        title: (it?.title || "").slice(0, 80),
+        reason: "manufacturer_mismatch",
+        requiredManufacturer,
+        foundManufacturer: listingManufacturer,
+      });
+      continue;
+    }
+
+    if (requiredFamily) {
+      // Look for the required family tokens and any rival-family tokens.
+      const requiredFamEntry = AIRCRAFT_FAMILY_MATCH.find((e) => e.family === requiredFamily);
+      const requiredFamHas = requiredFamEntry?.tokens.some((tok) => t.includes(tok)) ?? false;
+      let rivalFamHas = null;
+      for (const entry of AIRCRAFT_FAMILY_MATCH) {
+        if (entry.family === requiredFamily) continue;
+        if (entry.tokens.some((tok) => t.includes(tok))) { rivalFamHas = entry.family; break; }
+      }
+      if (!requiredFamHas && rivalFamHas) {
+        rejected.push({ item: it, reason: "family_mismatch", found: rivalFamHas, required: requiredFamily });
+        console.warn("AIRCRAFT_FAMILY_LOCK_REJECTED", {
+          title: (it?.title || "").slice(0, 80),
+          reason: "family_mismatch",
+          requiredFamily,
+          foundFamily: rivalFamHas,
+        });
+        continue;
+      }
+    }
+
+    kept.push(it);
+  }
+
+  console.log("AIRCRAFT_FAMILY_LOCK_SUMMARY", {
+    query: ctx.query || null,
+    requiredManufacturer,
+    requiredFamily,
+    rawCount: items.length,
+    keptCount: kept.length,
+    rejectedManufacturer: rejected.filter((r) => r.reason === "manufacturer_mismatch").length,
+    rejectedFamily: rejected.filter((r) => r.reason === "family_mismatch").length,
+    finalTopTitles: kept.slice(0, 3).map((it) => it?.title),
+    conflictAirlines: lock.conflict ? lock.conflictAirlines : null,
+  });
+
+  return kept;
+}
+
 // Scans query, variants, and identity for a recognizable aircraft family.
 // Returns { family, source, matchedToken } or null.
 // Only fires when text strongly suggests an aircraft/model context.
@@ -9071,6 +9277,132 @@ try {
   console.warn("AIRCRAFT_MERCH_FILTER_SELFTEST_ERROR", { error: String(_e) });
 }
 
+// ── Phase 2C.9 — Aircraft manufacturer + family lock self-test ───────────────
+// Asserts:
+//   - ANA A380 query rejects Boeing 747 listings (cross-family AND cross-
+//     manufacturer)
+//   - Hawaiian 787 query rejects 747/777/A380 listings
+//   - Boeing 747 query rejects A380 listings (cross-manufacturer)
+//   - "ANA Hawaiian Airlines Boeing 747" → AIRCRAFT_IDENTITY_CONFLICT
+try {
+  const _famCases = [
+    // ANA A380 (Airbus) rejects all Boeing 747 variants
+    { lock: { manufacturer: "airbus", family: "a380" }, title: "ANA Airbus A380 1:400 Sea Turtle JA381A Diecast Model", expectKept: true,  label: "ana_a380_correct" },
+    { lock: { manufacturer: "airbus", family: "a380" }, title: "ANA Boeing 747-400 1:200 Pokemon Model",                expectKept: false, label: "ana_a380_rejects_747" },
+    { lock: { manufacturer: "airbus", family: "a380" }, title: "ANA Boeing 777-300ER 1:400 Diecast",                    expectKept: false, label: "ana_a380_rejects_777" },
+    { lock: { manufacturer: "airbus", family: "a380" }, title: "ANA Boeing 787-9 Dreamliner Diecast Model",             expectKept: false, label: "ana_a380_rejects_787" },
+    // Hawaiian 787 (Boeing) rejects 747 / 777 / A380
+    { lock: { manufacturer: "boeing", family: "787" },  title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast Model",    expectKept: true,  label: "hawaiian_787_correct" },
+    { lock: { manufacturer: "boeing", family: "787" },  title: "Hawaiian Airlines Boeing 747-400 Diecast",              expectKept: false, label: "hawaiian_787_rejects_747" },
+    { lock: { manufacturer: "boeing", family: "787" },  title: "Hawaiian Airlines Boeing 777-300ER Diecast",            expectKept: false, label: "hawaiian_787_rejects_777" },
+    { lock: { manufacturer: "boeing", family: "787" },  title: "Airbus A380 Hawaiian Livery Diecast Model",             expectKept: false, label: "hawaiian_787_rejects_a380" },
+    // Boeing 747 query rejects A380 (cross-manufacturer)
+    { lock: { manufacturer: "boeing", family: "747" },  title: "ANA Boeing 747-400 1:200 Pokemon Model",                expectKept: true,  label: "boeing_747_correct" },
+    { lock: { manufacturer: "boeing", family: "747" },  title: "Airbus A380 Emirates Diecast",                          expectKept: false, label: "boeing_747_rejects_a380" },
+    { lock: { manufacturer: "boeing", family: "747" },  title: "ANA Airbus A380 Sea Turtle Livery",                     expectKept: false, label: "boeing_747_rejects_a380_with_ana" },
+  ];
+  let _famPass = 0;
+  for (const tc of _famCases) {
+    const out = applyAircraftFamilyLock([{ title: tc.title }], tc.lock, { query: "selftest" });
+    const kept = out.length === 1;
+    if (kept === tc.expectKept) {
+      _famPass++;
+    } else {
+      console.warn("AIRCRAFT_FAMILY_LOCK_SELFTEST_FAIL", {
+        label: tc.label,
+        title: tc.title.slice(0, 80),
+        lock: tc.lock,
+        expectedKept: tc.expectKept,
+        gotKept: kept,
+      });
+    }
+  }
+  // Identity conflict detection
+  let _conflictPass = 0;
+  let _conflictTotal = 0;
+  {
+    _conflictTotal++;
+    const c = detectAircraftIdentityConflict("ANA Hawaiian Airlines Boeing 747 diecast model airplane", null, null);
+    if (c && c.conflict && c.airlines.includes("ana") && c.airlines.includes("hawaiian")) _conflictPass++;
+    else console.warn("AIRCRAFT_FAMILY_LOCK_SELFTEST_FAIL", { label: "conflict_ana_hawaiian", got: c });
+  }
+  {
+    _conflictTotal++;
+    const c = detectAircraftIdentityConflict("Hawaiian Airlines Boeing 787-9 Dreamliner", null, null);
+    if (!c) _conflictPass++;
+    else console.warn("AIRCRAFT_FAMILY_LOCK_SELFTEST_FAIL", { label: "no_conflict_single_airline", got: c });
+  }
+  console.log("AIRCRAFT_FAMILY_LOCK_SELFTEST_PASS", {
+    familyLockPassed: _famPass,
+    familyLockTotal: _famCases.length,
+    conflictPassed: _conflictPass,
+    conflictTotal: _conflictTotal,
+  });
+} catch (_e) {
+  console.warn("AIRCRAFT_FAMILY_LOCK_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 2C.9 — Cross-route SerpAPI budget key reuse self-test ──────────────
+// Asserts: a scanId on /market/search/stream produces the same budget key as
+// a follow-up /market/search WITHOUT scanId when the same imageHash is supplied
+// (key-derivation falls back from scanId → imageHash). Also asserts that
+// `_makeBudgetKey` produces an "img:" prefix when no scanId is present, so the
+// existing budget entry from the stream call is found by the follow-up.
+try {
+  let _crossPass = 0;
+  let _crossTotal = 0;
+
+  // Same scanId from both routes → same key.
+  _crossTotal++;
+  const kA = _makeBudgetKey({ scanId: "shared_scan_X", imageHash: "h1", query: "q", userId: "u" });
+  const kB = _makeBudgetKey({ scanId: "shared_scan_X", imageHash: null, query: "q", userId: "u" });
+  if (kA === kB && kA.startsWith("scan:shared_scan_X")) _crossPass++;
+  else console.warn("CROSS_ROUTE_KEY_SELFTEST_FAIL", { case: "same_scanId", kA, kB });
+
+  // Stream has scanId, follow-up has only imageHash → DIFFERENT keys
+  // (scanId wins on stream). This is the FAIL case that motivated the
+  // frontend fix where /market/search now also sends the same scanId.
+  _crossTotal++;
+  const kStreamScan = _makeBudgetKey({ scanId: "S1", imageHash: "h2", query: "q", userId: "u" });
+  const kFollowImg  = _makeBudgetKey({ scanId: null,  imageHash: "h2", query: "q", userId: "u" });
+  if (kStreamScan.startsWith("scan:S1") && kFollowImg.startsWith("img:h2") && kStreamScan !== kFollowImg) {
+    _crossPass++;
+  } else {
+    console.warn("CROSS_ROUTE_KEY_SELFTEST_FAIL", { case: "mismatched_routes", kStreamScan, kFollowImg });
+  }
+
+  // Both routes pass scanId → keys collapse → second call sees the existing
+  // budget entry, can't consume a second time.
+  _crossTotal++;
+  const _testCtxSeed = { scanId: "cross_route_test_3", query: "q", userId: "u", route: "/test" };
+  const _runWithCtx = (seed) => new Promise((resolve) => {
+    const ctx = { ...seed, max: 1, callsUsed: 0, blockedExtraCalls: 0, cacheHit: false, key: _makeBudgetKey(seed) };
+    SERP_BUDGET_STORE.run(ctx, () => Promise.resolve().then(() => resolve(ctx)));
+  });
+  Promise.all([
+    _runWithCtx({ ..._testCtxSeed, route: "/stream" }).then((ctx) => consumeSerpBudget("serpShopping", { query: "q" })),
+    _runWithCtx({ ..._testCtxSeed, route: "/regular" }).then((ctx) => consumeSerpBudget("serpShopping", { query: "q" })),
+  ]).then(([a, b]) => {
+    // First consume must succeed; second must fail (shared budget).
+    if (a === true && b === false) {
+      _crossPass++;
+    } else {
+      console.warn("CROSS_ROUTE_KEY_SELFTEST_FAIL", { case: "shared_budget_collapse", first: a, second: b });
+    }
+    setImmediate(() => {
+      console.log("CROSS_ROUTE_KEY_SELFTEST_PASS", { passed: _crossPass, total: _crossTotal });
+      // Cleanup
+      for (const k of Array.from(_SERP_BUDGET_REGISTRY.keys())) {
+        if (k.startsWith("scan:cross_route_test_") || k.startsWith("scan:shared_scan_") || k.startsWith("scan:S1") || k.startsWith("img:h2")) {
+          _SERP_BUDGET_REGISTRY.delete(k);
+        }
+      }
+    });
+  });
+} catch (_e) {
+  console.warn("CROSS_ROUTE_KEY_SELFTEST_ERROR", { error: String(_e) });
+}
+
 // Returns true when a listing title has at least one strong signal proving it matches
 // the specific aircraft variant being scanned (family/maker/scale/registration).
 // Generic phrases like "model airplane", "collection", "gift" are intentionally excluded.
@@ -9341,14 +9673,24 @@ function resolveAircraftCachePolicy(query, items, scannedPrice, cacheKind) {
 // Pre-payload guard: runs airline identity lock + aircraft tier filter BEFORE
 // provisional / live_refresh payloads are built in /market/search/stream.
 // Only engages for aircraft/airline queries; no-ops for everything else.
-function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind) {
+function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind, identityFromBody = null, variantsFromBody = null, categoryFromBody = null) {
   if (!Array.isArray(items) || items.length === 0) return items;
   const q = normalizeTitleKey(query || "");
   if (!isAircraftModelQuery(q) && !detectAirlineLockInQuery(q)) return items;
 
   const beforeCount = items.length;
 
-  let filtered = filterRelevantListings(query, items);
+  // Phase 2C.9 — strict manufacturer + family lock runs FIRST so cross-
+  // manufacturer mismatches (Airbus A380 query → Boeing 747 listing) and
+  // cross-family mismatches (Boeing 747 query → Boeing 787 listing) are
+  // dropped before any tier / relevance / merch filter sees them.
+  let filtered = items;
+  const _aircraftLock = buildAircraftFamilyLock(query, identityFromBody, variantsFromBody, categoryFromBody);
+  if (_aircraftLock && (_aircraftLock.manufacturer || _aircraftLock.family)) {
+    filtered = applyAircraftFamilyLock(filtered, _aircraftLock, { query });
+  }
+
+  filtered = filterRelevantListings(query, filtered);
   filtered = applyAircraftModelTierFilter(query, filtered, scannedPrice);
 
   const afterCount = filtered.length;
@@ -25811,23 +26153,41 @@ const _budgetScanIdEarly = safeStr(req.body?.scanId, 64) || null;
 const _budgetImageHashEarly =
   safeStr(req.body?.imageHash || req.body?.scanAsset?.hash || req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128) || null;
 const _budgetUserIdEarly = safeStr(req.body?.userId || req.query?.userId, 64) || null;
-SERP_BUDGET_STORE.enterWith({
-  scanId: _budgetScanIdEarly,
-  imageHash: _budgetImageHashEarly,
-  query: rawQuery,
-  userId: _budgetUserIdEarly,
-  route: "/market/search",
-  max: SERP_BUDGET_MAX,
-  callsUsed: 0,
-  blockedExtraCalls: 0,
-  cacheHit: false,
-  key: _makeBudgetKey({
+{
+  const _budgetKey = _makeBudgetKey({
     scanId: _budgetScanIdEarly,
     imageHash: _budgetImageHashEarly,
     query: rawQuery,
     userId: _budgetUserIdEarly,
-  }),
-});
+  });
+  SERP_BUDGET_STORE.enterWith({
+    scanId: _budgetScanIdEarly,
+    imageHash: _budgetImageHashEarly,
+    query: rawQuery,
+    userId: _budgetUserIdEarly,
+    route: "/market/search",
+    max: SERP_BUDGET_MAX,
+    callsUsed: 0,
+    blockedExtraCalls: 0,
+    cacheHit: false,
+    key: _budgetKey,
+  });
+  console.log("SCAN_BUDGET_KEY_CREATED", {
+    route: "/market/search",
+    key: _budgetKey,
+    keyKind: _budgetScanIdEarly
+      ? "scanId"
+      : _budgetImageHashEarly ? "imageHash" : "queryUser",
+    scanId: _budgetScanIdEarly,
+    imageHashPrefix: _budgetImageHashEarly ? _budgetImageHashEarly.slice(0, 12) : null,
+    query: rawQuery,
+  });
+  console.log("SERP_PRIMARY_SOURCE_SELECTED", {
+    route: "/market/search",
+    primary: "serpShopping",
+    blockedSecondary: ["serpAmazon", "serpScopedSearch", "direct_url_recovery_google_product"],
+  });
+}
 // Capture a reference so the response-finish handler can emit the summary
 // regardless of which exit path the route takes (success, error, early return).
 const _budgetCtxRef_search = getCurrentSerpBudgetCtx();
@@ -26902,23 +27262,41 @@ app.post("/market/search/stream", async (req, res) => {
     const _budgetImageHashStream =
       safeStr(req.body?.imageHash || req.body?.scanAsset?.hash || req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128) || null;
     const _budgetUserIdStream = safeStr(req.body?.userId || req.query?.userId, 64) || null;
-    SERP_BUDGET_STORE.enterWith({
-      scanId: _budgetScanIdStream,
-      imageHash: _budgetImageHashStream,
-      query: rawQuery,
-      userId: _budgetUserIdStream,
-      route: "/market/search/stream",
-      max: SERP_BUDGET_MAX,
-      callsUsed: 0,
-      blockedExtraCalls: 0,
-      cacheHit: false,
-      key: _makeBudgetKey({
+    {
+      const _budgetKeyStream = _makeBudgetKey({
         scanId: _budgetScanIdStream,
         imageHash: _budgetImageHashStream,
         query: rawQuery,
         userId: _budgetUserIdStream,
-      }),
-    });
+      });
+      SERP_BUDGET_STORE.enterWith({
+        scanId: _budgetScanIdStream,
+        imageHash: _budgetImageHashStream,
+        query: rawQuery,
+        userId: _budgetUserIdStream,
+        route: "/market/search/stream",
+        max: SERP_BUDGET_MAX,
+        callsUsed: 0,
+        blockedExtraCalls: 0,
+        cacheHit: false,
+        key: _budgetKeyStream,
+      });
+      console.log("SCAN_BUDGET_KEY_CREATED", {
+        route: "/market/search/stream",
+        key: _budgetKeyStream,
+        keyKind: _budgetScanIdStream
+          ? "scanId"
+          : _budgetImageHashStream ? "imageHash" : "queryUser",
+        scanId: _budgetScanIdStream,
+        imageHashPrefix: _budgetImageHashStream ? _budgetImageHashStream.slice(0, 12) : null,
+        query: rawQuery,
+      });
+      console.log("SERP_PRIMARY_SOURCE_SELECTED", {
+        route: "/market/search/stream",
+        primary: "serpShopping",
+        blockedSecondary: ["serpAmazon", "serpScopedSearch", "direct_url_recovery_google_product"],
+      });
+    }
     const _budgetCtxRef_stream = getCurrentSerpBudgetCtx();
     res.on("finish", () => {
       try {
