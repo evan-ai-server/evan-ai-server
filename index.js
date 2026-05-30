@@ -3807,6 +3807,153 @@ function isUsableVisionQuery(query) {
   return true;
 }
 
+// ── Phase 2C.6: stronger generic-query detector ───────────────────────────────
+// isGarbageQuery only catches single-word literal junk ("item", "product",
+// "thing"). It cannot catch multi-word vague phrases like "item for",
+// "economy item for", "toy item", "model toy", "thing for sale". A real
+// scan that emitted "item for" was fanned out to SerpAPI and produced 40
+// unrelated results (Bluey toys, baby gear, etc.); a result-aware refresh
+// then mutated the query into "item bluey" since eBay's first hit was a
+// Bluey product. We need a stricter guard at the market-search entry.
+//
+// Rules:
+//   1. Anything isGarbageQuery rejects → reject here too.
+//   2. Tokenize. A token is "meaningful" iff it has ≥2 chars AND is not
+//      in the GENERIC_TOKEN_SET (which lists adjectives/prepositions/
+//      filler nouns that contribute zero search specificity).
+//   3. A token with a digit+letter mix ("787-9" → "7879", "rb3025",
+//      "yz450f", "next2") counts as a STRONG SIGNAL — SKU/model codes
+//      are evidence even when alone.
+//   4. Pass iff (hasStrongSignal) OR (meaningfulCount >= 2).
+//   5. Otherwise reject as generic.
+//
+// Examples that REJECT: "item for", "economy item for", "toy", "model",
+// "product object", "thing for sale", "stuff", "economy item".
+// Examples that PASS: "Hawaiian Airlines Boeing 787-9 model airplane"
+// (strong signal "787-9"), "Air Jordan 1 Low OG Year of the Rabbit"
+// (many meaningful tokens), "iPhone 13" (two meaningful tokens).
+const GENERIC_TOKEN_SET = new Set([
+  // Filler nouns
+  "item", "items", "object", "objects", "product", "products",
+  "thing", "things", "stuff", "goods", "merchandise", "wares",
+  "piece", "pieces", "model", "models", "unit", "units",
+  "toy", "toys", "set", "kit", "pack", "bundle",
+  // Adjectives that add no specificity
+  "economy", "basic", "standard", "generic", "plain", "simple",
+  "regular", "ordinary", "common", "general", "misc", "miscellaneous",
+  "unknown", "untitled", "various", "assorted",
+  // Prepositions / conjunctions / articles
+  "for", "of", "the", "an", "with", "without", "and", "or",
+  "to", "from", "in", "on", "at", "by",
+  // Condition / commerce filler
+  "new", "used", "good", "best", "cheap", "tier", "grade",
+  "sale", "listing", "consumer", "resale", "online", "value",
+  // Low-specificity catch-alls
+  "type", "kind", "style", "form", "version",
+]);
+
+function isGenericVisionQuery(q) {
+  const raw = String(q || "").trim();
+  if (!raw) return true;
+  const lower = raw.toLowerCase();
+  if (isGarbageQuery(lower)) return true;
+
+  const rawTokens = lower.split(/\s+/).filter(Boolean);
+  if (rawTokens.length === 0) return true;
+
+  let meaningful = 0;
+  let hasStrongSignal = false;
+  for (const tok of rawTokens) {
+    const clean = tok.replace(/[^a-z0-9]/g, "");
+    if (clean.length < 2) continue;
+
+    // Strong signal: SKU / model-code style (digits + letters).
+    if (/\d/.test(clean) && /[a-z]/.test(clean)) {
+      hasStrongSignal = true;
+      meaningful++;
+      continue;
+    }
+
+    // Generic word → not meaningful.
+    if (GENERIC_TOKEN_SET.has(clean)) continue;
+
+    meaningful++;
+  }
+
+  if (hasStrongSignal) return false;
+  if (meaningful < 2) return true;
+  return false;
+}
+
+// ── Phase 2C.6: identity-driven query recovery ────────────────────────────────
+// When the inbound query is generic, before we either search marketplaces
+// (which will produce garbage) or hard-block, try to recover a usable query
+// from the visionIdentity payload the client sent. Each strategy is checked
+// in order; the first to produce a non-generic query wins. Returns either
+// { query, source } or null if every strategy fails. The "source" string
+// goes into the VISION_QUERY_REPAIRED log so we can see which lane caught
+// the recovery in production.
+function recoverQueryFromIdentity(identity, currentQuery, category, variants) {
+  const tryQuery = (raw) => {
+    const norm = normalizeQuery(raw || "");
+    if (!norm) return null;
+    if (isGenericVisionQuery(norm)) return null;
+    return norm;
+  };
+
+  // 1. Vision's own canonical query.
+  let candidate = tryQuery(identity && identity.exactQuery);
+  if (candidate) return { query: candidate, source: "identity_exactQuery" };
+
+  // 2. Vision-suggested search queries (ranked array).
+  if (identity && Array.isArray(identity.searchQueries)) {
+    for (const sq of identity.searchQueries) {
+      candidate = tryQuery(sq);
+      if (candidate) return { query: candidate, source: "identity_searchQueries" };
+    }
+  }
+
+  // 3. Brand + model synthesis (e.g. "Hawaiian Airlines 787-9").
+  if (identity && identity.brand && identity.model) {
+    candidate = tryQuery(`${identity.brand} ${identity.model}`);
+    if (candidate) return { query: candidate, source: "identity_brand_model" };
+  }
+
+  // 4. Brand + category synthesis.
+  if (identity && identity.brand && (identity.category || category)) {
+    candidate = tryQuery(`${identity.brand} ${identity.category || category}`);
+    if (candidate) return { query: candidate, source: "identity_brand_category" };
+  }
+
+  // 5. Category-specific seed. Aircraft / model-airplane scans get an
+  //    explicit "model airplane" seed plus any airline / scale hint, so
+  //    a Hawaiian Airlines 787 scan doesn't fan out as "item for" even
+  //    when vision returned nothing structured.
+  const catRaw = String((identity && identity.category) || category || "").toLowerCase();
+  const queryRaw = String(currentQuery || "").toLowerCase();
+  const looksAircraft =
+    /aircraft|airplane|airline|aviation|boeing|airbus|jet/i.test(catRaw) ||
+    /aircraft|airplane|airline|aviation|boeing|airbus|jet/i.test(queryRaw);
+  if (looksAircraft) {
+    const airlineHint = (identity && (identity.airline || identity.subBrand)) || "";
+    const scaleHint   = (identity && identity.scale) || "";
+    const seedParts   = ["model airplane", "diecast", airlineHint, scaleHint]
+      .filter((s) => s && String(s).trim().length > 0);
+    candidate = tryQuery(seedParts.join(" "));
+    if (candidate) return { query: candidate, source: "category_aircraft_seed" };
+  }
+
+  // 6. Inbound variants[] (client sometimes ships specific phrasing here).
+  if (Array.isArray(variants)) {
+    for (const v of variants) {
+      candidate = tryQuery(v);
+      if (candidate) return { query: candidate, source: "variants" };
+    }
+  }
+
+  return null;
+}
+
 function inferVisionCategory(q) {
   const s = String(q || "").toLowerCase();
 
@@ -9061,6 +9208,72 @@ try {
   console.log("GENERIC_VARIANT_SELFTEST_PASS", { passed: _varPass, total: _varTests.length });
 } catch (_e) {
   console.warn("GENERIC_VARIANT_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 2C.6 — Generic-query guard self-test ───────────────────────────────
+// Asserts the bad-query detector catches the exact vague phrases seen in
+// production scans ("item for", "economy item for") AND keeps legitimate
+// brand+model queries flowing. Fails loudly at boot so a regression in
+// either direction can never reach a real device.
+try {
+  const _genericCases = [
+    // Should REJECT (generic / vague)
+    { q: "item for",                                              expect: true,  label: "production_item_for" },
+    { q: "economy item for",                                      expect: true,  label: "production_economy_item_for" },
+    { q: "toy item",                                              expect: true,  label: "two_generic_tokens" },
+    { q: "product",                                               expect: true,  label: "single_garbage_word" },
+    { q: "object",                                                expect: true,  label: "single_object" },
+    { q: "thing",                                                 expect: true,  label: "single_thing" },
+    { q: "toy",                                                   expect: true,  label: "single_toy" },
+    { q: "model",                                                 expect: true,  label: "single_model" },
+    { q: "",                                                      expect: true,  label: "empty_string" },
+    { q: "  ",                                                    expect: true,  label: "whitespace_only" },
+    { q: "the for of",                                            expect: true,  label: "stopwords_only" },
+    { q: "basic standard item",                                   expect: true,  label: "three_generic_tokens" },
+    // Should PASS (real specific scans)
+    { q: "Hawaiian Airlines Boeing 787-9 model airplane",         expect: false, label: "production_hawaiian_787" },
+    { q: "Air Jordan 1 Low OG Year of the Rabbit",                expect: false, label: "production_jordan_yotr" },
+    { q: "iPhone 13 Pro Max",                                     expect: false, label: "iphone_13_pro_max" },
+    { q: "Nike Vaporfly Next% 2",                                 expect: false, label: "vaporfly_next" },
+    { q: "Patagonia fleece jacket",                               expect: false, label: "two_specific_tokens" },
+    { q: "Ray-Ban RB3025",                                        expect: false, label: "rayban_sku" },
+  ];
+  let _gqPass = 0;
+  for (const tc of _genericCases) {
+    const got = isGenericVisionQuery(tc.q);
+    if (got === tc.expect) {
+      _gqPass++;
+    } else {
+      console.warn("GENERIC_QUERY_GUARD_SELFTEST_FAIL", {
+        label: tc.label,
+        query: tc.q,
+        expected: tc.expect,
+        got,
+      });
+    }
+  }
+  // Spot-check identity recovery: aircraft path should rescue "item for"
+  // when given a Hawaiian Airlines identity. This is the exact production
+  // scenario from the captured logs.
+  const _recovered = recoverQueryFromIdentity(
+    { brand: "Hawaiian Airlines", model: "Boeing 787-9", category: "model airplane" },
+    "item for",
+    "model airplane",
+    null
+  );
+  const _recoveredOk = !!_recovered && !isGenericVisionQuery(_recovered.query);
+  if (!_recoveredOk) {
+    console.warn("GENERIC_QUERY_GUARD_SELFTEST_FAIL", {
+      label: "recovery_hawaiian_787",
+      gotRecovered: _recovered,
+    });
+  }
+  console.log("GENERIC_QUERY_GUARD_SELFTEST_PASS", {
+    passed: _gqPass + (_recoveredOk ? 1 : 0),
+    total: _genericCases.length + 1,
+  });
+} catch (_e) {
+  console.warn("GENERIC_QUERY_GUARD_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // ── SERP fanout query builder ─────────────────────────────────────────────────
@@ -24878,6 +25091,31 @@ async function runResultAwareRefinement({
   let refinedSearchUsed = false;
   const warnings       = [];
 
+  // ── Phase 2C.6: refresh guard ───────────────────────────────────────────
+  // The refinement loop pulls the first plausible signal out of the live
+  // results and turns it into a second SerpAPI query. If the INITIAL query
+  // was generic ("item for", "economy item for"), the live results are
+  // already garbage (Bluey toys, baby gear), and using their first item as
+  // the new query produces nonsense like "item bluey". Short-circuit here:
+  // return original items unchanged when the initial query was generic, so
+  // the route-level guard's empty / repair response is what the user sees.
+  if (isGenericVisionQuery(initialQuery)) {
+    console.warn("RESULT_AWARE_REFRESH_BLOCKED_GENERIC", {
+      initialQuery,
+      reason: "generic_query_no_refinement",
+    });
+    return {
+      refinedQuery: initialQuery,
+      refinedItems: items,
+      resultConsensus: null,
+      crossCheck: { type: "skipped_generic", warnings: [] },
+      refinedSearchUsed: false,
+      warnings: ["initial_query_generic_no_refinement"],
+      confidenceV2: visionConfidence || 0,
+      initialQuery,
+    };
+  }
+
   // Phase 2+3: Extract signals + build consensus (check cache first)
   const consensusCacheKey = `rfc:${imageHash || ""}:${normalizeQuery(initialQuery)}`;
   let resultConsensus = RESULT_CONSENSUS_CACHE.get(consensusCacheKey) || null;
@@ -25012,6 +25250,54 @@ if (
   visionIdentity.searchQueries.length
 ) {
   query = normalizeQuery(visionIdentity.searchQueries[0]);
+}
+
+// ── Phase 2C.6: generic-query guard ──────────────────────────────────────────
+// The legacy isGarbageQuery only catches single-word junk. A real scan
+// emitted "item for" → SerpAPI returned 40 unrelated results → a result-
+// aware refresh then mutated it into "item bluey". Block multi-word vague
+// phrases at the route entry: try identity-driven recovery first, and if
+// no recovery succeeds, short-circuit with empty results so the UI shows
+// a clean retry state instead of garbage. The pre-recovery query is
+// reported in VISION_QUERY_REJECTED_GENERIC for debugging.
+if (isGenericVisionQuery(query)) {
+  const _origGeneric = query;
+  console.warn("VISION_QUERY_REJECTED_GENERIC", {
+    route: req.path,
+    query: _origGeneric,
+    hasIdentity: !!visionIdentity,
+  });
+  const _recovered = recoverQueryFromIdentity(
+    visionIdentity,
+    _origGeneric,
+    req.body?.category || (visionIdentity && visionIdentity.category) || null,
+    Array.isArray(req.body?.variants) ? req.body.variants : null
+  );
+  if (_recovered) {
+    query = _recovered.query;
+    console.log("VISION_QUERY_REPAIRED", {
+      route: req.path,
+      from: _origGeneric,
+      to: query,
+      source: _recovered.source,
+    });
+  } else {
+    console.warn("MARKET_SEARCH_BLOCKED_GENERIC_QUERY", {
+      route: req.path,
+      query: _origGeneric,
+      reason: "no_identity_recovery",
+    });
+    return res.status(200).json({
+      ok: false,
+      error: "scan_too_vague",
+      query: _origGeneric,
+      blocked: "generic_query",
+      items: [],
+      metaItems: [],
+      message:
+        "We couldn't identify the item clearly enough to search marketplaces. Try a sharper photo or add an item hint.",
+    });
+  }
 }
 
 const visualMatchQueries = extractVisualMatchQueries(req.body?.visualMatches);
@@ -25940,6 +26226,48 @@ app.post("/market/search/stream", async (req, res) => {
       query = normalizeQuery(visionIdentity.exactQuery);
     if ((!query || isGarbageQuery(query)) && Array.isArray(visionIdentity?.searchQueries) && visionIdentity.searchQueries.length)
       query = normalizeQuery(visionIdentity.searchQueries[0]);
+
+    // ── Phase 2C.6: generic-query guard (stream variant) ───────────────────
+    // Same logic as /market/search but emits an SSE error event instead of
+    // a JSON response, so the streaming client gets a clean termination
+    // signal it can render as a "scan too vague — try again" state.
+    if (isGenericVisionQuery(query)) {
+      const _origGeneric = query;
+      console.warn("VISION_QUERY_REJECTED_GENERIC", {
+        route: req.path,
+        query: _origGeneric,
+        hasIdentity: !!visionIdentity,
+      });
+      const _recovered = recoverQueryFromIdentity(
+        visionIdentity,
+        _origGeneric,
+        req.body?.category || (visionIdentity && visionIdentity.category) || null,
+        Array.isArray(req.body?.variants) ? req.body.variants : null
+      );
+      if (_recovered) {
+        query = _recovered.query;
+        console.log("VISION_QUERY_REPAIRED", {
+          route: req.path,
+          from: _origGeneric,
+          to: query,
+          source: _recovered.source,
+        });
+      } else {
+        console.warn("MARKET_SEARCH_BLOCKED_GENERIC_QUERY", {
+          route: req.path,
+          query: _origGeneric,
+          reason: "no_identity_recovery",
+        });
+        send("error", {
+          code: "GENERIC_QUERY_BLOCKED",
+          query: _origGeneric,
+          message:
+            "We couldn't identify the item clearly enough to search marketplaces. Try a sharper photo or add an item hint.",
+        });
+        endStream();
+        return;
+      }
+    }
 
     if (!query) { send("error", { code: "NO_QUERY" }); endStream(); return; }
 
@@ -27098,6 +27426,54 @@ if (
   visionIdentity.searchQueries.length
 ) {
   query = normalizeQuery(visionIdentity.searchQueries[0]);
+}
+
+// ── Phase 2C.6: generic-query guard ──────────────────────────────────────────
+// The legacy isGarbageQuery only catches single-word junk. A real scan
+// emitted "item for" → SerpAPI returned 40 unrelated results → a result-
+// aware refresh then mutated it into "item bluey". Block multi-word vague
+// phrases at the route entry: try identity-driven recovery first, and if
+// no recovery succeeds, short-circuit with empty results so the UI shows
+// a clean retry state instead of garbage. The pre-recovery query is
+// reported in VISION_QUERY_REJECTED_GENERIC for debugging.
+if (isGenericVisionQuery(query)) {
+  const _origGeneric = query;
+  console.warn("VISION_QUERY_REJECTED_GENERIC", {
+    route: req.path,
+    query: _origGeneric,
+    hasIdentity: !!visionIdentity,
+  });
+  const _recovered = recoverQueryFromIdentity(
+    visionIdentity,
+    _origGeneric,
+    req.body?.category || (visionIdentity && visionIdentity.category) || null,
+    Array.isArray(req.body?.variants) ? req.body.variants : null
+  );
+  if (_recovered) {
+    query = _recovered.query;
+    console.log("VISION_QUERY_REPAIRED", {
+      route: req.path,
+      from: _origGeneric,
+      to: query,
+      source: _recovered.source,
+    });
+  } else {
+    console.warn("MARKET_SEARCH_BLOCKED_GENERIC_QUERY", {
+      route: req.path,
+      query: _origGeneric,
+      reason: "no_identity_recovery",
+    });
+    return res.status(200).json({
+      ok: false,
+      error: "scan_too_vague",
+      query: _origGeneric,
+      blocked: "generic_query",
+      items: [],
+      metaItems: [],
+      message:
+        "We couldn't identify the item clearly enough to search marketplaces. Try a sharper photo or add an item hint.",
+    });
+  }
 }
 
 const visualMatchQueries = extractVisualMatchQueries(req.body?.visualMatches);
