@@ -8644,13 +8644,101 @@ const AIRCRAFT_TOY_TERMS = [
   "pocket plane", "foam plane", "kids toy",
 ];
 
-// Returns { tier: "premium_model" | "generic_toy" | "unknown_model", reasons, winningTerm }
-// Toy terms are checked FIRST so explicit toy/pullback/playset signals always
-// override generic model terms. "airplane model pullback" → generic_toy, not
-// premium_model. Strong brand signals (GeminiJets, 1:400, diecast) are only
-// premium when no toy terms are present.
+// ── Phase 2C.7: aircraft-merch terms ──────────────────────────────────────────
+// Apparel / decor / accessories that ride on the airline/aircraft theme but
+// are NOT physical model aircraft. A live scan of a Hawaiian Airlines 787
+// diecast model fanned out and returned the right airline + family, but the
+// result pool also contained Hawaiian shirts, Redbubble stickers, phone cases,
+// and pillow throws. Those items contaminate the median (a $22 t-shirt pulls
+// the median far below the $70-130 actual model price band) and corrupt the
+// verdict math. Reject them outright when the scan is for a physical model.
+// Phrases are short and matched as substrings of the normalized title; the
+// source-name set below is a secondary signal for merch-only marketplaces.
+const AIRCRAFT_MERCH_TERMS = [
+  // Apparel
+  "shirt", "t-shirt", "t shirt", "tshirt", "tee shirt",
+  "hoodie", "sweatshirt", "sweater", "pullover",
+  "jacket", "coat", "vest",
+  "polo", "tank top", "long sleeve", "short sleeve",
+  "hat", "cap", "beanie", "visor",
+  "sock", "socks", "pajama", "pajamas", "pyjama",
+  "swimsuit", "swimwear", "boardshort", "swim trunk",
+  "underwear", "boxer", "brief",
+  "scarf", "tie clip", "necktie", "bandana",
+  "graphic tee", "apparel", "clothing", "wearable",
+  // Wall decor / posters / stickers
+  "poster", "print", "art print", "wall art", "wall decor",
+  "canvas print", "canvas wall", "framed print",
+  "photo print", "photograph print",
+  "sticker", "stickers", "decal", "decals", "vinyl decal", "die-cut sticker",
+  "magnet", "fridge magnet", "refrigerator magnet",
+  "patch", "iron-on", "iron on patch",
+  "pin", "lapel pin", "enamel pin", "button pin",
+  "ornament", "christmas ornament", "tree ornament",
+  // Cases / drinkware / accessories
+  "phone case", "iphone case", "phone cover", "case for iphone",
+  "case for samsung", "samsung case",
+  "laptop sleeve", "laptop case", "tablet case", "tablet cover",
+  "ipad case",
+  "mug", "coffee mug", "ceramic mug", "travel mug",
+  "tumbler", "water bottle", "drinkware",
+  "shot glass", "pint glass",
+  "coaster", "coasters", "coaster set",
+  "keychain", "key chain", "key ring", "lanyard",
+  "bookmark", "bookmarks",
+  // Soft goods
+  "blanket", "throw blanket", "fleece blanket",
+  "pillow", "pillow cover", "pillow case", "throw pillow", "cushion cover",
+  "duvet", "duvet cover", "bedspread",
+  "towel", "beach towel", "bath towel",
+  "tapestry",
+  // Bags that are merch (not luggage)
+  "tote bag", "drawstring bag", "pouch", "makeup bag",
+  // Catch-all retail merch phrases
+  "merchandise",
+];
+
+// Marketplaces / sources that sell ~exclusively print-on-demand merch. Used
+// as a secondary signal so a title without an obvious apparel term still
+// gets rejected when the source itself is merch-only.
+const AIRCRAFT_MERCH_SOURCES = new Set([
+  "redbubble", "society6", "society 6", "teepublic", "tee public",
+  "zazzle", "spreadshirt", "cafepress", "cafe press",
+  "threadless", "etsy print", "merch shop",
+]);
+
+// Returns { tier: "premium_model" | "generic_toy" | "merch" | "unknown_model", reasons, winningTerm }
+// Phase 2C.7 — added "merch" tier. Apparel / decor / accessories (Hawaiian
+// shirts, Redbubble stickers, phone cases, pillow throws, etc.) are checked
+// FIRST so a "Hawaiian Airlines Boeing 787 Dreamliner Hawaiian Shirt" never
+// gets classified as a premium model — even though it contains "Hawaiian
+// Airlines" and "Boeing 787" and would otherwise match the family lock.
+// Toy terms are checked SECOND (after merch) so a "kids airplane t-shirt"
+// is correctly recognized as apparel, not a toy. Strong brand signals
+// (GeminiJets, 1:400, diecast) are only premium when no merch/toy term hit.
 function classifyAircraftModelListing(item) {
   const t = normalizeTitleKey(item?.title || "");
+  const sourceRaw = String((item && (item.source || item.store)) || "").toLowerCase().trim();
+
+  // Pass 0 — merch / apparel / decor. Checked first so the apparel reading
+  // always wins over toy / premium / family signals. A merch title in a
+  // premium-aircraft scan is contamination and must be dropped before the
+  // median is computed.
+  for (const term of AIRCRAFT_MERCH_TERMS) {
+    if (t.includes(normalizeTitleKey(term))) {
+      return { tier: "merch", reasons: [`merch_title:${term}`], winningTerm: term };
+    }
+  }
+  // Merch-only marketplace detection (Redbubble / Society6 / Zazzle / etc.).
+  // Title may not include an obvious apparel word ("Hawaiian Airlines Boeing
+  // 787 Dreamliner Photo" from Redbubble is a print, not a model).
+  if (sourceRaw) {
+    for (const src of AIRCRAFT_MERCH_SOURCES) {
+      if (sourceRaw.includes(src)) {
+        return { tier: "merch", reasons: [`merch_source:${src}`], winningTerm: src };
+      }
+    }
+  }
 
   // Pass 1: toy terms win unconditionally (even over diecast/scale brand signals).
   for (const term of AIRCRAFT_TOY_TERMS) {
@@ -8704,6 +8792,60 @@ try {
   }
 } catch (_e) {
   console.warn("AIRCRAFT_CLASSIFIER_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 2C.7 — aircraft merch-filter self-test ─────────────────────────────
+// Asserts the new merch tier catches apparel / decor / accessories that
+// rode through previously as "unknown_model" and contaminated the median.
+// Cases mirror the contamination seen in the production Hawaiian Airlines
+// 787 scan logs (shirts, Redbubble stickers, Aviation400 model passes).
+// Fails loudly at boot so a regression in either direction is caught
+// before any device sees it.
+try {
+  const _merchCases = [
+    // Should classify as merch (REJECTED in premium scans)
+    { title: "Hawaiian Airlines Boeing 787 9 Dreamliner Hawaiian Shirt Hawaiian",                                                                  expect: "merch", label: "hawaiian_airline_shirt" },
+    { title: "United Airlines Boeing 787 9 Dreamliner Hawaiian Shirt Hawaiian",                                                                    expect: "merch", label: "united_airline_shirt" },
+    { title: "Airlines Boeing 787 9 Dreamliner Short Sleeve Hawaiian Shirt",                                                                       expect: "merch", label: "generic_short_sleeve_shirt" },
+    { title: "Hawaiian Airlines Boeing 787 Dreamliner Hawaiian Airlines Sticker",                                                                  expect: "merch", label: "redbubble_sticker_title" },
+    { title: "Hawaiian Airlines Boeing 787 Dreamliner Hawaiian Airlines Poster",                                                                   expect: "merch", label: "redbubble_poster_title" },
+    { title: "Hawaiian Airlines Boeing 787 Dreamliner Hawaiian Airlines Phone Case",                                                               expect: "merch", label: "phone_case_title" },
+    { title: "Hawaiian Airlines Boeing 787 Throw Pillow",                                                                                          expect: "merch", label: "throw_pillow_title" },
+    { title: "Hawaiian Airlines Boeing 787 Coffee Mug",                                                                                            expect: "merch", label: "coffee_mug_title" },
+    // Source-only merch (title is generic) — caught via AIRCRAFT_MERCH_SOURCES.
+    { title: "Boeing 787 Dreamliner Photo",                              source: "Redbubble",   expect: "merch", label: "redbubble_source_only" },
+    { title: "Hawaiian Airlines 787 Print",                              source: "Society6",    expect: "merch", label: "society6_source_only" },
+    // Should classify as premium_model (KEPT)
+    { title: "Hawaiian Airlines 1:400 Scale Boeing 787-9 Diecast Model - Geminijets",                                                              expect: "premium_model", label: "geminijets_1_400_diecast" },
+    { title: "NG Models 1:400 Hawaiian Airlines Boeing 787-9 Dreamliner N780HA 55070 Diecast",                                                     expect: "premium_model", label: "ng_models_1_400" },
+    { title: "Herpa Boeing 787-9 Hawaiian Airlines Aircraft Model 1:200 Vehicles",                                                                 expect: "premium_model", label: "herpa_1_200_model" },
+    { title: "PPC Hawaiian Airlines Boeing 787-9 Aircraft Model",                                                                                  expect: "premium_model", label: "ppc_aircraft_model" },
+    { title: "GeminiJets 787-9 Hawaiian Airlines Dreamliner Diecast Model",                                                                        expect: "premium_model", label: "geminijets_diecast_model" },
+    // Should classify as generic_toy (KEPT only on toy-tier scans)
+    { title: "Daron Toy Airplane Boeing 787 Die-Cast Metal Model Airplane Toy for Kids Ages 3+",                                                   expect: "generic_toy",   label: "daron_toy_with_kids" },
+  ];
+  let _merchPass = 0;
+  for (const tc of _merchCases) {
+    const got = classifyAircraftModelListing({ title: tc.title, source: tc.source || null });
+    if (got.tier === tc.expect) {
+      _merchPass++;
+    } else {
+      console.warn("AIRCRAFT_MERCH_FILTER_SELFTEST_FAIL", {
+        label: tc.label,
+        title: tc.title.slice(0, 80),
+        source: tc.source || null,
+        expected: tc.expect,
+        got: got.tier,
+        winningTerm: got.winningTerm,
+      });
+    }
+  }
+  console.log("AIRCRAFT_MERCH_FILTER_SELFTEST_PASS", {
+    passed: _merchPass,
+    total: _merchCases.length,
+  });
+} catch (_e) {
+  console.warn("AIRCRAFT_MERCH_FILTER_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // Returns true when a listing title has at least one strong signal proving it matches
@@ -8795,6 +8937,7 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
 
   const premium = classified.filter((it) => it.__aircraftTier.tier === "premium_model");
   const toy     = classified.filter((it) => it.__aircraftTier.tier === "generic_toy");
+  const merch   = classified.filter((it) => it.__aircraftTier.tier === "merch");
   const unknown = classified.filter((it) => it.__aircraftTier.tier === "unknown_model");
 
   console.log("AIRCRAFT_MODEL_TIER_POLICY", {
@@ -8804,14 +8947,45 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
   let result = classified;
   const _rawCount = classified.length;
   let _rejectedCount = 0;
-  let _penalizedCount = 0;
+  let _merchRejectedCount = 0;
+  const _penalizedCount = 0;
+
+  // ── Phase 2C.7: merch rejection ────────────────────────────────────────────
+  // Whenever the scan is for a physical model aircraft (premium_model or
+  // unknown_model with no toy signal), reject all merch listings before any
+  // other tier logic runs. Hawaiian shirts, Redbubble stickers, phone cases,
+  // and pillow throws cannot anchor the median price of a $70-200 model
+  // airplane scan — they pull the median into the $15-30 apparel band and
+  // produce false PASS verdicts on legitimate inventory.
+  if (
+    merch.length > 0 &&
+    (scanTier === "premium_model" || scanTier === "unknown_model" || scanTier === "generic_toy")
+  ) {
+    for (const it of merch) {
+      _merchRejectedCount++;
+      console.log("AIRCRAFT_MERCH_REJECTED", {
+        title: it?.title,
+        source: it?.source || it?.store || null,
+        winningTerm: it.__aircraftTier?.winningTerm || null,
+        reason: it.__aircraftTier?.reasons?.[0] || "merch_match",
+        scanTier,
+        scannedPrice,
+      });
+    }
+    classified.splice(0, classified.length, ...classified.filter((it) => it.__aircraftTier.tier !== "merch"));
+  }
+
+  // Re-derive non-merch tier buckets after the splice above.
+  const premiumNoMerch = classified.filter((it) => it.__aircraftTier.tier === "premium_model");
+  const toyNoMerch     = classified.filter((it) => it.__aircraftTier.tier === "generic_toy");
+  const unknownNoMerch = classified.filter((it) => it.__aircraftTier.tier === "unknown_model");
 
   if (scanTier === "premium_model" || (scanTier === "unknown_model" && scannedPrice != null && scannedPrice >= 50)) {
     const nonToy = classified.filter((it) => it.__aircraftTier.tier !== "generic_toy");
-    if (toy.length > 0) {
+    if (toyNoMerch.length > 0) {
       if (nonToy.length >= 1) {
         // At least 1 premium/unknown comp exists — reject all toys.
-        for (const it of toy) {
+        for (const it of toyNoMerch) {
           _rejectedCount++;
           console.log("AIRCRAFT_MODEL_TIER_REJECTED", {
             title: it?.title, reason: "generic_toy_excluded", scanTier,
@@ -8820,24 +8994,30 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
         result = nonToy;
       } else {
         // Only toys remain — return empty rather than anchoring a premium scan to a toy price.
-        for (const it of toy) {
+        for (const it of toyNoMerch) {
           console.log("AIRCRAFT_MODEL_TIER_TOY_ONLY_REJECTED", {
             title: it?.title, reason: "only_toys_in_pool_degraded", scanTier, scannedPrice,
           });
         }
         result = [];
       }
+    } else {
+      result = nonToy;
     }
   } else if (scanTier === "unknown_model") {
     // Unknown tier without price: sort premium first, then unknown, then toy.
     // No hard rejection — we don't know enough to discard anything.
-    if (premium.length > 0 || toy.length > 0) {
-      result = [...premium, ...unknown, ...toy];
+    if (premiumNoMerch.length > 0 || toyNoMerch.length > 0) {
+      result = [...premiumNoMerch, ...unknownNoMerch, ...toyNoMerch];
+    } else {
+      result = classified;
     }
   }
   // generic_toy scanTier: allow toys, push expensive premium behind toy comps.
-  else if (scanTier === "generic_toy" && premium.length > 0) {
-    result = [...toy, ...unknown, ...premium];
+  else if (scanTier === "generic_toy" && premiumNoMerch.length > 0) {
+    result = [...toyNoMerch, ...unknownNoMerch, ...premiumNoMerch];
+  } else {
+    result = classified;
   }
 
   console.log("AIRCRAFT_MODEL_TIER_SUMMARY", {
@@ -8845,10 +9025,30 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
     rawCount: _rawCount,
     premiumCount: premium.length,
     genericToyCount: toy.length,
+    merchCount: merch.length,
     unknownCount: unknown.length,
     rejectedGenericToyCount: _rejectedCount,
+    rejectedMerchCount: _merchRejectedCount,
     penalizedGenericToyCount: _penalizedCount,
+    finalCount: result.length,
     finalTopTitles: result.slice(0, 3).map((it) => it?.title),
+  });
+
+  // ── Phase 2C.7: relevance summary ──────────────────────────────────────────
+  // One last-line summary so production logs reveal exactly how much of the
+  // raw pool was kept vs dropped per category — the single line a human can
+  // grep when triaging "why does this scan see weird prices?"
+  console.log("AIRCRAFT_MODEL_RELEVANCE_SUMMARY", {
+    query,
+    scanTier,
+    scannedPrice,
+    raw: _rawCount,
+    keptPremium: premiumNoMerch.length,
+    keptUnknown: unknownNoMerch.length,
+    keptToy: result.filter((it) => it.__aircraftTier?.tier === "generic_toy").length,
+    droppedMerch: _merchRejectedCount,
+    droppedToy: _rejectedCount,
+    final: result.length,
   });
 
   return result;
