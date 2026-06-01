@@ -351,32 +351,49 @@ export function calibrateEvidenceConfidence({
   const marketMathEligibleCount = computeMarketMathEligibleCount(uiItemArray);
   const sourceDiversity         = computeSourceDiversity(uiItemArray);
 
-  // Rejection counts — from identitySummary if provided, else approximate
+  // Rejection counts — from identitySummary if provided (Phase 4B.2 exact), else approximate.
   const rejectedCompetitorCount     = Number(identitySummary?.rejectedCompetitorCount     ?? 0);
-  const rejectedFamilyCount         = Number(identitySummary?.rejectedModelMismatchCount  ?? 0);
+  const rejectedFamilyCount         = Number(
+    (identitySummary?.rejectedFamilyCount ?? 0) +
+    (identitySummary?.rejectedModelMismatchCount ?? 0)
+  );
   const rejectedModelMismatchCount  = Number(identitySummary?.rejectedModelMismatchCount  ?? 0);
   const rejectedMissingAirlineCount = Number(identitySummary?.rejectedMissingAirlineCount ?? 0);
   const rejectedGenericToyCount     = Number(identitySummary?.rejectedGenericToyCount     ?? 0);
 
   let totalRejectedCount;
+  let rejectionRatio;
   if (identitySummary !== null) {
-    totalRejectedCount =
-      rejectedCompetitorCount +
-      rejectedModelMismatchCount +
-      rejectedMissingAirlineCount +
-      rejectedGenericToyCount;
+    // Phase 4B.2: use pre-normalized exact totalRejectedCount and rejectionRatio when present.
+    // identitySummary.totalRejectedCount is the authoritative sum of all specific buckets.
+    // identitySummary.rejectionRatio is pre-computed as totalRejectedCount / (total + kept).
+    if (Number.isFinite(identitySummary.totalRejectedCount) && identitySummary.totalRejectedCount >= 0) {
+      totalRejectedCount = identitySummary.totalRejectedCount;
+    } else {
+      // Fallback: sum available specific buckets (shouldn't happen with normalizeIdentitySummary)
+      totalRejectedCount =
+        rejectedCompetitorCount +
+        rejectedModelMismatchCount +
+        rejectedMissingAirlineCount +
+        rejectedGenericToyCount;
+    }
+    // Use pre-computed rejectionRatio if available; else compute from what we know.
+    if (Number.isFinite(identitySummary.rejectionRatio) && identitySummary.rejectionRatio >= 0) {
+      rejectionRatio = round2(identitySummary.rejectionRatio);
+    } else {
+      rejectionRatio = (totalRejectedCount + cleanCompCount) > 0
+        ? round2(totalRejectedCount / (totalRejectedCount + cleanCompCount))
+        : 0;
+    }
   } else {
     // Approximate: difference between raw pre-filter pool and clean post-filter pool.
     // Must use rawUrlSummary.total (pre-lock), not urlSummary.total (clean = same as cleanCompCount).
-    // TODO Phase 4A.2+: plumb exact per-reason rejection counts from filterRelevantListings /
-    // applyAircraftFamilyLock / applySneakerIdentityLock / applyJordanIdentityLock return values.
     const rawTotal = Number(rawUrlSummary?.total ?? 0);
     totalRejectedCount = Math.max(0, rawTotal - cleanCompCount);
+    rejectionRatio = (totalRejectedCount + cleanCompCount) > 0
+      ? round2(totalRejectedCount / (totalRejectedCount + cleanCompCount))
+      : 0;
   }
-
-  const rejectionRatio = (totalRejectedCount + cleanCompCount) > 0
-    ? round2(totalRejectedCount / (totalRejectedCount + cleanCompCount))
-    : 0;
 
   // ── 2. Risk scores ─────────────────────────────────────────────────────────
   const iq           = clamp01(Number(identityQuality));

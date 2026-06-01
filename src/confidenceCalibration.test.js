@@ -509,6 +509,260 @@ test("4B: If 2 verified listings recovered — tier improves to verified_moderat
   assert.equal(result.confidenceCap, 0.85, "cap is 0.85 for verified_moderate");
 });
 
+// ── Phase 4B.2: exact identitySummary beats fallback approximation ────────────
+
+test("exact identitySummary.totalRejectedCount=14 beats approx rawTotal-cleanComp=29", () => {
+  const items = Array(11).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 65, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary: { total: 40 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 30, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    // Exact counts from Phase 4B.2 plumbing
+    identitySummary: {
+      rawCount:                    40,
+      keptCount:                   11,
+      rejectedCompetitorCount:     2,
+      rejectedModelMismatchCount:  1,
+      rejectedMissingAirlineCount: 8,
+      rejectedGenericToyCount:     3,
+      rejectedFamilyCount:         0,
+      rejectedManufacturerCount:   0,
+      rejectedMerchCount:          0,
+      rejectedSneakerWrongLineCount: 0,
+      rejectedSneakerWrongGenerationCount: 0,
+      rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0,
+      rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0,
+      rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0,
+      rejectedOtherIdentityCount:  0,
+      totalRejectedCount:          14,
+      rejectionRatio:              0.56,  // 14/(14+11)
+      appliedLocks:                ["airline", "aircraft_model_tier"],
+      relaxed:                     false,
+    },
+  });
+  // Calibration must use totalRejectedCount=14, not approx 40-11=29
+  assert.equal(result.evidence.totalRejectedCount, 14, "exact totalRejectedCount=14 from identitySummary");
+  assert.ok(result.evidence.rejectionRatio <= 0.57, `rejectionRatio should be ~0.56, got ${result.evidence.rejectionRatio}`);
+  assert.ok(result.evidence.rejectionRatio >= 0.55, `rejectionRatio should be ~0.56, got ${result.evidence.rejectionRatio}`);
+});
+
+test("missing identitySummary falls back to rawUrlSummary approximation", () => {
+  const items = Array(11).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 65, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary: { total: 40 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 30, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    identitySummary: null,  // explicit null → fallback
+  });
+  // With null identitySummary: approx = 40 - 11 = 29
+  assert.equal(result.evidence.totalRejectedCount, 29, "fallback approx: 40-11=29");
+});
+
+test("rejectedCompetitorCount > 0 adds aircraft_competitor_match cap reason for aircraft category", () => {
+  const items = Array(8).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 70, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 30, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    category:      "model airplane",
+    query:         "hawaiian airlines boeing 787 diecast",
+    identitySummary: {
+      ...{ rawCount: 20, keptCount: 8, totalRejectedCount: 2, rejectionRatio: 0.2,
+           appliedLocks: ["airline"], relaxed: false,
+           rejectedFamilyCount: 0, rejectedManufacturerCount: 0,
+           rejectedModelMismatchCount: 0, rejectedMissingAirlineCount: 0,
+           rejectedGenericToyCount: 0, rejectedMerchCount: 0,
+           rejectedSneakerWrongLineCount: 0, rejectedSneakerWrongGenerationCount: 0,
+           rejectedSneakerVariantCount: 0,
+           rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+           rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+           rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0 },
+      rejectedCompetitorCount: 2,
+    },
+  });
+  assert.ok(result.capReasons.includes("aircraft_competitor_match"), "aircraft_competitor_match should be in capReasons");
+  assert.ok(result.capReasons.includes("competitor_brand_present"), "competitor_brand_present should also be in capReasons");
+});
+
+test("rejectedFamilyCount > 0 adds aircraft_family_mismatch cap reason", () => {
+  const items = Array(6).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 70, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 6, oracleEstimates: 0, total: 6 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 20, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    category:      "model airplane",
+    query:         "boeing 787 diecast model",
+    identitySummary: {
+      rawCount: 10, keptCount: 6, totalRejectedCount: 1, rejectionRatio: 0.143,
+      appliedLocks: ["aircraft_family"], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 1,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 1,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 0,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 0,
+      rejectedSneakerWrongGenerationCount: 0, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  assert.ok(result.capReasons.includes("aircraft_family_mismatch"), "aircraft_family_mismatch should be in capReasons");
+});
+
+test("rejectedGenericToyCount > 0 adds aircraft_generic_toy_contamination", () => {
+  const items = Array(6).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 70, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 6, oracleEstimates: 0, total: 6 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 20, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    category:      "model airplane",
+    query:         "hawaiian airlines boeing 787 diecast model",
+    identitySummary: {
+      rawCount: 12, keptCount: 6, totalRejectedCount: 3, rejectionRatio: 0.333,
+      appliedLocks: ["aircraft_model_tier"], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 0,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 0,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 3,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 0,
+      rejectedSneakerWrongGenerationCount: 0, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  assert.ok(result.capReasons.includes("aircraft_generic_toy_contamination"), "toy contamination reason present");
+  assert.ok(!result.capReasons.includes("aircraft_family_mismatch"), "toy should NOT create a family_mismatch reason");
+});
+
+test("sneaker wrong generation does not create aircraft_family_mismatch reason", () => {
+  const items = Array(6).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 220, source: "stockx",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.7,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 6, oracleEstimates: 0, total: 6 },
+    marketEvidence:{ confidence: "medium", priceSpreadPct: 15, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.60 },
+    category:      "sneakers",
+    query:         "nike zoomx vaporfly next% 2",
+    identitySummary: {
+      rawCount: 10, keptCount: 6, totalRejectedCount: 4, rejectionRatio: 0.4,
+      appliedLocks: ["sneaker_identity"], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 0,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 0,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 0,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 2,
+      rejectedSneakerWrongGenerationCount: 2, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  // Sneaker gen rejections count toward totalRejectedCount and rejectionRatio but NOT aircraft reasons
+  assert.equal(result.evidence.totalRejectedCount, 4);
+  assert.ok(!result.capReasons.includes("aircraft_family_mismatch"), "sneaker gen != aircraft_family_mismatch");
+  assert.ok(!result.capReasons.includes("aircraft_generic_toy_contamination"), "sneaker gen != toy contamination");
+  assert.ok(!result.capReasons.includes("aircraft_competitor_match"), "sneaker gen != aircraft competitor");
+});
+
+test("Jordan wrong theme counts toward rejectionRatio but not aircraft-specific reasons", () => {
+  const items = Array(5).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 180, source: "stockx",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.7,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 5, oracleEstimates: 0, total: 5 },
+    marketEvidence:{ confidence: "medium", priceSpreadPct: 20, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.55 },
+    category:      "sneakers",
+    query:         "air jordan 1 low og year of the rabbit",
+    identitySummary: {
+      rawCount: 12, keptCount: 5, totalRejectedCount: 3, rejectionRatio: 0.375,
+      appliedLocks: ["jordan_identity"], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 0,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 0,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 0,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 1,
+      rejectedSneakerWrongGenerationCount: 0, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 2,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  assert.equal(result.evidence.totalRejectedCount, 3, "Jordan theme rejections in totalRejectedCount");
+  assert.ok(!result.capReasons.includes("aircraft_competitor_match"), "Jordan theme != aircraft competitor");
+  assert.ok(!result.capReasons.includes("aircraft_family_mismatch"), "Jordan theme != aircraft family mismatch");
+});
+
+test("identitySummary.totalRejectedCount=0 with cleanCompCount>0 does not add identity_lock_high_rejection_ratio", () => {
+  const items = Array(8).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 70, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.7,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    marketEvidence:{ confidence: "medium", priceSpreadPct: 20, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.60 },
+    identitySummary: {
+      rawCount: 8, keptCount: 8, totalRejectedCount: 0, rejectionRatio: 0,
+      appliedLocks: [], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 0,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 0,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 0,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 0,
+      rejectedSneakerWrongGenerationCount: 0, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  assert.ok(!result.capReasons.includes("identity_lock_high_rejection_ratio"),
+    "zero rejections should not add identity_lock_high_rejection_ratio");
+});
+
 test("returns correct shape with all required fields", () => {
   const result = calibrateEvidenceConfidence({});
   const topLevel = [

@@ -536,6 +536,11 @@ import {
   evaluateRecoveredOfferIdentity,
   selectBestVerifiedSeller,
 } from "./src/offerIdentityGuard.js";
+import {
+  createEmptyIdentitySummary,
+  mergeIdentitySummaries,
+  normalizeIdentitySummary,
+} from "./src/identityRejectionSummary.js";
 
 // Phase 6 + Phase 11: server-side telemetry sink for verdict drift.
 // Routes verdict_disagreement_event into the structured logger so it
@@ -8933,7 +8938,7 @@ function buildAircraftFamilyLock(query, identity, variants, category) {
 // Boeing 787 listing) are also rejected. The function never relaxes the
 // family to fill the pool — the user explicitly said better thin-but-honest
 // than padded with wrong family.
-function applyAircraftFamilyLock(items, lock, ctx = {}) {
+function applyAircraftFamilyLock(items, lock, ctx = {}, _out = null) {
   if (!Array.isArray(items) || items.length === 0) return items;
   if (!lock || (!lock.manufacturer && !lock.family)) return items;
 
@@ -8982,14 +8987,22 @@ function applyAircraftFamilyLock(items, lock, ctx = {}) {
     kept.push(it);
   }
 
+  const _rejMfr    = rejected.filter((r) => r.reason === "manufacturer_mismatch").length;
+  const _rejFamily  = rejected.filter((r) => r.reason === "family_mismatch").length;
+  if (_out) {
+    _out.rejectedManufacturerCount += _rejMfr;
+    _out.rejectedFamilyCount       += _rejFamily;
+    if (!_out.appliedLocks.includes("aircraft_family")) _out.appliedLocks.push("aircraft_family");
+  }
+
   console.log("AIRCRAFT_FAMILY_LOCK_SUMMARY", {
     query: ctx.query || null,
     requiredManufacturer,
     requiredFamily,
     rawCount: items.length,
     keptCount: kept.length,
-    rejectedManufacturer: rejected.filter((r) => r.reason === "manufacturer_mismatch").length,
-    rejectedFamily: rejected.filter((r) => r.reason === "family_mismatch").length,
+    rejectedManufacturer: _rejMfr,
+    rejectedFamily:       _rejFamily,
     finalTopTitles: kept.slice(0, 3).map((it) => it?.title),
     conflictAirlines: lock.conflict ? lock.conflictAirlines : null,
   });
@@ -9579,7 +9592,7 @@ function inferScanTierFromQuery(q, scannedPrice = null) {
 // Called at route level where scannedPrice is available. Complements the
 // family-based toy rejection inside filterRelevantListings (which only fires
 // when requiredFamily is non-null). This handles the requiredFamily=null case.
-function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
+function applyAircraftModelTierFilter(query, items, scannedPrice = null, _out = null) {
   if (!Array.isArray(items) || items.length === 0) return items;
   const q = normalizeTitleKey(query || "");
   if (!isAircraftModelQuery(q)) return items;
@@ -9674,6 +9687,12 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null) {
     result = [...toyNoMerch, ...unknownNoMerch, ...premiumNoMerch];
   } else {
     result = classified;
+  }
+
+  if (_out) {
+    _out.rejectedGenericToyCount += _rejectedCount;
+    _out.rejectedMerchCount      += _merchRejectedCount;
+    if (!_out.appliedLocks.includes("aircraft_model_tier")) _out.appliedLocks.push("aircraft_model_tier");
   }
 
   console.log("AIRCRAFT_MODEL_TIER_SUMMARY", {
@@ -9774,7 +9793,7 @@ function resolveAircraftCachePolicy(query, items, scannedPrice, cacheKind) {
 // Pre-payload guard: runs airline identity lock + aircraft tier filter BEFORE
 // provisional / live_refresh payloads are built in /market/search/stream.
 // Only engages for aircraft/airline queries; no-ops for everything else.
-function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind, identityFromBody = null, variantsFromBody = null, categoryFromBody = null) {
+function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind, identityFromBody = null, variantsFromBody = null, categoryFromBody = null, _identitySummaryOut = null) {
   if (!Array.isArray(items) || items.length === 0) return items;
   const q = normalizeTitleKey(query || "");
   if (!isAircraftModelQuery(q) && !detectAirlineLockInQuery(q)) return items;
@@ -9788,11 +9807,11 @@ function applyPrePayloadAircraftFilter(query, items, scannedPrice, kind, identit
   let filtered = items;
   const _aircraftLock = buildAircraftFamilyLock(query, identityFromBody, variantsFromBody, categoryFromBody);
   if (_aircraftLock && (_aircraftLock.manufacturer || _aircraftLock.family)) {
-    filtered = applyAircraftFamilyLock(filtered, _aircraftLock, { query });
+    filtered = applyAircraftFamilyLock(filtered, _aircraftLock, { query }, _identitySummaryOut);
   }
 
-  filtered = filterRelevantListings(query, filtered);
-  filtered = applyAircraftModelTierFilter(query, filtered, scannedPrice);
+  filtered = filterRelevantListings(query, filtered, _identitySummaryOut);
+  filtered = applyAircraftModelTierFilter(query, filtered, scannedPrice, _identitySummaryOut);
 
   const afterCount = filtered.length;
   console.log("AIRCRAFT_FILTER_APPLIED_BEFORE_PAYLOAD", {
@@ -10503,13 +10522,14 @@ function extractSneakerIdentitySignals(text) {
 // No-op when query has no clear line or is not a sneaker query.
 // Only rejects items where we can CONFIRM wrong family or wrong generation —
 // items with no detectable line pass through (let other filters handle them).
-function applySneakerIdentityLock(query, items, context = {}) {
+function applySneakerIdentityLock(query, items, context = {}, _out = null) {
   if (!Array.isArray(items) || !items.length) return items;
 
   const qSig = extractSneakerIdentitySignals(query);
   if (!qSig.isSneakerQuery || !qSig.line) return items;
 
   const kept = [], rejected = [];
+  let _wrongLineCount = 0, _wrongGenCount = 0;
 
   for (const it of items) {
     const title = it?.title || it?.name || "";
@@ -10527,6 +10547,7 @@ function applySneakerIdentityLock(query, items, context = {}) {
         ...(context.scanId ? { scanId: context.scanId } : {}),
       });
       rejected.push(it);
+      _wrongLineCount++;
       continue;
     }
 
@@ -10540,10 +10561,17 @@ function applySneakerIdentityLock(query, items, context = {}) {
         ...(context.scanId ? { scanId: context.scanId } : {}),
       });
       rejected.push(it);
+      _wrongGenCount++;
       continue;
     }
 
     kept.push(it);
+  }
+
+  if (_out) {
+    _out.rejectedSneakerWrongLineCount       += _wrongLineCount;
+    _out.rejectedSneakerWrongGenerationCount += _wrongGenCount;
+    if (!_out.appliedLocks.includes("sneaker_identity")) _out.appliedLocks.push("sneaker_identity");
   }
 
   console.log("SNEAKER_IDENTITY_SUMMARY", {
@@ -10553,6 +10581,8 @@ function applySneakerIdentityLock(query, items, context = {}) {
     rawCount:      items.length,
     keptCount:     kept.length,
     rejectedCount: rejected.length,
+    rejectedWrongLine:       _wrongLineCount,
+    rejectedWrongGeneration: _wrongGenCount,
     ...(context.scanId ? { scanId: context.scanId } : {}),
   });
 
@@ -10643,12 +10673,13 @@ function extractJordanIdentitySignals(text) {
 // Filters Jordan listings that don't match the query's model/cut/subline/theme.
 // No-op when query is not a Jordan query (no model detected).
 // Conservatively passes items with no detectable Jordan signals through.
-function applyJordanIdentityLock(query, items, context = {}) {
+function applyJordanIdentityLock(query, items, context = {}, _out = null) {
   if (!Array.isArray(items) || !items.length) return items;
   const qSig = extractJordanIdentitySignals(query);
   if (!qSig.isJordanQuery) return items;
 
   const kept = [], rejected = [];
+  let _wrongModel=0, _wrongCut=0, _wrongSubline=0, _wrongTheme=0, _nonJordan=0;
 
   // Non-Jordan sneaker lines to reject when the query is a Jordan query
   const NON_JORDAN_LINES = ["dunk", "air force", "vaporfly", "zoom fly", "alphafly", "yeezy", "samba", "ultraboost", "adizero", "pegasus", "air max", "stan smith", "gazelle", "nmd", "fresh foam", "gel nimbus", "clifton", "bondi"];
@@ -10665,7 +10696,7 @@ function applyJordanIdentityLock(query, items, context = {}) {
       if (hasNonJordanLine) {
         const matchedLine = NON_JORDAN_LINES.find(l => tLow.includes(l));
         console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "non_jordan_sneaker_line", found: matchedLine, ...(context.scanId ? { scanId: context.scanId } : {}) });
-        rejected.push(it); continue;
+        rejected.push(it); _nonJordan++; continue;
       }
       // No Jordan signal and no competing sneaker line — pass through (can't confirm wrong)
       kept.push(it); continue;
@@ -10674,35 +10705,35 @@ function applyJordanIdentityLock(query, items, context = {}) {
     // Wrong Jordan model number
     if (qSig.model && iSig.model && iSig.model !== qSig.model) {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_model", required: qSig.model, found: iSig.model, ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongModel++; continue;
     }
 
     // Wrong cut (low vs mid vs high) — only reject when both are explicit
     if (qSig.cut && iSig.cut && iSig.cut !== qSig.cut) {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_cut", required: qSig.cut, found: iSig.cut, ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongCut++; continue;
     }
 
     // Wrong subline: query says OG but item says Elevate (or vice versa)
     if (qSig.subline === "og" && iSig.subline === "elevate") {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_subline_elevate_vs_og", ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongSubline++; continue;
     }
 
     // Wrong theme: query says "year_of_the_rabbit" — reject other year-of-the-X themes
     if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme && iSig.theme.startsWith("year_of_the_") && iSig.theme !== qSig.theme) {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_year_of_theme", required: qSig.theme, found: iSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongTheme++; continue;
     }
     // Reject Game Royal, Bred, etc. when query is year-of-the-X
     if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme && !iSig.theme.startsWith("year_of_the_")) {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "wrong_theme_not_year_of", required: qSig.theme, found: iSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongTheme++; continue;
     }
     // Generic "chinese_new_year" without matching year-of-the-X model code fails
     if (qSig.theme && qSig.theme.startsWith("year_of_the_") && iSig.theme === "chinese_new_year_generic") {
       console.log("JORDAN_IDENTITY_REJECTED", { title: title.slice(0, 80), reason: "chinese_new_year_unspecified", required: qSig.theme, ...(context.scanId ? { scanId: context.scanId } : {}) });
-      rejected.push(it); continue;
+      rejected.push(it); _wrongTheme++; continue;
     }
     // Reject non-Jordan sneakers in same theme (e.g. Nike Dunk Low Year of Rabbit)
     const tLower = title.toLowerCase();
@@ -10714,15 +10745,29 @@ function applyJordanIdentityLock(query, items, context = {}) {
     kept.push(it);
   }
 
+  if (_out) {
+    _out.rejectedJordanNonJordanCount   += _nonJordan;
+    _out.rejectedJordanWrongModelCount  += _wrongModel;
+    _out.rejectedJordanWrongCutCount    += _wrongCut;
+    _out.rejectedJordanWrongSublineCount+= _wrongSubline;
+    _out.rejectedJordanWrongThemeCount  += _wrongTheme;
+    if (!_out.appliedLocks.includes("jordan_identity")) _out.appliedLocks.push("jordan_identity");
+  }
+
   console.log("JORDAN_IDENTITY_SUMMARY", {
-    query:         (query || "").slice(0, 80),
-    model:         qSig.model,
-    cut:           qSig.cut,
-    subline:       qSig.subline,
-    theme:         qSig.theme,
-    rawCount:      items.length,
-    keptCount:     kept.length,
-    rejectedCount: rejected.length,
+    query:                (query || "").slice(0, 80),
+    model:                qSig.model,
+    cut:                  qSig.cut,
+    subline:              qSig.subline,
+    theme:                qSig.theme,
+    rawCount:             items.length,
+    keptCount:            kept.length,
+    rejectedCount:        rejected.length,
+    rejectedNonJordan:    _nonJordan,
+    rejectedWrongModel:   _wrongModel,
+    rejectedWrongCut:     _wrongCut,
+    rejectedWrongSubline: _wrongSubline,
+    rejectedWrongTheme:   _wrongTheme,
     ...(context.scanId ? { scanId: context.scanId } : {}),
   });
 
@@ -10877,7 +10922,7 @@ function normalizeFanoutSerpItems(rawItems, originalQuery, fanoutQuery, scanId) 
   return out;
 }
 
-function filterRelevantListings(query, items) {
+function filterRelevantListings(query, items, _out = null) {
   if (!Array.isArray(items)) return [];
 
   const q = normalizeTitleKey(query);
@@ -11139,6 +11184,17 @@ function filterRelevantListings(query, items) {
           specificMatchedCount: _specific.length,
           reason: "insufficient_specific_airline_matches",
         });
+      }
+    }
+
+    if (_out) {
+      _out.rejectedCompetitorCount          += _rejectedCompetitor;
+      _out.rejectedModelMismatchCount       += _rejectedModel;
+      _out.rejectedMissingAirlineCount      += _rejectedAirlineMissing;
+      _out.rejectedWeakAirlineGenericCount  += _rejectedWeakAirlineGeneric;
+      if (!_out.appliedLocks.includes("airline")) _out.appliedLocks.push("airline");
+      if (_noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0)) {
+        _out.relaxed = true;
       }
     }
 
@@ -23542,6 +23598,10 @@ async function buildMarketSearchResponsePayload({
   // lite=false and benefits from the SWR cache populated by background
   // re-fetches.
   lite = false,
+  // Phase 4B.2: optional pre-computed aircraft identity rejection summary from the
+  // route handler (populated when applyPrePayloadAircraftFilter is called upstream).
+  // When present, merged with sneaker/Jordan in-function counts for an exact summary.
+  identitySummaryFromRoute = null,
 } = {}) {
   const _bmt0 = Date.now();
   const _bmSteps = {};
@@ -23551,8 +23611,11 @@ async function buildMarketSearchResponsePayload({
   // Part D: sanitize all outbound items before any further processing
   const _rawSourceItems = (Array.isArray(items) ? items.filter(Boolean) : [])
     .map(it => sanitizeOutboundListingForClient(it, { scanId: retrievalMeta?.scanId || null }));
-  const _sneakerLocked  = applySneakerIdentityLock(baseQuery, _rawSourceItems);
-  const _jordanLocked   = applyJordanIdentityLock(baseQuery, _sneakerLocked);
+  // Phase 4B.2: accumulate per-reason identity rejection counts from sneaker/Jordan locks.
+  const _inFunctionIdentitySummary = createEmptyIdentitySummary();
+  _inFunctionIdentitySummary.rawCount = _rawSourceItems.length;
+  const _sneakerLocked  = applySneakerIdentityLock(baseQuery, _rawSourceItems, {}, _inFunctionIdentitySummary);
+  const _jordanLocked   = applyJordanIdentityLock(baseQuery, _sneakerLocked, {}, _inFunctionIdentitySummary);
   const sourceItems = applyGenericVariantQualityFilter(
     baseQuery, _jordanLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
   );
@@ -24241,6 +24304,17 @@ async function buildMarketSearchResponsePayload({
     };
 
     const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
+
+    // Phase 4B.2: Build exact identity rejection summary for calibration.
+    // Merge: aircraft counts from route handler + sneaker/Jordan counts from this function.
+    // Set keptCount to the final clean UI item count.
+    _inFunctionIdentitySummary.keptCount = uiItemsForCalibration.length;
+    const _mergedIdentitySummary = mergeIdentitySummaries(
+      identitySummaryFromRoute || {},
+      _inFunctionIdentitySummary,
+    );
+    const _finalIdentitySummary = normalizeIdentitySummary(_mergedIdentitySummary);
+
     let _confidenceCalibration = null;
     try {
       console.log("CONFIDENCE_CALIBRATION_POOL_CHECK", {
@@ -24255,6 +24329,28 @@ async function buildMarketSearchResponsePayload({
         cleanPricingSignals:     _cleanUrlSummary.pricingOnly,
         rejectedBeforeCalibration: Math.max(0, _urlSummary.total - _cleanUrlSummary.total),
         usingPool:               "clean_ui_items",
+      });
+
+      // Log exact identity rejection summary once per payload
+      console.log("IDENTITY_REJECTION_SUMMARY_FOR_CALIBRATION", {
+        scanId:                         retrievalMeta?.scanId || null,
+        query:                          baseQuery,
+        rawCount:                       _finalIdentitySummary.rawCount,
+        keptCount:                      _finalIdentitySummary.keptCount,
+        totalRejectedCount:             _finalIdentitySummary.totalRejectedCount,
+        rejectionRatio:                 _finalIdentitySummary.rejectionRatio,
+        appliedLocks:                   _finalIdentitySummary.appliedLocks,
+        rejectedCompetitorCount:        _finalIdentitySummary.rejectedCompetitorCount,
+        rejectedFamilyCount:            _finalIdentitySummary.rejectedFamilyCount,
+        rejectedManufacturerCount:      _finalIdentitySummary.rejectedManufacturerCount,
+        rejectedModelMismatchCount:     _finalIdentitySummary.rejectedModelMismatchCount,
+        rejectedMissingAirlineCount:    _finalIdentitySummary.rejectedMissingAirlineCount,
+        rejectedGenericToyCount:        _finalIdentitySummary.rejectedGenericToyCount,
+        rejectedMerchCount:             _finalIdentitySummary.rejectedMerchCount,
+        rejectedSneakerWrongLineCount:        _finalIdentitySummary.rejectedSneakerWrongLineCount,
+        rejectedSneakerWrongGenerationCount:  _finalIdentitySummary.rejectedSneakerWrongGenerationCount,
+        rejectedJordanWrongThemeCount:        _finalIdentitySummary.rejectedJordanWrongThemeCount,
+        rejectedOtherIdentityCount:           _finalIdentitySummary.rejectedOtherIdentityCount,
       });
 
       console.log("CONFIDENCE_CALIBRATION_INPUT", {
@@ -24273,8 +24369,16 @@ async function buildMarketSearchResponsePayload({
         consensusSpread:          marketEvidence?.priceSpreadPct ?? null,
         marketEvidenceConfidence: marketEvidence?.confidence ?? null,
         marketEvidenceReason:     marketEvidence?.reason    ?? null,
-        // TODO Phase 4A.2+: plumb exact rejection counts from identity lock functions
-        identityLockRejections:   null,
+        identityLockRejections: {
+          totalRejectedCount:         _finalIdentitySummary.totalRejectedCount,
+          rejectionRatio:             _finalIdentitySummary.rejectionRatio,
+          appliedLocks:               _finalIdentitySummary.appliedLocks,
+          rejectedCompetitorCount:    _finalIdentitySummary.rejectedCompetitorCount,
+          rejectedModelMismatchCount: _finalIdentitySummary.rejectedModelMismatchCount,
+          rejectedMissingAirlineCount:_finalIdentitySummary.rejectedMissingAirlineCount,
+          rejectedGenericToyCount:    _finalIdentitySummary.rejectedGenericToyCount,
+          rejectedMerchCount:         _finalIdentitySummary.rejectedMerchCount,
+        },
       });
 
       _confidenceCalibration = calibrateEvidenceConfidence({
@@ -24285,9 +24389,9 @@ async function buildMarketSearchResponsePayload({
         items:             uiItemsForCalibration,  // Phase 4B: may include recovered verified URLs
         marketEvidence,
         consensus,
-        identitySummary:   null,     // TODO Phase 4A.2+: plumb from identity lock functions
-        urlSummary:        _cleanUrlSummary,  // CLEAN post-filter counts (from uiItemsForCalibration)
-        rawUrlSummary:     _urlSummary,       // raw pre-filter (for rejection ratio approx)
+        identitySummary:   _finalIdentitySummary,  // Phase 4B.2: exact rejection counts
+        urlSummary:        _cleanUrlSummary,        // CLEAN post-filter counts (from uiItemsForCalibration)
+        rawUrlSummary:     _urlSummary,             // raw pre-filter (for fallback approx if identitySummary absent)
         scannedPrice:      finitePrice(scannedPrice),
         category,
         cacheKind:         retrievalMeta?.kind || null,
@@ -24396,6 +24500,9 @@ async function buildMarketSearchResponsePayload({
         evidenceTier:     _confidenceCalibration?.evidenceTier     ?? null,
         verdictStrengthCap: _confidenceCalibration?.verdictStrengthCap ?? null,
         urlVerificationEnabled: URL_VERIFICATION_ENABLED,
+        identityRejectedTotal:  _finalIdentitySummary.totalRejectedCount,
+        identityRejectionRatio: _finalIdentitySummary.rejectionRatio,
+        identityAppliedLocks:   _finalIdentitySummary.appliedLocks,
       });
     } catch { /* non-fatal */ }
 
@@ -28065,7 +28172,7 @@ app.post("/market/search/stream", async (req, res) => {
     ]);
 
     // ── Helper: assemble trusted profit intel + response payload ─────────
-    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false } = {}) => {
+    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false, identitySummaryFromRoute = null } = {}) => {
       // ── Phase 3 instrumentation: timestamp every major stage so the
       // 10s gap between phase1_done and scan_response becomes visible.
       // Format: BUILD_STAGE { scanId, kind, stage, ms } — grep-friendly.
@@ -28098,6 +28205,7 @@ app.post("/market/search/stream", async (req, res) => {
         retrievalMeta: { source, kind },
         persistSnapshot: !isOracleOnly,
         lite:             _isLite || deferEnrichments,
+        identitySummaryFromRoute,
       });
       _bp_log("buildMarketSearchResponsePayload", _t_buildResp);
       try {
@@ -28603,7 +28711,11 @@ app.post("/market/search/stream", async (req, res) => {
     enrichedItems = trimPriceOutliers(enrichedItems);
 
     // Apply aircraft identity lock + tier filter before live_refresh/complete payload.
-    enrichedItems = applyPrePayloadAircraftFilter(query, enrichedItems, scannedPrice, "live_refresh");
+    // Capture exact rejection counts for calibration (Phase 4B.2).
+    const _aircraftIdentitySummary = createEmptyIdentitySummary();
+    _aircraftIdentitySummary.rawCount = enrichedItems.length;
+    enrichedItems = applyPrePayloadAircraftFilter(query, enrichedItems, scannedPrice, "live_refresh", null, null, null, _aircraftIdentitySummary);
+    _aircraftIdentitySummary.keptCount = enrichedItems.length;
 
     if (!enrichedItems.length) {
       _degraded       = true;
@@ -28748,10 +28860,11 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _tFinalBuild = Date.now();
     const finalPayload = await _buildPayload(enrichedItems, {
-      source:            _oracleOnlyResult ? "gpt_oracle" : "live_market",
-      kind:              _oracleOnlyResult ? "oracle"      : "live_refresh",
-      isOracleOnly:      _oracleOnlyResult,
-      deferEnrichments:  true,
+      source:                  _oracleOnlyResult ? "gpt_oracle" : "live_market",
+      kind:                    _oracleOnlyResult ? "oracle"      : "live_refresh",
+      isOracleOnly:            _oracleOnlyResult,
+      deferEnrichments:        true,
+      identitySummaryFromRoute: _aircraftIdentitySummary,
     }).catch(() => ({ items: [], query, searchedQueries: searchedQueries || [query] }));
 
     if (_ebaySoldComps) finalPayload.ebaySoldComps = _ebaySoldComps;
