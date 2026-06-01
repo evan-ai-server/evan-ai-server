@@ -528,6 +528,10 @@ import {
   buildNotificationFromVerdict,
   REASON_CODES,
 } from "./shared/notification.js";
+import {
+  calibrateEvidenceConfidence,
+  runConfidenceCalibrationSelfTest,
+} from "./src/confidenceCalibration.js";
 
 // Phase 6 + Phase 11: server-side telemetry sink for verdict drift.
 // Routes verdict_disagreement_event into the structured logger so it
@@ -10751,6 +10755,13 @@ try {
   console.log("JORDAN_IDENTITY_SELFTEST_PASS", { passed: _jordPass, total: _jordanTests.length });
 } catch (_e) {
   console.warn("JORDAN_IDENTITY_SELFTEST_ERROR", { error: String(_e) });
+}
+
+// ── Phase 4A.1 — Evidence calibration self-test ───────────────────────────────
+try {
+  runConfidenceCalibrationSelfTest();
+} catch (_e) {
+  console.warn("CONFIDENCE_CALIBRATION_SELFTEST_ERROR", { error: String(_e) });
 }
 
 // Shared clean-pool measurement used by cache bypass + fanout stop condition.
@@ -23274,18 +23285,21 @@ async function buildMarketSearchResponsePayload({
     baseQuery, _jordanLocked, scannedPrice, { kind: retrievalMeta?.kind || "payload" }
   );
 
-  // Parts E + F: URL trust summary — every item is now sanitized so counts are accurate
+  // Parts E + F: URL trust summary — every item is now sanitized so counts are accurate.
+  // Extracted into _urlSummary so the Phase 4A.1 calibration layer can read pre-lock counts.
+  const _urlSummary = {
+    total:            _rawSourceItems.length,
+    clickable:        _rawSourceItems.filter(x => x?.clickable !== false && x?.directUrl).length,
+    pricingOnly:      _rawSourceItems.filter(x => x?.clickable === false).length,
+    googleUnresolved: _rawSourceItems.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length,
+    googleUnwrapped:  _rawSourceItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length,
+    missingUrl:       _rawSourceItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length,
+    merchantDirect:   _rawSourceItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length,
+    legacyNormalized: _rawSourceItems.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length,
+    oracleEstimates:  _rawSourceItems.filter(x => x?.urlQuality === "oracle_pricing_estimate").length,
+    verifiedListings: _rawSourceItems.filter(x => x?.isVerifiedListing === true).length,
+  };
   {
-    const _urlTotal         = _rawSourceItems.length;
-    const _urlClickable     = _rawSourceItems.filter(x => x?.clickable !== false && x?.directUrl).length;
-    const _urlPricingOnly   = _rawSourceItems.filter(x => x?.clickable === false).length;
-    const _urlGoogleUnres   = _rawSourceItems.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length;
-    const _urlGoogleUnwrap  = _rawSourceItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length;
-    const _urlMissing       = _rawSourceItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length;
-    const _urlMerchDirect   = _rawSourceItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length;
-    const _urlLegacy        = _rawSourceItems.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length;
-    const _urlOracle        = _rawSourceItems.filter(x => x?.urlQuality === "oracle_pricing_estimate").length;
-    const _urlVerified      = _rawSourceItems.filter(x => x?.isVerifiedListing === true).length;
     const _topPricingTitles = _rawSourceItems
       .filter(x => x?.clickable === false && x?.title)
       .slice(0, 3)
@@ -23293,33 +23307,33 @@ async function buildMarketSearchResponsePayload({
 
     console.log("URL_RESOLUTION_SUMMARY", {
       kind:             retrievalMeta?.kind || null,
-      total:            _urlTotal,
-      clickable:        _urlClickable,
-      pricingOnly:      _urlPricingOnly,
-      googleUnresolved: _urlGoogleUnres,
-      googleUnwrapped:  _urlGoogleUnwrap,
-      missingUrl:       _urlMissing,
-      merchantDirect:   _urlMerchDirect,
-      legacyNormalized: _urlLegacy,
-      oracleEstimates:  _urlOracle,
-      verifiedListings: _urlVerified,
+      total:            _urlSummary.total,
+      clickable:        _urlSummary.clickable,
+      pricingOnly:      _urlSummary.pricingOnly,
+      googleUnresolved: _urlSummary.googleUnresolved,
+      googleUnwrapped:  _urlSummary.googleUnwrapped,
+      missingUrl:       _urlSummary.missingUrl,
+      merchantDirect:   _urlSummary.merchantDirect,
+      legacyNormalized: _urlSummary.legacyNormalized,
+      oracleEstimates:  _urlSummary.oracleEstimates,
+      verifiedListings: _urlSummary.verifiedListings,
       topPricingOnlyTitles: _topPricingTitles,
     });
 
     // CHECK 5: reconciliation — clickable + pricingOnly must equal total
-    if (_urlClickable + _urlPricingOnly !== _urlTotal) {
+    if (_urlSummary.clickable + _urlSummary.pricingOnly !== _urlSummary.total) {
       const _offenders = _rawSourceItems
         .filter(x => x?.clickable !== false && !x?.directUrl)
         .slice(0, 3)
         .map(x => ({ title: (x?.title || "").slice(0, 50), clickable: x?.clickable, directUrl: x?.directUrl || null, urlQuality: x?.urlQuality }));
       console.warn("URL_RESOLUTION_SUMMARY_MISMATCH", {
-        kind:       retrievalMeta?.kind || null,
-        total:      _urlTotal,
-        clickable:  _urlClickable,
-        pricingOnly: _urlPricingOnly,
-        sum:        _urlClickable + _urlPricingOnly,
-        diff:       _urlTotal - (_urlClickable + _urlPricingOnly),
-        offenders:  _offenders,
+        kind:        retrievalMeta?.kind || null,
+        total:       _urlSummary.total,
+        clickable:   _urlSummary.clickable,
+        pricingOnly: _urlSummary.pricingOnly,
+        sum:         _urlSummary.clickable + _urlSummary.pricingOnly,
+        diff:        _urlSummary.total - (_urlSummary.clickable + _urlSummary.pricingOnly),
+        offenders:   _offenders,
       });
     }
   }
@@ -23897,6 +23911,88 @@ async function buildMarketSearchResponsePayload({
       visionIdentity?.title || ""
     );
 
+    // ── Phase 4A.1: Evidence-based confidence calibration ─────────────────────
+    // Runs AFTER marketEvidence (needs its confidence/spread), BEFORE buyOrPass
+    // (so calibration can influence the verdict-strength cap).
+    const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
+    let _confidenceCalibration = null;
+    try {
+      console.log("CONFIDENCE_CALIBRATION_INPUT", {
+        scanId:                   retrievalMeta?.scanId || null,
+        query:                    baseQuery,
+        kind:                     retrievalMeta?.kind   || null,
+        visionConfidence:         Number((visionConfidence ?? 0).toFixed(3)),
+        visualConfidence:         Number((visionIdentity?.visualConfidence ?? 0).toFixed(3)),
+        brandCertainty:           Number((visionIdentity?.brandCertainty   ?? 0).toFixed(3)),
+        identityQuality:          Number((_calibIdentityQuality            ?? 0).toFixed(3)),
+        scannedPrice:             finitePrice(scannedPrice) || null,
+        category:                 category || null,
+        uiItemCount:              uiItems.length,
+        consensusListingCount:    consensus?.listingCount   ?? null,
+        consensusMedian:          consensus?.median         ?? null,
+        consensusSpread:          marketEvidence?.priceSpreadPct ?? null,
+        marketEvidenceConfidence: marketEvidence?.confidence ?? null,
+        marketEvidenceReason:     marketEvidence?.reason    ?? null,
+        // TODO Phase 4A.2+: plumb exact rejection counts from identity lock functions
+        identityLockRejections:   null,
+      });
+
+      _confidenceCalibration = calibrateEvidenceConfidence({
+        visionConfidence:  visionConfidence ?? 0.5,
+        visualConfidence:  visionIdentity?.visualConfidence ?? 0,
+        brandCertainty:    visionIdentity?.brandCertainty   ?? 0,
+        identityQuality:   _calibIdentityQuality,
+        items:             uiItems,
+        marketEvidence,
+        consensus,
+        identitySummary:   null,  // TODO Phase 4A.2+: plumb from identity lock functions
+        urlSummary:        _urlSummary,
+        scannedPrice:      finitePrice(scannedPrice),
+        category,
+        cacheKind:         retrievalMeta?.kind || null,
+        query:             baseQuery,
+        scanId:            retrievalMeta?.scanId || null,
+      });
+
+      console.log("CONFIDENCE_CALIBRATION_RESULT", {
+        scanId:                      retrievalMeta?.scanId || null,
+        query:                       baseQuery,
+        kind:                        retrievalMeta?.kind   || null,
+        evidenceTier:                _confidenceCalibration.evidenceTier,
+        marketConfidence:            _confidenceCalibration.marketConfidence,
+        evidenceConfidence:          _confidenceCalibration.evidenceConfidence,
+        calibratedConfidence:        _confidenceCalibration.calibratedConfidence,
+        confidenceCap:               _confidenceCalibration.confidenceCap,
+        capApplied:                  _confidenceCalibration.capApplied,
+        capReasons:                  _confidenceCalibration.capReasons,
+        verdictStrengthCap:          _confidenceCalibration.verdictStrengthCap,
+        canShowStrongLanguage:       _confidenceCalibration.canShowStrongLanguage,
+        canShowVerifiedLanguage:     _confidenceCalibration.canShowVerifiedLanguage,
+        canShowMedianAsAuthoritative:_confidenceCalibration.canShowMedianAsAuthoritative,
+        explanationForLogs:          _confidenceCalibration.explanationForLogs,
+      });
+
+      if (_confidenceCalibration.capApplied) {
+        console.log("CONFIDENCE_CAP_APPLIED", {
+          scanId:               retrievalMeta?.scanId || null,
+          query:                baseQuery,
+          evidenceTier:         _confidenceCalibration.evidenceTier,
+          rawConfidence:        visionConfidence ?? 0,
+          cappedConfidence:     _confidenceCalibration.calibratedConfidence,
+          capDelta:             Number(((visionConfidence ?? 0) - _confidenceCalibration.calibratedConfidence).toFixed(3)),
+          capReasons:           _confidenceCalibration.capReasons,
+          verifiedListingCount: _confidenceCalibration.evidence.verifiedListingCount,
+          pricingSignalCount:   _confidenceCalibration.evidence.pricingSignalCount,
+          cleanCompCount:       _confidenceCalibration.evidence.cleanCompCount,
+        });
+      }
+    } catch (_calibErr) {
+      console.warn("CONFIDENCE_CALIBRATION_ERROR", {
+        scanId: retrievalMeta?.scanId || null,
+        error:  _calibErr?.message || String(_calibErr),
+      });
+    }
+
     // ── Feature 62: Buy or Pass Engine (THE FINAL VERDICT) ────────────────────
     const buyOrPassResult = buildBuyOrPassPayload({
       dealComparator,
@@ -23913,7 +24009,36 @@ async function buildMarketSearchResponsePayload({
       visionIdentity,
       evanSummary,
       marketEvidence,
+      calibration:       _confidenceCalibration,  // Phase 4A.1
+      scanId:            retrievalMeta?.scanId || null,
+      query:             baseQuery,
     });
+
+    // Phase 4A.1: mirror calibration fields onto buyOrPass for frontend convenience
+    if (buyOrPassResult?.buyOrPass && _confidenceCalibration) {
+      buyOrPassResult.buyOrPass.verdictStrength = _confidenceCalibration.verdictStrengthCap;
+      buyOrPassResult.buyOrPass.evidenceTier    = _confidenceCalibration.evidenceTier;
+      buyOrPassResult.buyOrPass.capReasons      = _confidenceCalibration.capReasons;
+    }
+
+    try {
+      console.log("MARKET_CONFIDENCE_SUMMARY", {
+        scanId:                   retrievalMeta?.scanId || null,
+        query:                    baseQuery,
+        kind:                     retrievalMeta?.kind   || null,
+        visionConfidence:         Number((visionConfidence ?? 0).toFixed(3)),
+        calibratedConfidence:     _confidenceCalibration?.calibratedConfidence ?? null,
+        consensusMedian:          consensus?.median     ?? null,
+        consensusListingCount:    uiItems.length,
+        marketEvidenceConfidence: marketEvidence?.confidence ?? null,
+        verifiedListingCount:     _confidenceCalibration?.evidence?.verifiedListingCount ?? 0,
+        pricingSignalCount:       _confidenceCalibration?.evidence?.pricingSignalCount   ?? 0,
+        cleanCompCount:           _confidenceCalibration?.evidence?.cleanCompCount        ?? 0,
+        evidenceTier:             _confidenceCalibration?.evidenceTier     ?? null,
+        verdictStrengthCap:       _confidenceCalibration?.verdictStrengthCap ?? null,
+        finalVerdict:             buyOrPassResult?.buyOrPass?.verdict ?? null,
+      });
+    } catch { /* non-fatal */ }
 
     // ── Feature 68: Seal / Tag / Sticker Detector ─────────────────────────────
     const sealTags = buildSealTagPayload({
@@ -24122,8 +24247,9 @@ async function buildMarketSearchResponsePayload({
       authServiceRoute,
       counterofferScript,
       evanExplainer,
-      buyOrPass:    safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
-      multiAngle:   null, // populated by route layer from multiAngleResult
+      buyOrPass:             safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
+      confidenceCalibration: _confidenceCalibration || null,  // Phase 4A.1
+      multiAngle:            null, // populated by route layer from multiAngleResult
 
       // Features 68-77
       sealTags:             sealTags             || null,

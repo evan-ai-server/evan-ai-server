@@ -86,6 +86,7 @@ export function computeBuyOrPass(bundle = {}) {
   const condition    = bundle?.conditionForensics;
   const priceProj    = bundle?.priceProjection?.projection;
   const fakeDetect   = bundle?.fakeDetector?.listing;
+  const calibration  = bundle?.calibration  || null;   // Phase 4A.1
 
   // ── Evidence gate ────────────────────────────────────────────────────────
   // Without comps, every downstream signal (deal, flip, demand, risk) is
@@ -192,6 +193,47 @@ export function computeBuyOrPass(bundle = {}) {
     capReasons.push(`single-source thin market (${marketEvidence.reason})`);
   }
 
+  // ── Phase 4A.1: Evidence-calibration verdict-strength cap ──────────────────
+  // Downgrades BUY → HOLD when the calibration layer determined that evidence
+  // is too weak to support a BUY call (no verified listings + other risk factors).
+  // Never fires if the existing SerpAPI gate already handled the downgrade.
+  if (calibration) {
+    const { verdictStrengthCap, evidenceTier, capReasons: calibCapReasons } = calibration;
+
+    if (verdictKey === "BUY" && verdictStrengthCap === "evidence_limited" && evidenceTier !== "verified_strong") {
+      const topReason = calibCapReasons?.[0] || "weak_evidence";
+      capReasons.push(`evidence_limited: ${topReason}`);
+      try {
+        console.log("VERDICT_STRENGTH_CAPPED", {
+          scanId:                   bundle.scanId || null,
+          query:                    bundle.query  || null,
+          verdict:                  verdictKey,
+          rawConfidence:            confidence,
+          finalConfidence:          confidence,
+          rawStrength:              "uncapped",
+          cappedStrength:           "evidence_limited",
+          capReasons:               calibCapReasons || [],
+          marketEvidenceConfidence: marketEvidence?.confidence ?? null,
+          evidenceTier,
+        });
+      } catch {}
+      verdictKey = "HOLD";
+    }
+
+    // Phase 4A.1: PASS escalation — allow PASS on pricing_signal_only when
+    // the scanned price is clearly above the clean market signal range.
+    // This is evidence_limited-grade: honest PASS, not a strong PASS.
+    if (
+      verdictKey === "HOLD" &&
+      evidenceTier === "pricing_signal_only" &&
+      calibCapReasons?.includes("pricing_signal_against_high_scan_price") &&
+      (calibration.evidence?.cleanCompCount ?? 0) >= 4
+    ) {
+      verdictKey = "PASS";
+      capReasons.push("pass_on_pricing_signal_above_market");
+    }
+  }
+
   const verdict = VERDICTS[verdictKey];
 
   // ── Supporting signal text ───────────────────────────────────────────────
@@ -277,6 +319,10 @@ export function computeBuyOrPass(bundle = {}) {
     dimensions,
     topSignal:         oneLineReason,
     marketEvidence:    marketEvidence || null,
+    // Phase 4A.1 — calibration mirrors (also set from index.js as safety net)
+    verdictStrength:   calibration?.verdictStrengthCap ?? null,
+    evidenceTier:      calibration?.evidenceTier       ?? null,
+    capReasons:        capReasons.length ? capReasons : (calibration?.capReasons ?? []),
   };
 }
 
