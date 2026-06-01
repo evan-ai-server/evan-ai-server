@@ -325,6 +325,190 @@ test("raw pricing signal count (40) does NOT inflate pricingSignalCount beyond c
   assert.equal(result.evidenceTier, "pricing_signal_only");
 });
 
+// ── Phase 4B: URL evidence upgrade safety tests ───────────────────────────────
+
+test("4B: Google search ibp=oshop URL remains pricing_signal — cannot be verified", () => {
+  // Case 1: google.com/search?ibp=oshop is not a direct merchant URL.
+  // calibration must see 0 verified even though items exist.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    items:            makePricingSignalItems(11),  // all google_unresolved
+    urlSummary:       { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 50, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.25 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0, "ibp=oshop must not count as verified");
+  assert.equal(result.canShowVerifiedLanguage, false, "no verified language for google-unresolved items");
+  assert.ok(result.capReasons.includes("no_verified_listings"), "no_verified_listings reason must fire");
+  assert.notEqual(result.evidenceTier, "verified_strong",    "must not be verified_strong");
+  assert.notEqual(result.evidenceTier, "verified_moderate",  "must not be verified_moderate");
+});
+
+test("4B: Direct merchant product URL becomes verified_listing tier", () => {
+  // Case 2: clean merchant direct URL → verified_listing evidenceQuality.
+  // Simulate post-recovery state: item now has clickable=true, isVerifiedListing=true.
+  const verifiedItems = [
+    { isVerifiedListing: true, evidenceQuality: "verified_listing", clickable: true,
+      directUrl: "https://www.ebay.com/itm/387654321", price: 65, source: "ebay" },
+    ...makePricingSignalItems(4),
+  ];
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    items:            verifiedItems,
+    urlSummary:       { verifiedListings: 1, pricingOnly: 4, oracleEstimates: 0, total: 5 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "medium", priceSpreadPct: 25, directUrlCount: 1 },
+    consensus:        { marketConfidence: 0.65 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 1, "recovered verified listing should count");
+  assert.equal(result.evidenceTier, "verified_thin", "1 verified → verified_thin");
+  assert.equal(result.canShowVerifiedLanguage, true, "verified language allowed with 1 verified listing");
+});
+
+test("4B: Google redirect that unwraps safely to eBay becomes verified evidence", () => {
+  // Case 3: aclk?adurl=ebay.com/itm/ is already handled by extractFromGoogleRedirect.
+  // After resolution: item has clickable=true, directUrl=ebay.com/itm/..., urlQuality=google_redirect_unwrapped.
+  const unwrappedItem = {
+    isVerifiedListing: true, evidenceQuality: "verified_listing",
+    clickable: true, directUrl: "https://www.ebay.com/itm/123456789",
+    urlQuality: "google_redirect_unwrapped", price: 70, source: "ebay-seller",
+  };
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    items:            [unwrappedItem, ...makePricingSignalItems(5)],
+    urlSummary:       { verifiedListings: 1, pricingOnly: 5, oracleEstimates: 0, total: 6 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "medium", priceSpreadPct: 20, directUrlCount: 1 },
+    consensus:        { marketConfidence: 0.70 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 1, "unwrapped redirect counts as verified");
+  assert.equal(result.evidenceTier, "verified_thin");
+  assert.equal(result.canShowVerifiedLanguage, true);
+});
+
+test("4B: Google redirect that unwraps to Google homepage stays pricing_signal", () => {
+  // Case 4: redirect that resolves to google.com should never be verified.
+  // This simulates a google.com/url?q=google.com case — rejected by isGoogleHost.
+  // calibration receives it with clickable=false, no directUrl.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    items:            makePricingSignalItems(5),  // all clickable=false
+    urlSummary:       { verifiedListings: 0, pricingOnly: 5, oracleEstimates: 0, total: 5 },
+    rawUrlSummary:    { total: 10 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 40, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.30 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0, "google-resolving redirect must not be verified");
+  assert.equal(result.canShowVerifiedLanguage, false);
+});
+
+test("4B: Blocked or tracking URL remains pricing_signal", () => {
+  // Case 5: items with blocked directUrls have clickable=false after sanitizeOutboundListingForClient.
+  // Simulate: all items are non-clickable.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.8,
+    items:            makePricingSignalItems(8),
+    urlSummary:       { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    rawUrlSummary:    { total: 8 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 35, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.40 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0);
+  assert.ok(result.capReasons.includes("no_verified_listings"));
+});
+
+test("4B: Wrong-identity items filtered before calibration — verified count stays clean", () => {
+  // Case 6: raw pool had wrong-airline verified items (ANA 787 with ebay.com/itm/ URLs).
+  // After identity lock, only clean Hawaiian 787 items remain (all pricing_signal).
+  // urlSummary (clean) has verifiedListings=0; rawUrlSummary.total=15 (3 verified rejected + 12 clean).
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    identityQuality:  0.6,
+    items:            makePricingSignalItems(12),   // 0 verified (wrong-airline filtered out)
+    urlSummary:       { verifiedListings: 0, pricingOnly: 12, oracleEstimates: 0, total: 12 },
+    rawUrlSummary:    { total: 15 },  // 3 filtered verified items in raw pool
+    marketEvidence:   { confidence: "low", priceSpreadPct: 45, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.35 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0, "filtered verified items must NOT count");
+  assert.equal(result.canShowVerifiedLanguage, false, "no verified language after filtering");
+  assert.ok(result.evidence.rejectionRatio > 0, "rejection ratio should reflect filtered items");
+});
+
+test("4B: Hawaiian 787 style — 0 verified stays 0 when no free recovery possible", () => {
+  // Case 7: raw=40, clean=11, all ibp=oshop (no free extraction).
+  // No URL_VERIFICATION_ENABLED → verifiedListings=0.
+  // evidenceTier=pricing_signal_only, evidenceLimited, canShowVerifiedLanguage=false.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    identityQuality:  0.55,
+    items:            makePricingSignalItems(11),
+    urlSummary:       { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 80, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.25, typicalHigh: 95 },
+    scannedPrice:     165.99,
+    identitySummary:  {
+      rejectedCompetitorCount:     2,
+      rejectedModelMismatchCount:  1,
+      rejectedMissingAirlineCount: 8,
+      rejectedGenericToyCount:     3,
+    },
+    category: "model airplane",
+    query:    "hawaiian airlines boeing 787 diecast model airplane",
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0, "Hawaiian 787: 0 verified is correct honest result");
+  assert.equal(result.evidence.pricingSignalCount, 11, "11 clean signals used");
+  assert.equal(result.evidenceTier, "pricing_signal_only", "pricing_signal_only is correct");
+  assert.equal(result.verdictStrengthCap, "evidence_limited", "evidence_limited for 0 verified");
+  assert.equal(result.canShowVerifiedLanguage, false, "no verified language");
+  assert.equal(result.canShowStrongLanguage, false, "no strong language");
+  assert.ok(result.capReasons.includes("no_verified_listings"));
+  assert.ok(result.capReasons.includes("wide_spread"));
+  assert.ok(result.capReasons.includes("pricing_signal_against_high_scan_price"));
+});
+
+test("4B: If 2 verified listings recovered — tier improves to verified_moderate", () => {
+  // Case 8: Phase 4B opt-in recovery succeeded for 2 items.
+  // urlSummary now shows verifiedListings=2 from clean uiItems.
+  // calibration should see verified_moderate, canShowVerifiedLanguage=true.
+  const recovered = [
+    { isVerifiedListing: true, evidenceQuality: "verified_listing", clickable: true,
+      directUrl: "https://www.ebay.com/itm/111111111111", urlQuality: "merchant_direct",
+      price: 68, source: "ebay-seller-a" },
+    { isVerifiedListing: true, evidenceQuality: "verified_listing", clickable: true,
+      directUrl: "https://www.ebay.com/itm/222222222222", urlQuality: "merchant_direct",
+      price: 72, source: "ebay-seller-b" },
+    { isVerifiedListing: true, evidenceQuality: "verified_listing", clickable: true,
+      directUrl: "https://www.ebay.com/itm/333333333333", urlQuality: "merchant_direct",
+      price: 75, source: "ebay-seller-c" },
+    ...makePricingSignalItems(8),
+  ];
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    identityQuality:  0.7,
+    items:            recovered,
+    urlSummary:       { verifiedListings: 3, pricingOnly: 8, oracleEstimates: 0, total: 11 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "medium", priceSpreadPct: 20, directUrlCount: 3 },
+    consensus:        { marketConfidence: 0.65 },
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 3, "3 verified from recovery");
+  assert.equal(result.evidenceTier, "verified_moderate", "tier improves to verified_moderate");
+  assert.equal(result.canShowVerifiedLanguage, true, "verified language allowed");
+  assert.equal(result.capApplied, true, "cap still applied since 0.9 > 0.85");
+  assert.equal(result.confidenceCap, 0.85, "cap is 0.85 for verified_moderate");
+});
+
 test("returns correct shape with all required fields", () => {
   const result = calibrateEvidenceConfidence({});
   const topLevel = [

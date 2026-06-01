@@ -21936,6 +21936,236 @@ async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) 
 
 // ── End Phase 2C resolver ─────────────────────────────────────────────────────
 
+// ── Phase 4B: Post-filter verified listing upgrade ────────────────────────────
+// Runs on clean uiItems AFTER all identity filtering (aircraft/sneaker/Jordan
+// locks already applied). Only active when URL_VERIFICATION_ENABLED=true.
+//
+// Uses SerpAPI google_product engine to recover direct merchant URLs from items
+// that have a _productId but no clickable URL. This is a SEPARATE budget from
+// the main SERP shopping budget — these are paid SerpAPI calls, so requires
+// explicit opt-in via env var.
+//
+// Limits:
+//   - max candidates: URL_VERIFICATION_MAX_CANDIDATES (default 5)
+//   - concurrency: URL_VERIFICATION_CONCURRENCY (default 3)
+//   - per-item timeout: URL_VERIFICATION_ITEM_TIMEOUT_MS (default 800)
+//   - total wall budget: URL_VERIFICATION_TOTAL_TIMEOUT_MS (default 1500)
+//   - fails closed (any error → item stays pricing_signal)
+//   - circuit-breaks on 401 (plan doesn't support engine)
+
+const URL_VERIFICATION_ENABLED         = String(process.env.URL_VERIFICATION_ENABLED || "").trim() === "true";
+const URL_VERIFICATION_MAX_CANDIDATES  = Math.min(8, Math.max(1, Number(process.env.URL_VERIFICATION_MAX_CANDIDATES || 5)));
+const URL_VERIFICATION_CONCURRENCY     = Math.min(5, Math.max(1, Number(process.env.URL_VERIFICATION_CONCURRENCY    || 3)));
+const URL_VERIFICATION_ITEM_TIMEOUT_MS = Math.min(2000, Math.max(300, Number(process.env.URL_VERIFICATION_ITEM_TIMEOUT_MS  || 800)));
+const URL_VERIFICATION_TOTAL_TIMEOUT_MS = Math.min(3000, Math.max(500, Number(process.env.URL_VERIFICATION_TOTAL_TIMEOUT_MS || 1500)));
+
+/** Attempt to resolve a direct merchant URL for one item via SerpAPI google_product. */
+async function _verifyOneItem(it, serpApiKey, scanId) {
+  const productId = it._productId;
+  if (!productId) return null;
+
+  const apiUrl = it._serpapiProductApiUrl ||
+    `https://serpapi.com/search.json?${new URLSearchParams({ engine: "google_product", product_id: String(productId), api_key: serpApiKey })}`;
+
+  const title    = (it.title || "").slice(0, 60);
+  const source   = it.source || "unknown";
+  const qualBefore = it.urlQuality || "google_unresolved";
+
+  console.log("DIRECT_URL_RECOVERY_ATTEMPT", {
+    scanId: scanId || null,
+    title,
+    source,
+    urlQualityBefore: qualBefore,
+    candidateUrlHost: productId ? "serpapi.com/google_product" : "none",
+    method: "serpapi_google_product",
+  });
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), URL_VERIFICATION_ITEM_TIMEOUT_MS);
+  try {
+    const r = await fetch(apiUrl, { signal: ctrl.signal });
+    clearTimeout(t);
+    const data = await r.json();
+    if (!r.ok) {
+      if (r.status === 401 || (r.status === 400 && String(data?.error || "").includes("Unsupported"))) {
+        _googleProductApiAvailable = false;
+      }
+      console.log("DIRECT_URL_RECOVERY_REJECTED", {
+        scanId: scanId || null,
+        title, source,
+        reason: "api_error",
+        host: "serpapi.com",
+        urlQualityBefore: qualBefore,
+      });
+      return null;
+    }
+
+    const sellers = (data?.sellers_results?.online_sellers || [])
+      .filter(s => _isValidMerchantUrl(s.link))
+      .sort((a, b) => (Number(a.extracted_total_price) || 9999) - (Number(b.extracted_total_price) || 9999));
+
+    if (!sellers.length) {
+      console.log("DIRECT_URL_RECOVERY_REJECTED", {
+        scanId: scanId || null,
+        title, source,
+        reason: "no_valid_merchant_sellers",
+        host: "serpapi.com",
+        urlQualityBefore: qualBefore,
+      });
+      return null;
+    }
+
+    const best = sellers[0];
+    let recoveredHost;
+    try { recoveredHost = new URL(best.link).hostname.toLowerCase(); } catch {
+      console.log("DIRECT_URL_RECOVERY_REJECTED", {
+        scanId: scanId || null,
+        title, source, reason: "url_parse_failed",
+        host: "unknown", urlQualityBefore: qualBefore,
+      });
+      return null;
+    }
+
+    // Final outbound policy check
+    if (!_isValidMerchantUrl(best.link)) {
+      console.log("DIRECT_URL_RECOVERY_REJECTED", {
+        scanId: scanId || null,
+        title, source, reason: "outbound_policy_blocked",
+        host: recoveredHost, urlQualityBefore: qualBefore,
+      });
+      return null;
+    }
+
+    console.log("DIRECT_URL_RECOVERY_UPGRADED", {
+      scanId: scanId || null,
+      title, source,
+      recoveredHost,
+      recoveredUrlQuality: "merchant_direct",
+      evidenceQualityBefore: "pricing_signal",
+      evidenceQualityAfter:  "verified_listing",
+    });
+    return {
+      _productId: productId,
+      directUrl: best.link,
+      urlQuality: "merchant_direct",
+      urlHost: recoveredHost,
+    };
+  } catch (err) {
+    clearTimeout(t);
+    console.log("DIRECT_URL_RECOVERY_REJECTED", {
+      scanId: scanId || null,
+      title, source,
+      reason: String(err?.name) === "AbortError" ? "timeout" : "fetch_error",
+      host: "serpapi.com",
+      urlQualityBefore: qualBefore,
+    });
+    return null;
+  }
+}
+
+/**
+ * Phase 4B: attempt verified listing upgrade for clean uiItems.
+ * Must be called AFTER identity filtering, BEFORE _cleanUrlSummary is computed.
+ * Returns updated uiItems array (items that couldn't be upgraded are unchanged).
+ */
+async function upgradeToVerifiedListings(uiItems, serpApiKey, { scanId = null, query = "" } = {}) {
+  if (!URL_VERIFICATION_ENABLED || !serpApiKey || !_googleProductApiAvailable) return uiItems;
+
+  const candidates = uiItems
+    .filter(it => !it.clickable && it._productId)
+    .slice(0, URL_VERIFICATION_MAX_CANDIDATES);
+
+  console.log("DIRECT_URL_RECOVERY_ELIGIBLE", {
+    scanId,
+    query: (query || "").slice(0, 80),
+    rawCandidates:   uiItems.filter(it => !it.clickable).length,
+    cleanCandidates: candidates.length,
+    eligibleCandidates: candidates.length,
+    reason: candidates.length > 0 ? "has_product_ids" : "no_product_ids_or_all_verified",
+  });
+
+  if (!candidates.length) return uiItems;
+
+  // Concurrency-limited parallel resolution with total wall-clock guard
+  const totalGuard = new Promise((res) => {
+    const t = setTimeout(() => res("timeout"), URL_VERIFICATION_TOTAL_TIMEOUT_MS);
+    if (typeof t.unref === "function") t.unref();
+  });
+
+  // Process in slices of URL_VERIFICATION_CONCURRENCY
+  const recovered = new Map(); // _productId → upgrade data
+  let attempted = 0, timedOut = 0;
+
+  const _runSlice = async (slice) => {
+    const settled = await Promise.allSettled(
+      slice.map(it => {
+        attempted++;
+        return _verifyOneItem(it, serpApiKey, scanId);
+      })
+    );
+    for (const r of settled) {
+      if (r.status === "fulfilled" && r.value) {
+        recovered.set(r.value._productId, r.value);
+      }
+    }
+  };
+
+  const raceResult = await Promise.race([
+    (async () => {
+      for (let i = 0; i < candidates.length; i += URL_VERIFICATION_CONCURRENCY) {
+        const slice = candidates.slice(i, i + URL_VERIFICATION_CONCURRENCY);
+        await _runSlice(slice);
+      }
+      return "done";
+    })(),
+    totalGuard,
+  ]);
+  if (raceResult === "timeout") timedOut = attempted;
+
+  if (!recovered.size) return uiItems;
+
+  // Apply recovered URLs — only to items whose _productId matched
+  const upgraded = uiItems.map(it => {
+    if (!it._productId || !recovered.has(it._productId)) return it;
+    const rec = recovered.get(it._productId);
+    return {
+      ...it,
+      directUrl:        rec.directUrl,
+      link:             rec.directUrl,
+      url:              rec.directUrl,
+      buyLink:          rec.directUrl,
+      clickable:        true,
+      urlQuality:       "merchant_direct",
+      urlHost:          rec.urlHost,
+      evidenceQuality:  "verified_listing",
+      isVerifiedListing: true,
+      isPricingEvidenceOnly: false,
+    };
+  });
+
+  const topHosts = [...new Set(
+    [...recovered.values()].map(r => r.urlHost).filter(Boolean)
+  )].slice(0, 5);
+
+  console.log("DIRECT_URL_RECOVERY_SUMMARY", {
+    scanId,
+    query: (query || "").slice(0, 80),
+    total: uiItems.length,
+    attempted,
+    recoveredDirect: recovered.size,
+    rejected: attempted - recovered.size,
+    pricingOnly: upgraded.filter(it => !it.clickable).length,
+    timedOut,
+    cacheHits: 0,
+    topRecoveredHosts: topHosts,
+    topRejectedReasons: [],
+  });
+
+  return upgraded;
+}
+
+// ── End Phase 4B ──────────────────────────────────────────────────────────────
+
 // -------------------- SERP: google shopping --------------------
 async function serpShopping(query, opts = {}) {
   const { bypassCooldown = false, softFail = false, bypassHardenedCache = false } = opts || {};
@@ -23386,7 +23616,42 @@ async function buildMarketSearchResponsePayload({
     console.log("PAYLOAD_FINAL_ITEMS_BEFORE_SEND", { sourceCount: (sourceItems||[]).length, uiCount: (uiItems||[]).length, top5source: _pfTop5src, top5ui: _pfTop5ui });
   } catch {}
 
-  const soldPool = uiItems.filter(
+  // Phase 4B: log eligible candidates before any verification attempt.
+  // This fires regardless of whether URL_VERIFICATION_ENABLED is on,
+  // so we always know what COULD be recovered.
+  try {
+    const _eligibleCount = uiItems.filter(it => !it.clickable && it._productId).length;
+    console.log("DIRECT_URL_RECOVERY_ELIGIBLE", {
+      scanId:             retrievalMeta?.scanId || null,
+      query:              baseQuery,
+      rawCandidates:      _urlSummary.total - _urlSummary.verifiedListings,
+      cleanCandidates:    uiItems.filter(it => !it.clickable).length,
+      eligibleCandidates: _eligibleCount,
+      reason: URL_VERIFICATION_ENABLED
+        ? (_eligibleCount > 0 ? "url_verification_will_attempt" : "no_product_ids_in_clean_pool")
+        : (_eligibleCount > 0 ? "url_verification_disabled_has_candidates" : "no_product_ids"),
+    });
+  } catch {}
+
+  // Phase 4B: opt-in verified listing upgrade (URL_VERIFICATION_ENABLED=true).
+  // Runs on clean post-filter uiItems BEFORE _cleanUrlSummary so that recovered
+  // direct URLs count toward verifiedListings in the calibration inputs.
+  let uiItemsForCalibration = uiItems;
+  if (URL_VERIFICATION_ENABLED && SERPAPI_KEY) {
+    try {
+      uiItemsForCalibration = await upgradeToVerifiedListings(uiItems, SERPAPI_KEY, {
+        scanId: retrievalMeta?.scanId || null,
+        query:  baseQuery,
+      });
+    } catch (_verErr) {
+      console.warn("DIRECT_URL_RECOVERY_ERROR", {
+        scanId: retrievalMeta?.scanId || null,
+        error:  _verErr?.message || String(_verErr),
+      });
+    }
+  }
+
+  const soldPool = uiItemsForCalibration.filter(
     (i) => i?.sold === true || String(i?.status || "").toLowerCase() === "sold"
   );
 
@@ -23907,7 +24172,7 @@ async function buildMarketSearchResponsePayload({
     // listings, prices too spread out, low query-relevance overall). Without
     // this gate, a small SerpAPI result set can produce false BUY confidence.
     const marketEvidence = computeMarketEvidence(
-      Array.isArray(uiItems) ? uiItems : [],
+      Array.isArray(uiItemsForCalibration) ? uiItemsForCalibration : [],
       visionIdentity?.title || ""
     );
 
@@ -23915,21 +24180,22 @@ async function buildMarketSearchResponsePayload({
     // Runs AFTER marketEvidence (needs its confidence/spread), BEFORE buyOrPass
     // (so calibration can influence the verdict-strength cap).
     //
-    // _cleanUrlSummary is computed from uiItems (post-identity-lock clean pool).
+    // _cleanUrlSummary is computed from uiItemsForCalibration (post-identity-lock
+    // clean pool, with Phase 4B URL verification applied if enabled).
     // _urlSummary (raw, from _rawSourceItems) is passed as rawUrlSummary so the
     // rejection ratio approximation can compare raw vs clean pool sizes.
     // Evidence counts (verifiedListings, pricingOnly) must use CLEAN counts only.
     const _cleanUrlSummary = {
-      total:            uiItems.length,
-      clickable:        uiItems.filter(x => x?.clickable !== false && x?.directUrl).length,
-      pricingOnly:      uiItems.filter(x => x?.clickable === false).length,
-      googleUnresolved: uiItems.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length,
-      googleUnwrapped:  uiItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length,
-      missingUrl:       uiItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length,
-      merchantDirect:   uiItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length,
-      legacyNormalized: uiItems.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length,
-      oracleEstimates:  uiItems.filter(x => x?.urlQuality === "oracle_pricing_estimate").length,
-      verifiedListings: uiItems.filter(x => x?.isVerifiedListing === true).length,
+      total:            uiItemsForCalibration.length,
+      clickable:        uiItemsForCalibration.filter(x => x?.clickable !== false && x?.directUrl).length,
+      pricingOnly:      uiItemsForCalibration.filter(x => x?.clickable === false).length,
+      googleUnresolved: uiItemsForCalibration.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length,
+      googleUnwrapped:  uiItemsForCalibration.filter(x => x?.urlQuality === "google_redirect_unwrapped").length,
+      missingUrl:       uiItemsForCalibration.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length,
+      merchantDirect:   uiItemsForCalibration.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length,
+      legacyNormalized: uiItemsForCalibration.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length,
+      oracleEstimates:  uiItemsForCalibration.filter(x => x?.urlQuality === "oracle_pricing_estimate").length,
+      verifiedListings: uiItemsForCalibration.filter(x => x?.isVerifiedListing === true).length,
     };
 
     const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
@@ -23974,11 +24240,11 @@ async function buildMarketSearchResponsePayload({
         visualConfidence:  visionIdentity?.visualConfidence ?? 0,
         brandCertainty:    visionIdentity?.brandCertainty   ?? 0,
         identityQuality:   _calibIdentityQuality,
-        items:             uiItems,
+        items:             uiItemsForCalibration,  // Phase 4B: may include recovered verified URLs
         marketEvidence,
         consensus,
         identitySummary:   null,     // TODO Phase 4A.2+: plumb from identity lock functions
-        urlSummary:        _cleanUrlSummary,  // CLEAN post-filter counts (from uiItems)
+        urlSummary:        _cleanUrlSummary,  // CLEAN post-filter counts (from uiItemsForCalibration)
         rawUrlSummary:     _urlSummary,       // raw pre-filter (for rejection ratio approx)
         scannedPrice:      finitePrice(scannedPrice),
         category,
@@ -24062,7 +24328,7 @@ async function buildMarketSearchResponsePayload({
         visionConfidence:         Number((visionConfidence ?? 0).toFixed(3)),
         calibratedConfidence:     _confidenceCalibration?.calibratedConfidence ?? null,
         consensusMedian:          consensus?.median     ?? null,
-        consensusListingCount:    uiItems.length,
+        consensusListingCount:    uiItemsForCalibration.length,
         marketEvidenceConfidence: marketEvidence?.confidence ?? null,
         verifiedListingCount:     _confidenceCalibration?.evidence?.verifiedListingCount ?? 0,
         pricingSignalCount:       _confidenceCalibration?.evidence?.pricingSignalCount   ?? 0,
@@ -24070,6 +24336,24 @@ async function buildMarketSearchResponsePayload({
         evidenceTier:             _confidenceCalibration?.evidenceTier     ?? null,
         verdictStrengthCap:       _confidenceCalibration?.verdictStrengthCap ?? null,
         finalVerdict:             buyOrPassResult?.buyOrPass?.verdict ?? null,
+      });
+    } catch { /* non-fatal */ }
+
+    // Phase 4B: EVIDENCE_QUALITY_SUMMARY — single authoritative log per scan
+    // showing the final clean evidence breakdown used for calibration.
+    try {
+      console.log("EVIDENCE_QUALITY_SUMMARY", {
+        scanId:           retrievalMeta?.scanId || null,
+        query:            baseQuery,
+        cleanTotal:       _cleanUrlSummary.total,
+        verifiedListings: _cleanUrlSummary.verifiedListings,
+        pricingSignals:   _cleanUrlSummary.pricingOnly,
+        oracleEstimates:  _cleanUrlSummary.oracleEstimates,
+        googleUnresolved: _cleanUrlSummary.googleUnresolved,
+        merchantDirect:   _cleanUrlSummary.merchantDirect,
+        evidenceTier:     _confidenceCalibration?.evidenceTier     ?? null,
+        verdictStrengthCap: _confidenceCalibration?.verdictStrengthCap ?? null,
+        urlVerificationEnabled: URL_VERIFICATION_ENABLED,
       });
     } catch { /* non-fatal */ }
 
@@ -24214,14 +24498,14 @@ async function buildMarketSearchResponsePayload({
     searchedQueries,
     variants,
 
-    items: uiItems,
-    top3: uiItems.slice(0, 3),
+    items: uiItemsForCalibration,
+    top3: uiItemsForCalibration.slice(0, 3),
 
-    market: uiItems,
-    results: uiItems,
+    market: uiItemsForCalibration,
+    results: uiItemsForCalibration,
     best,
     bestPrice,
-    totalMatches: uiItems.length,
+    totalMatches: uiItemsForCalibration.length,
 
     visionIdentity,
     authenticityFlags: Array.isArray(authenticityFlags) ? authenticityFlags : [],
