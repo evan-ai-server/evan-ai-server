@@ -532,6 +532,10 @@ import {
   calibrateEvidenceConfidence,
   runConfidenceCalibrationSelfTest,
 } from "./src/confidenceCalibration.js";
+import {
+  evaluateRecoveredOfferIdentity,
+  selectBestVerifiedSeller,
+} from "./src/offerIdentityGuard.js";
 
 // Phase 6 + Phase 11: server-side telemetry sink for verdict drift.
 // Routes verdict_disagreement_event into the structured logger so it
@@ -22000,11 +22004,9 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
       return null;
     }
 
-    const sellers = (data?.sellers_results?.online_sellers || [])
-      .filter(s => _isValidMerchantUrl(s.link))
-      .sort((a, b) => (Number(a.extracted_total_price) || 9999) - (Number(b.extracted_total_price) || 9999));
+    const rawSellers = data?.sellers_results?.online_sellers || [];
 
-    if (!sellers.length) {
+    if (!rawSellers.length) {
       console.log("DIRECT_URL_RECOVERY_REJECTED", {
         scanId: scanId || null,
         title, source,
@@ -22015,26 +22017,55 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
       return null;
     }
 
-    const best = sellers[0];
-    let recoveredHost;
-    try { recoveredHost = new URL(best.link).hostname.toLowerCase(); } catch {
+    // Phase 4B.1 — Offer identity guard: pick the best guard-passing seller,
+    // NOT the cheapest. _isValidMerchantUrl enforces outbound policy.
+    const guardResult = selectBestVerifiedSeller(rawSellers, it, _isValidMerchantUrl);
+
+    if (!guardResult) {
+      // Log per-seller rejections for auditability
+      for (const seller of rawSellers) {
+        const link = String(seller?.link || "");
+        if (!link) continue;
+        const singleGuard = evaluateRecoveredOfferIdentity(it, seller, link);
+        let sellerHost = "unknown";
+        try { sellerHost = new URL(link).hostname.toLowerCase(); } catch {}
+        console.log("OFFER_IDENTITY_GUARD_REJECT", {
+          scanId: scanId || null,
+          title,
+          originalSource: source,
+          recoveredHost: sellerHost,
+          originalPrice: singleGuard.details.originalPrice,
+          recoveredPrice: singleGuard.details.recoveredPrice,
+          priceDeltaAbs: singleGuard.details.priceDeltaAbs,
+          priceDeltaPct: singleGuard.details.priceDeltaPct,
+          reason: singleGuard.reason,
+          score: singleGuard.score,
+        });
+      }
       console.log("DIRECT_URL_RECOVERY_REJECTED", {
         scanId: scanId || null,
-        title, source, reason: "url_parse_failed",
-        host: "unknown", urlQualityBefore: qualBefore,
+        title, source,
+        reason: "offer_no_guard_passing_seller",
+        host: "serpapi.com",
+        urlQualityBefore: qualBefore,
       });
       return null;
     }
 
-    // Final outbound policy check
-    if (!_isValidMerchantUrl(best.link)) {
-      console.log("DIRECT_URL_RECOVERY_REJECTED", {
-        scanId: scanId || null,
-        title, source, reason: "outbound_policy_blocked",
-        host: recoveredHost, urlQualityBefore: qualBefore,
-      });
-      return null;
-    }
+    const { link: bestLink, host: recoveredHost, guardResult: gr } = guardResult;
+
+    console.log("OFFER_IDENTITY_GUARD_PASS", {
+      scanId: scanId || null,
+      title,
+      originalSource: source,
+      recoveredHost,
+      originalPrice: gr.details.originalPrice,
+      recoveredPrice: gr.details.recoveredPrice,
+      priceDeltaAbs: gr.details.priceDeltaAbs,
+      priceDeltaPct: gr.details.priceDeltaPct,
+      score: gr.score,
+      reason: gr.reason,
+    });
 
     console.log("DIRECT_URL_RECOVERY_UPGRADED", {
       scanId: scanId || null,
@@ -22043,10 +22074,15 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
       recoveredUrlQuality: "merchant_direct",
       evidenceQualityBefore: "pricing_signal",
       evidenceQualityAfter:  "verified_listing",
+      offerGuardPassed: true,
+      offerGuardReason: gr.reason,
+      originalSource: source,
+      originalPrice: gr.details.originalPrice,
+      recoveredPrice: gr.details.recoveredPrice,
     });
     return {
       _productId: productId,
-      directUrl: best.link,
+      directUrl: bestLink,
       urlQuality: "merchant_direct",
       urlHost: recoveredHost,
     };
@@ -22095,6 +22131,7 @@ async function upgradeToVerifiedListings(uiItems, serpApiKey, { scanId = null, q
   // Process in slices of URL_VERIFICATION_CONCURRENCY
   const recovered = new Map(); // _productId → upgrade data
   let attempted = 0, timedOut = 0;
+  const guardRejectReasons = {};
 
   const _runSlice = async (slice) => {
     const settled = await Promise.allSettled(
@@ -22158,7 +22195,12 @@ async function upgradeToVerifiedListings(uiItems, serpApiKey, { scanId = null, q
     timedOut,
     cacheHits: 0,
     topRecoveredHosts: topHosts,
-    topRejectedReasons: [],
+    guardPassed: recovered.size,
+    guardRejected: attempted - recovered.size,
+    topGuardRejectReasons: Object.entries(guardRejectReasons)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => ({ reason, count })),
   });
 
   return upgraded;
