@@ -178,7 +178,9 @@ test("no_evidence: empty items → 0.15 cap, calibratedConfidence = 0.15", () =>
   assert.equal(result.verdictStrengthCap, "evidence_limited");
 });
 
-test("Hawaiian 787 style: 0 verified, 37 signals, wide spread, high rejection → pricing_signal_only, evidence_limited", () => {
+test("Hawaiian 787 style: 0 verified, 13 clean signals (not raw 37), wide spread → pricing_signal_only, evidence_limited", () => {
+  // urlSummary = CLEAN counts from 13 post-filter items; rawUrlSummary carries raw total 37.
+  // identitySummary provides exact rejection counts so rawUrlSummary not used for ratio.
   const result = calibrateEvidenceConfidence({
     visionConfidence:  0.9,
     brandCertainty:    0.8,
@@ -187,7 +189,8 @@ test("Hawaiian 787 style: 0 verified, 37 signals, wide spread, high rejection �
       isVerifiedListing: false, evidenceQuality: "pricing_signal",
       clickable: false, price: 65, source: "ebay",
     })),
-    urlSummary:        { verifiedListings: 0, pricingOnly: 37, oracleEstimates: 0, total: 37 },
+    urlSummary:        { verifiedListings: 0, pricingOnly: 13, oracleEstimates: 0, total: 13 },
+    rawUrlSummary:     { total: 37 },
     marketEvidence:    { confidence: "low", priceSpreadPct: 80, directUrlCount: 0 },
     consensus:         { marketConfidence: 0.25, typicalHigh: 95 },
     scannedPrice:      165.99,
@@ -212,7 +215,7 @@ test("Hawaiian 787 style: 0 verified, 37 signals, wide spread, high rejection �
   assert.ok(result.capReasons.includes("identity_lock_high_rejection_ratio"), "high rejection ratio reason");
   assert.ok(result.capReasons.includes("pricing_signal_against_high_scan_price"), "scan price above market reason");
   assert.equal(result.evidence.verifiedListingCount, 0);
-  assert.equal(result.evidence.pricingSignalCount, 37);
+  assert.equal(result.evidence.pricingSignalCount, 13, "uses clean count (13), not raw (37)");
   assert.equal(result.evidence.cleanCompCount, 13);
   assert.equal(result.evidence.rejectedCompetitorCount, 2);
   assert.equal(result.evidence.rejectedGenericToyCount, 3);
@@ -230,28 +233,35 @@ test("caps visionConfidence of 0.0 correctly at tier cap", () => {
   assert.equal(result.capApplied, false); // 0.0 not > 0.15
 });
 
-test("identitySummary=null falls back to urlSummary.total approximation", () => {
+test("identitySummary=null uses rawUrlSummary.total for rejection approximation", () => {
+  // urlSummary = CLEAN (10 items); rawUrlSummary.total = 30 (raw pre-filter).
+  // With identitySummary=null: totalRejectedCount = max(0, 30-10) = 20; rejectionRatio ≈ 0.67.
   const result = calibrateEvidenceConfidence({
     visionConfidence: 0.8,
     identityQuality:  0.5,
     items:            makePricingSignalItems(10),
-    urlSummary:       { verifiedListings: 0, pricingOnly: 20, oracleEstimates: 0, total: 30 },
+    urlSummary:       { verifiedListings: 0, pricingOnly: 10, oracleEstimates: 0, total: 10 },
+    rawUrlSummary:    { total: 30 },
     marketEvidence:   { confidence: "low", priceSpreadPct: 30, directUrlCount: 0 },
     consensus:        { marketConfidence: 0.4 },
     identitySummary:  null,
   });
 
-  // totalRejectedCount ≈ 30 - 10 = 20; rejectionRatio = 20/30 ≈ 0.67
-  assert.ok(result.evidence.totalRejectedCount >= 0, "totalRejectedCount should be non-negative");
-  assert.ok(result.evidence.rejectionRatio > 0, "rejectionRatio should be positive with null identitySummary");
+  // totalRejectedCount = max(0, rawTotal=30 - cleanCompCount=10) = 20
+  // rejectionRatio = 20 / (20+10) ≈ 0.67
+  assert.equal(result.evidence.pricingSignalCount, 10, "uses clean pricingOnly=10, not raw");
+  assert.equal(result.evidence.cleanCompCount, 10);
+  assert.ok(result.evidence.totalRejectedCount > 0, "rejection count derived from raw vs clean");
+  assert.ok(result.evidence.rejectionRatio > 0.5, "high rejection ratio from raw=30 clean=10");
   assert.ok(result.capReasons.includes("no_verified_listings"));
+  assert.ok(result.capReasons.includes("identity_lock_high_rejection_ratio"), "high rejection flagged");
 });
 
 test("canShowMedianAsAuthoritative only with enough clean comps and tight spread", () => {
   const tightResult = calibrateEvidenceConfidence({
     visionConfidence: 0.7,
     items:            makePricingSignalItems(5),
-    urlSummary:       { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    urlSummary:       { verifiedListings: 0, pricingOnly: 5, oracleEstimates: 0, total: 5 },
     marketEvidence:   { confidence: "medium", priceSpreadPct: 20, directUrlCount: 0 },
     consensus:        { marketConfidence: 0.65 },
   });
@@ -260,11 +270,59 @@ test("canShowMedianAsAuthoritative only with enough clean comps and tight spread
   const wideResult = calibrateEvidenceConfidence({
     visionConfidence: 0.7,
     items:            makePricingSignalItems(5),
-    urlSummary:       { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    urlSummary:       { verifiedListings: 0, pricingOnly: 5, oracleEstimates: 0, total: 5 },
     marketEvidence:   { confidence: "low", priceSpreadPct: 80, directUrlCount: 0 },
     consensus:        { marketConfidence: 0.20 },
   });
   assert.equal(wideResult.canShowMedianAsAuthoritative, false, "wide spread blocks median authority");
+});
+
+// ── Clean-vs-raw contamination guard tests ────────────────────────────────────
+
+test("raw verified listings from wrong-airline items do NOT inflate verifiedListingCount", () => {
+  // Scenario: 3 raw verified items were wrong-airline (ANA 787, JAL 787) and filtered out.
+  // Clean uiItems: 0 verified, 11 pricing-signal only.
+  // urlSummary = CLEAN (0 verified); rawUrlSummary.total = 14 (3 filtered verified + 11 clean).
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items:            makePricingSignalItems(11),
+    urlSummary:       { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary:    { total: 14 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 40, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.45 },
+    identitySummary:  null,
+  });
+
+  assert.equal(result.evidence.verifiedListingCount, 0, "no verified in clean pool");
+  assert.equal(result.canShowVerifiedLanguage, false, "clean pool has 0 verified");
+  assert.ok(result.capReasons.includes("no_verified_listings"), "no_verified_listings flagged");
+  assert.notEqual(result.evidenceTier, "verified_moderate", "must not be verified_moderate");
+  assert.notEqual(result.evidenceTier, "verified_strong",   "must not be verified_strong");
+});
+
+test("raw pricing signal count (40) does NOT inflate pricingSignalCount beyond clean count (11)", () => {
+  // Scenario: raw pool had 40 items (many irrelevant aircraft/toys/wrong-airline).
+  // After identity filtering, only 11 clean Hawaiian-787 comps remain.
+  // pricingSignalCount must come from clean 11, not raw 40.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.9,
+    identityQuality:  0.6,
+    items:            makePricingSignalItems(11),
+    urlSummary:       { verifiedListings: 0, pricingOnly: 11, oracleEstimates: 0, total: 11 },
+    rawUrlSummary:    { total: 40 },
+    marketEvidence:   { confidence: "low", priceSpreadPct: 55, directUrlCount: 0 },
+    consensus:        { marketConfidence: 0.30 },
+    identitySummary:  null,
+  });
+
+  assert.equal(result.evidence.pricingSignalCount, 11, "clean pricingSignals=11, not raw=40");
+  assert.equal(result.evidence.cleanCompCount, 11);
+  // 40 - 11 = 29 rejected; rejectionRatio = 29/40 ≈ 0.725 → high
+  assert.ok(result.evidence.rejectionRatio > 0.5, "high rejection from large raw pool");
+  assert.ok(result.capReasons.includes("identity_lock_high_rejection_ratio"), "high rejection flagged");
+  // With 11 clean signals, tier should be pricing_signal_only (11>=4 but spread >0.5 blocks strong)
+  assert.equal(result.evidenceTier, "pricing_signal_only");
 });
 
 test("returns correct shape with all required fields", () => {

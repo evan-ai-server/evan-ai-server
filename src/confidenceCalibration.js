@@ -325,7 +325,8 @@ export function calibrateEvidenceConfidence({
   marketEvidence    = null,
   consensus         = null,
   identitySummary   = null,   // optional — null triggers fallback approximation
-  urlSummary        = null,   // { verifiedListings, pricingOnly, oracleEstimates, total, ... }
+  urlSummary        = null,   // CLEAN summary from uiItems (post-identity-lock)
+  rawUrlSummary     = null,   // RAW summary from _rawSourceItems (pre-filter; used only for rejection ratio approx)
   scannedPrice      = null,
   category          = null,
   cacheKind         = null,
@@ -336,8 +337,10 @@ export function calibrateEvidenceConfidence({
   const uiItemArray = Array.isArray(items) ? items : [];
 
   // ── 1. Evidence counts ─────────────────────────────────────────────────────
-  // urlSummary = raw counts BEFORE identity filtering (pre-lock pool)
-  // items      = post-identity-lock pool (cleanCompCount)
+  // urlSummary = CLEAN post-identity-lock counts (from uiItems).
+  // rawUrlSummary = pre-filter counts (used only for rejection ratio approximation).
+  // items = uiItems (post-filter) — authoritative for cleanCompCount.
+  // Evidence quality must come from the clean pool only, never raw source items.
   const verifiedListingCount   = Number(urlSummary?.verifiedListings ??
     uiItemArray.filter(i => i?.isVerifiedListing === true).length);
   const pricingSignalCount     = Number(urlSummary?.pricingOnly ??
@@ -363,8 +366,11 @@ export function calibrateEvidenceConfidence({
       rejectedMissingAirlineCount +
       rejectedGenericToyCount;
   } else {
-    // Approximate: difference between raw pool and clean post-lock pool
-    const rawTotal = Number(urlSummary?.total ?? 0);
+    // Approximate: difference between raw pre-filter pool and clean post-filter pool.
+    // Must use rawUrlSummary.total (pre-lock), not urlSummary.total (clean = same as cleanCompCount).
+    // TODO Phase 4A.2+: plumb exact per-reason rejection counts from filterRelevantListings /
+    // applyAircraftFamilyLock / applySneakerIdentityLock / applyJordanIdentityLock return values.
+    const rawTotal = Number(rawUrlSummary?.total ?? 0);
     totalRejectedCount = Math.max(0, rawTotal - cleanCompCount);
   }
 
@@ -538,14 +544,16 @@ export function runConfidenceCalibrationSelfTest() {
           { isVerifiedListing: false, evidenceQuality: "pricing_signal",   clickable: false, price: 70, source: "amazon-b" },
           { isVerifiedListing: false, evidenceQuality: "pricing_signal",   clickable: false, price: 63, source: "amazon-c" },
         ],
-        urlSummary:    { verifiedListings: 1, pricingOnly: 4, oracleEstimates: 0, total: 5 },
+        urlSummary:    { verifiedListings: 1, pricingOnly: 3, oracleEstimates: 0, total: 4 },
         marketEvidence:{ confidence: "medium", priceSpreadPct: 30, directUrlCount: 1 },
         consensus:     { marketConfidence: 0.60 },
       },
       expect: { evidenceTier: "verified_thin", capApplied: true, calibratedConfidence: 0.70 },
     },
     {
-      // Hawaiian Airlines Boeing 787 diecast: verifiedListings=0, pricingSignals=37, wide spread
+      // Hawaiian Airlines Boeing 787 diecast: 0 verified, 13 clean signals, wide spread.
+      // urlSummary uses CLEAN post-filter counts; rawUrlSummary carries the raw total for
+      // rejection ratio approximation (unused here since identitySummary is provided).
       label:  "pricing_signal_only_hawaiian_787",
       input:  {
         visionConfidence: 0.9,
@@ -555,7 +563,8 @@ export function runConfidenceCalibrationSelfTest() {
           isVerifiedListing: false, evidenceQuality: "pricing_signal",
           clickable: false, price: 65, source: "ebay",
         })),
-        urlSummary:    { verifiedListings: 0, pricingOnly: 37, oracleEstimates: 0, total: 37 },
+        urlSummary:    { verifiedListings: 0, pricingOnly: 13, oracleEstimates: 0, total: 13 },
+        rawUrlSummary: { total: 37 },  // raw pre-filter pool size
         marketEvidence:{ confidence: "low", priceSpreadPct: 80, directUrlCount: 0 },
         consensus:     { marketConfidence: 0.25, typicalHigh: 95 },
         scannedPrice:  165.99,
@@ -618,15 +627,17 @@ export function runConfidenceCalibrationSelfTest() {
       expect: { evidenceTier: "no_evidence", confidenceCap: 0.15, verdictStrengthCap: "evidence_limited", calibratedConfidence: 0.15 },
     },
     {
+      // pricing_signal_strong requires >= 8 clean signals, >= 4 comps, tight spread, low identity risk.
+      // urlSummary reflects the CLEAN pool (8 items = 8 pricing signals).
       label:  "pricing_signal_strong",
       input:  {
         visionConfidence: 0.85,
         identityQuality:  0.75,
-        items: Array(6).fill(null).map((_, i) => ({
+        items: Array(8).fill(null).map((_, i) => ({
           isVerifiedListing: false, evidenceQuality: "pricing_signal",
           clickable: false, price: 100 + i, source: `store-${i}`,
         })),
-        urlSummary:    { verifiedListings: 0, pricingOnly: 10, oracleEstimates: 0, total: 10 },
+        urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
         marketEvidence:{ confidence: "medium", priceSpreadPct: 20, directUrlCount: 0 },
         consensus:     { marketConfidence: 0.75 },
       },

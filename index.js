@@ -23914,9 +23914,41 @@ async function buildMarketSearchResponsePayload({
     // ── Phase 4A.1: Evidence-based confidence calibration ─────────────────────
     // Runs AFTER marketEvidence (needs its confidence/spread), BEFORE buyOrPass
     // (so calibration can influence the verdict-strength cap).
+    //
+    // _cleanUrlSummary is computed from uiItems (post-identity-lock clean pool).
+    // _urlSummary (raw, from _rawSourceItems) is passed as rawUrlSummary so the
+    // rejection ratio approximation can compare raw vs clean pool sizes.
+    // Evidence counts (verifiedListings, pricingOnly) must use CLEAN counts only.
+    const _cleanUrlSummary = {
+      total:            uiItems.length,
+      clickable:        uiItems.filter(x => x?.clickable !== false && x?.directUrl).length,
+      pricingOnly:      uiItems.filter(x => x?.clickable === false).length,
+      googleUnresolved: uiItems.filter(x => x?.urlQuality === "google_unresolved" || x?.urlQuality === "google_unresolved_stale_cache").length,
+      googleUnwrapped:  uiItems.filter(x => x?.urlQuality === "google_redirect_unwrapped").length,
+      missingUrl:       uiItems.filter(x => x?.urlQuality === "missing_direct_url" || x?.urlQuality === "unresolved").length,
+      merchantDirect:   uiItems.filter(x => x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved").length,
+      legacyNormalized: uiItems.filter(x => x?.urlQuality === "unknown_legacy_no_url" || x?.urlQuality === "unknown_legacy_has_url").length,
+      oracleEstimates:  uiItems.filter(x => x?.urlQuality === "oracle_pricing_estimate").length,
+      verifiedListings: uiItems.filter(x => x?.isVerifiedListing === true).length,
+    };
+
     const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
     let _confidenceCalibration = null;
     try {
+      console.log("CONFIDENCE_CALIBRATION_POOL_CHECK", {
+        scanId:                  retrievalMeta?.scanId || null,
+        query:                   baseQuery,
+        kind:                    retrievalMeta?.kind   || null,
+        rawTotal:                _urlSummary.total,
+        cleanTotal:              _cleanUrlSummary.total,
+        rawVerifiedListings:     _urlSummary.verifiedListings,
+        cleanVerifiedListings:   _cleanUrlSummary.verifiedListings,
+        rawPricingSignals:       _urlSummary.pricingOnly,
+        cleanPricingSignals:     _cleanUrlSummary.pricingOnly,
+        rejectedBeforeCalibration: Math.max(0, _urlSummary.total - _cleanUrlSummary.total),
+        usingPool:               "clean_ui_items",
+      });
+
       console.log("CONFIDENCE_CALIBRATION_INPUT", {
         scanId:                   retrievalMeta?.scanId || null,
         query:                    baseQuery,
@@ -23945,8 +23977,9 @@ async function buildMarketSearchResponsePayload({
         items:             uiItems,
         marketEvidence,
         consensus,
-        identitySummary:   null,  // TODO Phase 4A.2+: plumb from identity lock functions
-        urlSummary:        _urlSummary,
+        identitySummary:   null,     // TODO Phase 4A.2+: plumb from identity lock functions
+        urlSummary:        _cleanUrlSummary,  // CLEAN post-filter counts (from uiItems)
+        rawUrlSummary:     _urlSummary,       // raw pre-filter (for rejection ratio approx)
         scannedPrice:      finitePrice(scannedPrice),
         category,
         cacheKind:         retrievalMeta?.kind || null,
