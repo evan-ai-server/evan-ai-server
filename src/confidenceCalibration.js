@@ -168,13 +168,15 @@ function buildCapReasons({
   if (rejectionRatio > 0.25)           reasons.push("identity_lock_high_rejection_ratio");
 
   if (isAircraft) {
-    const compCt   = identitySummary?.rejectedCompetitorCount    ?? 0;
-    const familyCt = identitySummary?.rejectedModelMismatchCount ?? 0;
-    const toyCt    = identitySummary?.rejectedGenericToyCount    ?? 0;
-    if (compCt   > 0) reasons.push("aircraft_competitor_match");
-    if (familyCt > 0) reasons.push("aircraft_family_mismatch");
-    if (toyCt    > 0) reasons.push("aircraft_generic_toy_contamination");
-    if (compCt   > 0) reasons.push("competitor_brand_present");
+    const compCt        = identitySummary?.rejectedCompetitorCount    ?? 0;
+    const familyCt      = identitySummary?.rejectedFamilyCount        ?? 0;
+    const modelMismatch = identitySummary?.rejectedModelMismatchCount ?? 0;
+    const toyCt         = identitySummary?.rejectedGenericToyCount    ?? 0;
+    if (compCt        > 0) reasons.push("aircraft_competitor_match");
+    if (familyCt      > 0) reasons.push("aircraft_family_mismatch");
+    if (modelMismatch > 0) reasons.push("aircraft_model_mismatch");
+    if (toyCt         > 0) reasons.push("aircraft_generic_toy_contamination");
+    if (compCt        > 0) reasons.push("competitor_brand_present");
   } else {
     const compCt = identitySummary?.rejectedCompetitorCount ?? 0;
     if (compCt > 0) reasons.push("competitor_brand_present");

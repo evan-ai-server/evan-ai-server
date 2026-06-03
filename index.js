@@ -540,6 +540,8 @@ import {
   createEmptyIdentitySummary,
   mergeIdentitySummaries,
   normalizeIdentitySummary,
+  packMarketItemsWithIdentity,
+  unpackMarketItemsWithIdentity,
 } from "./src/identityRejectionSummary.js";
 
 // Phase 6 + Phase 11: server-side telemetry sink for verdict drift.
@@ -13570,13 +13572,20 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   const instantKey = scanFingerprint(normalizedQuery, incomingVariants);
   const instantHit = INSTANT_SCAN_CACHE.get(instantKey);
 
-  if (Array.isArray(instantHit) && instantHit.length) {
-    console.log("⚡ INSTANT SCAN CACHE HIT", {
-      query: normalizedQuery,
-      instantKey,
-      count: instantHit.length,
-    });
-    return instantHit;
+  if (instantHit != null) {
+    const _instantUnpacked = unpackMarketItemsWithIdentity(instantHit);
+    if (Array.isArray(_instantUnpacked.items) && _instantUnpacked.items.length) {
+      console.log("⚡ INSTANT SCAN CACHE HIT", {
+        query: normalizedQuery,
+        instantKey,
+        count: _instantUnpacked.items.length,
+      });
+      if (identitySummaryOut && _instantUnpacked.identitySummary) {
+        Object.assign(identitySummaryOut, _instantUnpacked.identitySummary);
+        identitySummaryOut.sourceStage = _instantUnpacked.identitySummary.sourceStage || "instant_cache_hit";
+      }
+      return _instantUnpacked.items;
+    }
   }
 
   const runtimePlan = String(identity?.plan || "free").toLowerCase();
@@ -14530,7 +14539,7 @@ merged = [...merged].sort((a, b) => {
   }
 
   if (Array.isArray(merged) && merged.length > 0) {
-    INSTANT_SCAN_CACHE.set(instantKey, merged);
+    INSTANT_SCAN_CACHE.set(instantKey, packMarketItemsWithIdentity(merged, identitySummaryOut));
   }
 
   console.log("🔥 MARKET MERGED CHEAPEST", {
@@ -24349,12 +24358,21 @@ async function buildMarketSearchResponsePayload({
       keptCount: uiItemsForCalibration.length,
     };
     const _finalIdentitySummary = normalizeIdentitySummary(_mergedIdentitySummary);
+    const _inFuncSneakerJordanCount =
+      (_inFunctionIdentitySummary.rejectedSneakerWrongLineCount       ?? 0) +
+      (_inFunctionIdentitySummary.rejectedSneakerWrongGenerationCount ?? 0) +
+      (_inFunctionIdentitySummary.rejectedSneakerVariantCount         ?? 0) +
+      (_inFunctionIdentitySummary.rejectedJordanWrongModelCount       ?? 0) +
+      (_inFunctionIdentitySummary.rejectedJordanWrongCutCount         ?? 0) +
+      (_inFunctionIdentitySummary.rejectedJordanWrongSublineCount     ?? 0) +
+      (_inFunctionIdentitySummary.rejectedJordanWrongThemeCount       ?? 0) +
+      (_inFunctionIdentitySummary.rejectedJordanNonJordanCount        ?? 0);
     console.log("IDENTITY_REJECTION_SUMMARY_MERGED", {
       query: baseQuery,
       sources: [
         identitySummaryFromRetrieval?.sourceStage,
         identitySummaryFromRoute ? "pre_payload_aircraft_filter" : null,
-        "payload_sneaker_jordan",
+        _inFuncSneakerJordanCount > 0 ? "payload_sneaker_jordan" : "payload_identity_checks",
       ].filter(Boolean),
       rawCount:                   _finalIdentitySummary.rawCount,
       keptCount:                  _finalIdentitySummary.keptCount,
@@ -27580,31 +27598,72 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
 }
 
 const _nonStreamRetrievalSummary = createEmptyIdentitySummary();
-let items = await withInflight(cacheKey, async () => {
+// withInflight returns a packed { items, identitySummary } object so the identity
+// summary survives route cache hits, singleflight coalescing, and instant-scan cache hits.
+const _packedMarketResult = await withInflight(cacheKey, async () => {
   const routeCacheKey = `market_route_result:${cacheKey}`;
   const cachedResult = await cacheGet(routeCacheKey);
 
-  if (Array.isArray(cachedResult) && cachedResult.length) {
-    return cachedResult;
+  if (cachedResult != null) {
+    const { items: _cachedItems, identitySummary: _cachedSummary } = unpackMarketItemsWithIdentity(cachedResult);
+    if (Array.isArray(_cachedItems) && _cachedItems.length) {
+      const _cachedNorm = normalizeIdentitySummary(_cachedSummary || {});
+      console.log("IDENTITY_REJECTION_SUMMARY_CACHE_UNPACKED", {
+        query,
+        source: "route_cache",
+        hasIdentitySummary: _cachedNorm.totalRejectedCount > 0,
+        totalRejectedCount: _cachedNorm.totalRejectedCount,
+        appliedLocks: _cachedSummary?.appliedLocks || [],
+      });
+      return packMarketItemsWithIdentity(_cachedItems, _cachedSummary);
+    }
   }
 
   const live = await distributedSingleflight.run(
     `market:${cacheKey}`,
     async () => {
+      const _sfSummary = createEmptyIdentitySummary();
       const fresh = await mergeCheapestSources(query, variants, visionIdentity, {
-        identitySummaryOut: _nonStreamRetrievalSummary,
+        identitySummaryOut: _sfSummary,
       });
 
       if (Array.isArray(fresh) && fresh.length) {
-        await cacheSet(routeCacheKey, fresh, MARKET_ROUTE_CACHE_TTL_SEC);
+        const _sfNorm = normalizeIdentitySummary(_sfSummary);
+        console.log("IDENTITY_REJECTION_SUMMARY_CACHE_PACKED", {
+          query,
+          rawCount:                   _sfSummary.rawCount,
+          keptCount:                  fresh.length,
+          totalRejectedCount:         _sfNorm.totalRejectedCount,
+          rejectedCompetitorCount:    _sfSummary.rejectedCompetitorCount,
+          rejectedMissingAirlineCount:_sfSummary.rejectedMissingAirlineCount,
+          rejectedGenericToyCount:    _sfSummary.rejectedGenericToyCount,
+          appliedLocks:               _sfSummary.appliedLocks,
+        });
+        const packed = packMarketItemsWithIdentity(fresh, _sfSummary);
+        await cacheSet(routeCacheKey, packed, MARKET_ROUTE_CACHE_TTL_SEC);
+        return packed;
       }
 
-      return fresh;
+      return packMarketItemsWithIdentity(fresh, _sfSummary);
     }
   );
 
-  return Array.isArray(live) ? live : [];
+  const { items: _liveItems, identitySummary: _liveSummary } = unpackMarketItemsWithIdentity(live);
+  const _liveNorm = normalizeIdentitySummary(_liveSummary || {});
+  console.log("IDENTITY_REJECTION_SUMMARY_CACHE_UNPACKED", {
+    query,
+    source: "singleflight",
+    hasIdentitySummary: _liveNorm.totalRejectedCount > 0,
+    totalRejectedCount: _liveNorm.totalRejectedCount,
+    appliedLocks: _liveSummary?.appliedLocks || [],
+  });
+  return packMarketItemsWithIdentity(_liveItems, _liveSummary);
 });
+
+// Unpack and populate retrieval summary from whichever path ran
+const { items: _wi_items, identitySummary: _wi_summary } = unpackMarketItemsWithIdentity(_packedMarketResult);
+let items = Array.isArray(_wi_items) ? _wi_items : [];
+if (_wi_summary) Object.assign(_nonStreamRetrievalSummary, _wi_summary);
 
 if ((!Array.isArray(items) || items.length === 0) && Array.isArray(cached) && cached.length > 0) {
   console.warn("⚠️ Using cached fallback market results");
@@ -27689,6 +27748,20 @@ if (!_oracleOnlyResult && Array.isArray(items)) {
 // upgrades "unknown_model" to "premium_model" when price ≥ $50.
 if (Array.isArray(items) && items.length > 0) {
   items = applyAircraftModelTierFilter(query, items, scannedPrice);
+}
+
+// Log which retrieval identity summary will reach calibration
+{
+  const _selNorm = normalizeIdentitySummary(_nonStreamRetrievalSummary);
+  console.log("IDENTITY_REJECTION_SUMMARY_SELECTED_FOR_PAYLOAD", {
+    query,
+    selectedSource: _nonStreamRetrievalSummary.sourceStage || "unknown",
+    totalRejectedCount:          _selNorm.totalRejectedCount,
+    rejectedCompetitorCount:     _selNorm.rejectedCompetitorCount,
+    rejectedMissingAirlineCount: _selNorm.rejectedMissingAirlineCount,
+    rejectedGenericToyCount:     _selNorm.rejectedGenericToyCount,
+    appliedLocks:                _selNorm.appliedLocks,
+  });
 }
 
 // Feature 4 + 5: fire eBay sold comps + local comps in parallel with payload build

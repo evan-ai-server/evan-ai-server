@@ -637,6 +637,37 @@ test("rejectedFamilyCount > 0 adds aircraft_family_mismatch cap reason", () => {
   assert.ok(result.capReasons.includes("aircraft_family_mismatch"), "aircraft_family_mismatch should be in capReasons");
 });
 
+test("rejectedModelMismatchCount > 0 adds aircraft_model_mismatch (not aircraft_family_mismatch)", () => {
+  const items = Array(6).fill(null).map(() => ({
+    isVerifiedListing: false, evidenceQuality: "pricing_signal",
+    clickable: false, price: 70, source: "ebay",
+  }));
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items,
+    urlSummary:    { verifiedListings: 0, pricingOnly: 6, oracleEstimates: 0, total: 6 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 20, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.40 },
+    category:      "model airplane",
+    query:         "hawaiian airlines boeing 787 diecast model",
+    identitySummary: {
+      rawCount: 10, keptCount: 6, totalRejectedCount: 1, rejectionRatio: 0.143,
+      appliedLocks: ["aircraft_model_tier"], relaxed: false,
+      rejectedCompetitorCount: 0, rejectedFamilyCount: 0,
+      rejectedManufacturerCount: 0, rejectedModelMismatchCount: 1,
+      rejectedMissingAirlineCount: 0, rejectedGenericToyCount: 0,
+      rejectedMerchCount: 0, rejectedSneakerWrongLineCount: 0,
+      rejectedSneakerWrongGenerationCount: 0, rejectedSneakerVariantCount: 0,
+      rejectedJordanWrongModelCount: 0, rejectedJordanWrongCutCount: 0,
+      rejectedJordanWrongSublineCount: 0, rejectedJordanWrongThemeCount: 0,
+      rejectedJordanNonJordanCount: 0, rejectedOtherIdentityCount: 0,
+    },
+  });
+  assert.ok(result.capReasons.includes("aircraft_model_mismatch"), "aircraft_model_mismatch when rejectedModelMismatchCount>0");
+  assert.ok(!result.capReasons.includes("aircraft_family_mismatch"), "no aircraft_family_mismatch when rejectedFamilyCount=0");
+});
+
 test("rejectedGenericToyCount > 0 adds aircraft_generic_toy_contamination", () => {
   const items = Array(6).fill(null).map(() => ({
     isVerifiedListing: false, evidenceQuality: "pricing_signal",
