@@ -763,6 +763,95 @@ test("identitySummary.totalRejectedCount=0 with cleanCompCount>0 does not add id
     "zero rejections should not add identity_lock_high_rejection_ratio");
 });
 
+// ── Phase 4B.2.1: early retrieval identity summary calibration tests ──────────
+
+test("exact early identity summary with totalRejectedCount 14 produces identity_lock_high_rejection_ratio", () => {
+  // Simulates the merged summary from retrieval stage for Hawaiian 787 scan.
+  const result = calibrateEvidenceConfidence({
+    visionConfidence:  0.9,
+    identityQuality:   0.55,
+    items: Array(8).fill(null).map(() => ({
+      isVerifiedListing: false, evidenceQuality: "pricing_signal",
+      clickable: false, price: 65, source: "ebay",
+    })),
+    urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 80, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.25, typicalHigh: 95 },
+    scannedPrice:  165.99,
+    identitySummary: {
+      rawCount:                    36,
+      keptCount:                    8,
+      totalRejectedCount:          14,
+      rejectionRatio:              Math.round((14 / 22) * 1000) / 1000,
+      rejectedCompetitorCount:      1,
+      rejectedModelMismatchCount:   0,
+      rejectedMissingAirlineCount: 10,
+      rejectedGenericToyCount:      3,
+      appliedLocks: ["airline"],
+    },
+    category: "model airplane",
+    query:    "hawaiian airlines boeing 787 diecast model airplane",
+  });
+  assert.ok(result.capReasons.includes("identity_lock_high_rejection_ratio"),
+    "rejectionRatio ~0.636 > 0.25 must produce identity_lock_high_rejection_ratio");
+  assert.equal(result.evidenceTier, "pricing_signal_only");
+  assert.equal(result.canShowVerifiedLanguage, false);
+  assert.equal(result.evidence.verifiedListingCount, 0);
+  assert.equal(result.evidence.totalRejectedCount, 14);
+});
+
+test("competitor count on aircraft query produces aircraft_competitor_match and competitor_brand_present", () => {
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.6,
+    items: Array(8).fill(null).map(() => ({
+      isVerifiedListing: false, evidenceQuality: "pricing_signal",
+      clickable: false, price: 70, source: "ebay",
+    })),
+    urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 40, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.3 },
+    identitySummary: {
+      rawCount: 20, keptCount: 8, totalRejectedCount: 5,
+      rejectionRatio: Math.round((5 / 13) * 1000) / 1000,
+      rejectedCompetitorCount: 1,
+      appliedLocks: ["airline"],
+    },
+    category: "model airplane",
+    query: "hawaiian airlines boeing 787 diecast",
+  });
+  assert.ok(result.capReasons.includes("aircraft_competitor_match"),
+    "rejectedCompetitorCount>0 on aircraft query must produce aircraft_competitor_match");
+  assert.ok(result.capReasons.includes("competitor_brand_present"),
+    "rejectedCompetitorCount>0 on aircraft query must produce competitor_brand_present");
+});
+
+test("generic toy count on aircraft query produces aircraft_generic_toy_contamination", () => {
+  const result = calibrateEvidenceConfidence({
+    visionConfidence: 0.85,
+    identityQuality:  0.65,
+    items: Array(8).fill(null).map(() => ({
+      isVerifiedListing: false, evidenceQuality: "pricing_signal",
+      clickable: false, price: 60, source: "ebay",
+    })),
+    urlSummary:    { verifiedListings: 0, pricingOnly: 8, oracleEstimates: 0, total: 8 },
+    marketEvidence:{ confidence: "low", priceSpreadPct: 30, directUrlCount: 0 },
+    consensus:     { marketConfidence: 0.3 },
+    identitySummary: {
+      rawCount: 15, keptCount: 8, totalRejectedCount: 3,
+      rejectionRatio: Math.round((3 / 11) * 1000) / 1000,
+      rejectedGenericToyCount: 3,
+      appliedLocks: ["airline"],
+    },
+    category: "model airplane",
+    query: "hawaiian airlines boeing 787 diecast",
+  });
+  assert.ok(result.capReasons.includes("aircraft_generic_toy_contamination"),
+    "rejectedGenericToyCount>0 on aircraft query must produce aircraft_generic_toy_contamination");
+  assert.equal(result.evidence.verifiedListingCount, 0);
+  assert.equal(result.evidence.pricingSignalCount, 8);
+});
+
 test("returns correct shape with all required fields", () => {
   const result = calibrateEvidenceConfidence({});
   const topLevel = [

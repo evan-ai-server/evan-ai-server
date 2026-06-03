@@ -192,3 +192,71 @@ test("totalRejectedCount=0 with cleanCompCount>0: no identity_lock_high_rejectio
   assert.equal(s.rejectionRatio, 0);
   // rejectionRatio=0 < 0.25 threshold → no identity_lock_high_rejection_ratio in calibration
 });
+
+// ── Phase 4B.2.1: multi-stage merge tests ────────────────────────────────────
+
+test("merge distinct stages: rejection buckets sum across stages, raw/kept use override", () => {
+  // Simulates retrieval stage (real rejections) + route stage (no rejections on clean pool)
+  const retrieval = {
+    ...createEmptyIdentitySummary(),
+    rawCount: 36,
+    rejectedCompetitorCount:     1,
+    rejectedMissingAirlineCount: 10,
+    rejectedGenericToyCount:     3,
+    appliedLocks: ["airline"],
+    sourceStage: "retrieval_post_serp_filter",
+  };
+  const route = {
+    ...createEmptyIdentitySummary(),
+    rawCount: 8,
+    appliedLocks: ["airline"],
+    sourceStage: "pre_payload_aircraft_filter",
+  };
+  // Strip raw/kept from upstream, then override authoritative values
+  const strippedRetrieval = { ...retrieval, rawCount: 0, keptCount: 0 };
+  const strippedRoute     = { ...route,     rawCount: 0, keptCount: 0 };
+  const inFunction        = { ...createEmptyIdentitySummary(), rawCount: 0, keptCount: 8 };
+  const merged = mergeIdentitySummaries(strippedRetrieval, strippedRoute, inFunction);
+  const authoritative = { ...merged, rawCount: retrieval.rawCount, keptCount: 8 };
+  const n = normalizeIdentitySummary(authoritative);
+  assert.equal(n.totalRejectedCount, 14, "competitor+missing+toy=14");
+  assert.equal(n.rawCount, 36, "rawCount from retrieval stage");
+  assert.equal(n.keptCount, 8, "keptCount from final clean pool");
+  const expected = Math.round((14 / (14 + 8)) * 1000) / 1000;
+  assert.ok(n.rejectionRatio >= 0.55 && n.rejectionRatio <= 0.65,
+    `rejectionRatio ${n.rejectionRatio} should be ~0.636`);
+  assert.equal(n.rejectionRatio, expected);
+  assert.equal(n.rejectedCompetitorCount, 1);
+  assert.equal(n.rejectedMissingAirlineCount, 10);
+  assert.equal(n.rejectedGenericToyCount, 3);
+  assert.ok(n.appliedLocks.includes("airline"));
+});
+
+test("do not double-count: stripping rawCount/keptCount before merge prevents pool-count inflation", () => {
+  // If we naively added keptCount: rawCount would be 36+8+8=52, keptCount 8+8=16 → wrong ratio
+  const retrieval = { ...createEmptyIdentitySummary(), rawCount: 36, keptCount: 22, rejectedCompetitorCount: 1 };
+  const route     = { ...createEmptyIdentitySummary(), rawCount: 8,  keptCount: 8  };
+  const inFunction= { ...createEmptyIdentitySummary(), rawCount: 0,  keptCount: 8  };
+  const stripped  = [retrieval, route, inFunction].map(s => ({ ...s, rawCount: 0, keptCount: 0 }));
+  stripped[2].keptCount = 8; // authoritative keptCount on inFunction only
+  const merged = mergeIdentitySummaries(...stripped);
+  const authoritative = { ...merged, rawCount: 36, keptCount: 8 };
+  const n = normalizeIdentitySummary(authoritative);
+  assert.equal(n.rawCount, 36, "rawCount must not be summed");
+  assert.equal(n.keptCount, 8, "keptCount must not be summed");
+  assert.equal(n.rejectedCompetitorCount, 1);
+});
+
+test("early retrieval summary with 14 total rejections normalizes correctly", () => {
+  const retrieval = {
+    ...createEmptyIdentitySummary(),
+    rejectedCompetitorCount:     1,
+    rejectedMissingAirlineCount: 10,
+    rejectedGenericToyCount:     3,
+  };
+  const n = normalizeIdentitySummary({ ...retrieval, rawCount: 36, keptCount: 8 });
+  assert.equal(n.totalRejectedCount, 14);
+  const expected = Math.round((14 / 22) * 1000) / 1000;
+  assert.equal(n.rejectionRatio, expected);
+  assert.ok(n.rejectionRatio > 0.25, "high rejection ratio should trigger identity_lock_high_rejection_ratio cap reason");
+});

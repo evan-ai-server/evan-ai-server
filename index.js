@@ -11049,6 +11049,7 @@ function filterRelevantListings(query, items, _out = null) {
     let _penalizedModel = 0;
     let _rejectedAirlineMissing = 0;
     let _rejectedWeakAirlineGeneric = 0;
+    let _rejectedGenericToy = 0;
 
     // Step 1: annotate each item with identity lock metadata.
     for (const it of preserved) {
@@ -11125,6 +11126,7 @@ function filterRelevantListings(query, items, _out = null) {
       if (_toyPool.length > 0) {
         if (_nonToy.length >= 2) {
           for (const it of _toyPool) {
+            _rejectedGenericToy++;
             console.log("IDENTITY_LOCK_GENERIC_TOY_REJECTED", {
               title: it?.title, reason: "generic_toy_comp_excluded", requiredFamily,
             });
@@ -11192,6 +11194,7 @@ function filterRelevantListings(query, items, _out = null) {
       _out.rejectedModelMismatchCount       += _rejectedModel;
       _out.rejectedMissingAirlineCount      += _rejectedAirlineMissing;
       _out.rejectedWeakAirlineGenericCount  += _rejectedWeakAirlineGeneric;
+      _out.rejectedGenericToyCount          += _rejectedGenericToy;
       if (!_out.appliedLocks.includes("airline")) _out.appliedLocks.push("airline");
       if (_noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0)) {
         _out.relaxed = true;
@@ -13531,7 +13534,7 @@ function buildExpansionVariants(query) {
   return kept;
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null } = {}) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null } = {}) {
 
   // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
   // A 6s kill timer added ~1.5s of dead wait after SerpAPI either landed or
@@ -14127,7 +14130,23 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
     }))
     .sort((a, b) => Number(b.__relevance || 0) - Number(a.__relevance || 0));
 
-  const stageRelevant = filterRelevantListings(normalizedQuery, stageDeduped);
+  if (identitySummaryOut) {
+    identitySummaryOut.rawCount = stageDeduped.length;
+    identitySummaryOut.sourceStage = "retrieval_post_serp_filter";
+  }
+  const stageRelevant = filterRelevantListings(normalizedQuery, stageDeduped, identitySummaryOut);
+  if (identitySummaryOut) {
+    console.log("IDENTITY_REJECTION_SUMMARY_CAPTURED", {
+      query: normalizedQuery,
+      stage: identitySummaryOut.sourceStage,
+      rawCount: identitySummaryOut.rawCount,
+      keptCount: stageRelevant.length,
+      rejectedCompetitorCount:    identitySummaryOut.rejectedCompetitorCount,
+      rejectedMissingAirlineCount:identitySummaryOut.rejectedMissingAirlineCount,
+      rejectedGenericToyCount:    identitySummaryOut.rejectedGenericToyCount,
+      appliedLocks: identitySummaryOut.appliedLocks,
+    });
+  }
   const stageMarketplacePreferred = preferMarketplaceIfHealthy(
     stageRelevant,
     normalizedQuery
@@ -23602,6 +23621,9 @@ async function buildMarketSearchResponsePayload({
   // route handler (populated when applyPrePayloadAircraftFilter is called upstream).
   // When present, merged with sneaker/Jordan in-function counts for an exact summary.
   identitySummaryFromRoute = null,
+  // Phase 4B.2.1: optional early retrieval identity summary captured inside
+  // mergeCheapestSources before the items reach the route handler.
+  identitySummaryFromRetrieval = null,
 } = {}) {
   const _bmt0 = Date.now();
   const _bmSteps = {};
@@ -24305,15 +24327,44 @@ async function buildMarketSearchResponsePayload({
 
     const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
 
-    // Phase 4B.2: Build exact identity rejection summary for calibration.
-    // Merge: aircraft counts from route handler + sneaker/Jordan counts from this function.
-    // Set keptCount to the final clean UI item count.
+    // Phase 4B.2.1: Build exact identity rejection summary for calibration.
+    // Merge three stages: early retrieval → pre-payload aircraft filter → in-function sneaker/Jordan.
+    // Each stage's rejection buckets are additive (exclusive pools). rawCount/keptCount must NOT
+    // be summed across stages — rawCount is the earliest stage's raw pool; keptCount is the final
+    // clean UI item count. Strip raw/kept from upstream summaries before merging.
     _inFunctionIdentitySummary.keptCount = uiItemsForCalibration.length;
-    const _mergedIdentitySummary = mergeIdentitySummaries(
-      identitySummaryFromRoute || {},
-      _inFunctionIdentitySummary,
+    const _strippedRetrieval = identitySummaryFromRetrieval
+      ? { ...identitySummaryFromRetrieval, rawCount: 0, keptCount: 0 }
+      : {};
+    const _strippedRoute = identitySummaryFromRoute
+      ? { ...identitySummaryFromRoute, rawCount: 0, keptCount: 0 }
+      : {};
+    const _strippedInFunction = { ..._inFunctionIdentitySummary, rawCount: 0 };
+    const _mergedRejections = mergeIdentitySummaries(
+      _strippedRetrieval, _strippedRoute, _strippedInFunction,
     );
+    const _mergedIdentitySummary = {
+      ..._mergedRejections,
+      rawCount:  identitySummaryFromRetrieval?.rawCount || _rawSourceItems.length,
+      keptCount: uiItemsForCalibration.length,
+    };
     const _finalIdentitySummary = normalizeIdentitySummary(_mergedIdentitySummary);
+    console.log("IDENTITY_REJECTION_SUMMARY_MERGED", {
+      query: baseQuery,
+      sources: [
+        identitySummaryFromRetrieval?.sourceStage,
+        identitySummaryFromRoute ? "pre_payload_aircraft_filter" : null,
+        "payload_sneaker_jordan",
+      ].filter(Boolean),
+      rawCount:                   _finalIdentitySummary.rawCount,
+      keptCount:                  _finalIdentitySummary.keptCount,
+      totalRejectedCount:         _finalIdentitySummary.totalRejectedCount,
+      rejectionRatio:             _finalIdentitySummary.rejectionRatio,
+      rejectedCompetitorCount:    _finalIdentitySummary.rejectedCompetitorCount,
+      rejectedMissingAirlineCount:_finalIdentitySummary.rejectedMissingAirlineCount,
+      rejectedGenericToyCount:    _finalIdentitySummary.rejectedGenericToyCount,
+      appliedLocks:               _finalIdentitySummary.appliedLocks,
+    });
 
     let _confidenceCalibration = null;
     try {
@@ -27528,6 +27579,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   return res.status(200).json(responsePayload);
 }
 
+const _nonStreamRetrievalSummary = createEmptyIdentitySummary();
 let items = await withInflight(cacheKey, async () => {
   const routeCacheKey = `market_route_result:${cacheKey}`;
   const cachedResult = await cacheGet(routeCacheKey);
@@ -27539,7 +27591,9 @@ let items = await withInflight(cacheKey, async () => {
   const live = await distributedSingleflight.run(
     `market:${cacheKey}`,
     async () => {
-      const fresh = await mergeCheapestSources(query, variants, visionIdentity);
+      const fresh = await mergeCheapestSources(query, variants, visionIdentity, {
+        identitySummaryOut: _nonStreamRetrievalSummary,
+      });
 
       if (Array.isArray(fresh) && fresh.length) {
         await cacheSet(routeCacheKey, fresh, MARKET_ROUTE_CACHE_TTL_SEC);
@@ -27656,6 +27710,7 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
       kind:   _oracleOnlyResult ? "oracle"     : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
     },
     persistSnapshot: !_oracleOnlyResult, // don't pollute snapshot with oracle-only data
+    identitySummaryFromRetrieval: _nonStreamRetrievalSummary,
   }),
   serpEbaySold(query).catch(() => null),
   userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
@@ -28172,7 +28227,7 @@ app.post("/market/search/stream", async (req, res) => {
     ]);
 
     // ── Helper: assemble trusted profit intel + response payload ─────────
-    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false, identitySummaryFromRoute = null } = {}) => {
+    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false, identitySummaryFromRoute = null, identitySummaryFromRetrieval = null } = {}) => {
       // ── Phase 3 instrumentation: timestamp every major stage so the
       // 10s gap between phase1_done and scan_response becomes visible.
       // Format: BUILD_STAGE { scanId, kind, stage, ms } — grep-friendly.
@@ -28206,6 +28261,7 @@ app.post("/market/search/stream", async (req, res) => {
         persistSnapshot: !isOracleOnly,
         lite:             _isLite || deferEnrichments,
         identitySummaryFromRoute,
+        identitySummaryFromRetrieval,
       });
       _bp_log("buildMarketSearchResponsePayload", _t_buildResp);
       try {
@@ -28573,14 +28629,17 @@ app.post("/market/search/stream", async (req, res) => {
 
     // In-flight dedup: share the Phase 1 promise across concurrent identical scans.
     // earlyItemsCb is only wired for the FIRST request — inflight hits get phase1Items directly.
+    const _retrievalIdentitySummary = createEmptyIdentitySummary();
     let phase1Promise;
     if (STREAM_PHASE1_INFLIGHT.has(cacheKey)) {
       _recordStreamMetric("inflightHits", 1);
       phase1Promise = STREAM_PHASE1_INFLIGHT.get(cacheKey);
-      // No earlyItemsCb for inflight hits — they receive full phase1Items when promise resolves
+      // No earlyItemsCb for inflight hits — they receive full phase1Items when promise resolves.
+      // _retrievalIdentitySummary stays empty for inflight; calibration gracefully handles it.
     } else {
       phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
         skipOracle: true, earlyItemsCb: _onEarlyItemsWrapped,
+        identitySummaryOut: _retrievalIdentitySummary,
       });
       STREAM_PHASE1_INFLIGHT.set(cacheKey, phase1Promise);
       phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
@@ -28860,11 +28919,12 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _tFinalBuild = Date.now();
     const finalPayload = await _buildPayload(enrichedItems, {
-      source:                  _oracleOnlyResult ? "gpt_oracle" : "live_market",
-      kind:                    _oracleOnlyResult ? "oracle"      : "live_refresh",
-      isOracleOnly:            _oracleOnlyResult,
-      deferEnrichments:        true,
-      identitySummaryFromRoute: _aircraftIdentitySummary,
+      source:                      _oracleOnlyResult ? "gpt_oracle" : "live_market",
+      kind:                        _oracleOnlyResult ? "oracle"      : "live_refresh",
+      isOracleOnly:                _oracleOnlyResult,
+      deferEnrichments:            true,
+      identitySummaryFromRoute:    _aircraftIdentitySummary,
+      identitySummaryFromRetrieval: _retrievalIdentitySummary,
     }).catch(() => ({ items: [], query, searchedQueries: searchedQueries || [query] }));
 
     if (_ebaySoldComps) finalPayload.ebaySoldComps = _ebaySoldComps;
