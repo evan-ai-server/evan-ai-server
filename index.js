@@ -1307,6 +1307,8 @@ import { guardPayloadSafe, auditB2BPayload } from "./src/consistencyGuard.js";
 import { applyTruthGuardSafe, getCorrectionRate, getTruthCorrectionHistory } from "./src/truthGuard.js";
 import { logEvent as logStructuredEvent, LOG_TYPES } from "./src/structuredLogger.js";
 import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordVerdict } from "./src/scanHarness.js";
+// Phase 4C — real-world scan accuracy review artifacts (dev/internal dataset).
+import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
@@ -17187,6 +17189,38 @@ function requireApiKey(req, res, next) {
   return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 
+// Phase 4C — dev/internal scan-review access guard. Open in dev/local; in
+// production require a dev token (DEV_REVIEW_TOKEN, falling back to API_KEY)
+// via the x-dev-token or x-api-key header. Fails closed in production.
+function requireDevReviewAccess(req, res, next) {
+  if (!IS_PROD) return next();
+  const configured = String(process.env.DEV_REVIEW_TOKEN || process.env.API_KEY || "").trim();
+  if (!configured) return res.status(503).json({ ok: false, error: "dev_review_not_configured" });
+  const provided = String(req.headers["x-dev-token"] || req.headers["x-api-key"] || "").trim().slice(0, 240);
+  if (!provided) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const a = Buffer.from(provided,   "utf8");
+  const b = Buffer.from(configured, "utf8");
+  if (a.length === b.length && crypto.timingSafeEqual(a, b)) return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+}
+
+// Phase 4C — in-process dedupe so a single scan (which can hit /market/search
+// more than once under one shared scanId — e.g. the main call plus the
+// post-vision collector pass) records exactly one scan-review artifact. Keyed
+// by scanId (or imageHash). Bounded to avoid unbounded memory growth.
+const _SCAN_REVIEW_SEEN = new Set();
+const _SCAN_REVIEW_SEEN_CAP = 4000;
+function _scanReviewShouldRecord(key) {
+  if (!key) return true;                       // no stable key → always record
+  if (_SCAN_REVIEW_SEEN.has(key)) return false;
+  _SCAN_REVIEW_SEEN.add(key);
+  if (_SCAN_REVIEW_SEEN.size > _SCAN_REVIEW_SEEN_CAP) {
+    let drop = Math.floor(_SCAN_REVIEW_SEEN_CAP / 2);
+    for (const k of _SCAN_REVIEW_SEEN) { _SCAN_REVIEW_SEEN.delete(k); if (--drop <= 0) break; }
+  }
+  return true;
+}
+
 function safeJsonParse(value, fallback = {}) {
   try {
     if (typeof value !== "string" || !value.trim()) return fallback;
@@ -23633,6 +23667,11 @@ async function buildMarketSearchResponsePayload({
   // Phase 4B.2.1: optional early retrieval identity summary captured inside
   // mergeCheapestSources before the items reach the route handler.
   identitySummaryFromRetrieval = null,
+  // Phase 4C: optional review-capture context from the route handler. When
+  // reviewContext.captureReview === true, a sanitized scan-review artifact is
+  // recorded after the final (non-lite) payload is assembled. Logging-only —
+  // it never affects the response, verdict, calibration, or filtering.
+  reviewContext = null,
 } = {}) {
   const _bmt0 = Date.now();
   const _bmSteps = {};
@@ -24895,6 +24934,95 @@ async function buildMarketSearchResponsePayload({
   } catch { /* analytics must not break a response */ }
 
   harnessRecordVerdict("buildMarketSearchResponsePayload", _responsePayload).catch(() => {});
+
+  // ── Phase 4C: structured scan-review artifact ─────────────────────────────
+  // Records one sanitized accuracy-review record per scan for the final,
+  // non-lite payload the user actually sees. Opt-in via reviewContext from the
+  // route handler; dedup'd by scanId so multiple /market/search calls in one
+  // scan produce a single record. Best-effort: never throws, never alters the
+  // response, verdict, calibration, filtering, or pricing.
+  if (reviewContext?.captureReview === true && !lite) {
+    const _rvScanId = reviewContext.scanId || _responsePayload?.scanId || retrievalMeta?.scanId || null;
+    const _rvKey    = _rvScanId || reviewContext.imageHash || null;
+    if (_scanReviewShouldRecord(_rvKey)) {
+      try {
+        const _review = createScanReviewRecord({
+          route:     reviewContext.route || null,
+          scanId:    _rvScanId,
+          traceId:   reviewContext.traceId || null,
+          rid:       reviewContext.rid || null,
+          userId:    reviewContext.userId || null,
+          deviceId:  reviewContext.deviceId || null,
+          imageHash: reviewContext.imageHash || null,
+          predicted: {
+            query:            baseQuery,
+            finalQuery:       activeQuery,
+            category:         category || null,
+            brand:            visionIdentity?.brand || null,
+            model:            visionIdentity?.model || null,
+            identity:         visionIdentity || null,
+            variants:         Array.isArray(variants) ? variants : [],
+            visionConfidence: visionConfidence ?? null,
+            visualConfidence: visionIdentity?.visualConfidence ?? null,
+            brandCertainty:   visionIdentity?.brandCertainty ?? null,
+          },
+          market: {
+            finalVerdict:     _responsePayload?.buyOrPass?.verdict ?? null,
+            displayedVerdict: null,   // frontend-displayed verdict not captured in 4C
+            canonicalVerdict: _responsePayload?.buyOrPass?.verdict ?? null,
+            calibratedConfidence:         _confidenceCalibration?.calibratedConfidence ?? null,
+            marketConfidence:             _confidenceCalibration?.marketConfidence ?? null,
+            evidenceConfidence:           _confidenceCalibration?.evidenceConfidence ?? null,
+            evidenceTier:                 _confidenceCalibration?.evidenceTier ?? null,
+            verdictStrengthCap:           _confidenceCalibration?.verdictStrengthCap ?? null,
+            canShowVerifiedLanguage:      _confidenceCalibration?.canShowVerifiedLanguage ?? null,
+            canShowStrongLanguage:        _confidenceCalibration?.canShowStrongLanguage ?? null,
+            canShowMedianAsAuthoritative: _confidenceCalibration?.canShowMedianAsAuthoritative ?? null,
+            verifiedListingCount: _confidenceCalibration?.evidence?.verifiedListingCount ?? _cleanUrlSummary?.verifiedListings ?? 0,
+            pricingSignalCount:   _confidenceCalibration?.evidence?.pricingSignalCount   ?? _cleanUrlSummary?.pricingOnly     ?? 0,
+            cleanCompCount:       _confidenceCalibration?.evidence?.cleanCompCount        ?? null,
+            consensusMedian:        consensus?.median ?? null,
+            consensusListingCount:  consensus?.listingCount ?? (Array.isArray(uiItemsForCalibration) ? uiItemsForCalibration.length : null),
+            consensusSpread:        marketEvidence?.priceSpreadPct ?? consensus?.spread ?? null,
+            marketEvidenceConfidence: marketEvidence?.confidence ?? null,
+            marketEvidenceReason:     marketEvidence?.reason ?? null,
+            urlVerificationEnabled:   URL_VERIFICATION_ENABLED,
+          },
+          identityRejections: _finalIdentitySummary,
+          topListings:        uiItemsForCalibration,
+        });
+        console.log("SCAN_REVIEW_RECORD_CREATED", {
+          scanId:               _review.scanId,
+          query:                _review.predicted.query,
+          finalVerdict:         _review.market.finalVerdict,
+          evidenceTier:         _review.market.evidenceTier,
+          verifiedListingCount: _review.market.verifiedListingCount,
+          pricingSignalCount:   _review.market.pricingSignalCount,
+          topListingCount:      _review.topListings.length,
+          path:                 _review.route,
+        });
+        appendScanReviewRecord(_review).then((ok) => {
+          if (!ok) {
+            console.warn("SCAN_REVIEW_RECORD_FAILED", {
+              scanId: _rvScanId, query: baseQuery,
+              errorName: "AppendFailed", errorMessage: "appendScanReviewRecord returned false",
+            });
+          }
+        }).catch((err) => {
+          console.warn("SCAN_REVIEW_RECORD_FAILED", {
+            scanId: _rvScanId, query: baseQuery,
+            errorName: err?.name || "Error", errorMessage: err?.message || String(err),
+          });
+        });
+      } catch (err) {
+        console.warn("SCAN_REVIEW_RECORD_FAILED", {
+          scanId: _rvScanId, query: baseQuery,
+          errorName: err?.name || "Error", errorMessage: err?.message || String(err),
+        });
+      }
+    }
+  }
+
   // ── Per-section timing log ──────────────────────────────────────────────
   // Emits once per call so the kind=provisional vs kind=live_refresh wall
   // breakdown becomes visible in live logs. Largest contributors usually:
@@ -24955,6 +25083,54 @@ app.post("/api/alert/set", async (req, res) => {
     return res.status(200).json({ ok: true, alertId, alert });
   } catch (e) {
     return res.status(200).json({ ok: false, error: "alert_set_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 4C — DEV/INTERNAL scan accuracy review endpoints.
+// Guarded by requireDevReviewAccess (open in dev/local; dev-token-gated + fail-
+// closed in production). These expose the scan-review JSONL artifacts so scans
+// can be reviewed and corrected by hand. They never touch verdict math,
+// calibration, identity locks, URL verification, affiliate, or scan responses.
+//   GET  /api/dev/scan-review/recent?limit=50
+//   GET  /api/dev/scan-review/:scanId
+//   POST /api/dev/scan-review/:scanId/review
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/dev/scan-review/recent", requireDevReviewAccess, async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(500, parseInt(req.query?.limit, 10) || 50));
+    const records = await readRecentScanReviews({ limit });
+    return res.status(200).json({ ok: true, count: records.length, records });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "scan_review_read_failed" });
+  }
+});
+
+app.get("/api/dev/scan-review/:scanId", requireDevReviewAccess, async (req, res) => {
+  try {
+    const record = await findScanReviewByScanId(req.params?.scanId);
+    if (!record) return res.status(404).json({ ok: false, error: "not_found" });
+    return res.status(200).json({ ok: true, record });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "scan_review_read_failed" });
+  }
+});
+
+app.post("/api/dev/scan-review/:scanId/review", requireDevReviewAccess, async (req, res) => {
+  try {
+    const updated = await updateScanReview(req.params?.scanId, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: "not_found" });
+    console.log("SCAN_REVIEW_UPDATED", {
+      scanId:                updated.scanId,
+      reviewStatus:          updated.review?.status ?? null,
+      identityCorrect:       updated.review?.identityCorrect ?? null,
+      queryCorrect:          updated.review?.queryCorrect ?? null,
+      topListingsComparable: updated.review?.topListingsComparable ?? null,
+      verdictFair:           updated.review?.verdictFair ?? null,
+    });
+    return res.status(200).json({ ok: true, record: updated });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "scan_review_update_failed" });
   }
 });
 
@@ -26907,6 +27083,18 @@ const _budgetScanIdEarly = safeStr(req.body?.scanId, 64) || null;
 const _budgetImageHashEarly =
   safeStr(req.body?.imageHash || req.body?.scanAsset?.hash || req.body?.visionIdentity?.imageHash || req.body?.identity?.imageHash, 128) || null;
 const _budgetUserIdEarly = safeStr(req.body?.userId || req.query?.userId, 64) || null;
+// Phase 4C — review-capture context shared by every /market/search build path.
+// Reuses the already-parsed scan identity; logging-only, passed straight through.
+const _reviewCtx = {
+  captureReview: true,
+  route:     "/market/search",
+  scanId:    _budgetScanIdEarly,
+  imageHash: _budgetImageHashEarly,
+  userId:    _budgetUserIdEarly,
+  deviceId:  getDeviceId(req) || null,
+  traceId:   req.traceId || null,
+  rid:       req.rid || null,
+};
 {
   const _budgetKey = _makeBudgetKey({
     scanId: _budgetScanIdEarly,
@@ -27321,6 +27509,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
       counts: internalHit?.counts || null,
     },
     persistSnapshot: false,
+    reviewContext: _reviewCtx,
   });
   try {
     // Run cheap pure-function signal extraction (no API calls) for crossCheck + real confidenceV2
@@ -27469,6 +27658,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
       kind: "route_cache_hit",
     },
     persistSnapshot: false,
+    reviewContext: _reviewCtx,
   });
   try {
     let _rcCrossCheck = null;
@@ -27784,6 +27974,7 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     },
     persistSnapshot: !_oracleOnlyResult, // don't pollute snapshot with oracle-only data
     identitySummaryFromRetrieval: _nonStreamRetrievalSummary,
+    reviewContext: _reviewCtx,
   }),
   serpEbaySold(query).catch(() => null),
   userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),

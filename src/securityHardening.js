@@ -482,6 +482,12 @@ export const SCHEMAS = {
     category:         { type: "string",  max: 80  },
     scannedPrice:     { type: "number",  min: 0, max: 999_999 },
     userId:           { type: "string",  max: 128 },
+    // Shared per-scan session id (Phase 2C.9): the frontend sends the same
+    // scanId on /market/search and /market/search/stream so the server's
+    // per-scan SerpAPI budget key collapses across both routes. Must be
+    // declared here or schemaMiddleware strips it (which silently forced the
+    // budget + scan-review records to fall back to imageHash with scanId=null).
+    scanId:           { type: "string",  max: 64  },
     zipCode:          { type: "string",  max: 10, pattern: /^\d{5}(-\d{4})?$|^$/ },
     sizeHint:         { type: "string",  max: 40  },
     imageHash:        { type: "string",  max: 128 },
