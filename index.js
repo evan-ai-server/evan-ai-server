@@ -1309,6 +1309,8 @@ import { logEvent as logStructuredEvent, LOG_TYPES } from "./src/structuredLogge
 import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordVerdict } from "./src/scanHarness.js";
 // Phase 4C — real-world scan accuracy review artifacts (dev/internal dataset).
 import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
+// Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
+import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
@@ -27620,11 +27622,12 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   const _finalSignalA = responsePayload.profitIntel.buySignal;
   const _finalTrustA  = responsePayload.trustScore ?? 0;
   // _scanIdA hoisted to top of route handler (TDZ fix)
-  if (_finalTrustA >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalA)) {
+  const _affEligA = evaluateAffiliateEligibilityForPayload(responsePayload, { signal: _finalSignalA, trustScore: _finalTrustA, minTrust: MIN_TRUST_FOR_AFFILIATE, weakSignals: WEAK_SIGNALS_NO_AFFILIATE });
+  if (_affEligA.eligible) {
     attachAffiliateLinksToPayload(responsePayload);
     logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA }, redis);
   } else {
-    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA, reason: _finalTrustA < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdA, signal: _finalSignalA, trustScore: _finalTrustA, reason: _affEligA.reason }, redis);
   }
   // Phase 18+19: scan metrics (non-blocking) — includes latency and category
   const _latA = Date.now() - _routeT0;
@@ -27767,11 +27770,12 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   const _finalSignalB = responsePayload.profitIntel.buySignal;
   const _finalTrustB  = responsePayload.trustScore ?? 0;
   // _scanIdB hoisted to top of route handler (TDZ fix)
-  if (_finalTrustB >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalB)) {
+  const _affEligB = evaluateAffiliateEligibilityForPayload(responsePayload, { signal: _finalSignalB, trustScore: _finalTrustB, minTrust: MIN_TRUST_FOR_AFFILIATE, weakSignals: WEAK_SIGNALS_NO_AFFILIATE });
+  if (_affEligB.eligible) {
     attachAffiliateLinksToPayload(responsePayload);
     logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB }, redis);
   } else {
-    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB, reason: _finalTrustB < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+    logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdB, signal: _finalSignalB, trustScore: _finalTrustB, reason: _affEligB.reason }, redis);
   }
   // Phase 18+19: scan metrics and learning (non-blocking)
   const _latB = Date.now() - _routeT0;
@@ -28113,11 +28117,12 @@ if (!responsePayload?.profitIntel?.buySignal) {
 const _finalSignalC = responsePayload.profitIntel.buySignal;
 const _finalTrustC  = responsePayload.trustScore ?? 0;
 // _scanIdC hoisted to top of route handler (TDZ fix)
-if (_finalTrustC >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalC)) {
+const _affEligC = evaluateAffiliateEligibilityForPayload(responsePayload, { signal: _finalSignalC, trustScore: _finalTrustC, minTrust: MIN_TRUST_FOR_AFFILIATE, weakSignals: WEAK_SIGNALS_NO_AFFILIATE });
+if (_affEligC.eligible) {
   attachAffiliateLinksToPayload(responsePayload);
   logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC }, redis);
 } else {
-  logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC, reason: _finalTrustC < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+  logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdC, signal: _finalSignalC, trustScore: _finalTrustC, reason: _affEligC.reason }, redis);
 }
 // Phase 18+19: scan metrics and learning (non-blocking)
 const _latC = Date.now() - _routeT0;
@@ -28646,11 +28651,12 @@ app.post("/market/search/stream", async (req, res) => {
       // Phase 19: affiliate decision logging — final corrected signal and trust
       const _finalSignalD = payload.profitIntel.buySignal;
       const _finalTrustD  = payload.trustScore ?? 0;
-      if (_finalTrustD >= MIN_TRUST_FOR_AFFILIATE && !WEAK_SIGNALS_NO_AFFILIATE.has(_finalSignalD)) {
+      const _affEligD = evaluateAffiliateEligibilityForPayload(payload, { signal: _finalSignalD, trustScore: _finalTrustD, minTrust: MIN_TRUST_FOR_AFFILIATE, weakSignals: WEAK_SIGNALS_NO_AFFILIATE });
+      if (_affEligD.eligible) {
         attachAffiliateLinksToPayload(payload);
         logStructuredEvent(LOG_TYPES.AFFILIATE_ATTACHED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD }, redis);
       } else {
-        logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD, reason: _finalTrustD < MIN_TRUST_FOR_AFFILIATE ? "trust_below_threshold" : "weak_signal" }, redis);
+        logStructuredEvent(LOG_TYPES.AFFILIATE_BLOCKED, { scanId: _scanIdD, signal: _finalSignalD, trustScore: _finalTrustD, reason: _affEligD.reason }, redis);
       }
       // Phase 18+19: scan metrics and learning (non-blocking)
       const _latD = Date.now() - _t0;
