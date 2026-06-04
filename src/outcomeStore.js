@@ -154,6 +154,7 @@ function computePredictionError(prediction = {}, outcome = {}) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export async function recordPredictionSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== "object") return null;
   const scanId = snapshot.scanId;
   if (!scanId) return null;
 

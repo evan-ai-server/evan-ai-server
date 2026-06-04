@@ -319,6 +319,98 @@ await test("missing prediction shell marks predictionFound:false in dev route lo
   }
 });
 
+// ── Phase 4D.2 tests ─────────────────────────────────────────────────────────
+
+await test("recordPredictionSnapshot returns null for null/undefined input (no throw)", async () => {
+  const r1 = await recordPredictionSnapshot(null);
+  const r2 = await recordPredictionSnapshot(undefined);
+  const r3 = await recordPredictionSnapshot({ scanId: null, query: "test" });
+  assert.equal(r1, null, "null input returns null");
+  assert.equal(r2, null, "undefined input returns null");
+  assert.equal(r3, null, "null scanId returns null");
+});
+
+await test("non-stream fallback: snapshot captured under client scanId when no stream snapshot", async () => {
+  const clientScanId = uid();
+  try {
+    // Simulate what _tryRecordSnapshot("non_stream_fallback", ...) does:
+    // no prior snapshot exists for this scanId → new file written
+    const snap = await recordPredictionSnapshot({
+      scanId: clientScanId,
+      query: "hawaiian airlines boeing 787 diecast model airplane",
+      category: "General",
+      verdict: "PASS",
+      confidence: 0.38,
+      trust: {
+        canonicalVerdict: "PASS",
+        evidenceTier: "pricing_signal_only",
+        verdictStrengthCap: "evidence_limited",
+        calibratedConfidence: 0.38,
+        verifiedListingCount: 0,
+        pricingSignalCount: 7,
+        cleanCompCount: 7,
+        consensusMedian: 70.87,
+        canShowStrongLanguage: false,
+      },
+    });
+    assert.ok(snap, "non-stream fallback snapshot should be written");
+    assert.equal(snap.trust?.evidenceTier, "pricing_signal_only");
+    assert.equal(snap.trust?.verifiedListingCount, 0);
+    assert.equal(snap.trust?.pricingSignalCount, 7);
+    assert.equal(snap.trust?.canonicalVerdict, "PASS");
+    assert.equal(snap.trust?.canShowStrongLanguage, false);
+  } finally {
+    await cleanup(clientScanId);
+  }
+});
+
+await test("non-stream fallback does not overwrite when stream already recorded", async () => {
+  const serverScanId = uid();
+  const clientScanId = uid(); // different scanId — these are separate files
+  try {
+    // Stream provisional capture fires first under server scanId
+    const streamSnap = await recordPredictionSnapshot({
+      scanId: serverScanId, query: "test item", verdict: "BUY",
+      trust: { evidenceTier: "verified_strong", verifiedListingCount: 5 },
+    });
+    assert.equal(streamSnap?.trust?.evidenceTier, "verified_strong");
+
+    // Non-stream fallback fires under client scanId (separate file, different key)
+    const nonStreamSnap = await recordPredictionSnapshot({
+      scanId: clientScanId, query: "test item", verdict: "HOLD",
+      trust: { evidenceTier: "pricing_signal_only", verifiedListingCount: 0 },
+    });
+    assert.equal(nonStreamSnap?.trust?.evidenceTier, "pricing_signal_only");
+
+    // Server snapshot is untouched
+    const reDiskServer = await getPredictionSnapshot(serverScanId);
+    assert.equal(reDiskServer?.trust?.evidenceTier, "verified_strong", "stream snapshot not affected by non-stream fallback");
+  } finally {
+    await cleanup(serverScanId);
+    await cleanup(clientScanId);
+  }
+});
+
+await test("recordPredictionSnapshot is idempotent: repeated call with same scanId returns original", async () => {
+  const scanId = uid();
+  try {
+    await recordPredictionSnapshot({
+      scanId, query: "first write", verdict: "BUY",
+      trust: { evidenceTier: "verified_strong", pricingSignalCount: 4 },
+    });
+    // Call again with different data — should return first snapshot unchanged
+    const second = await recordPredictionSnapshot({
+      scanId, query: "second write", verdict: "PASS",
+      trust: { evidenceTier: "no_evidence", pricingSignalCount: 0 },
+    });
+    assert.equal(second?.query, "first write", "query must not be overwritten");
+    assert.equal(second?.trust?.evidenceTier, "verified_strong", "trust must not be overwritten");
+    assert.equal(second?.trust?.pricingSignalCount, 4, "pricingSignalCount must not be overwritten");
+  } finally {
+    await cleanup(scanId);
+  }
+});
+
 // ── summary ───────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

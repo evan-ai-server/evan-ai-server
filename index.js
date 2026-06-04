@@ -27717,6 +27717,11 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalA, scanId: _scanIdA, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   harnessRecordScan(req, responsePayload).catch(() => {});
+  // Phase 4D.2: non-stream fallback — captures prediction snapshot when stream provisional
+  // may have been skipped (e.g. 0-item degraded scan). Uses the client scanId (_reviewCtx.scanId).
+  // The outcome UI posts under the server-generated stream scanId (from SSE events); this snapshot
+  // may be orphaned from that join but ensures a complete record for analysis + stats.
+  _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
   return res.status(200).json(responsePayload);
 }
 
@@ -27865,6 +27870,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalB, scanId: _scanIdB, itemName: responsePayload.itemName || null }).catch(() => {});
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   harnessRecordScan(req, responsePayload).catch(() => {});
+  _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
   return res.status(200).json(responsePayload);
 }
 
@@ -28212,6 +28218,7 @@ storeSignalSnapshot(redis, _scanIdC, { userId: _userId, signal: _finalSignalC, t
 if (_userId) checkWatchlistForScan(redis, { userId: _userId, category, brand: responsePayload.identity?.brand || null, model: responsePayload.identity?.model || null, scannedPrice: responsePayload.profitIntel?.marketPriceMedian || null, signal: _finalSignalC, scanId: _scanIdC, itemName: responsePayload.itemName || null }).catch(() => {});
 if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
 harnessRecordScan(req, responsePayload).catch(() => {});
+_tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
 // ── Phase 2C.8: cross-route cache populate (/market/search success) ──────────
 // Stash the final payload so a follow-up /market/search/stream for the same
 // scan can read this cached pool instead of re-firing SerpAPI. Also record
@@ -28339,6 +28346,42 @@ function extractPredictionSnapshotFromPayload({
     },
   };
 }
+
+// Phase 4D.2 — Best-effort snapshot recorder used by all capture points (stream provisional,
+// stream complete, non-stream fallback). Never throws. Logs results and failures explicitly so
+// silent catch is never the outcome.
+async function _tryRecordSnapshot(source, { req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence, visionIdentity }) {
+  if (!scanId) {
+    console.log("PREDICTION_SNAPSHOT_SKIPPED", { source, scanId: null, query, reason: "no_scanId", hasPayload: !!finalPayload });
+    return null;
+  }
+  if (!finalPayload) {
+    console.log("PREDICTION_SNAPSHOT_SKIPPED", { source, scanId, query, reason: "no_payload" });
+    return null;
+  }
+  try {
+    const snap = await recordPredictionSnapshot(
+      extractPredictionSnapshotFromPayload({ req, scanId, query, category, scannedPrice, finalPayload, enrichedItems: enrichedItems || [], visionConfidence, visionIdentity })
+    );
+    if (snap) {
+      console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
+        source, scanId, query,
+        verdict: snap.verdict,
+        confidence: snap.confidence,
+        predictedProfit: snap.predictedProfit,
+        evidenceTier: snap.trust?.evidenceTier ?? null,
+        verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
+        verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
+        pricingSignalCount: snap.trust?.pricingSignalCount ?? null,
+      });
+    }
+    return snap;
+  } catch (e) {
+    console.warn("PREDICTION_SNAPSHOT_FAILED", { source, scanId, query, errorName: e?.name, errorMessage: e?.message || String(e) });
+    return null;
+  }
+}
+
 // Event sequence:
 //   event: phase        data: { phase: "analyzing_fast"|"enriching", query?, scanId }
 //   event: provisional  data: { ...payload, status:"provisional", enriching:true,
@@ -28984,22 +29027,7 @@ app.post("/market/search/stream", async (req, res) => {
       // recorded even when the client disconnects before the complete event.
       // Immutable: a second write for the same scanId from the final payload is
       // a no-op — whichever fires first wins without overwriting.
-      recordPredictionSnapshot(
-        extractPredictionSnapshotFromPayload({
-          req, scanId, query, category, scannedPrice,
-          finalPayload: earlyPayload, enrichedItems: _earlyItems, visionConfidence,
-          visionIdentity,
-        })
-      ).then((snap) => {
-        if (snap) console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
-          scanId, query, verdict: snap.verdict, confidence: snap.confidence,
-          predictedProfit: snap.predictedProfit,
-          evidenceTier: snap.trust?.evidenceTier ?? null,
-          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
-          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
-          source: "early_provisional",
-        });
-      }).catch(() => {});
+      _tryRecordSnapshot("early_provisional", { req, scanId, query, category, scannedPrice, finalPayload: earlyPayload, enrichedItems: _earlyItems, visionConfidence, visionIdentity }).catch(() => {});
     };
 
     // Synthetic placeholder safety net: if no provisional fires within 1.5s, emit
@@ -29094,22 +29122,16 @@ app.post("/market/search/stream", async (req, res) => {
       scanLog("provisional_sent", scanId, { itemCount: _provItems.length, verdict: _provVerdictKey });
       // Phase 4D: capture prediction snapshot from phase1 provisional so it is
       // recorded even when the client disconnects before the complete event.
-      recordPredictionSnapshot(
-        extractPredictionSnapshotFromPayload({
-          req, scanId, query, category, scannedPrice,
-          finalPayload: provPayload, enrichedItems: _provItems, visionConfidence,
-          visionIdentity,
-        })
-      ).then((snap) => {
-        if (snap) console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
-          scanId, query, verdict: snap.verdict, confidence: snap.confidence,
-          predictedProfit: snap.predictedProfit,
-          evidenceTier: snap.trust?.evidenceTier ?? null,
-          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
-          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
-          source: "provisional",
-        });
-      }).catch(() => {});
+      _tryRecordSnapshot("provisional", { req, scanId, query, category, scannedPrice, finalPayload: provPayload, enrichedItems: _provItems, visionConfidence, visionIdentity }).catch(() => {});
+    } else if (!_earlyProvSent) {
+      // Neither early provisional nor phase1 provisional fired — log why no snapshot was captured
+      console.log("PREDICTION_SNAPSHOT_SKIPPED", {
+        source: "stream_provisional",
+        scanId, query,
+        reason: phase1Items.length < 2 ? "insufficient_phase1_items" : "client_closed_before_provisional",
+        phase1Count: phase1Items.length,
+        clientClosed,
+      });
     }
 
     if (clientClosed) { endStream(); return; }
@@ -29427,29 +29449,8 @@ app.post("/market/search/stream", async (req, res) => {
 
     harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
 
-    // ── Outcome flywheel: record immutable prediction snapshot ────────────────
-    recordPredictionSnapshot(
-      extractPredictionSnapshotFromPayload({
-        req, scanId, query, category, scannedPrice,
-        finalPayload, enrichedItems, visionConfidence,
-        visionIdentity,
-      })
-    ).then((snap) => {
-      if (snap) {
-        console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
-          scanId,
-          query,
-          verdict: snap.verdict,
-          confidence: snap.confidence,
-          predictedProfit: snap.predictedProfit,
-          evidenceTier: snap.trust?.evidenceTier ?? null,
-          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
-          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
-        });
-      }
-    }).catch((e) => {
-      console.warn("⚠️ prediction_snapshot_record_failed", { scanId, error: e?.message || String(e) });
-    });
+    // ── Outcome flywheel: record immutable prediction snapshot (final payload) ──
+    _tryRecordSnapshot("complete", { req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence, visionIdentity }).catch(() => {});
 
     // ── Background retrieval expansion ────────────────────────────────────────
     // The `complete` event is already on the wire. The SSE connection stays open
