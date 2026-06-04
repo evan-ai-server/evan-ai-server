@@ -521,6 +521,29 @@ export const SCHEMAS = {
     targetPrice: { type: "number", min: 0.01, max: 999_999 },
     direction:   { type: "string", enum: ["below", "above"] },
   },
+
+  // Phase 4D: outcome update — used by OutcomeEditorSheet, DecisionSheet, PLTracker
+  outcomeUpdate: {
+    userId:          { type: "string",  max: 128 },
+    deviceId:        { type: "string",  max: 128 },
+    guestId:         { type: "string",  max: 128 },
+    bought:          { type: "boolean" },
+    listed:          { type: "boolean" },
+    sold:            { type: "boolean" },
+    actualBuyPrice:  { type: "number",  min: 0, max: 999_999 },
+    actualSellPrice: { type: "number",  min: 0, max: 999_999 },
+    actualFees:      { type: "number",  min: 0, max: 999_999 },
+    shippingCost:    { type: "number",  min: 0, max: 99_999  },
+    listingPrice:    { type: "number",  min: 0, max: 999_999 },
+    daysToSell:      { type: "number",  min: 0, max: 3650    },
+    salePlatform:    { type: "string",  max: 80  },
+    platform:        { type: "string",  max: 80  },
+    userNotes:       { type: "string",  max: 1000 },
+    notes:           { type: "string",  max: 1000 },
+    boughtAt:        { type: "string",  max: 40  },
+    listedAt:        { type: "string",  max: 40  },
+    soldAt:          { type: "string",  max: 40  },
+  },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

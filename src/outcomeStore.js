@@ -161,6 +161,24 @@ export async function recordPredictionSnapshot(snapshot = {}) {
   const existing = await readJson(file, null);
   if (existing) return existing; // immutable — never overwrite
 
+  // Phase 4D: sanitize trust block — only known scalar fields survive
+  const _rawTrust = snapshot.trust && typeof snapshot.trust === "object" ? snapshot.trust : null;
+  const trust = _rawTrust ? {
+    canonicalVerdict:             typeof _rawTrust.canonicalVerdict === "string"     ? _rawTrust.canonicalVerdict.slice(0, 40) : null,
+    evidenceTier:                 typeof _rawTrust.evidenceTier     === "string"     ? _rawTrust.evidenceTier.slice(0, 60)     : null,
+    verdictStrengthCap:           typeof _rawTrust.verdictStrengthCap === "string"   ? _rawTrust.verdictStrengthCap.slice(0, 60) : null,
+    calibratedConfidence:         numOrNull(_rawTrust.calibratedConfidence),
+    marketConfidence:             numOrNull(_rawTrust.marketConfidence) ?? (typeof _rawTrust.marketConfidence === "string" ? _rawTrust.marketConfidence.slice(0, 20) : null),
+    evidenceConfidence:           numOrNull(_rawTrust.evidenceConfidence),
+    verifiedListingCount:         Number.isFinite(Number(_rawTrust.verifiedListingCount)) ? Number(_rawTrust.verifiedListingCount) : 0,
+    pricingSignalCount:           Number.isFinite(Number(_rawTrust.pricingSignalCount))   ? Number(_rawTrust.pricingSignalCount)   : 0,
+    cleanCompCount:               numOrNull(_rawTrust.cleanCompCount),
+    consensusMedian:              numOrNull(_rawTrust.consensusMedian),
+    canShowStrongLanguage:        _rawTrust.canShowStrongLanguage        ?? null,
+    canShowVerifiedLanguage:      _rawTrust.canShowVerifiedLanguage      ?? null,
+    canShowMedianAsAuthoritative: _rawTrust.canShowMedianAsAuthoritative ?? null,
+  } : null;
+
   const clean = {
     scanId,
     userId: snapshot.userId || null,
@@ -174,9 +192,12 @@ export async function recordPredictionSnapshot(snapshot = {}) {
     verdict: snapshot.verdict || null,
     confidence: numOrNull(snapshot.confidence),
     reasonCode: snapshot.reasonCode || null,
+    predictedBrand: typeof snapshot.predictedBrand === "string" ? snapshot.predictedBrand.slice(0, 120) : null,
+    predictedModel: typeof snapshot.predictedModel === "string" ? snapshot.predictedModel.slice(0, 120) : null,
     predictedResalePrice: numOrNull(snapshot.predictedResalePrice),
     predictedProfit: numOrNull(snapshot.predictedProfit),
     predictedMarginPct: numOrNull(snapshot.predictedMarginPct),
+    predictedRoiPct: numOrNull(snapshot.predictedRoiPct),
     suggestedOffer: numOrNull(snapshot.suggestedOffer),
     estimatedFees: numOrNull(snapshot.estimatedFees),
     listingCount: numOrNull(snapshot.listingCount),
@@ -184,6 +205,7 @@ export async function recordPredictionSnapshot(snapshot = {}) {
     sourceGroups: numOrNull(snapshot.sourceGroups),
     marketConfidence: snapshot.marketConfidence || null,
     marketEvidenceReason: snapshot.marketEvidenceReason || null,
+    trust,
     topListings: Array.isArray(snapshot.topListings)
       ? snapshot.topListings.slice(0, 8).map((x) => ({
           title: x?.title || x?.itemName || null,
@@ -362,5 +384,66 @@ export async function computeOutcomeMetrics(userId) {
       daysToSellCount > 0
         ? Number((daysToSellSum / daysToSellCount).toFixed(1))
         : null,
+  };
+}
+
+// Phase 4D: aggregate breakdowns by category, evidenceTier, and verdict.
+// Joins realized outcomes with their prediction snapshots so trust-tier
+// accuracy can be computed. Never throws.
+export async function computeOutcomeStatsBreakdown(userId = null) {
+  const outcomes = await listOutcomesForUser(userId, 1000).catch(() => []);
+
+  // bucket shape: { count, soldCount, profitSum, profitErrAbsSum, profitErrCount, dirCorrect, dirKnown }
+  function emptyBucket() {
+    return { count: 0, soldCount: 0, profitSum: 0, profitErrAbsSum: 0, profitErrCount: 0, dirCorrect: 0, dirKnown: 0 };
+  }
+  function addToBucket(b, outcome) {
+    b.count++;
+    const realized = numOrNull(outcome.realizedProfit);
+    if (outcome.sold === true) {
+      b.soldCount++;
+      if (realized != null) b.profitSum += realized;
+    }
+    const pe = outcome.predictionError || {};
+    const profitErr = numOrNull(pe.profitError);
+    if (profitErr != null) { b.profitErrAbsSum += Math.abs(profitErr); b.profitErrCount++; }
+    if (typeof pe.directionCorrect === "boolean") { b.dirKnown++; if (pe.directionCorrect) b.dirCorrect++; }
+  }
+  function serializeBucket(b) {
+    return {
+      count: b.count,
+      soldCount: b.soldCount,
+      avgRealizedProfit: b.soldCount > 0 ? Number((b.profitSum / b.soldCount).toFixed(2)) : null,
+      avgProfitError: b.profitErrCount > 0 ? Number((b.profitErrAbsSum / b.profitErrCount).toFixed(2)) : null,
+      directionCorrectCount: b.dirCorrect,
+      directionKnownCount: b.dirKnown,
+      directionAccuracy: b.dirKnown > 0 ? Number((b.dirCorrect / b.dirKnown).toFixed(4)) : null,
+    };
+  }
+
+  const byCategory    = {};
+  const byEvidenceTier = {};
+  const byVerdict     = {};
+
+  for (const o of outcomes) {
+    // Resolved prediction for trust-tier lookup — join from prediction snapshot
+    const prediction = await getPredictionSnapshot(o.scanId).catch(() => null);
+
+    const cat  = prediction?.category || o.category || "unknown";
+    const tier = prediction?.trust?.evidenceTier || "unknown";
+    const verd = prediction?.verdict || o.predictionError?.verdict || "unknown";
+
+    for (const [map, key] of [[byCategory, cat], [byEvidenceTier, tier], [byVerdict, verd]]) {
+      if (!map[key]) map[key] = emptyBucket();
+      addToBucket(map[key], o);
+    }
+  }
+
+  return {
+    total: outcomes.length,
+    soldCount: outcomes.filter(o => o.sold === true).length,
+    byCategory:     Object.fromEntries(Object.entries(byCategory).map(([k, v])    => [k, serializeBucket(v)])),
+    byEvidenceTier: Object.fromEntries(Object.entries(byEvidenceTier).map(([k, v]) => [k, serializeBucket(v)])),
+    byVerdict:      Object.fromEntries(Object.entries(byVerdict).map(([k, v])      => [k, serializeBucket(v)])),
   };
 }

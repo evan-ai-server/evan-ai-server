@@ -269,6 +269,7 @@ import {
     getOutcomeWithPrediction,
     listOutcomesForUser,
     computeOutcomeMetrics,
+    computeOutcomeStatsBreakdown,
   } from "./src/outcomeStore.js";
 
   import {
@@ -25137,6 +25138,82 @@ app.post("/api/dev/scan-review/:scanId/review", requireDevReviewAccess, async (r
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 4D — Dev/internal outcome read + stats routes.
+// Guarded by requireDevReviewAccess (open in dev/local; dev-token-gated +
+// fail-closed in production). Read-only except from-scan, which creates
+// an outcome shell. Never touches verdict math or calibration.
+//   GET  /api/dev/outcomes/recent?limit=50
+//   GET  /api/dev/outcomes/stats
+//   GET  /api/dev/outcomes/:scanId
+//   POST /api/dev/outcomes/from-scan/:scanId
+// ─────────────────────────────────────────────────────────────────────────────
+app.get("/api/dev/outcomes/recent", requireDevReviewAccess, async (req, res) => {
+  try {
+    const limit   = Math.max(1, Math.min(500, parseInt(req.query?.limit, 10) || 50));
+    const userId  = safeStr(req.query?.userId, 128) || null;
+    const records = await listOutcomesForUser(userId, limit);
+    return res.status(200).json({ ok: true, count: records.length, records });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "dev_outcomes_read_failed" });
+  }
+});
+
+app.get("/api/dev/outcomes/stats", requireDevReviewAccess, async (req, res) => {
+  try {
+    const userId   = safeStr(req.query?.userId, 128) || null;
+    const [metrics, breakdown] = await Promise.all([
+      computeOutcomeMetrics(userId),
+      computeOutcomeStatsBreakdown(userId),
+    ]);
+    console.log("📊 DEV_OUTCOME_STATS_READ", {
+      userId,
+      total: metrics.outcomeCount,
+      soldCount: metrics.soldCount,
+      directionAccuracy: metrics.directionAccuracy,
+    });
+    return res.status(200).json({ ok: true, metrics, breakdown });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "dev_outcomes_stats_failed" });
+  }
+});
+
+app.get("/api/dev/outcomes/:scanId", requireDevReviewAccess, async (req, res) => {
+  try {
+    const scanId = safeStr(req.params?.scanId, 128);
+    if (!scanId) return res.status(400).json({ ok: false, error: "missing_scan_id" });
+    const row = await getOutcomeWithPrediction(scanId);
+    if (!row.prediction && !row.outcome) return res.status(404).json({ ok: false, error: "not_found" });
+    return res.status(200).json({ ok: true, ...row });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "dev_outcome_read_failed" });
+  }
+});
+
+app.post("/api/dev/outcomes/from-scan/:scanId", requireDevReviewAccess, async (req, res) => {
+  try {
+    const scanId = safeStr(req.params?.scanId, 128);
+    if (!scanId) return res.status(400).json({ ok: false, error: "missing_scan_id" });
+    const prediction = await getPredictionSnapshot(scanId);
+    const existing   = await getOutcomeRecord(scanId);
+    if (existing) {
+      return res.status(200).json({ ok: true, created: false, scanId, outcome: existing, prediction, predictionFound: !!prediction });
+    }
+    // Create empty outcome shell linked to this scanId
+    const outcome = await recordOutcome(scanId, {
+      userId: prediction?.userId || safeStr(req.body?.userId, 128) || null,
+    });
+    console.log("📋 DEV_OUTCOME_SHELL_CREATED", {
+      scanId,
+      predictionFound: !!prediction,
+      userId: outcome?.userId || null,
+    });
+    return res.status(200).json({ ok: true, created: true, scanId, outcome, prediction, predictionFound: !!prediction });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "dev_outcome_shell_failed" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Feature 9: Auto-Relist Suggestions — POST /api/relist/suggestions
 // Analyzes watchlist items' price history + market trends to produce actionable
 // "Sell Now / Hold / Wait" recommendations with optimal listing prices.
@@ -28179,11 +28256,14 @@ return res.status(200).json(responsePayload);
 // Uses actual field names from this codebase — not the generic template names.
 function extractPredictionSnapshotFromPayload({
   req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence,
+  visionIdentity,
 }) {
   const buyOrPass   = finalPayload?.buyOrPass || {};
   const profitIntel = finalPayload?.profitIntel || {};
   const priceStats  = profitIntel?.priceStats || {};
   const marketEv    = buyOrPass?.marketEvidence || {};
+  const cal         = finalPayload?.confidenceCalibration || {};
+  const calEv       = cal?.evidence || {};
 
   const verdict   = buyOrPass?.verdict || null;
   const confidence = buyOrPass?.confidence ?? null;
@@ -28200,6 +28280,30 @@ function extractPredictionSnapshotFromPayload({
       .filter(Boolean)
   ).size;
 
+  // Phase 4D: derive roi from predicted profit / scanned price (null when either is absent)
+  const _sp = Number.isFinite(Number(scannedPrice)) && Number(scannedPrice) > 0 ? Number(scannedPrice) : null;
+  const _pp = typeof predictedProfit === "number" ? predictedProfit : null;
+  const predictedRoiPct = _sp != null && _pp != null ? Number((_pp / _sp).toFixed(4)) : null;
+
+  // Phase 4D: canonical trust block snapshotted at scan time — immutable from here on
+  const trust = {
+    canonicalVerdict:             verdict,
+    evidenceTier:                 cal.evidenceTier             ?? null,
+    verdictStrengthCap:           cal.verdictStrengthCap       ?? null,
+    calibratedConfidence:         typeof cal.calibratedConfidence === "number" ? cal.calibratedConfidence : null,
+    marketConfidence:             typeof cal.marketConfidence    === "number" ? cal.marketConfidence : (cal.marketConfidence ?? null),
+    evidenceConfidence:           typeof cal.evidenceConfidence  === "number" ? cal.evidenceConfidence : null,
+    verifiedListingCount:         Number.isFinite(Number(calEv.verifiedListingCount))  ? Number(calEv.verifiedListingCount)  : 0,
+    pricingSignalCount:           Number.isFinite(Number(calEv.pricingSignalCount))    ? Number(calEv.pricingSignalCount)    : 0,
+    cleanCompCount:               Number.isFinite(Number(calEv.cleanCompCount))        ? Number(calEv.cleanCompCount)        : null,
+    consensusMedian:              typeof predictedResalePrice === "number" ? predictedResalePrice : null,
+    canShowStrongLanguage:        cal.canShowStrongLanguage        ?? null,
+    canShowVerifiedLanguage:      cal.canShowVerifiedLanguage      ?? null,
+    canShowMedianAsAuthoritative: cal.canShowMedianAsAuthoritative ?? null,
+  };
+
+  const vi = visionIdentity || finalPayload?.visionIdentity || finalPayload?.identity || {};
+
   return {
     scanId,
     userId:    req?.body?.userId || req?.query?.userId || null,
@@ -28212,9 +28316,12 @@ function extractPredictionSnapshotFromPayload({
     verdict,
     confidence,
     reasonCode,
+    predictedBrand:       typeof vi.brand === "string" && vi.brand ? vi.brand : null,
+    predictedModel:       typeof vi.model === "string" && vi.model ? vi.model : null,
     predictedResalePrice: typeof predictedResalePrice === "number" ? predictedResalePrice : null,
     predictedProfit:      typeof predictedProfit      === "number" ? predictedProfit      : null,
     predictedMarginPct:   null,
+    predictedRoiPct,
     suggestedOffer:       null,
     estimatedFees:        null,
     listingCount:         Array.isArray(enrichedItems) ? enrichedItems.length : null,
@@ -28222,6 +28329,7 @@ function extractPredictionSnapshotFromPayload({
     sourceGroups,
     marketConfidence:     marketEv?.confidence || null,
     marketEvidenceReason: marketEv?.reason || null,
+    trust,
     topListings,
     rawLiteMeta: {
       visionConfidence: visionConfidence ?? null,
@@ -29286,6 +29394,7 @@ app.post("/market/search/stream", async (req, res) => {
       extractPredictionSnapshotFromPayload({
         req, scanId, query, category, scannedPrice,
         finalPayload, enrichedItems, visionConfidence,
+        visionIdentity,
       })
     ).then((snap) => {
       if (snap) {
@@ -29295,6 +29404,9 @@ app.post("/market/search/stream", async (req, res) => {
           verdict: snap.verdict,
           confidence: snap.confidence,
           predictedProfit: snap.predictedProfit,
+          evidenceTier: snap.trust?.evidenceTier ?? null,
+          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
+          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
         });
       }
     }).catch((e) => {
@@ -42202,7 +42314,7 @@ app.get("/api/outcomes/:scanId", async (req, res) => {
   }
 });
 
-app.post("/api/outcomes/:scanId", async (req, res) => {
+app.post("/api/outcomes/:scanId", bodySchemaMiddleware(SCHEMAS.outcomeUpdate), async (req, res) => {
   try {
     const scanId = safeStr(req.params?.scanId, 128);
     if (!scanId) return res.status(400).json({ ok: false, error: "missing_scan_id" });
