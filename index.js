@@ -28980,6 +28980,26 @@ app.post("/market/search/stream", async (req, res) => {
       scanLog("early_provisional_sent", scanId, {
         itemCount: _earlyItems.length, verdict: _provVerdictKey, earlyMs: _earlyMs,
       });
+      // Phase 4D: capture prediction snapshot from early provisional so it is
+      // recorded even when the client disconnects before the complete event.
+      // Immutable: a second write for the same scanId from the final payload is
+      // a no-op — whichever fires first wins without overwriting.
+      recordPredictionSnapshot(
+        extractPredictionSnapshotFromPayload({
+          req, scanId, query, category, scannedPrice,
+          finalPayload: earlyPayload, enrichedItems: _earlyItems, visionConfidence,
+          visionIdentity,
+        })
+      ).then((snap) => {
+        if (snap) console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
+          scanId, query, verdict: snap.verdict, confidence: snap.confidence,
+          predictedProfit: snap.predictedProfit,
+          evidenceTier: snap.trust?.evidenceTier ?? null,
+          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
+          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
+          source: "early_provisional",
+        });
+      }).catch(() => {});
     };
 
     // Synthetic placeholder safety net: if no provisional fires within 1.5s, emit
@@ -29072,6 +29092,24 @@ app.post("/market/search/stream", async (req, res) => {
         _scanPhase1Ms: _phase1Ms,
       });
       scanLog("provisional_sent", scanId, { itemCount: _provItems.length, verdict: _provVerdictKey });
+      // Phase 4D: capture prediction snapshot from phase1 provisional so it is
+      // recorded even when the client disconnects before the complete event.
+      recordPredictionSnapshot(
+        extractPredictionSnapshotFromPayload({
+          req, scanId, query, category, scannedPrice,
+          finalPayload: provPayload, enrichedItems: _provItems, visionConfidence,
+          visionIdentity,
+        })
+      ).then((snap) => {
+        if (snap) console.log("📸 PREDICTION_SNAPSHOT_RECORDED", {
+          scanId, query, verdict: snap.verdict, confidence: snap.confidence,
+          predictedProfit: snap.predictedProfit,
+          evidenceTier: snap.trust?.evidenceTier ?? null,
+          verdictStrengthCap: snap.trust?.verdictStrengthCap ?? null,
+          verifiedListingCount: snap.trust?.verifiedListingCount ?? null,
+          source: "provisional",
+        });
+      }).catch(() => {});
     }
 
     if (clientClosed) { endStream(); return; }
