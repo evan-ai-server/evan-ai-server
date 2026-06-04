@@ -193,6 +193,23 @@ const NOISE_WORDS = new Set([
   "bundle", "buy it now", "bin",
 ]);
 
+// ── Protected (non-sneaker) identity guard ────────────────────────────────────
+// High-specificity identities — especially aircraft / diecast models — where the
+// sneaker/streetwear colorway + model-code aliasing below must NEVER fire. Without
+// this, "ANA Airbus A380" had its "380" rewritten to "Yeezy 380" → "Ayeezy 380",
+// which then fed fabricated oracle comps. Aircraft model codes (A380, 787, 737-9)
+// collide directly with Yeezy/New-Balance numeric aliases, so we hard-skip the
+// sneaker substitution steps whenever an aircraft/diecast marker is present.
+const PROTECTED_IDENTITY_RE = /\b(airbus|boeing|embraer|bombardier|mcdonnell|douglas|lockheed|aircraft|airplane|airliner|diecast|die-?cast|gemini\s?jets|phoenix\s?models|herpa|jc\s?wings|aeroclassics|inflight|ng\s?models|dragon\s?wings|a2\d{2}|a3\d{2}|b7\d{2}|7[0-8]7)\b/i;
+
+/** True when the text names an aircraft / diecast (or other protected) identity. */
+export function containsProtectedIdentity(text = "") {
+  if (!text || typeof text !== "string") return false;
+  return PROTECTED_IDENTITY_RE.test(text);
+}
+
+const _escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 // ── Core normalizer ───────────────────────────────────────────────────────────
 
 /**
@@ -239,23 +256,34 @@ export function normalizeSellerJargon(input = "") {
     }
   }
 
+  // Aircraft / diecast and other protected identities must skip the sneaker
+  // colorway + model-code substitution entirely — their model codes (A380, 787,
+  // 737-9) collide with Yeezy/New-Balance numeric aliases.
+  const protectedIdentity = containsProtectedIdentity(input);
+
   // ── 4. Replace colorway aliases ─────────────────────────────────────────
-  const textLower2 = text.toLowerCase();
-  for (const [alias, canonical] of Object.entries(COLORWAY_ALIASES)) {
-    if (textLower2.includes(alias)) {
-      extractedData.colorway = canonical;
-      text = text.replace(new RegExp(alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), canonical);
-      break;
+  if (!protectedIdentity) {
+    const textLower2 = text.toLowerCase();
+    for (const [alias, canonical] of Object.entries(COLORWAY_ALIASES)) {
+      if (textLower2.includes(alias)) {
+        extractedData.colorway = canonical;
+        text = text.replace(new RegExp(_escapeRe(alias), "gi"), canonical);
+        break;
+      }
     }
   }
 
   // ── 5. Replace model aliases ─────────────────────────────────────────────
-  const textLower3 = text.toLowerCase();
-  for (const [alias, canonical] of Object.entries(MODEL_ALIASES)) {
-    if (textLower3.includes(alias)) {
-      extractedData.model = canonical;
-      text = text.replace(new RegExp(alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), canonical);
-      break;
+  // Word-boundary matched so a numeric model alias ("380", "700", "550") only
+  // fires on a standalone token — never inside another token like "a380".
+  if (!protectedIdentity) {
+    for (const [alias, canonical] of Object.entries(MODEL_ALIASES)) {
+      const aliasRe = new RegExp(`\\b${_escapeRe(alias)}\\b`, "i");
+      if (aliasRe.test(text)) {
+        extractedData.model = canonical;
+        text = text.replace(new RegExp(`\\b${_escapeRe(alias)}\\b`, "gi"), canonical);
+        break;
+      }
     }
   }
 
