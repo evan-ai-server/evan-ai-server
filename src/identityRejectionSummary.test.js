@@ -7,6 +7,8 @@ import {
   createEmptyIdentitySummary,
   mergeIdentitySummaries,
   normalizeIdentitySummary,
+  packMarketItemsWithIdentity,
+  unpackMarketItemsWithIdentity,
 } from "./identityRejectionSummary.js";
 
 // ── createEmptyIdentitySummary ────────────────────────────────────────────────
@@ -259,4 +261,74 @@ test("early retrieval summary with 14 total rejections normalizes correctly", ()
   const expected = Math.round((14 / 22) * 1000) / 1000;
   assert.equal(n.rejectionRatio, expected);
   assert.ok(n.rejectionRatio > 0.25, "high rejection ratio should trigger identity_lock_high_rejection_ratio cap reason");
+});
+
+// ── Phase 4B.2.2: pack/unpack cache helpers ───────────────────────────────────
+
+test("unpack: legacy plain array returns items and null identitySummary", () => {
+  const items = [{ title: "item1", price: 50 }, { title: "item2", price: 60 }];
+  const result = unpackMarketItemsWithIdentity(items);
+  assert.deepEqual(result.items, items);
+  assert.equal(result.identitySummary, null);
+});
+
+test("unpack: packed object preserves items and identitySummary", () => {
+  const items = [{ title: "item1", price: 50 }];
+  const summary = {
+    ...createEmptyIdentitySummary(),
+    rawCount: 36, keptCount: 8,
+    rejectedCompetitorCount: 1, rejectedMissingAirlineCount: 7, rejectedGenericToyCount: 3,
+    appliedLocks: ["airline"],
+    sourceStage: "retrieval_post_serp_filter",
+  };
+  const packed = packMarketItemsWithIdentity(items, summary);
+  const unpacked = unpackMarketItemsWithIdentity(packed);
+  assert.deepEqual(unpacked.items, items);
+  assert.ok(unpacked.identitySummary !== null, "identitySummary must be preserved");
+  assert.equal(unpacked.identitySummary.rejectedCompetitorCount, 1);
+  assert.equal(unpacked.identitySummary.rejectedMissingAirlineCount, 7);
+  assert.equal(unpacked.identitySummary.rejectedGenericToyCount, 3);
+  assert.ok(unpacked.identitySummary.appliedLocks.includes("airline"));
+});
+
+test("unpack then normalize: totalRejectedCount survives cache round-trip", () => {
+  const items = [{ title: "item1", price: 50 }];
+  const summary = {
+    ...createEmptyIdentitySummary(),
+    rawCount: 39,
+    rejectedCompetitorCount: 1,
+    rejectedMissingAirlineCount: 7,
+    rejectedGenericToyCount: 3,
+    appliedLocks: ["airline"],
+  };
+  const { identitySummary: unpacked } = unpackMarketItemsWithIdentity(
+    packMarketItemsWithIdentity(items, summary)
+  );
+  const n = normalizeIdentitySummary({ ...unpacked, keptCount: 11 });
+  assert.equal(n.totalRejectedCount, 11, "1+7+3=11");
+  assert.ok(n.totalRejectedCount >= 11, "totalRejectedCount must survive round-trip");
+  assert.ok(n.rejectionRatio > 0.25, "rejection ratio should flag for calibration");
+});
+
+test("unpack then merge: cached retrieval summary with final clean count does not double-count rawCount/keptCount", () => {
+  // Simulates using a cached retrieval summary alongside the final clean item pool
+  const cachedSummary = {
+    ...createEmptyIdentitySummary(),
+    rawCount: 39, keptCount: 13,
+    rejectedCompetitorCount: 1, rejectedMissingAirlineCount: 7, rejectedGenericToyCount: 3,
+    appliedLocks: ["airline"],
+  };
+  const { identitySummary: unpackedSummary } = unpackMarketItemsWithIdentity(
+    packMarketItemsWithIdentity([], cachedSummary)
+  );
+  // Reproduce the buildMarketSearchResponsePayload merge logic
+  const stripped = { ...unpackedSummary, rawCount: 0, keptCount: 0 };
+  const inFunction = { ...createEmptyIdentitySummary(), rawCount: 0, keptCount: 11 };
+  const merged = mergeIdentitySummaries(stripped, inFunction);
+  const authoritative = { ...merged, rawCount: unpackedSummary.rawCount, keptCount: 11 };
+  const n = normalizeIdentitySummary(authoritative);
+  assert.equal(n.rawCount, 39, "rawCount must come from retrieval, not be summed");
+  assert.equal(n.keptCount, 11, "keptCount must come from final clean pool, not be summed");
+  assert.equal(n.totalRejectedCount, 11, "1+7+3=11");
+  assert.ok(n.rejectionRatio > 0.25);
 });

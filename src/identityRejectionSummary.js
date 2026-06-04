@@ -1,5 +1,5 @@
 // src/identityRejectionSummary.js
-// Phase 4B.2 — Pure helpers for building an exact identity rejection summary.
+// Phase 4B.2 / 4B.2.2 — Pure helpers for building an exact identity rejection summary.
 //
 // The summary is accumulated as identity-filter functions run (optional _out sidecar),
 // then normalized and passed into calibrateEvidenceConfidence() as identitySummary.
@@ -75,6 +75,37 @@ export function mergeIdentitySummaries(...summaries) {
 }
 
 // ── Normalize ─────────────────────────────────────────────────────────────────
+
+// ── Cache pack/unpack ─────────────────────────────────────────────────────────
+
+/**
+ * Pack items + identity summary into a single cache-safe object.
+ * normalizeIdentitySummary is called so stored counts are always clean.
+ */
+export function packMarketItemsWithIdentity(items, identitySummary) {
+  return {
+    items: Array.isArray(items) ? items : [],
+    identitySummary: normalizeIdentitySummary(identitySummary || {}),
+  };
+}
+
+/**
+ * Unpack a cached value that may be either a legacy plain array or a packed
+ * { items, identitySummary } object. Always returns { items, identitySummary }.
+ * Backward-compatible: plain arrays return identitySummary = null.
+ */
+export function unpackMarketItemsWithIdentity(value) {
+  if (Array.isArray(value)) {
+    return { items: value, identitySummary: null };
+  }
+  if (value && Array.isArray(value.items)) {
+    return {
+      items: value.items,
+      identitySummary: value.identitySummary || null,
+    };
+  }
+  return { items: [], identitySummary: null };
+}
 
 /** Compute totalRejectedCount, rejectionRatio, and clamp all fields ≥ 0. */
 export function normalizeIdentitySummary(summary) {
