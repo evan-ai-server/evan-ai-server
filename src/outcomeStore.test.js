@@ -411,6 +411,63 @@ await test("recordPredictionSnapshot is idempotent: repeated call with same scan
   }
 });
 
+// ── Phase 4F: marketStructure snapshot tests ──────────────────────────────────
+
+await test("marketStructure compact summary persists through disk roundtrip", async () => {
+  const scanId = uid();
+  try {
+    const snap = await recordPredictionSnapshot({
+      scanId,
+      query: "hawaiian airlines boeing 787 diecast",
+      verdict: "PASS",
+      trust: { evidenceTier: "pricing_signal_only", verifiedListingCount: 0 },
+      marketStructure: {
+        clusterCount:              2,
+        dominantMedian:            73.5,
+        dominantCount:             4,
+        scannedPricePosition:      "above",
+        scannedPriceVsDominantPct: 0.9523,
+        thinMarket:                false,
+        unresolvedUrlRisk:         true,
+        spreadRisk:                false,
+      },
+    });
+    assert.ok(snap, "snapshot should be returned");
+    assert.ok(snap.marketStructure !== undefined, "marketStructure should be present");
+    assert.equal(snap.marketStructure?.clusterCount, 2, "clusterCount should persist");
+    assert.equal(snap.marketStructure?.dominantMedian, 73.5, "dominantMedian should persist");
+    assert.equal(snap.marketStructure?.scannedPricePosition, "above", "scannedPricePosition should persist");
+    assert.equal(snap.marketStructure?.unresolvedUrlRisk, true, "unresolvedUrlRisk should persist");
+
+    const fromDisk = await getPredictionSnapshot(scanId);
+    assert.equal(fromDisk?.marketStructure?.clusterCount, 2, "clusterCount should survive disk roundtrip");
+    assert.equal(fromDisk?.marketStructure?.scannedPricePosition, "above", "scannedPricePosition should survive disk roundtrip");
+  } finally {
+    await cleanup(scanId);
+  }
+});
+
+await test("old snapshot without marketStructure still parses correctly", async () => {
+  const scanId = uid();
+  const legacyPath = path.join(ROOT_REAL, "predictions", `${scanId}.json`);
+  await fs.mkdir(path.dirname(legacyPath), { recursive: true });
+  await fs.writeFile(legacyPath, JSON.stringify({
+    scanId, query: "legacy scan without market structure", verdict: "HOLD", confidence: 0.5,
+    trust: { evidenceTier: "pricing_signal_only", verifiedListingCount: 0 },
+  }), "utf8");
+  try {
+    const snap = await getPredictionSnapshot(scanId);
+    assert.ok(snap, "legacy snapshot should parse");
+    assert.equal(snap.scanId, scanId);
+    assert.equal(snap.verdict, "HOLD");
+    // marketStructure absent on legacy record is fine — should not throw
+    assert.ok(snap.marketStructure === undefined || snap.marketStructure === null,
+      "missing marketStructure on legacy record is acceptable");
+  } finally {
+    await cleanup(scanId);
+  }
+});
+
 // ── summary ───────────────────────────────────────────────────────────────────
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

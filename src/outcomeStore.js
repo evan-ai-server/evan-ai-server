@@ -217,6 +217,21 @@ export async function recordPredictionSnapshot(snapshot = {}) {
         }))
       : [],
     rawLiteMeta: snapshot.rawLiteMeta || {},
+    // Phase 4F: compact market structure summary — additive only, old records without it still parse
+    marketStructure: (() => {
+      const ms = snapshot.marketStructure;
+      if (!ms || typeof ms !== "object") return null;
+      return {
+        clusterCount:              ms.clusterCount              ?? null,
+        dominantMedian:            ms.dominantMedian            ?? null,
+        dominantCount:             ms.dominantCount             ?? null,
+        scannedPricePosition:      typeof ms.scannedPricePosition === "string" ? ms.scannedPricePosition.slice(0, 20) : null,
+        scannedPriceVsDominantPct: typeof ms.scannedPriceVsDominantPct === "number" ? ms.scannedPriceVsDominantPct : null,
+        thinMarket:                ms.thinMarket                ?? null,
+        unresolvedUrlRisk:         ms.unresolvedUrlRisk         ?? null,
+        spreadRisk:                ms.spreadRisk                ?? null,
+      };
+    })(),
   };
 
   await writeJsonAtomic(file, clean);

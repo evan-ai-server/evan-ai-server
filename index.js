@@ -285,6 +285,10 @@ import {
   } from "./src/marketPredictionAccuracyEngine.js";
 
   import {
+    analyzeMarketStructure,
+  } from "./src/marketStructureEngine.js";
+
+  import {
     buildResaleIntelligenceDataset,
     saveResaleIntelligenceDataset,
     loadLatestResaleIntelligenceDataset,
@@ -24549,6 +24553,28 @@ async function buildMarketSearchResponsePayload({
       });
     }
 
+    // ── Phase 4F: Market Structure Engine ────────────────────────────────────
+    // Pure, additive, display-only. Never throws. Never affects verdict,
+    // calibration, affiliate, or filtering.
+    let _marketStructure = null;
+    try {
+      _marketStructure = analyzeMarketStructure(
+        Array.isArray(uiItemsForCalibration) ? uiItemsForCalibration : [],
+        {
+          scannedPrice:       finitePrice(scannedPrice),
+          category,
+          query:              baseQuery,
+          calibration:        _confidenceCalibration,
+          identityRejections: _finalIdentitySummary,
+        }
+      );
+    } catch (_msErr) {
+      console.warn("MARKET_STRUCTURE_FAILED", {
+        query: baseQuery,
+        error: _msErr?.message || String(_msErr),
+      });
+    }
+
     // ── Feature 62: Buy or Pass Engine (THE FINAL VERDICT) ────────────────────
     const buyOrPassResult = buildBuyOrPassPayload({
       dealComparator,
@@ -24826,6 +24852,7 @@ async function buildMarketSearchResponsePayload({
       evanExplainer,
       buyOrPass:             safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
       confidenceCalibration: _confidenceCalibration || null,  // Phase 4A.1
+      marketStructure:       _marketStructure,                // Phase 4F: additive display-only
       multiAngle:            null, // populated by route layer from multiAngleResult
 
       // Features 68-77
@@ -28344,6 +28371,21 @@ function extractPredictionSnapshotFromPayload({
       retrievalDepthScore: finalPayload?.retrievalDepthScore ?? null,
       dataDepth:        finalPayload?.dataDepth ?? null,
     },
+    // Phase 4F: compact market structure summary — additive only
+    marketStructure: (() => {
+      const ms = finalPayload?.marketStructure;
+      if (!ms || typeof ms !== "object") return null;
+      return {
+        clusterCount:              typeof ms.clusterCount === "number" ? ms.clusterCount : null,
+        dominantMedian:            typeof ms.dominantCluster?.median === "number" ? ms.dominantCluster.median : null,
+        dominantCount:             typeof ms.dominantCluster?.count === "number" ? ms.dominantCluster.count : null,
+        scannedPricePosition:      typeof ms.scannedPricePosition === "string" ? ms.scannedPricePosition : null,
+        scannedPriceVsDominantPct: typeof ms.scannedPriceVsDominantPct === "number" ? ms.scannedPriceVsDominantPct : null,
+        thinMarket:                ms.thinMarket ?? null,
+        unresolvedUrlRisk:         ms.unresolvedUrlRisk ?? null,
+        spreadRisk:                ms.spreadRisk ?? null,
+      };
+    })(),
   };
 }
 
