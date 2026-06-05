@@ -193,6 +193,19 @@ function sourceDepthKey(prediction = {}) {
 const MIN_SAMPLES_FOR_BIAS = 5;
 const MIN_SAMPLES_FOR_BUCKET = 5;
 
+// Phase 4E: evidence tier keys from confidenceCalibration.js — the full
+// vocabulary of tiers produced by calibrateEvidenceConfidence(). "unknown"
+// catches old predictions that predate the trust block.
+const EVIDENCE_TIER_KEYS = [
+  "verified_strong",
+  "verified_partial",
+  "pricing_signal_only",
+  "thin_pricing_signal",
+  "estimate_only",
+  "no_evidence",
+  "unknown",
+];
+
 function computePricingBias(globalStats) {
   if (!globalStats || !globalStats.count) return "unknown";
   if (globalStats.count < MIN_SAMPLES_FOR_BIAS) return "insufficient_data";
@@ -259,12 +272,26 @@ function recommendationFromReport(report) {
   return recs;
 }
 
+// Phase 4E: wrap price-accuracy stats with a reliability assessment so callers
+// know which tier buckets have enough data to trust vs. which are exploratory.
+function withReliability(stats, minSamples = MIN_SAMPLES_FOR_BIAS) {
+  const count = stats?.count ?? 0;
+  const reliability = count === 0 ? "no_data"
+    : count < minSamples ? "insufficient_data"
+    : "reliable";
+  return { ...stats, reliability };
+}
+
 function emptyReport(userId = null) {
+  const emptyTierEntry = { ...emptyStats(), reliability: "no_data" };
   return {
     userId: userId || null,
     generatedAt: nowIso(),
     totalOutcomes: 0,
     usableOutcomes: 0,
+    joinedPredictionCount: 0,
+    droppedNoPrediction: 0,
+    droppedUnsold: 0,
     global: emptyStats(),
     profitAccuracy: summarizeProfitRows([]),
     byCategory: {},
@@ -286,6 +313,7 @@ function emptyReport(userId = null) {
       healthyListings: emptyStats(),
       unknown: emptyStats(),
     },
+    byEvidenceTier: Object.fromEntries(EVIDENCE_TIER_KEYS.map((k) => [k, emptyTierEntry])),
     worstCategories: [],
     bestCategories: [],
     pricingBias: "unknown",
@@ -318,15 +346,21 @@ export async function buildMarketPredictionAccuracyReport(userId = null) {
     return emptyReport(userId);
   }
 
+  // Phase 4E: join-drop counters so silent subset exclusion is visible.
+  let joinedPredictionCount = 0;
+  let droppedNoPrediction   = 0;
+  let droppedUnsold         = 0;
+
   const rows = [];
   for (const outcome of outcomes) {
     const scanId = outcome?.scanId;
-    if (!scanId) continue;
+    if (!scanId) { droppedNoPrediction++; continue; }
 
     const prediction = await getPredictionSnapshot(scanId).catch(() => null);
-    if (!prediction) continue;
+    if (!prediction) { droppedNoPrediction++; continue; }
+    joinedPredictionCount++;
 
-    if (outcome.sold !== true) continue;
+    if (outcome.sold !== true) { droppedUnsold++; continue; }
 
     const actualSellPrice = numOrNull(outcome.actualSellPrice);
     const predictedResalePrice = numOrNull(prediction.predictedResalePrice);
@@ -344,6 +378,8 @@ export async function buildMarketPredictionAccuracyReport(userId = null) {
       verdict: String(prediction.verdict || "unknown").toUpperCase(),
       marketConfidence: safeLower(prediction.marketConfidence || "unknown"),
       sourceDepth: sourceDepthKey(prediction),
+      // Phase 4E: read trust block — old predictions without it map to "unknown"
+      evidenceTier: prediction.trust?.evidenceTier ?? "unknown",
       predictedResalePrice,
       actualSellPrice,
       priceError,
@@ -357,22 +393,35 @@ export async function buildMarketPredictionAccuracyReport(userId = null) {
     });
   }
 
+  console.log("PREDICTION_JOIN_SUMMARY", {
+    engine: "marketPredictionAccuracy",
+    totalOutcomes: outcomes.length,
+    joinedPredictionCount,
+    droppedNoPrediction,
+    droppedUnsold,
+  });
+
   if (!rows.length) {
     const r = emptyReport(userId);
     r.totalOutcomes = outcomes.length;
+    r.joinedPredictionCount = joinedPredictionCount;
+    r.droppedNoPrediction   = droppedNoPrediction;
+    r.droppedUnsold         = droppedUnsold;
     return r;
   }
 
-  const byCategoryRows = {};
-  const byVerdictRows = {};
+  const byCategoryRows        = {};
+  const byVerdictRows         = {};
   const byMarketConfidenceRows = {};
-  const bySourceDepthRows = {};
+  const bySourceDepthRows     = {};
+  const byEvidenceTierRows    = {};
 
   for (const row of rows) {
-    pushGroup(byCategoryRows, row.category, row);
-    pushGroup(byVerdictRows, row.verdict, row);
+    pushGroup(byCategoryRows,         row.category,        row);
+    pushGroup(byVerdictRows,          row.verdict,         row);
     pushGroup(byMarketConfidenceRows, row.marketConfidence, row);
-    pushGroup(bySourceDepthRows, row.sourceDepth, row);
+    pushGroup(bySourceDepthRows,      row.sourceDepth,     row);
+    pushGroup(byEvidenceTierRows,     row.evidenceTier,    row);
   }
 
   const global = summarizePriceRows(rows);
@@ -380,18 +429,25 @@ export async function buildMarketPredictionAccuracyReport(userId = null) {
   const byCategory = summarizeGroupMap(byCategoryRows);
   const byVerdict = summarizeGroupMap(byVerdictRows, ["BUY", "HOLD", "PASS"]);
   const byMarketConfidence = summarizeGroupMap(byMarketConfidenceRows, [
-    "high",
-    "medium",
-    "low",
-    "unknown",
+    "high", "medium", "low", "unknown",
   ]);
   const bySourceDepth = summarizeGroupMap(bySourceDepthRows, [
-    "singleSource",
-    "multiSource",
-    "thinListings",
-    "healthyListings",
-    "unknown",
+    "singleSource", "multiSource", "thinListings", "healthyListings", "unknown",
   ]);
+
+  // Phase 4E: build evidence-tier accuracy breakdown, each bucket labelled with
+  // reliability so callers never silently act on thin data.
+  const byEvidenceTier = {};
+  for (const key of EVIDENCE_TIER_KEYS) {
+    const tierRows = byEvidenceTierRows[key] || [];
+    byEvidenceTier[key] = withReliability(summarizePriceRows(tierRows));
+  }
+  // Also include any unexpected tier values not in the forced list
+  for (const [key, tierRows] of Object.entries(byEvidenceTierRows)) {
+    if (!byEvidenceTier[key]) {
+      byEvidenceTier[key] = withReliability(summarizePriceRows(tierRows));
+    }
+  }
 
   const categoryStats = Object.entries(byCategory)
     .map(([category, stats]) => ({ category, ...stats }))
@@ -409,12 +465,16 @@ export async function buildMarketPredictionAccuracyReport(userId = null) {
     generatedAt: nowIso(),
     totalOutcomes: outcomes.length,
     usableOutcomes: rows.length,
+    joinedPredictionCount,
+    droppedNoPrediction,
+    droppedUnsold,
     global,
     profitAccuracy,
     byCategory,
     byVerdict,
     byMarketConfidence,
     bySourceDepth,
+    byEvidenceTier,
     worstCategories,
     bestCategories,
     pricingBias: computePricingBias(global),

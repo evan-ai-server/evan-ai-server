@@ -29,6 +29,17 @@ const BUCKETS = ["0-20", "20-40", "40-60", "60-80", "80-100"];
 const VERDICT_KEYS = ["BUY", "HOLD", "PASS"];
 const MIN_COUNT_FOR_ADJUSTMENT = 10;
 
+// Phase 4E: evidence tier vocabulary (mirrors marketPredictionAccuracyEngine).
+const EVIDENCE_TIER_KEYS = [
+  "verified_strong",
+  "verified_partial",
+  "pricing_signal_only",
+  "thin_pricing_signal",
+  "estimate_only",
+  "no_evidence",
+  "unknown",
+];
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function bucketConfidence(confidence) {
@@ -138,10 +149,16 @@ export async function loadLatestCalibrationReport() {
 async function collectUsableRows(userId) {
   const outcomes = await listOutcomesForUser(userId, 5000);
   const rows = [];
+  // Phase 4E: track join-drops so silent subset exclusion is visible to callers.
+  let joinedPredictionCount = 0;
+  let droppedNoPrediction   = 0;
+  let droppedInsufficient   = 0;
+
   for (const o of outcomes) {
-    if (!o?.scanId) continue;
+    if (!o?.scanId) { droppedNoPrediction++; continue; }
     const prediction = await getPredictionSnapshot(o.scanId);
-    if (!prediction) continue;
+    if (!prediction) { droppedNoPrediction++; continue; }
+    joinedPredictionCount++;
 
     // numOrNull, not Number.isFinite(Number(v)): Number(null) === 0 is finite,
     // so the old form admitted unsold/no-signal rows and inflated usableOutcomes.
@@ -150,11 +167,11 @@ async function collectUsableRows(userId) {
       (numOrNull(o.predictionError.profitError) != null ||
         typeof o.predictionError.directionCorrect === "boolean");
     const hasRealizedProfit = numOrNull(o.realizedProfit) != null;
-    if (!hasPredictionError && !hasRealizedProfit) continue;
+    if (!hasPredictionError && !hasRealizedProfit) { droppedInsufficient++; continue; }
 
     rows.push({ prediction, outcome: o });
   }
-  return { totalOutcomes: outcomes.length, rows };
+  return { totalOutcomes: outcomes.length, rows, joinedPredictionCount, droppedNoPrediction, droppedInsufficient };
 }
 
 // Build a calibration sub-report (buckets + rolled stats) from a set of rows.
@@ -312,6 +329,9 @@ function emptyReport(userId) {
     generatedAt: nowIso(),
     totalOutcomes: 0,
     usableOutcomes: 0,
+    joinedPredictionCount: 0,
+    droppedNoPrediction: 0,
+    droppedInsufficient: 0,
     buckets: BUCKETS.map((b) => ({
       bucket: b,
       count: 0,
@@ -325,6 +345,7 @@ function emptyReport(userId) {
     })),
     byVerdict: Object.fromEntries(VERDICT_KEYS.map((k) => [k, null])),
     byCategory: {},
+    byEvidenceTier: Object.fromEntries(EVIDENCE_TIER_KEYS.map((k) => [k, { count: 0, reliability: "no_data" }])),
     global: {
       directionAccuracy: null,
       averagePredictionError: null,
@@ -342,10 +363,23 @@ function emptyReport(userId) {
 }
 
 export async function buildConfidenceCalibrationReport(userId = null) {
-  const { totalOutcomes, rows } = await collectUsableRows(userId);
+  const { totalOutcomes, rows, joinedPredictionCount, droppedNoPrediction, droppedInsufficient } =
+    await collectUsableRows(userId);
+
+  console.log("PREDICTION_JOIN_SUMMARY", {
+    engine: "confidenceCalibration",
+    totalOutcomes,
+    joinedPredictionCount,
+    droppedNoPrediction,
+    droppedInsufficient,
+  });
+
   if (rows.length === 0) {
     const empty = emptyReport(userId);
     empty.totalOutcomes = totalOutcomes;
+    empty.joinedPredictionCount = joinedPredictionCount;
+    empty.droppedNoPrediction   = droppedNoPrediction;
+    empty.droppedInsufficient   = droppedInsufficient;
     return empty;
   }
 
@@ -377,14 +411,44 @@ export async function buildConfidenceCalibrationReport(userId = null) {
     byCategory[k] = { count: slice.length, ...buildBucketStats(slice) };
   }
 
+  // Phase 4E: evidence-tier slices. Each entry always present (forced keys),
+  // tagged with reliability so callers know which tiers have enough data.
+  const evidenceTierGroups = new Map(EVIDENCE_TIER_KEYS.map((k) => [k, []]));
+  for (const r of rows) {
+    const k = r.prediction.trust?.evidenceTier ?? "unknown";
+    if (!evidenceTierGroups.has(k)) evidenceTierGroups.set(k, []);
+    evidenceTierGroups.get(k).push(r);
+  }
+  const byEvidenceTier = {};
+  for (const key of EVIDENCE_TIER_KEYS) {
+    const slice = evidenceTierGroups.get(key) || [];
+    const count = slice.length;
+    const reliability = count === 0 ? "no_data"
+      : count < MIN_COUNT_FOR_ADJUSTMENT ? "insufficient_data"
+      : "reliable";
+    byEvidenceTier[key] = { count, reliability, ...(count > 0 ? buildBucketStats(slice) : {}) };
+  }
+  // Carry through any unexpected tier values not in the forced list
+  for (const [key, slice] of evidenceTierGroups.entries()) {
+    if (!byEvidenceTier[key]) {
+      const count = slice.length;
+      const reliability = count < MIN_COUNT_FOR_ADJUSTMENT ? "insufficient_data" : "reliable";
+      byEvidenceTier[key] = { count, reliability, ...buildBucketStats(slice) };
+    }
+  }
+
   return {
     userId: userId || null,
     generatedAt: nowIso(),
     totalOutcomes,
     usableOutcomes: rows.length,
+    joinedPredictionCount,
+    droppedNoPrediction,
+    droppedInsufficient,
     buckets: overall.buckets,
     byVerdict,
     byCategory,
+    byEvidenceTier,
     global: {
       directionAccuracy: overall.overallDirectionAccuracy,
       averagePredictionError: overall.averagePredictionError,
