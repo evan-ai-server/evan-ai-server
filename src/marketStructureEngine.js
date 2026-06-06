@@ -114,8 +114,12 @@ function buildClusterObject(entries, label, isAircraft) {
   };
 }
 
-function buildMarketStory({ scannedPricePosition, clusterCount, thinMarket, unresolvedUrlRisk, spreadRisk, dominantCluster }) {
-  // A: Clear value pocket — scanned price below the dominant band
+function buildMarketStory({ scannedPricePosition, clusterCount, thinMarket, unresolvedUrlRisk, spreadRisk, dominantCluster, genericToyContamination, premiumTierDetected }) {
+  // A: Scanned price sits below the dominant band.
+  // When the pool is premium-tier-detected or toy-contaminated, a cheap scanned
+  // price most likely reflects a different item (generic toy vs. premium model,
+  // or a lower-spec variant), not a genuine market discount. Use a cautionary
+  // variant instead of "promising" to avoid misleading the user.
   if (
     scannedPricePosition === "below" &&
     dominantCluster &&
@@ -125,6 +129,10 @@ function buildMarketStory({ scannedPricePosition, clusterCount, thinMarket, unre
     const lo = dominantCluster.minPrice != null ? `$${Math.round(dominantCluster.minPrice)}` : null;
     const hi = dominantCluster.maxPrice != null ? `$${Math.round(dominantCluster.maxPrice)}` : null;
     const range = lo && hi ? `${lo}–${hi}` : "the market band";
+
+    if (genericToyContamination || premiumTierDetected) {
+      return `Comparable listings cluster around ${range}, but the scanned price sits well below that band. Verify the item is the same brand, scale, and variant — a lower price often means a different product in this category.`;
+    }
     return `Comparable listings cluster around ${range}, and the scanned price sits below that band. Treat this as promising, but still check condition and exact match.`;
   }
 
@@ -345,6 +353,8 @@ function _analyzeMarketStructure(items, ctx) {
     unresolvedUrlRisk,
     spreadRisk,
     dominantCluster: dominantClusterForStory,
+    genericToyContamination,
+    premiumTierDetected,
   });
 
   return {

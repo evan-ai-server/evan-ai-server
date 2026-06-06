@@ -250,3 +250,68 @@ test("10. missing calibration/trust ctx — safe defaults, no throw", () => {
     assert.ok(field in r1, `field "${field}" must be present`);
   }
 });
+
+// ── P1-2: marketStory "promising" must not fire when caution flags are set ────
+
+test("11. below-band + genericToyContamination → cautionary variant, not 'promising'", () => {
+  // Scanned price well below a clear market band, but toys were rejected from the pool.
+  // A cheap price most likely means a generic toy, not a discount premium model.
+  const items = [
+    { price: 65, title: "Gemini Jets 787", source: "geminijets", isVerifiedListing: false },
+    { price: 70, title: "Herpa 787",       source: "herpa",      isVerifiedListing: false },
+    { price: 72, title: "NG Models 787",   source: "ngmodels",   isVerifiedListing: false },
+    { price: 75, title: "JC Wings 787",    source: "jcwings",    isVerifiedListing: false },
+    { price: 80, title: "Aeroclassics",    source: "aeroclassics", isVerifiedListing: false },
+  ];
+  const ctx = {
+    scannedPrice: 14.99,
+    category: "aircraft_diecast",
+    identityRejections: { rejectedGenericToyCount: 4 },
+  };
+  const r = analyzeMarketStructure(items, ctx);
+
+  assert.equal(r.scannedPricePosition, "below", "scanned price should be below the band");
+  assert.equal(r.genericToyContamination, true, "genericToyContamination should be true");
+  assert.ok(!r.marketStory.includes("promising"), `must not say "promising" when toys were rejected: "${r.marketStory}"`);
+  assert.ok(r.marketStory.toLowerCase().includes("verify") || r.marketStory.toLowerCase().includes("brand") || r.marketStory.toLowerCase().includes("variant"),
+    `cautionary variant must mention verification/brand/variant: "${r.marketStory}"`);
+});
+
+test("12. below-band + premiumTierDetected → cautionary variant, not 'promising'", () => {
+  // Scanned price far below a premium-model band. The cluster tier shows premium
+  // brands (Gemini/Herpa) dominate the market — a $15 price is a different product.
+  const items = [
+    { price: 68, title: "Gemini Jets Hawaiian Airlines 787", source: "geminijets", isVerifiedListing: false },
+    { price: 75, title: "Herpa Hawaiian 787 1:200",          source: "herpa",      isVerifiedListing: false },
+    { price: 90, title: "NG Models 787 Hawaiian",            source: "ngmodels",   isVerifiedListing: false },
+    { price: 95, title: "JC Wings Hawaiian 787",             source: "jcwings",    isVerifiedListing: false },
+  ];
+  const ctx = { scannedPrice: 12.00, category: "aircraft_diecast" };
+
+  const r = analyzeMarketStructure(items, ctx);
+
+  assert.equal(r.scannedPricePosition, "below", "scanned price should be below the band");
+  assert.equal(r.premiumTierDetected, true, "premiumTierDetected should be true");
+  assert.ok(!r.marketStory.includes("promising"), `must not say "promising" when premium tier detected: "${r.marketStory}"`);
+  assert.ok(r.marketStory.toLowerCase().includes("verify") || r.marketStory.toLowerCase().includes("brand") || r.marketStory.toLowerCase().includes("variant"),
+    `cautionary variant must mention verification/brand/variant: "${r.marketStory}"`);
+});
+
+test("13. below-band with no caution flags → standard 'promising' story is fine", () => {
+  // Clean pool, no toy contamination, no premium-tier detection, no aircraft context.
+  // The "promising" story is appropriate here.
+  const items = [
+    { price: 80,  title: "Nike Air Max 1 OG", source: "ebay",   isVerifiedListing: false },
+    { price: 85,  title: "Nike Air Max 1",    source: "amazon", isVerifiedListing: false },
+    { price: 90,  title: "Nike Air Max 1",    source: "goat",   isVerifiedListing: false },
+    { price: 95,  title: "Nike Air Max 1",    source: "stockx", isVerifiedListing: false },
+  ];
+  const ctx = { scannedPrice: 55, category: "sneakers" };
+
+  const r = analyzeMarketStructure(items, ctx);
+
+  assert.equal(r.scannedPricePosition, "below", "scanned price should be below the band");
+  assert.equal(r.genericToyContamination, false, "no toy contamination");
+  assert.equal(r.premiumTierDetected, false, "no premium tier");
+  assert.ok(r.marketStory.includes("promising"), `standard below-band story should say "promising": "${r.marketStory}"`);
+});
