@@ -130,9 +130,17 @@ function buildMarketStory({ scannedPricePosition, clusterCount, thinMarket, unre
     const hi = dominantCluster.maxPrice != null ? `$${Math.round(dominantCluster.maxPrice)}` : null;
     const range = lo && hi ? `${lo}–${hi}` : "the market band";
 
+    // Tier mismatch: cheap price likely means a different product, not a discount.
     if (genericToyContamination || premiumTierDetected) {
-      return `Comparable listings cluster around ${range}, but the scanned price sits well below that band. Verify the item is the same brand, scale, and variant — a lower price often means a different product in this category.`;
+      return `The scanned price is below the comp band (${range}), but the gap may indicate a different tier or generic version. Verify exact model, scale, and condition before treating it as upside.`;
     }
+
+    // Evidence quality: all URLs unresolved or source pool is too thin to trust
+    // the band. Saying "promising" here would overstate certainty.
+    if (unresolvedUrlRisk || thinMarket) {
+      return `The scanned price is below the estimated band (${range}), but these are pricing signals, not verified comps. Treat the upside as directional until direct listings are confirmed.`;
+    }
+
     return `Comparable listings cluster around ${range}, and the scanned price sits below that band. Treat this as promising, but still check condition and exact match.`;
   }
 

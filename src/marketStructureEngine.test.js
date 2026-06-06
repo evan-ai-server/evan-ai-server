@@ -298,13 +298,14 @@ test("12. below-band + premiumTierDetected → cautionary variant, not 'promisin
 });
 
 test("13. below-band with no caution flags → standard 'promising' story is fine", () => {
-  // Clean pool, no toy contamination, no premium-tier detection, no aircraft context.
-  // The "promising" story is appropriate here.
+  // Clean pool: at least one verified listing so unresolvedUrlRisk=false,
+  // multiple sources so thinMarket=false, no toy/premium contamination.
+  // Only when all caution flags are clear is "promising" appropriate.
   const items = [
-    { price: 80,  title: "Nike Air Max 1 OG", source: "ebay",   isVerifiedListing: false },
-    { price: 85,  title: "Nike Air Max 1",    source: "amazon", isVerifiedListing: false },
-    { price: 90,  title: "Nike Air Max 1",    source: "goat",   isVerifiedListing: false },
-    { price: 95,  title: "Nike Air Max 1",    source: "stockx", isVerifiedListing: false },
+    { price: 80, title: "Nike Air Max 1", source: "stockx",  isVerifiedListing: true  }, // verified
+    { price: 85, title: "Nike Air Max 1", source: "goat",    isVerifiedListing: false },
+    { price: 90, title: "Nike Air Max 1", source: "ebay",    isVerifiedListing: false },
+    { price: 95, title: "Nike Air Max 1", source: "amazon",  isVerifiedListing: false },
   ];
   const ctx = { scannedPrice: 55, category: "sneakers" };
 
@@ -313,5 +314,33 @@ test("13. below-band with no caution flags → standard 'promising' story is fin
   assert.equal(r.scannedPricePosition, "below", "scanned price should be below the band");
   assert.equal(r.genericToyContamination, false, "no toy contamination");
   assert.equal(r.premiumTierDetected, false, "no premium tier");
-  assert.ok(r.marketStory.includes("promising"), `standard below-band story should say "promising": "${r.marketStory}"`);
+  assert.equal(r.unresolvedUrlRisk, false, "one verified comp → unresolvedUrlRisk should be false");
+  assert.equal(r.thinMarket, false, "4 items, 4 sources — not thin");
+  assert.ok(r.marketStory.includes("promising"), `standard below-band with clean evidence should say "promising": "${r.marketStory}"`);
+});
+
+test("14. below-band + unresolvedUrlRisk (all unresolved URLs) → evidence-quality warning, not 'promising'", () => {
+  // Scanned price below the band, but every comp is a google_unresolved URL.
+  // unresolvedUrlRisk=true means zero verified comps — "promising" overstates certainty.
+  const items = [
+    { price: 170, title: "AirPods Pro 2 used", source: "google_shopping", isVerifiedListing: false, urlQuality: "google_unresolved" },
+    { price: 185, title: "AirPods Pro 2",      source: "google_shopping", isVerifiedListing: false, urlQuality: "google_unresolved" },
+    { price: 200, title: "AirPods Pro 2 good", source: "ebay",            isVerifiedListing: false, urlQuality: "google_unresolved" },
+    { price: 220, title: "AirPods Pro 2",      source: "amazon",          isVerifiedListing: false, urlQuality: "google_unresolved" },
+    { price: 255, title: "AirPods Pro 2 box",  source: "walmart",         isVerifiedListing: false, urlQuality: "google_unresolved" },
+  ];
+  const ctx = { scannedPrice: 90 };
+
+  const r = analyzeMarketStructure(items, ctx);
+
+  assert.equal(r.scannedPricePosition, "below", "scanned price below the $170–$255 band");
+  assert.equal(r.unresolvedUrlRisk, true, "zero verified comps → unresolvedUrlRisk true");
+  assert.equal(r.genericToyContamination, false, "no toy contamination");
+  assert.equal(r.premiumTierDetected, false, "no premium tier in this context");
+  assert.ok(!r.marketStory.includes("promising"), `must not say "promising" with zero verified comps: "${r.marketStory}"`);
+  const storyLower = r.marketStory.toLowerCase();
+  assert.ok(
+    storyLower.includes("signal") || storyLower.includes("directional") || storyLower.includes("confirmed"),
+    `story must convey evidence uncertainty: "${r.marketStory}"`
+  );
 });
