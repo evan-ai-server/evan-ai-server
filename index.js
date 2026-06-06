@@ -1321,6 +1321,7 @@ import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
 import { refreshThresholdCache, getAllAdaptiveOverrides } from "./src/adaptiveThresholds.js";
+import { isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategoryPolicy } from "./src/visionCategoryPolicy.js";
 import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
 import {
   storeSignalSnapshot,
@@ -19384,20 +19385,8 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
   }
 }
 
-// Categories where high brandCertainty is a GOOD signal, not a risk.
-// Visible brand/text (e.g. "Hawaiian Airlines" on a model airplane) is what
-// makes the query specific and searchable. Only auth-sensitive categories need
-// the brand gate to block hallucinated luxury/designer brands.
-function isBrandUsefulCategory(category) {
-  if (!category) return false;
-  const c = String(category).trim().toLowerCase();
-  if (c.includes("model") || c.includes("diecast") || c.includes("die cast")) return true;
-  if (c.includes("toy") || c.includes("collectible") || c.includes("figurine")) return true;
-  if (c.includes("book") || c.includes("dvd") || c.includes("cd") || c.includes("blu")) return true;
-  if (c.includes("game") || c.includes("puzzle")) return true;
-  if (c.includes("tool") || c.includes("camera") || c.includes("appliance")) return true;
-  return false;
-}
+// isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategoryPolicy
+// are imported from src/visionCategoryPolicy.js above.
 
 // Phase A2.7: Gate for accepting the query_fast result.
 function shouldAcceptQueryFast(result, mode) {
@@ -19416,17 +19405,22 @@ function shouldAcceptQueryFast(result, mode) {
   if (!category)                                    return { accepted: false, reason: "missing_category",        query: q, confidence, category, brandCertainty };
 
   // Compute all policy flags before logging so the log always reflects the full decision.
-  const highStakes     = HIGH_STAKES_CATEGORIES.has(category);
-  const brandUseful    = isBrandUsefulCategory(category);
-  // High brandCertainty is rejected when: (a) category is auth-sensitive/high-stakes, OR
+  // isTrueHighStakesVisionCategory exempts "collectible"/"collectibles" from the hard
+  // block: diecast/model collectibles are brand-useful (the brand IS the identity token).
+  // HIGH_STAKES_CATEGORIES is the market-side filter set and is intentionally NOT used
+  // here — use the vision-specific policy instead.
+  const _catPolicy  = getVisionCategoryPolicy(category);
+  const trueHighStakes = _catPolicy.trueHighStakes;
+  const brandUseful    = _catPolicy.brandUseful;
+  // High brandCertainty is rejected when: (a) category is auth-sensitive/true-high-stakes, OR
   // (b) category is not brand-useful (generic goods where brand auth matters at consensus).
   // Brand-useful categories (models, collectibles, toys, books) visually display brand as
   // identity — high brandCertainty is a signal, not a trust problem.
   const brandGateFails = brandCertainty > QUERY_FAST_BRAND_CERTAINTY_MAX && !brandUseful;
 
-  const accepted = !highStakes && !brandGateFails;
-  const reason   = highStakes
-    ? "high_stakes_category"
+  const accepted = !trueHighStakes && !brandGateFails;
+  const reason   = trueHighStakes
+    ? "true_high_stakes_category"
     : brandGateFails
       ? "brand_certainty_too_high"
       : "accepted";
@@ -19445,10 +19439,31 @@ function shouldAcceptQueryFast(result, mode) {
   );
   const needsAircraftFamilyRefinement = accepted && _isAircraftCategory && _hasAirlineInQuery && !_hasFamilyInQuery;
 
+  // Identify which protected family token (if any) is in the query.
+  const _protectedFamily = _hasFamilyInQuery
+    ? (AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => _qNorm.includes(tok)))?.family || null)
+    : null;
+
+  // Log the category policy decision for audit trail.
+  console.log("VISION_CATEGORY_POLICY", {
+    category,
+    rawCategory: result?.parsed?.category || null,
+    trueHighStakes,
+    brandUsefulCollectible: _catPolicy.brandUsefulCollectible,
+    reason: _catPolicy.reason,
+  });
+
   console.log("VISION_QUERY_FAST_BRAND_POLICY", {
-    category, brandCertainty, brandUseful, highStakes,
+    query:                  q,
+    category,
+    brandCertainty,
+    brandUseful,
+    trueHighStakes,
+    brandUsefulCollectible: _catPolicy.brandUsefulCollectible,
     accepted,
     reason,
+    identityTokens:         _isAircraftCategory ? { hasAirline: _hasAirlineInQuery, hasFamily: _hasFamilyInQuery } : null,
+    protectedFamily:        _protectedFamily,
     needsAircraftFamilyRefinement,
   });
 
@@ -19474,7 +19489,7 @@ function shouldAcceptFastVisionResult(result) {
   if (!hasMeaningfulIdentity) return false;
 
   const cat = String(id.category || "").trim().toLowerCase();
-  if (cat && HIGH_STAKES_CATEGORIES.has(cat)) return false;
+  if (cat && isTrueHighStakesVisionCategory(cat)) return false;
 
   return true;
 }
@@ -19686,12 +19701,14 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
 
       visualPromise.then((r) => {
         const conf = Number(r?.parsed?.confidence ?? 0);
-        // Don't fire visual_early on high-stakes categories — visual_shape now
+        // Don't fire visual_early on true-high-stakes categories — visual_shape
         // runs on gpt-4.1-mini for speed, and we don't trust mini to identify
         // luxury / sneakers / watches / electronics / cards on its own. Master
         // (gpt-4.1) is still racing in the background; wait for it to escalate.
+        // Brand-useful collectibles (diecast, model planes) ARE allowed through:
+        // the brand text is the identity, and aircraft locks protect against drift.
         const cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
-        const isHighStakes = !!cat && HIGH_STAKES_CATEGORIES.has(cat);
+        const isHighStakes = !!cat && isTrueHighStakesVisionCategory(cat);
         const brandCertainty = Number(r?.parsed?.attributeCertainty?.brand ?? 0);
         if (
           skipMasterAllowed &&
@@ -20063,7 +20080,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
 
     const visualConfidence    = Number(visualResult?.parsed?.confidence ?? 0);
     const visualCategory      = String(visualResult?.parsed?.identity?.category || "").trim().toLowerCase();
-    const visualHighStakes    = !!visualCategory && HIGH_STAKES_CATEGORIES.has(visualCategory);
+    const visualHighStakes    = !!visualCategory && isTrueHighStakesVisionCategory(visualCategory);
     const visualBrandCertainty = Number(visualResult?.parsed?.attributeCertainty?.brand ?? 0);
     const visualAcceptable =
       skipMasterAllowed &&
@@ -20135,7 +20152,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             isUsableVisionQuery(q) &&
             conf >= minConf &&
             brand <= 0.2 &&
-            cat && !HIGH_STAKES_CATEGORIES.has(cat);
+            cat && !isTrueHighStakesVisionCategory(cat);
           if (acceptable) {
             _seedResult = { r, sourcePass, q, conf, cat };
             console.log("VISION_SEED_RECOVERY_USED", {
@@ -20150,7 +20167,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
                     : conf < minConf               ? "confidence_too_low"
                     : brand > 0.2                  ? "brand_detected"
                     : !cat                         ? "no_category"
-                    : HIGH_STAKES_CATEGORIES.has(cat) ? "high_stakes_category"
+                    : isTrueHighStakesVisionCategory(cat) ? "high_stakes_category"
                     : "unknown",
             });
           }
@@ -20197,7 +20214,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             for (const { r, sourcePass } of _hardCandidates) {
               if (r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)) {
                 const _cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
-                if (!_cat || !HIGH_STAKES_CATEGORIES.has(_cat)) {
+                if (!_cat || !isTrueHighStakesVisionCategory(_cat)) {
                   _hardSeed = { r, sourcePass };
                   break;
                 }
@@ -20205,12 +20222,24 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             }
             if (_hardSeed) {
               try { masterAbortCtrl.abort(); } catch {}
+              const _hrElapsedMs  = Date.now() - passT0;
+              const _hrQuery      = _hardSeed.r?.parsed?.query;
+              const _hrConfidence = Number(_hardSeed.r?.parsed?.confidence ?? 0);
+              console.log("VISION_HARD_RETURN_SEED_USED", {
+                rid:               req.rid,
+                elapsedMs:         _hrElapsedMs,
+                selectedPass:      _hardSeed.sourcePass,
+                query:             _hrQuery,
+                confidence:        _hrConfidence,
+                reason:            "seed_available_at_hard_return_ceiling",
+                masterStillRunning: !masterAbortCtrl.signal.aborted,
+              });
               console.log("VISION_HARD_RETURN_USED", {
                 rid:        req.rid,
-                elapsedMs:  Date.now() - passT0,
+                elapsedMs:  _hrElapsedMs,
                 source:     _hardSeed.sourcePass,
-                query:      _hardSeed.r?.parsed?.query,
-                confidence: Number(_hardSeed.r?.parsed?.confidence ?? 0),
+                query:      _hrQuery,
+                confidence: _hrConfidence,
               });
               passes     = [_hardSeed.r];
               passLabels = [_hardSeed.sourcePass];
@@ -20218,9 +20247,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
               master     = null; // skip normal consensus assembly
             } else {
               // No usable seed — ceiling can't help us. Await master now.
+              const _hrSkipMs = Date.now() - passT0;
+              console.log("VISION_HARD_RETURN_SEED_SKIPPED", {
+                rid:       req.rid,
+                elapsedMs: _hrSkipMs,
+                reason:    "no_usable_seed_at_ceiling",
+              });
               console.log("VISION_HARD_RETURN_SKIPPED", {
                 rid:       req.rid,
-                elapsedMs: Date.now() - passT0,
+                elapsedMs: _hrSkipMs,
                 reason:    "no_usable_seed_at_ceiling",
               });
               master = await masterPromise;
@@ -21136,65 +21171,101 @@ if (!openai) {
 
       // Perceptual-similarity early-return — saves the 5–12s vision call when
       // the same item has been scanned recently from a different angle/lighting.
-      // CLIP embedding is raced behind a 300ms timeout; embed and preprocess now
-      // run in parallel for item/prop (A2.8).
+      //
+      // A2.8 (item/prop parallel mode): Sharp preprocessing runs in a worker thread
+      // alongside ONNX embedding. However, on cold-start both fight for CPU and the
+      // Node.js event loop can be blocked for ~650ms, making setTimeout(300) fire
+      // as late as ~951ms. To enforce the budget reliably, item/prop skips the await
+      // entirely and runs the embed purely in the background. The similarity check is
+      // skipped for this scan but the embedding is stored for similarityRegister at
+      // the end, so future scans of the same item still benefit from the similarity
+      // cache. Text modes (barcode/label/mark) keep the 300ms race — they have no
+      // parallel Sharp work so the event loop stays free.
       const _t_embed = Date.now();
       let _similarityVec = null;
       let _embedTimedOut = false;
       const _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
-      const _embedRace = await Promise.race([
-        _embedPromise.then((v) => ({ kind: "ready", vec: v })),
-        new Promise((r) => setTimeout(() => r({ kind: "timeout" }), 300)),
-      ]);
-      _stepLog("embed", _t_embed);
 
-      if (_embedRace?.kind === "ready" && Array.isArray(_embedRace.vec) && _embedRace.vec.length) {
-        _similarityVec = _embedRace.vec;
-        try {
-          if (!skipCaches) {
-            const hit = similarityFindSimilar(_similarityVec);
-            if (hit?.payload) {
-              visionTierStats.similarityCacheHit++;
-              console.log("VISION_SIMILARITY_POLICY", {
-                rid: req.rid, mode,
-                blocking: !_useFastPreConsensus, timeoutMs: 300,
-                reason: _useFastPreConsensus ? "item_prop_parallel" : "text_mode_conservative",
-                hit: true, timedOut: false, elapsedMs: _ppSteps.embed ?? null,
-              });
-              console.log("🎯 SIMILARITY HIT", {
-                rid: req.rid,
-                priorImageHash: hit.imageHash,
-                similarity: Number(hit.similarity.toFixed(4)),
-              });
-              return res.status(200).json({
-                ...hit.payload,
-                imageHash:    imgHash,
-                cached:       true,
-                cacheSource:  "similarity",
-                similarity:   hit.similarity,
-              });
-            }
-          }
-        } catch (e) {
-          console.warn("similarity_lookup_error", e?.message || e);
-        }
-      } else if (_embedRace?.kind === "timeout") {
-        _embedTimedOut = true;
-        // Background-drain so the embedding still becomes available for the
-        // similarityRegister step at the end of the handler (best-effort —
-        // if the late vec arrives before registration, we use it; otherwise
-        // we skip registration and next scan re-embeds).
+      if (_useFastPreConsensus) {
+        // item/prop: skip the await, run embed fully in background.
+        // The embed result is captured for similarityRegister (end of handler).
         _embedPromise.then((v) => {
           if (Array.isArray(v) && v.length) _similarityVec = v;
         }).catch(() => {});
-      }
+        _stepLog("embed", _t_embed); // records ~0ms (no await)
+        console.log("VISION_SIMILARITY_BUDGET_ENFORCED", {
+          rid:      req.rid,
+          budgetMs: 0,
+          elapsedMs: 0,
+          mode,
+          timedOut: false,
+          blocking: false,
+          reason:   "item_prop_preconsensus_background",
+        });
+        console.log("VISION_SIMILARITY_POLICY", {
+          rid: req.rid, mode,
+          blocking: false, timeoutMs: 0,
+          reason: "item_prop_preconsensus_background",
+          hit: false, timedOut: false, elapsedMs: 0,
+        });
+      } else {
+        // text mode: await the 300ms race (event loop is not busy with parallel Sharp)
+        const _embedRace = await Promise.race([
+          _embedPromise.then((v) => ({ kind: "ready", vec: v })),
+          new Promise((r) => setTimeout(() => r({ kind: "timeout" }), 300)),
+        ]);
+        _stepLog("embed", _t_embed);
 
-      console.log("VISION_SIMILARITY_POLICY", {
-        rid: req.rid, mode,
-        blocking: !_useFastPreConsensus, timeoutMs: 300,
-        reason: _useFastPreConsensus ? "item_prop_parallel" : "text_mode_conservative",
-        hit: false, timedOut: _embedTimedOut, elapsedMs: _ppSteps.embed ?? null,
-      });
+        if (_embedRace?.kind === "ready" && Array.isArray(_embedRace.vec) && _embedRace.vec.length) {
+          _similarityVec = _embedRace.vec;
+          try {
+            if (!skipCaches) {
+              const hit = similarityFindSimilar(_similarityVec);
+              if (hit?.payload) {
+                visionTierStats.similarityCacheHit++;
+                console.log("VISION_SIMILARITY_POLICY", {
+                  rid: req.rid, mode,
+                  blocking: true, timeoutMs: 300,
+                  reason: "text_mode_conservative",
+                  hit: true, timedOut: false, elapsedMs: _ppSteps.embed ?? null,
+                });
+                console.log("🎯 SIMILARITY HIT", {
+                  rid: req.rid,
+                  priorImageHash: hit.imageHash,
+                  similarity: Number(hit.similarity.toFixed(4)),
+                });
+                return res.status(200).json({
+                  ...hit.payload,
+                  imageHash:    imgHash,
+                  cached:       true,
+                  cacheSource:  "similarity",
+                  similarity:   hit.similarity,
+                });
+              }
+            }
+          } catch (e) {
+            console.warn("similarity_lookup_error", e?.message || e);
+          }
+        } else if (_embedRace?.kind === "timeout") {
+          _embedTimedOut = true;
+          // Background-drain: embedding still available for similarityRegister.
+          _embedPromise.then((v) => {
+            if (Array.isArray(v) && v.length) _similarityVec = v;
+          }).catch(() => {});
+        }
+
+        console.log("VISION_SIMILARITY_POLICY", {
+          rid: req.rid, mode,
+          blocking: true, timeoutMs: 300,
+          reason: "text_mode_conservative",
+          hit: false, timedOut: _embedTimedOut, elapsedMs: _ppSteps.embed ?? null,
+        });
+        console.log("VISION_SIMILARITY_BUDGET_ENFORCED", {
+          rid: req.rid, budgetMs: 300, elapsedMs: _ppSteps.embed ?? null,
+          mode, timedOut: _embedTimedOut, blocking: true,
+          reason: "text_mode_await_race",
+        });
+      }
 
       // Preprocess: for item/prop, use the result if preprocessScanUpload already
       // finished during the embed race; otherwise fall through to the original
@@ -21734,6 +21805,30 @@ if (!openai) {
           innerWallMs:      shaped?.visionTimings?.visionWallMs || null,
         };
         console.log("⏱️ VISION_ENDPOINT_TIMINGS", _ep);
+        // VISION_CRITICAL_PATH_TIMING — compact single-line breakdown for future audits.
+        // Captures the full wall budget from upload to response with pass-level detail.
+        try {
+          const _vt = shaped?.visionTimings || {};
+          const _cat = shaped?.identity?.category || shaped?.visionIdentity?.category || null;
+          console.log("VISION_CRITICAL_PATH_TIMING", {
+            rid:                   req.rid,
+            totalMs:               _epT4PreResponse - _epT0,
+            exactCacheMs:          null, // not applicable (early-return before this point if cached)
+            similarityMs:          _ppSteps.embed ?? null,
+            preprocessMs:          _ppSteps.preprocess ?? null,
+            queryFastMs:           _vt.queryFastMs ?? null,
+            fastMs:                _vt.fastMs ?? null,
+            visualMs:              _vt.visualMs ?? null,
+            masterMs:              _vt.masterMs ?? null,
+            selectedPass:          _vt.raceWinner ?? shaped?.visionTier ?? null,
+            selectedQuery:         shaped?.query ?? null,
+            selectedConfidence:    typeof shaped?.confidence === "number" ? shaped.confidence : null,
+            hardReturnUsed:        shaped?.visionTier === "hard_return",
+            masterLaunched:        _vt.masterLaunched ?? false,
+            masterBlockedResponse: _vt.raceWinner === "consensus",
+            categoryPolicy:        _cat ? getVisionCategoryPolicy(_cat) : null,
+          });
+        } catch { /* non-fatal */ }
         return res.status(200).json(shaped);
     } catch (err) {
       if (err?.status === 429 || String(err?.message || "").includes("429")) {
