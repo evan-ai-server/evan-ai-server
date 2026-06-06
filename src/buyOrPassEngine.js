@@ -240,6 +240,14 @@ export function computeBuyOrPass(bundle = {}) {
   const supportingSignals = [];
   const riskFlags         = [];
 
+  // Evidence honesty gate: phrases that reference "recent sales", "sold comps",
+  // or "sale history" must only fire when the calibration layer confirms real
+  // verified listings exist. Without verified evidence Evan must not imply data
+  // it does not have — substitute cautious pricing-signal phrasing instead.
+  const _verifiedCount       = calibration?.evidence?.verifiedListingCount ?? 0;
+  const _canShowVerified     = calibration?.canShowVerifiedLanguage === true;
+  const _hasVerifiedEvidence = _verifiedCount > 0 && _canShowVerified;
+
   // Price signals
   const savingsPct = finiteOrNull(deal?.savingsPct ?? deal?.discountPct);
   const median     = finiteOrNull(bundle?.consensus?.median ?? bundle?.consensus?.medianPrice);
@@ -252,19 +260,33 @@ export function computeBuyOrPass(bundle = {}) {
   } else if (deal?.verdict === "fair") {
     riskFlags.push("Priced at market — no margin built in");
   } else if (deal?.verdict === "high" || deal?.verdict === "price_trap") {
-    riskFlags.push("Above market on recent comps");
+    riskFlags.push(_hasVerifiedEvidence
+      ? "Above market on recent comps"
+      : "Above the market price signal");
   }
 
   if (demand?.tier === "hot")        supportingSignals.push("Resells fast at this price");
   else if (demand?.tier === "warm")  supportingSignals.push("Steady resale demand");
   else if (demand?.tier === "cold")  riskFlags.push("Slow resale at this price");
 
-  if (flip?.score >= 72)             supportingSignals.push(`Strong margin on recent sales`);
-  else if (flip?.score >= 55)        supportingSignals.push(`Margin holds on recent sales`);
-  else if (flip?.score !== undefined && flip.score < 38) riskFlags.push(`Thin margin on recent sales`);
+  if (flip?.score >= 72) {
+    supportingSignals.push(_hasVerifiedEvidence
+      ? "Strong margin on recent sales"
+      : "Pricing signals show strong margin potential");
+  } else if (flip?.score >= 55) {
+    supportingSignals.push(_hasVerifiedEvidence
+      ? "Margin holds on recent sales"
+      : "Price signal suggests possible upside, but direct comps are not verified");
+  } else if (flip?.score !== undefined && flip.score < 38) {
+    riskFlags.push(_hasVerifiedEvidence
+      ? "Thin margin on recent sales"
+      : "Pricing signals show thin margin — verify direct comps");
+  }
 
   if (risk?.tier === "safe" || (finiteOrNull(risk?.score) ?? 1) < 0.2) {
-    supportingSignals.push("Clean recent sale history");
+    supportingSignals.push(_hasVerifiedEvidence
+      ? "Clean recent sale history"
+      : "No red flags on listing pattern");
   } else if (risk?.tier === "risky" || risk?.tier === "avoid") {
     riskFlags.push(`Listing pattern looks risky`);
   }
@@ -278,7 +300,9 @@ export function computeBuyOrPass(bundle = {}) {
   }
 
   if (priceProj?.verdict === "WAIT") {
-    riskFlags.push("Recent comps trending down — may sell cheaper soon");
+    riskFlags.push(_hasVerifiedEvidence
+      ? "Recent comps trending down — may sell cheaper soon"
+      : "Price signal trending down — may improve soon");
   }
 
   if (hardPass.length) {
