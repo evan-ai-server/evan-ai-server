@@ -237,11 +237,15 @@ export function normalizeSellerJargon(input = "") {
   }
 
   // ── 2. Extract condition ────────────────────────────────────────────────
+  // Word-boundary guard: seller shorthands like "ds", "vnds", "beat" must only
+  // fire as standalone tokens. Without \b, "ds" would corrupt "adidas", "beat"
+  // would corrupt "deadbeat", etc.
   const textLower = text.toLowerCase();
   for (const [alias, canonical] of Object.entries(CONDITION_ALIASES)) {
-    if (textLower.includes(alias)) {
+    const condTestRe = new RegExp(`\\b${_escapeRe(alias)}\\b`, "i");
+    if (condTestRe.test(textLower)) {
       extractedData.condition = canonical;
-      text = text.replace(new RegExp(alias, "gi"), "").trim();
+      text = text.replace(new RegExp(`\\b${_escapeRe(alias)}\\b`, "gi"), "").trim();
       break;
     }
   }
@@ -262,12 +266,17 @@ export function normalizeSellerJargon(input = "") {
   const protectedIdentity = containsProtectedIdentity(input);
 
   // ── 4. Replace colorway aliases ─────────────────────────────────────────
+  // Word-boundary guard: short aliases like "ow" (Off-White) must only fire as
+  // standalone tokens, never as substrings inside real words. Without \b, "ow"
+  // corrupts "Low"→"LOff-White", "Yellow"→"YellOff-White", "Brown"→"BrOff-Whiten".
+  // Mirrors the same guard already applied to MODEL_ALIASES (step 5).
   if (!protectedIdentity) {
     const textLower2 = text.toLowerCase();
     for (const [alias, canonical] of Object.entries(COLORWAY_ALIASES)) {
-      if (textLower2.includes(alias)) {
+      const colorTestRe = new RegExp(`\\b${_escapeRe(alias)}\\b`, "i");
+      if (colorTestRe.test(textLower2)) {
         extractedData.colorway = canonical;
-        text = text.replace(new RegExp(_escapeRe(alias), "gi"), canonical);
+        text = text.replace(new RegExp(`\\b${_escapeRe(alias)}\\b`, "gi"), canonical);
         break;
       }
     }

@@ -68,3 +68,84 @@ test("non-matching plain query is returned unchanged", () => {
   const r = normalizeSellerJargon("sony wh-1000xm5 headphones");
   assert.equal(r.changed, false);
 });
+
+// ── P0 regressions: "ow" substring must not corrupt words containing "ow" ─────
+// Root cause: COLORWAY_ALIASES "ow"→"Off-White" was using substring match
+// without word boundaries, so "Low"→"LOff-White", "Yellow"→"YellOff-White",
+// "Brown"→"BrOff-Whiten", "Glow"→"GlOff-White", "snow"→"snOff-White".
+
+test("P0: 'Low' in sneaker query is never corrupted to 'LOff-White'", () => {
+  const r = normalizeSellerJargon("Air Jordan 1 Low OG Year of the Rabbit");
+  assert.ok(!r.normalized.includes("Off-White"), `must not contain Off-White: "${r.normalized}"`);
+  assert.ok(!r.normalized.includes("LOff"),      `must not contain LOff: "${r.normalized}"`);
+  assert.ok(r.normalized.toLowerCase().includes("low"), `must preserve Low: "${r.normalized}"`);
+  assert.ok(r.normalized.toLowerCase().includes("jordan"), `must preserve Jordan identity: "${r.normalized}"`);
+});
+
+test("P0: 'Air Force 1 Low White' — Low is not corrupted", () => {
+  const r = normalizeSellerJargon("Air Force 1 Low White");
+  assert.ok(!r.normalized.includes("Off-White"), `must not produce Off-White: "${r.normalized}"`);
+  assert.ok(!r.normalized.includes("LOff"),      `must not contain LOff: "${r.normalized}"`);
+  assert.ok(r.normalized.toLowerCase().includes("low"), `must preserve Low: "${r.normalized}"`);
+});
+
+test("P0: 'Nike Dunk Low Panda' — Low is not corrupted", () => {
+  const r = normalizeSellerJargon("Nike Dunk Low Panda");
+  assert.ok(!r.normalized.includes("LOff"),      `must not contain LOff: "${r.normalized}"`);
+  // 'panda' is a real colorway alias — it should still resolve
+  assert.ok(r.normalized.toLowerCase().includes("panda"), `Panda colorway should be kept: "${r.normalized}"`);
+});
+
+test("P0: 'Yellow' is not corrupted to 'YellOff-White'", () => {
+  const r = normalizeSellerJargon("New Balance 550 Yellow colorway");
+  assert.ok(!r.normalized.includes("YellOff"),   `must not contain YellOff: "${r.normalized}"`);
+  assert.ok(!r.normalized.includes("Off-White"), `must not produce Off-White: "${r.normalized}"`);
+  assert.ok(r.normalized.toLowerCase().includes("yellow"), `must preserve Yellow: "${r.normalized}"`);
+});
+
+test("P0: 'Brown' is not corrupted to 'BrOff-Whiten'", () => {
+  const r = normalizeSellerJargon("Brown leather boot");
+  assert.ok(!r.normalized.includes("BrOff"),     `must not contain BrOff: "${r.normalized}"`);
+  assert.ok(!r.normalized.includes("Off-White"), `must not produce Off-White: "${r.normalized}"`);
+});
+
+test("P0: 'Glow in the dark' is not corrupted", () => {
+  const r = normalizeSellerJargon("Glow in the dark sneaker");
+  assert.ok(!r.normalized.includes("Off-White"), `must not produce Off-White: "${r.normalized}"`);
+  assert.ok(!r.normalized.includes("GlOff"),     `must not contain GlOff: "${r.normalized}"`);
+});
+
+test("P0: 'snow boot' is not corrupted", () => {
+  const r = normalizeSellerJargon("snow boot");
+  assert.ok(!r.normalized.includes("Off-White"), `must not produce Off-White: "${r.normalized}"`);
+});
+
+// ── Positive: standalone seller shorthand still resolves ──────────────────────
+
+test("'ow' as a standalone token still maps to Off-White", () => {
+  const r = normalizeSellerJargon("ow jordan 1");
+  assert.ok(r.normalized.includes("Off-White"), `standalone ow must resolve to Off-White: "${r.normalized}"`);
+  assert.equal(r.extracted.colorway, "Off-White");
+});
+
+test("'off white' phrase still maps to Off-White", () => {
+  const r = normalizeSellerJargon("off white jordan 1");
+  assert.ok(r.normalized.includes("Off-White"), `"off white" phrase must resolve: "${r.normalized}"`);
+  assert.equal(r.extracted.colorway, "Off-White");
+});
+
+test("condition alias 'vnds' works as standalone token", () => {
+  const r = normalizeSellerJargon("vnds jordan 1 bred sz 10");
+  assert.ok(r.extracted.condition !== null, `vnds should extract condition, got null: "${r.normalized}"`);
+  assert.equal(r.extracted.condition, "like_new");
+  // Should not appear in normalized output (stripped)
+  assert.ok(!r.normalized.toLowerCase().includes("vnds"), `vnds should be stripped from output: "${r.normalized}"`);
+});
+
+test("condition alias 'ds' works as standalone token", () => {
+  const r = normalizeSellerJargon("ds jordan 1");
+  assert.ok(r.extracted.condition !== null, `ds should extract condition: "${r.normalized}"`);
+  assert.equal(r.extracted.condition, "deadstock");
+  assert.ok(!r.normalized.toLowerCase().includes(" ds ") && !r.normalized.toLowerCase().startsWith("ds "),
+    `ds should be stripped from output: "${r.normalized}"`);
+});
