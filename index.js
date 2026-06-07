@@ -22183,6 +22183,28 @@ const URL_VERIFICATION_CONCURRENCY     = Math.min(5, Math.max(1, Number(process.
 const URL_VERIFICATION_ITEM_TIMEOUT_MS = Math.min(2000, Math.max(300, Number(process.env.URL_VERIFICATION_ITEM_TIMEOUT_MS  || 800)));
 const URL_VERIFICATION_TOTAL_TIMEOUT_MS = Math.min(3000, Math.max(500, Number(process.env.URL_VERIFICATION_TOTAL_TIMEOUT_MS || 1500)));
 
+// ── Phase 4 (Prompt 3): async verified-URL recovery SCAFFOLDING ───────────────
+// "Prepare verified recovery" — config knobs for a future async, post-first-paint
+// recovery lane that runs on its OWN budget (NOT the SERP_BUDGET_PER_SCAN=1 lane,
+// which would always starve it). DISABLED by default and intentionally NOT wired
+// to a live execution path this round: google_product returns 401 on the current
+// SerpAPI plan, so recovery MUST fail closed (keep pricing_signal_only, no
+// verified language, no affiliate). When the plan supports google_product, the
+// recovery executor can read these without re-plumbing config.
+const URL_RECOVERY_ASYNC_ENABLED       = String(process.env.URL_RECOVERY_ASYNC_ENABLED || "").trim() === "true";
+const URL_RECOVERY_BUDGET_PER_SCAN     = Math.max(0, Number(process.env.URL_RECOVERY_BUDGET_PER_SCAN || 3));
+const URL_RECOVERY_MAX_CANDIDATES      = Math.min(10, Math.max(1, Number(process.env.URL_RECOVERY_MAX_CANDIDATES || 3)));
+// Recovered URLs are cached by stable product identity so repeat scans are free.
+const URL_RECOVERY_CACHE = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 2000 });
+if (!URL_RECOVERY_ASYNC_ENABLED) {
+  console.log("URL_RECOVERY_SCAFFOLD_DISABLED", {
+    reason: "URL_RECOVERY_ASYNC_ENABLED!=true",
+    budgetPerScan: URL_RECOVERY_BUDGET_PER_SCAN,
+    maxCandidates: URL_RECOVERY_MAX_CANDIDATES,
+    note: "recovery fails closed; verified evidence unchanged; affiliate stays gated",
+  });
+}
+
 /** Attempt to resolve a direct merchant URL for one item via SerpAPI google_product. */
 async function _verifyOneItem(it, serpApiKey, scanId) {
   const productId = it._productId;
@@ -24475,6 +24497,55 @@ async function buildMarketSearchResponsePayload({
       verifiedListings: uiItemsForCalibration.filter(x => x?.isVerifiedListing === true).length,
     };
 
+    // ── Phase 4 (Prompt 3): direct_clickable_listing evidence class ───────────
+    // A native clickable merchant URL (eBay/Etsy/etc.) is STRONGER than an
+    // unresolved Google Shopping pricing signal but, under the current stack
+    // (no google_product recovery, no affiliate infra), it is NOT equivalent to
+    // a fully-verified listing. Per product decision: surface it as a SEPARATE,
+    // observation-only evidence class. It MUST NOT change verifiedListingCount,
+    // evidenceTier, confidence calibration, or affiliate eligibility — those
+    // continue to read isVerifiedListing (google_product recovery) only.
+    // Logging + optional UI metadata only; fail-closed trust model preserved.
+    const _directClickableItems = uiItemsForCalibration.filter(x =>
+      x?.clickable === true &&
+      !!x?.directUrl &&
+      x?.isVerifiedListing !== true &&  // exclude already-verified (counted separately)
+      (x?.urlQuality === "merchant_direct" || x?.urlQuality === "merchant_resolved")
+    );
+    const _directClickableCount = _directClickableItems.length;
+    const _directClickableHosts = [...new Set(
+      _directClickableItems.map(x => x?.urlHost || x?.source).filter(Boolean)
+    )].slice(0, 8);
+    if (_directClickableCount > 0) {
+      console.log("DIRECT_CLICKABLE_LISTING_DETECTED", {
+        scanId: retrievalMeta?.scanId || null,
+        query: baseQuery,
+        hosts: _directClickableHosts,
+        sampleTitles: _directClickableItems.slice(0, 3).map(x => (x?.title || "").slice(0, 50)),
+      });
+    }
+    console.log("DIRECT_CLICKABLE_LISTING_COUNT", {
+      scanId: retrievalMeta?.scanId || null,
+      directClickableCount: _directClickableCount,
+      totalCleanItems: uiItemsForCalibration.length,
+    });
+    // Authoritative summary: makes explicit that this class does NOT lift trust.
+    console.log("DIRECT_CLICKABLE_LISTING_SUMMARY", {
+      scanId: retrievalMeta?.scanId || null,
+      query: baseQuery,
+      directClickableCount: _directClickableCount,
+      hosts: _directClickableHosts,
+      verifiedListingCount: _cleanUrlSummary.verifiedListings,  // unchanged by this class
+      note: "observation_only_not_counted_as_verified",
+    });
+    // Optional UI metadata — additive, ignored by calibration/affiliate/verdict.
+    const _directClickableMeta = {
+      count: _directClickableCount,
+      hosts: _directClickableHosts,
+      class: "direct_clickable_listing",
+      countsAsVerified: false,
+    };
+
     const _calibIdentityQuality = computeIdentityQuality(visionIdentity);
 
     // Phase 4B.2.1: Build exact identity rejection summary for calibration.
@@ -24771,8 +24842,6 @@ async function buildMarketSearchResponsePayload({
     // fires both concurrently to cut wall time by ~3.4s on cache misses.
     let premiumPrices  = null;
     let regionalPricing = null;
-    const _t_premiumPrices = Date.now();
-    const _t_regional      = Date.now();
     // Hard cap: enrichments must not dominate live_refresh wall time. Previously
     // premiumPrices hit 5-6s and regionalPricing hit 3-4s (parallel = 6s).
     // Cap each at 1500ms — on SWR cache hit they land in <100ms anyway; on
@@ -24782,7 +24851,16 @@ async function buildMarketSearchResponsePayload({
       p,
       new Promise((res) => { const t = setTimeout(() => res(null), ENRICHMENT_TIMEOUT_MS); if (typeof t.unref === "function") t.unref(); }),
     ]);
+    // Phase 3 (Prompt 3): honest timing. premiumPrices + regionalPricing run in
+    // ONE Promise.all, so they share a single wall clock. The previous code
+    // stamped two separate timestamps at the same instant and logged the same
+    // wall twice (e.g. "premiumPrices:1507, regionalPricing:1507" = ONE 1507ms
+    // cost double-counted). Measure the parallel wall ONCE; report each lane's
+    // contribution as the same shared wall but tag it so it's not summed.
+    const _t_enrichParallel = Date.now();
+    let _enrichRan = false;
     if (!lite && SERPAPI_KEY && activeQuery) {
+      _enrichRan = true;
       const [_ppResult, _rpResult] = await Promise.all([
         _withEnrichTimeout(buildPremiumPriceSourcesPayload({ query: activeQuery, serpKey: SERPAPI_KEY, category }).catch(() => null)),
         _withEnrichTimeout(buildRegionalPricePayload({ query: activeQuery, serpKey: SERPAPI_KEY, category }).catch(() => null)),
@@ -24790,8 +24868,27 @@ async function buildMarketSearchResponsePayload({
       premiumPrices   = _ppResult;
       regionalPricing = _rpResult;
     }
-    _bmLog("premiumPrices", _t_premiumPrices);
-    _bmLog("regionalPricing", _t_regional);
+    const _enrichParallelMs = Date.now() - _t_enrichParallel;
+    // Single honest step entry for the shared parallel wall (not double-counted).
+    _bmLog("premiumRegionalParallel", _t_enrichParallel);
+    if (_enrichRan) {
+      console.log("HEAVY_ENRICHMENT_TIMING", {
+        scanId:           retrievalMeta?.scanId || null,
+        kind:             retrievalMeta?.kind   || null,
+        parallelWallMs:   _enrichParallelMs,     // the TRUE combined cost
+        capMs:            ENRICHMENT_TIMEOUT_MS,
+        hasPremiumPrices: !!premiumPrices,
+        hasRegionalPricing: !!regionalPricing,
+        note: "premium+regional share one Promise.all wall — not summed",
+      });
+    } else {
+      console.log("HEAVY_ENRICHMENT_DEFERRED_REASON", {
+        scanId: retrievalMeta?.scanId || null,
+        kind:   retrievalMeta?.kind   || null,
+        reason: lite ? "lite_first_payload" : !SERPAPI_KEY ? "no_serp_key" : "no_active_query",
+        fields: ["premiumPrices", "regionalPricing"],
+      });
+    }
 
     // ── Feature 73: Price Floor Tracker ───────────────────────────────────────
     // Hits Redis SERPAPI cache + optional live fetch. Cheap on cache hit,
@@ -24948,6 +25045,7 @@ async function buildMarketSearchResponsePayload({
       buyOrPass:             safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
       confidenceCalibration: _confidenceCalibration || null,  // Phase 4A.1
       marketStructure:       _marketStructure,                // Phase 4F: additive display-only
+      directClickableListings: _directClickableMeta,          // Phase 4 (Prompt 3): observation-only, not verified
       multiAngle:            null, // populated by route layer from multiAngleResult
 
       // Features 68-77
@@ -27386,6 +27484,18 @@ if (_crossRouteCache && _crossRouteCache.payload) {
     hitKey: _crossRouteCache.hitKey,
     finalItemCount: _itemCount,
   });
+  // Phase 3 (Prompt 3): distinguish a FULL payload cache hit (build skipped
+  // entirely) from a raw listing-pool hit. A full payload carries buyOrPass/
+  // confidenceCalibration; a bare {items:[...]} test/seed entry does not.
+  const _isFullPayloadCache = !!(_crossRouteCache.payload?.buyOrPass || _crossRouteCache.payload?.confidenceCalibration);
+  console.log("PAYLOAD_CACHE_HIT", {
+    scanId: _budgetScanIdEarly,
+    route: "/market/search",
+    hitKey: _crossRouteCache.hitKey,
+    fullPayload: _isFullPayloadCache,
+    finalItemCount: _itemCount,
+    ageMs: _crossRouteCache.ts ? (Date.now() - _crossRouteCache.ts) : null,
+  });
   if (_origQ && _origQ.toLowerCase().trim() !== rawQuery.toLowerCase().trim()) {
     console.warn("ENRICHED_QUERY_MARKET_CALL_BLOCKED", {
       route: "/market/search",
@@ -27398,8 +27508,48 @@ if (_crossRouteCache && _crossRouteCache.payload) {
     });
   }
   emitSerpBudgetSummary(_itemCount);
+  if (_isFullPayloadCache) {
+    console.log("CACHE_PAYLOAD_RETURNED_DIRECT", {
+      scanId: _budgetScanIdEarly, route: "/market/search",
+      finalItemCount: _itemCount, serverMs: Date.now() - _routeT0,
+    });
+  }
   return res.status(200).json(_crossRouteCache.payload);
 }
+console.log("PAYLOAD_CACHE_MISS", {
+  scanId: _budgetScanIdEarly,
+  route: "/market/search",
+  query: rawQuery,
+  reason: "no_cross_route_payload_for_scan",
+});
+
+// Phase 2 (Prompt 3): populate the cross-route payload cache after a non-stream
+// build so a subsequent /market/search for the SAME scan returns the full payload
+// directly (CACHE_PAYLOAD_RETURNED_DIRECT) instead of rebuilding premium/regional.
+// Previously only the stream's `complete` event wrote this cache, so a stream that
+// bailed on client-close left the cache empty and every fallback rebuilt from
+// scratch. Guarded on a real built payload (has items) to avoid caching error
+// shells. Mirrors the stream's setMarketScanResult write.
+const _writeNonStreamPayloadCache = (payload, source) => {
+  try {
+    const _hasItems = Array.isArray(payload?.items) && payload.items.length > 0;
+    const _hasVerdict = !!(payload?.buyOrPass || payload?.confidenceCalibration);
+    if (!_hasItems || !_hasVerdict) {
+      console.log("PAYLOAD_CACHE_WRITE_SKIPPED", {
+        scanId: _budgetScanIdEarly, route: "/market/search", source,
+        reason: !_hasItems ? "no_items" : "no_verdict_block",
+      });
+      return;
+    }
+    const _ctxNs = getCurrentSerpBudgetCtx();
+    if (!_ctxNs) return;
+    setMarketScanResult(_ctxNs, { payload, route: "/market/search" });
+    console.log("PAYLOAD_CACHE_WRITTEN", {
+      scanId: _budgetScanIdEarly, route: "/market/search", source,
+      finalItemCount: payload.items.length,
+    });
+  } catch (_e) { /* non-fatal — cache write must never break the response */ }
+};
 
 query = bestHistoricalQuery(query);
 query = canonicalizeQuery(query);
@@ -27844,6 +27994,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   // The outcome UI posts under the server-generated stream scanId (from SSE events); this snapshot
   // may be orphaned from that join but ensures a complete record for analysis + stats.
   _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
+  _writeNonStreamPayloadCache(responsePayload, "non_stream_build");
   return res.status(200).json(responsePayload);
 }
 
@@ -27993,6 +28144,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   if (multiAngleResult) responsePayload.multiAngle = multiAngleResult;
   harnessRecordScan(req, responsePayload).catch(() => {});
   _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
+  _writeNonStreamPayloadCache(responsePayload, "non_stream_build");
   return res.status(200).json(responsePayload);
 }
 
@@ -29257,9 +29409,21 @@ app.post("/market/search/stream", async (req, res) => {
         _scanPhase1Ms: _phase1Ms,
       });
       scanLog("provisional_sent", scanId, { itemCount: _provItems.length, verdict: _provVerdictKey });
+      // Phase 5 (Prompt 3): explicit stream-first observability.
+      console.log("STREAM_PROVISIONAL_EMITTED", {
+        scanId, query, itemCount: _provItems.length, verdict: _provVerdictKey,
+        phase1Ms: _phase1Ms, source: "phase1_provisional",
+      });
+      console.log("FIRST_PAYLOAD_TIMING", {
+        scanId, firstPayloadSource: "stream_provisional",
+        firstPayloadMs: Date.now() - _t0, phase1Ms: _phase1Ms,
+        itemCount: _provItems.length,
+      });
       // Phase 4D: capture prediction snapshot from phase1 provisional so it is
       // recorded even when the client disconnects before the complete event.
-      _tryRecordSnapshot("provisional", { req, scanId, query, category, scannedPrice, finalPayload: provPayload, enrichedItems: _provItems, visionConfidence, visionIdentity }).catch(() => {});
+      _tryRecordSnapshot("provisional", { req, scanId, query, category, scannedPrice, finalPayload: provPayload, enrichedItems: _provItems, visionConfidence, visionIdentity })
+        .then(() => console.log("STREAM_SNAPSHOT_RECORDED", { scanId, source: "stream_provisional", verdict: _provVerdictKey }))
+        .catch(() => {});
     } else if (!_earlyProvSent) {
       // Neither early provisional nor phase1 provisional fired — log why no snapshot was captured
       console.log("PREDICTION_SNAPSHOT_SKIPPED", {
@@ -29271,7 +29435,10 @@ app.post("/market/search/stream", async (req, res) => {
       });
     }
 
-    if (clientClosed) { endStream(); return; }
+    if (clientClosed) {
+      console.log("STREAM_CLIENT_CLOSED_STAGE", { scanId, stage: "after_provisional", phase1Count: phase1Items.length, provisionalSent: _earlyProvSent });
+      endStream(); return;
+    }
 
     // ── PHASE 2: oracle (budgeted) + enrichment ───────────────────────────
     send("phase", { phase: "enriching", needsOracle, itemCount: phase1Items.length });
@@ -29357,7 +29524,10 @@ app.post("/market/search/stream", async (req, res) => {
       scanLog("no_results", scanId, { query });
     }
 
-    if (clientClosed) { endStream(); return; }
+    if (clientClosed) {
+      console.log("STREAM_CLIENT_CLOSED_STAGE", { scanId, stage: "after_oracle_phase", provisionalSent: _earlyProvSent });
+      endStream(); return;
+    }
 
     const [_ebaySoldComps, _localComps] = await Promise.all([_ebaySoldPromise, _localCompsPromise]);
     const _phase2Ms = Date.now() - _t2;
@@ -29530,6 +29700,10 @@ app.post("/market/search/stream", async (req, res) => {
       if (_ctxFinal) {
         _ctxFinal._finalItemCount = Array.isArray(finalPayload?.items) ? finalPayload.items.length : null;
         setMarketScanResult(_ctxFinal, { payload: finalPayload, route: "/market/search/stream" });
+        console.log("STREAM_PAYLOAD_CACHE_WRITTEN", {
+          scanId, route: "/market/search/stream",
+          finalItemCount: _ctxFinal._finalItemCount,
+        });
       }
     } catch {}
     send("complete", {
@@ -29547,6 +29721,10 @@ app.post("/market/search/stream", async (req, res) => {
     });
     _recordStreamMetric("totalCompleted", 1);
     if (_degraded) _recordStreamMetric("degradedCompletions", 1);
+    console.log("STREAM_COMPLETE_EMITTED", {
+      scanId, query, itemCount: enrichedItems.length, verdict: _finalVerdictKey,
+      totalMs: _totalMs, degraded: _degraded, verdictChanged: _diff.verdictChanged,
+    });
     scanLog("complete", scanId, {
       itemCount: enrichedItems.length, verdict: _finalVerdictKey,
       verdictChanged: _diff.verdictChanged, oracleContributed: _oracleContributed,
@@ -29587,7 +29765,9 @@ app.post("/market/search/stream", async (req, res) => {
     harnessRecordScan(req, { scanId, ...finalPayload, _degraded, _degradedReason }).catch(() => {});
 
     // ── Outcome flywheel: record immutable prediction snapshot (final payload) ──
-    _tryRecordSnapshot("complete", { req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence, visionIdentity }).catch(() => {});
+    _tryRecordSnapshot("complete", { req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence, visionIdentity })
+      .then(() => console.log("STREAM_SNAPSHOT_RECORDED", { scanId, source: "stream_complete", verdict: _finalVerdictKey }))
+      .catch(() => {});
 
     // ── Background retrieval expansion ────────────────────────────────────────
     // The `complete` event is already on the wire. The SSE connection stays open
