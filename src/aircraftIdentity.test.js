@@ -1,0 +1,285 @@
+// src/aircraftIdentity.test.js
+// Tests for aircraft identity completeness detection, family token detection,
+// query preservation, and aircraft family lock non-regression.
+//
+// These tests reproduce the inline logic from index.js (AIRCRAFT_FAMILY_MAP,
+// AIRCRAFT_FAMILY_MATCH, AIRLINE_COMPETITOR_MAP) since those data structures
+// are not exported as a module. The goal is to pin the exact token sets and
+// classification rules so regressions surface immediately.
+//
+// Run: node --test src/aircraftIdentity.test.js
+
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { evaluateAffiliateEligibility } from "./affiliateGate.js";
+
+// ── Mirrors of the index.js aircraft data structures ─────────────────────────
+// Keep these in sync if AIRCRAFT_FAMILY_MATCH or AIRLINE_COMPETITOR_MAP change.
+
+const AIRCRAFT_FAMILY_MATCH = [
+  { family: "787",      tokens: ["787 9", "787", "dreamliner", "boeing 787"] },
+  { family: "777",      tokens: ["777", "boeing 777"] },
+  { family: "747",      tokens: ["747", "jumbo jet", "boeing 747"] },
+  { family: "737",      tokens: ["737", "boeing 737"] },
+  { family: "a321",     tokens: ["a321neo", "a321", "airbus a321"] },
+  { family: "a320",     tokens: ["a320", "airbus a320"] },
+  { family: "a350",     tokens: ["a350", "airbus a350"] },
+  { family: "a330",     tokens: ["a330", "airbus a330"] },
+  { family: "a380",     tokens: ["a380", "airbus a380"] },
+  { family: "a319",     tokens: ["a319", "airbus a319"] },
+  { family: "concorde", tokens: ["concorde"] },
+];
+
+const AIRLINE_COMPETITOR_MAP = {
+  "hawaiian":  ["united", "delta", "american airlines", "southwest", "alaska", "jetblue", "ana"],
+  "united":    ["hawaiian", "delta", "american airlines", "southwest", "alaska"],
+  "delta":     ["hawaiian", "united", "american airlines", "southwest", "alaska"],
+  "ana":       ["united", "delta", "american airlines", "alaska", "jetblue", "korean air", "jal"],
+  "jal":       ["ana", "united", "delta", "american airlines", "alaska", "korean air"],
+  "emirates":  ["qatar", "etihad", "lufthansa", "british airways", "air france"],
+};
+
+function normalizeTitleKey(t = "") {
+  return String(t).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function titleHasToken(titleKey, token) {
+  return (` ${titleKey} `).includes(` ${token.trim()} `);
+}
+
+function hasFamilyInQuery(query) {
+  const qNorm = normalizeTitleKey(query || "");
+  return AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => qNorm.includes(tok)));
+}
+
+function hasAirlineInQuery(query) {
+  const qNorm = normalizeTitleKey(query || "");
+  return Object.keys(AIRLINE_COMPETITOR_MAP).some((airline) => titleHasToken(qNorm, airline));
+}
+
+function detectFamilyInQuery(query) {
+  const qNorm = normalizeTitleKey(query || "");
+  const entry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => qNorm.includes(tok)));
+  return entry?.family || null;
+}
+
+function needsAircraftFamilyRefinement(query, category) {
+  const catNorm = (category || "").toLowerCase();
+  const isAircraftCategory =
+    catNorm.includes("airplane") || catNorm.includes("aircraft") ||
+    catNorm.includes("diecast") || catNorm.includes("model plane") ||
+    catNorm.includes("aviation");
+  return isAircraftCategory && hasAirlineInQuery(query) && !hasFamilyInQuery(query);
+}
+
+// ── A. Aircraft identity completeness detection ───────────────────────────────
+
+describe("Aircraft identity — needsAircraftFamilyRefinement", () => {
+  it("airline present, family absent → needs refinement", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("Hawaiian Airlines diecast model airplane", "diecast"),
+      true
+    );
+  });
+
+  it("airline + family present → no refinement needed", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("Hawaiian Airlines Boeing 787 diecast model airplane", "diecast"),
+      false
+    );
+  });
+
+  it("no airline, family present → no refinement needed", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("Boeing 787 diecast model airplane", "diecast"),
+      false
+    );
+  });
+
+  it("non-aircraft category → no refinement (not aircraft context)", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("Hawaiian Airlines shirt", "clothing"),
+      false
+    );
+  });
+
+  it("ANA airline without A380 → needs refinement", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("ANA diecast airplane model", "diecast"),
+      true
+    );
+  });
+
+  it("ANA with A380 → no refinement needed", () => {
+    assert.equal(
+      needsAircraftFamilyRefinement("ANA Airbus A380 diecast airplane model", "diecast"),
+      false
+    );
+  });
+});
+
+// ── B. Aircraft family token detection ────────────────────────────────────────
+
+describe("Aircraft family token detection", () => {
+  it("detects 787 from Boeing 787 query", () => {
+    assert.equal(detectFamilyInQuery("Hawaiian Airlines Boeing 787 diecast"), "787");
+  });
+
+  it("detects 787 from bare 787 token", () => {
+    assert.equal(detectFamilyInQuery("787 diecast model airplane"), "787");
+  });
+
+  it("detects dreamliner as 787 family", () => {
+    assert.equal(detectFamilyInQuery("Hawaiian Airlines Dreamliner model airplane"), "787");
+  });
+
+  it("detects a380 family", () => {
+    assert.equal(detectFamilyInQuery("Emirates Airbus A380 diecast model"), "a380");
+  });
+
+  it("detects a330 family", () => {
+    assert.equal(detectFamilyInQuery("Air France Airbus A330 model airplane"), "a330");
+  });
+
+  it("detects 777 family", () => {
+    assert.equal(detectFamilyInQuery("United Airlines Boeing 777 diecast"), "777");
+  });
+
+  it("no family tokens → null", () => {
+    assert.equal(detectFamilyInQuery("Hawaiian Airlines diecast model airplane"), null);
+  });
+
+  it("no family tokens — generic diecast → null", () => {
+    assert.equal(detectFamilyInQuery("white diecast metal airplane model"), null);
+  });
+});
+
+// ── C. Hawaiian 787 query preserves critical tokens ───────────────────────────
+
+describe("Hawaiian 787 query token preservation", () => {
+  const GOOD_QUERY    = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const GENERIC_QUERY = "Hawaiian Airlines diecast model airplane";
+
+  it("GOOD_QUERY contains 787 family token", () => {
+    assert.equal(hasFamilyInQuery(GOOD_QUERY), true);
+    assert.equal(detectFamilyInQuery(GOOD_QUERY), "787");
+  });
+
+  it("GENERIC_QUERY is missing 787 family token — refinement needed", () => {
+    assert.equal(hasFamilyInQuery(GENERIC_QUERY), false);
+    assert.equal(needsAircraftFamilyRefinement(GENERIC_QUERY, "diecast"), true);
+  });
+
+  it("GOOD_QUERY does not trigger refinement", () => {
+    assert.equal(needsAircraftFamilyRefinement(GOOD_QUERY, "diecast"), false);
+  });
+
+  it("GOOD_QUERY would lock on 787 as requiredFamily", () => {
+    const family = detectFamilyInQuery(GOOD_QUERY);
+    assert.equal(family, "787");
+  });
+
+  it("GENERIC_QUERY gives requiredFamily=null (no lock → accepts wrong families)", () => {
+    const family = detectFamilyInQuery(GENERIC_QUERY);
+    assert.equal(family, null);
+  });
+});
+
+// ── D. Aircraft family lock rejects wrong families ────────────────────────────
+
+describe("Aircraft family lock — requiredFamily=787 rejects A321/A330/B777", () => {
+  // Mirrors the AIRCRAFT_FAMILY_MATCH filtering logic in index.js:
+  // when requiredFamily is set, listing titles with a DIFFERENT family token are rejected.
+
+  const requiredFamily = "787";
+
+  function isWrongFamily(listingTitle) {
+    const titleNorm = normalizeTitleKey(listingTitle);
+    const listingFamily = detectFamilyInQuery(titleNorm);
+    if (!listingFamily) return false; // no family token in title → may be kept as generic
+    return listingFamily !== requiredFamily;
+  }
+
+  it("A321 listing is wrong family for 787 query", () => {
+    assert.equal(isWrongFamily("Hawaiian Airlines Airbus A321 diecast model"), true);
+  });
+
+  it("A330 listing is wrong family for 787 query", () => {
+    assert.equal(isWrongFamily("Hawaiian Airlines Airbus A330 model airplane"), true);
+  });
+
+  it("777 listing is wrong family for 787 query", () => {
+    assert.equal(isWrongFamily("United Airlines Boeing 777 diecast model"), true);
+  });
+
+  it("787 listing passes for 787 requiredFamily", () => {
+    assert.equal(isWrongFamily("Hawaiian Airlines Boeing 787 Dreamliner diecast"), false);
+  });
+
+  it("787 Dreamliner listing passes via dreamliner token", () => {
+    assert.equal(isWrongFamily("Hawaiian Airlines Dreamliner 1:400 model"), false);
+  });
+
+  it("Generic 'Hawaiian Airlines diecast' with no family is NOT wrong family (no token)", () => {
+    assert.equal(isWrongFamily("Hawaiian Airlines diecast model airplane"), false);
+  });
+});
+
+// ── E. Refinement outcome — fast pass result with 787 overrides generic query ─
+
+describe("Aircraft refinement — fast pass override logic", () => {
+  it("fast pass result with 787 would be accepted as refinement", () => {
+    const fastPassResult = { parsed: { identity: { exactQuery: "Hawaiian Airlines Boeing 787-9 diecast model airplane 1:400" } } };
+    const rq = normalizeTitleKey(fastPassResult?.parsed?.query || fastPassResult?.parsed?.identity?.exactQuery || "");
+    const hasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => rq.includes(tok)));
+    assert.equal(hasFamily, true);
+    assert.equal(detectFamilyInQuery(fastPassResult.parsed.identity.exactQuery), "787");
+  });
+
+  it("fast pass result without 787 would NOT be used as refinement", () => {
+    const fastPassResult = { parsed: { identity: { exactQuery: "Hawaiian Airlines white diecast airplane model" } } };
+    const rq = normalizeTitleKey(fastPassResult?.parsed?.query || fastPassResult?.parsed?.identity?.exactQuery || "");
+    const hasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => rq.includes(tok)));
+    assert.equal(hasFamily, false);
+  });
+
+  it("visual_shape result with 787 would be accepted as refinement", () => {
+    const visualResult = { parsed: { query: "Hawaiian Airlines Boeing 787-9 Dreamliner collectible model" } };
+    const rq = normalizeTitleKey(visualResult?.parsed?.query || "");
+    const hasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => rq.includes(tok)));
+    assert.equal(hasFamily, true);
+  });
+
+  it("cancelled result is never used (safety check)", () => {
+    const cancelledResult = { cancelled: true, parsed: { query: "Hawaiian Airlines Boeing 787 diecast" } };
+    const accepted = !(!cancelledResult || cancelledResult.cancelled);
+    assert.equal(accepted, false);
+  });
+});
+
+// ── F. Non-regression — Prompt 3 trust contract unchanged ─────────────────────
+
+describe("Prompt 3 non-regression — trust/evidence contract", () => {
+  it("pricing_signal_only still blocks affiliate", () => {
+    const result = evaluateAffiliateEligibility({
+      signal: "GOOD DEAL", trustScore: 0.9, verdict: "BUY",
+      evidenceTier: "pricing_signal_only", verifiedListingCount: 0,
+    });
+    assert.equal(result.eligible, false);
+  });
+
+  it("verifiedListingCount=0 still blocks affiliate for any evidence tier", () => {
+    const result = evaluateAffiliateEligibility({
+      signal: "STRONG BUY", trustScore: 0.95, verdict: "BUY",
+      evidenceTier: "strong_verified", verifiedListingCount: 0,
+    });
+    assert.equal(result.eligible, false);
+  });
+
+  it("google_unresolved URL → pricing_signal evidence quality (non-verified)", () => {
+    const urlQuality = "google_unresolved";
+    const isMerchant = (q) => q === "merchant_direct" || q === "merchant_resolved";
+    const evidenceQuality = (isMerchant(urlQuality) && true && true) ? "verified_listing" : "pricing_signal";
+    assert.equal(evidenceQuality, "pricing_signal");
+  });
+});

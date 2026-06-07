@@ -19793,6 +19793,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       let _refinementApplied = false;
       let _refinementMs      = 0;
 
+      // Identity completeness check — aircraft diecast requires airline + family.
+      console.log("AIRCRAFT_IDENTITY_COMPLETENESS_CHECK", {
+        rid: req.rid, query: qfQuery, category: qfCategory,
+        hasAirline: qfAcceptance.needsAircraftFamilyRefinement || false,
+        hasFamilyInQuery: !qfAcceptance.needsAircraftFamilyRefinement,
+        needsRefinement: !!(qfAcceptance.needsAircraftFamilyRefinement && AIRCRAFT_IDENTITY_REFINE_ENABLED),
+        refinementEnabled: AIRCRAFT_IDENTITY_REFINE_ENABLED,
+      });
+
       if (qfAcceptance.needsAircraftFamilyRefinement && AIRCRAFT_IDENTITY_REFINE_ENABLED) {
         console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_NEEDED", {
           rid: req.rid, query: qfQuery, category: qfCategory,
@@ -19818,8 +19827,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             rid: req.rid, originalQuery: qfQuery, refinedQuery: _finalQuery,
             source: "query_fast_variant", familyFound: _lockWithContext.requiredFamily,
           });
+          console.log("AIRCRAFT_IDENTITY_FAMILY_REFINED", {
+            rid: req.rid, source: "query_fast_variant", familyFound: _lockWithContext.requiredFamily,
+            originalQuery: qfQuery, refinedQuery: _finalQuery,
+          });
         } else {
-          // Step 2: wait up to AIRCRAFT_IDENTITY_REFINE_MS for visual_shape / master.
+          // Step 2: wait up to AIRCRAFT_IDENTITY_REFINE_MS for visual_shape / fast / master.
+          // fastPromise (gpt-4.1-mini lean pass) is already running and may identify the
+          // aircraft family faster than master (gpt-4.1). Include it in the race so a
+          // visible "787" on the model has the best chance of being captured.
           const _refineT0 = Date.now();
           launchMasterNow();
 
@@ -19834,6 +19850,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
             });
             const _betterResult = await Promise.race([
               visualPromise.then((r) => (!r || r.cancelled || !_hasAircraftFamily(r)) ? null : r).catch(() => null),
+              fastPromise.then((r) => (!r || r.cancelled || !_hasAircraftFamily(r)) ? null : r).catch(() => null),
               masterPromise.then((r) => (!r || r.cancelled || !_hasAircraftFamily(r)) ? null : r).catch(() => null),
               _ceiling,
             ]);
@@ -19843,11 +19860,18 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
               const _bq = _betterResult?.parsed?.query || _betterResult?.parsed?.identity?.exactQuery || null;
               if (_bq) {
                 _finalQuery        = _bq;
-                _refinementSource  = "visual_or_master";
+                _refinementSource  = "fast_visual_or_master";
                 _refinementApplied = true;
+                const _refinedFamily = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) =>
+                  tokens.some((tok) => normalizeTitleKey(_bq).includes(tok))
+                )?.family || null;
                 console.log("QUERY_FAST_AIRCRAFT_REFINEMENT_USED", {
                   rid: req.rid, originalQuery: qfQuery, refinedQuery: _finalQuery,
                   source: _refinementSource, refinedInMs: _refinementMs,
+                });
+                console.log("AIRCRAFT_IDENTITY_FAMILY_REFINED", {
+                  rid: req.rid, source: _refinementSource, familyFound: _refinedFamily,
+                  originalQuery: qfQuery, refinedQuery: _finalQuery, refinedInMs: _refinementMs,
                 });
               }
             } else {
@@ -19855,9 +19879,28 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
                 rid: req.rid, query: qfQuery, reason: "no_family_found_in_refine_window",
                 refinedInMs: _refinementMs,
               });
+              console.log("AIRCRAFT_IDENTITY_INCOMPLETE_QUERY_FAST_REJECTED", {
+                rid: req.rid, query: qfQuery, category: qfCategory,
+                reason: "family_not_extractable_within_refine_window",
+                refinedInMs: _refinementMs,
+                note: "market_search_will_use_airline_only_query_requiredFamily_null",
+              });
             }
           } catch {}
         }
+      }
+
+      // Log the final selected query for aircraft identity audit trail.
+      if (qfAcceptance.needsAircraftFamilyRefinement || false) {
+        const _finalFamily = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) =>
+          tokens.some((tok) => normalizeTitleKey(_finalQuery || "").includes(tok))
+        )?.family || null;
+        console.log("AIRCRAFT_IDENTITY_FINAL_QUERY_SELECTED", {
+          rid: req.rid, finalQuery: _finalQuery, originalQuery: qfQuery,
+          familyPresent: !!_finalFamily, family: _finalFamily,
+          refinementApplied: _refinementApplied, refinementSource: _refinementSource,
+          refinementMs: _refinementMs,
+        });
       }
 
       // Now cancel everything still in flight.
@@ -24001,6 +24044,27 @@ async function buildMarketSearchResponsePayload({
   );
 
   const activeQuery = resolvedFinalQuery || baseQuery;
+
+  // Log the best identity query selected for this payload build.
+  // Flags if the active query is weaker/more generic than the incoming base query.
+  const _isGenericDowngrade = activeQuery !== baseQuery && baseQuery.length > activeQuery.length &&
+    !normalizeTitleKey(activeQuery).includes("787") && !normalizeTitleKey(activeQuery).includes("777") &&
+    !normalizeTitleKey(activeQuery).includes("a380") && !normalizeTitleKey(activeQuery).includes("a320");
+  console.log("BEST_IDENTITY_QUERY_SELECTED", {
+    scanId:     retrievalMeta?.scanId || null,
+    baseQuery,
+    finalQuery: finalQuery || null,
+    activeQuery,
+    resolvedFrom: finalQuery ? "finalQuery_param" : sourceItems.length ? "promoted_from_market" : "base_query",
+  });
+  if (_isGenericDowngrade) {
+    console.warn("GENERIC_QUERY_DOWNRANKED", {
+      scanId:      retrievalMeta?.scanId || null,
+      baseQuery,
+      activeQuery,
+      reason:      "active_query_shorter_than_base_may_lose_specificity",
+    });
+  }
 
   const _t_finalUi = Date.now();
   const { uiItems, intelligence } = await buildFinalUiItemsWithIntelligence(
@@ -28768,6 +28832,18 @@ async function _tryRecordSnapshot(source, { req, scanId, query, category, scanne
     console.log("PREDICTION_SNAPSHOT_SKIPPED", { source, scanId, query, reason: "no_payload" });
     return null;
   }
+  // Log which query is being preserved in the snapshot so we can catch
+  // generic-query drift (e.g., "Hawaiian Airlines diecast" instead of "Hawaiian Airlines Boeing 787 diecast").
+  const _snapshotFinalQuery = finalPayload?.finalQuery || finalPayload?.query || query || null;
+  const _snapshotHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) =>
+    tokens.some((tok) => normalizeTitleKey(_snapshotFinalQuery || "").includes(tok))
+  );
+  console.log("SNAPSHOT_QUERY_PRESERVED", {
+    source, scanId,
+    query,
+    snapshotFinalQuery: _snapshotFinalQuery,
+    aircraftFamilyPresent: _snapshotHasFamily,
+  });
   try {
     const snap = await recordPredictionSnapshot(
       extractPredictionSnapshotFromPayload({ req, scanId, query, category, scannedPrice, finalPayload, enrichedItems: enrichedItems || [], visionConfidence, visionIdentity })
@@ -29480,7 +29556,17 @@ app.post("/market/search/stream", async (req, res) => {
       phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
     }
 
+    // Keepalive: send SSE comment every 2s during phase1 so React Native's XHR
+    // readyState=3 fires periodically, resetting the client-side chunk timeout.
+    // Without this, RN may buffer partial chunks and the 15s client timer fires
+    // before the provisional arrives → client_closed_before_provisional.
+    const _keepAliveInterval = setInterval(() => {
+      if (clientClosed || res.writableEnded) { clearInterval(_keepAliveInterval); return; }
+      try { res.write(`:ping\n\n`); } catch {}
+    }, 2000);
+
     const _phase1Raw = await phase1Promise;
+    clearInterval(_keepAliveInterval);
     clearTimeout(_syntheticTimer); // real data arrived — cancel synthetic safety net
     // If 5s kill timer fired in mergeCheapestSources, fall back to earlyItems
     const phase1Items = _phase1Raw.length > 0 ? assignItemIds(_phase1Raw) : (_earlyItems || []);
