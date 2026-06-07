@@ -22194,6 +22194,7 @@ const URL_VERIFICATION_TOTAL_TIMEOUT_MS = Math.min(3000, Math.max(500, Number(pr
 const URL_RECOVERY_ASYNC_ENABLED       = String(process.env.URL_RECOVERY_ASYNC_ENABLED || "").trim() === "true";
 const URL_RECOVERY_BUDGET_PER_SCAN     = Math.max(0, Number(process.env.URL_RECOVERY_BUDGET_PER_SCAN || 3));
 const URL_RECOVERY_MAX_CANDIDATES      = Math.min(10, Math.max(1, Number(process.env.URL_RECOVERY_MAX_CANDIDATES || 3)));
+const URL_RECOVERY_CONCURRENCY         = Math.min(5, Math.max(1, Number(process.env.URL_RECOVERY_CONCURRENCY || 2)));
 // Recovered URLs are cached by stable product identity so repeat scans are free.
 const URL_RECOVERY_CACHE = new TTLCache({ ttlMs: 24 * 60 * 60 * 1000, maxSize: 2000 });
 if (!URL_RECOVERY_ASYNC_ENABLED) {
@@ -22203,6 +22204,99 @@ if (!URL_RECOVERY_ASYNC_ENABLED) {
     maxCandidates: URL_RECOVERY_MAX_CANDIDATES,
     note: "recovery fails closed; verified evidence unchanged; affiliate stays gated",
   });
+}
+// Key + engine diagnostic emitted once at startup so ops can confirm the
+// SerpAPI key is wired and the google_product circuit state is visible.
+// _googleProductApiAvailable latches false on first 401 and stays false until restart.
+console.log("URL_RECOVERY_KEY_DIAGNOSTIC", {
+  serpApiKeyPresent:         !!SERPAPI_KEY,
+  serpApiKeySource:          "SERPAPI_KEY",
+  serpApiKeyHint:            SERPAPI_KEY ? `${SERPAPI_KEY.slice(0, 4)}...${SERPAPI_KEY.slice(-4)}` : null,
+  googleProductApiAvailable: _googleProductApiAvailable,
+  urlVerificationEnabled:    URL_VERIFICATION_ENABLED,
+  urlRecoveryAsyncEnabled:   URL_RECOVERY_ASYNC_ENABLED,
+  maxCandidates:             URL_RECOVERY_MAX_CANDIDATES,
+  concurrency:               URL_RECOVERY_CONCURRENCY,
+  status: !SERPAPI_KEY
+    ? "missing_key_recovery_fails_closed"
+    : !_googleProductApiAvailable
+    ? "circuit_broken_prior_401_disabled_until_restart"
+    : URL_RECOVERY_ASYNC_ENABLED
+    ? "async_recovery_armed"
+    : URL_VERIFICATION_ENABLED
+    ? "sync_verification_armed"
+    : "all_recovery_disabled_set_URL_RECOVERY_ASYNC_ENABLED=true_to_enable",
+});
+
+/**
+ * Post-response async URL recovery. Fires AFTER first payload is on the wire so
+ * it never delays the client. Results are stored in URL_RECOVERY_CACHE keyed by
+ * product ID; the next buildMarketSearchResponsePayload call for items with matching
+ * _productId will inject recovered direct URLs before evidence tier classification.
+ * Fails closed: verifiedListingCount/evidenceTier/affiliate are unchanged if recovery fails.
+ */
+async function _scheduleAsyncUrlRecovery(items, { scanId = null, query = "" } = {}) {
+  if (!URL_RECOVERY_ASYNC_ENABLED) return;
+  if (!SERPAPI_KEY) {
+    console.log("URL_RECOVERY_ASYNC_SKIPPED", { scanId, query: (query || "").slice(0, 80), reason: "no_serpapi_key" });
+    return;
+  }
+  if (!_googleProductApiAvailable) {
+    console.log("URL_RECOVERY_ASYNC_SKIPPED", { scanId, query: (query || "").slice(0, 80), reason: "circuit_broken_prior_401" });
+    return;
+  }
+
+  const candidates = (Array.isArray(items) ? items : [])
+    .filter(it => it && !it.isVerifiedListing && it._productId && !URL_RECOVERY_CACHE.get(`pid:${it._productId}`))
+    .slice(0, URL_RECOVERY_MAX_CANDIDATES);
+
+  if (!candidates.length) {
+    console.log("URL_RECOVERY_ASYNC_SKIPPED", { scanId, query: (query || "").slice(0, 80), reason: "no_eligible_candidates" });
+    return;
+  }
+
+  console.log("URL_RECOVERY_ASYNC_SCHEDULED", {
+    scanId, query: (query || "").slice(0, 80), candidates: candidates.length,
+    productIds: candidates.map(it => it._productId).filter(Boolean).slice(0, 3),
+  });
+
+  const totalGuard = new Promise(res => {
+    const t = setTimeout(() => res("timeout"), URL_VERIFICATION_TOTAL_TIMEOUT_MS);
+    if (typeof t.unref === "function") t.unref();
+  });
+
+  const recoveryRun = (async () => {
+    const recovered = new Map();
+    for (let i = 0; i < candidates.length; i += URL_RECOVERY_CONCURRENCY) {
+      const slice = candidates.slice(i, i + URL_RECOVERY_CONCURRENCY);
+      const settled = await Promise.allSettled(
+        slice.map(it => _verifyOneItem(it, SERPAPI_KEY, scanId))
+      );
+      for (const r of settled) {
+        if (r.status === "fulfilled" && r.value) recovered.set(r.value._productId, r.value);
+      }
+    }
+    return recovered;
+  })();
+
+  const raceResult = await Promise.race([recoveryRun, totalGuard]);
+  const recovered  = (raceResult instanceof Map) ? raceResult : new Map();
+
+  console.log("URL_RECOVERY_ASYNC_RESULT", {
+    scanId, query: (query || "").slice(0, 80),
+    attempted:    candidates.length,
+    recovered:    recovered.size,
+    timedOut:     raceResult === "timeout",
+    circuitBroken: !_googleProductApiAvailable,
+    hosts: [...new Set([...recovered.values()].map(r => r.urlHost).filter(Boolean))].slice(0, 5),
+  });
+
+  for (const [productId, rec] of recovered) {
+    URL_RECOVERY_CACHE.set(`pid:${productId}`, rec);
+    console.log("URL_RECOVERY_METADATA_PRESERVED", {
+      scanId, productId, urlHost: rec.urlHost, note: "cached_for_future_scans",
+    });
+  }
 }
 
 /** Attempt to resolve a direct merchant URL for one item via SerpAPI google_product. */
@@ -23802,9 +23896,19 @@ async function buildMarketSearchResponsePayload({
   const _bmLog = (name, fromTs) => { _bmSteps[name] = Date.now() - fromTs; };
 
   const baseQuery = normalizeQuery(query || "");
-  // Part D: sanitize all outbound items before any further processing
+  // Part D: sanitize all outbound items before any further processing.
+  // URL_RECOVERY_CACHE injection: if a prior async recovery run stored a direct
+  // merchant URL for this item's _productId, inject it BEFORE the outbound
+  // sanitizer so the sanitizer classifies it as merchant_direct → isVerifiedListing.
   const _rawSourceItems = (Array.isArray(items) ? items.filter(Boolean) : [])
-    .map(it => sanitizeOutboundListingForClient(it, { scanId: retrievalMeta?.scanId || null }));
+    .map(it => {
+      const _pid = it._productId || null;
+      const _cachedRec = _pid ? URL_RECOVERY_CACHE.get(`pid:${_pid}`) : null;
+      const _itToSanitize = (_cachedRec?.directUrl && _isValidMerchantUrl(_cachedRec.directUrl) && !it.isVerifiedListing)
+        ? { ...it, directUrl: _cachedRec.directUrl, link: _cachedRec.directUrl, url: _cachedRec.directUrl, buyLink: _cachedRec.directUrl, clickable: true, urlQuality: "merchant_direct", urlHost: _cachedRec.urlHost }
+        : it;
+      return sanitizeOutboundListingForClient(_itToSanitize, { scanId: retrievalMeta?.scanId || null });
+    });
   // Phase 4B.2: accumulate per-reason identity rejection counts from sneaker/Jordan locks.
   const _inFunctionIdentitySummary = createEmptyIdentitySummary();
   _inFunctionIdentitySummary.rawCount = _rawSourceItems.length;
@@ -24496,6 +24600,19 @@ async function buildMarketSearchResponsePayload({
       oracleEstimates:  uiItemsForCalibration.filter(x => x?.urlQuality === "oracle_pricing_estimate").length,
       verifiedListings: uiItemsForCalibration.filter(x => x?.isVerifiedListing === true).length,
     };
+
+    console.log("VERIFIED_LISTING_EVIDENCE_SUMMARY", {
+      scanId:               retrievalMeta?.scanId || null,
+      query:                baseQuery,
+      totalItems:           _cleanUrlSummary.total,
+      verifiedListings:     _cleanUrlSummary.verifiedListings,
+      merchantDirect:       _cleanUrlSummary.merchantDirect,
+      pricingOnly:          _cleanUrlSummary.pricingOnly,
+      googleUnresolved:     _cleanUrlSummary.googleUnresolved,
+      urlRecoveryAsyncEnabled: URL_RECOVERY_ASYNC_ENABLED,
+      urlVerificationEnabled:  URL_VERIFICATION_ENABLED,
+      googleProductAvailable:  _googleProductApiAvailable,
+    });
 
     // ── Phase 4 (Prompt 3): direct_clickable_listing evidence class ───────────
     // A native clickable merchant URL (eBay/Etsy/etc.) is STRONGER than an
@@ -27995,6 +28112,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   // may be orphaned from that join but ensures a complete record for analysis + stats.
   _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
   _writeNonStreamPayloadCache(responsePayload, "non_stream_build");
+  if (URL_RECOVERY_ASYNC_ENABLED) setImmediate(() => _scheduleAsyncUrlRecovery(responsePayload?.items || [], { scanId: _reviewCtx?.scanId || null, query }).catch(() => {}));
   return res.status(200).json(responsePayload);
 }
 
@@ -28145,6 +28263,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   harnessRecordScan(req, responsePayload).catch(() => {});
   _tryRecordSnapshot("non_stream_fallback", { req, scanId: _reviewCtx.scanId, query, category, scannedPrice, finalPayload: responsePayload, enrichedItems: Array.isArray(responsePayload?.items) ? responsePayload.items : [], visionConfidence, visionIdentity }).catch(() => {});
   _writeNonStreamPayloadCache(responsePayload, "non_stream_build");
+  if (URL_RECOVERY_ASYNC_ENABLED) setImmediate(() => _scheduleAsyncUrlRecovery(responsePayload?.items || [], { scanId: _reviewCtx?.scanId || null, query }).catch(() => {}));
   return res.status(200).json(responsePayload);
 }
 
@@ -28504,6 +28623,7 @@ try {
     setMarketScanResult(_ctxFinal, { payload: responsePayload, route: "/market/search" });
   }
 } catch {}
+if (URL_RECOVERY_ASYNC_ENABLED) setImmediate(() => _scheduleAsyncUrlRecovery(responsePayload?.items || [], { scanId: _budgetScanIdEarly || null, query }).catch(() => {}));
 return res.status(200).json(responsePayload);
 
   } catch (err) {
@@ -29768,6 +29888,15 @@ app.post("/market/search/stream", async (req, res) => {
     _tryRecordSnapshot("complete", { req, scanId, query, category, scannedPrice, finalPayload, enrichedItems, visionConfidence, visionIdentity })
       .then(() => console.log("STREAM_SNAPSHOT_RECORDED", { scanId, source: "stream_complete", verdict: _finalVerdictKey }))
       .catch(() => {});
+
+    // ── Async URL recovery (URL_RECOVERY_ASYNC_ENABLED=true) ──────────────────────────────
+    // Fires post-complete so the response is never delayed. Results land in
+    // URL_RECOVERY_CACHE and are injected on the NEXT scan of the same items.
+    if (URL_RECOVERY_ASYNC_ENABLED) {
+      setImmediate(() => {
+        _scheduleAsyncUrlRecovery(finalPayload?.items || [], { scanId, query }).catch(() => {});
+      });
+    }
 
     // ── Background retrieval expansion ────────────────────────────────────────
     // The `complete` event is already on the wire. The SSE connection stays open
