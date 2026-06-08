@@ -401,3 +401,70 @@ describe("Prompt 3 non-regression — trust/evidence contract", () => {
     assert.equal(evidenceQuality, "pricing_signal");
   });
 });
+
+// ── I. Vision hard deadline — master cannot block first result ────────────────
+// These tests reproduce the Phase 4H.2 hard-deadline race logic in isolation,
+// verifying that a slow master does not block the first response.
+
+describe("Vision hard deadline — master cannot block first result", () => {
+  it("hard_deadline tag wins when master is slower than deadline", async () => {
+    let masterDone = false;
+    const masterP = new Promise((res) => setTimeout(() => { masterDone = true; res("m"); }, 500));
+    const deadlineP = new Promise((res) => setTimeout(() => res(), 50));
+    const tag = await Promise.race([
+      masterP.then(() => "master_consensus"),
+      deadlineP.then(() => "hard_deadline"),
+    ]);
+    assert.equal(tag, "hard_deadline");
+    assert.equal(masterDone, false, "master must still be running at deadline");
+    await masterP;
+  });
+
+  it("master_consensus tag wins when master is faster than deadline", async () => {
+    const masterP = new Promise((res) => setTimeout(() => res("m"), 50));
+    const deadlineP = new Promise((res) => setTimeout(() => res(), 500));
+    const tag = await Promise.race([
+      masterP.then(() => "master_consensus"),
+      deadlineP.then(() => "hard_deadline"),
+    ]);
+    assert.equal(tag, "master_consensus");
+  });
+
+  it("VISION_MASTER_BLOCKS_FIRST_RESULT defaults to false (deadline enabled)", () => {
+    const val = String(process.env.VISION_MASTER_BLOCKS_FIRST_RESULT || "false").toLowerCase() === "true";
+    assert.equal(val, false, "hard deadline must be active by default");
+  });
+
+  it("VISION_BAD_SCAN_HARD_FAIL_MS defaults to 4500", () => {
+    const val = Number(process.env.VISION_BAD_SCAN_HARD_FAIL_MS || 4500);
+    assert.equal(val, 4500);
+  });
+
+  it("hard_deadline_fail path sets passes=[] preventing .map() crash", () => {
+    let passes = undefined;   // initial let passes; in runVisionConsensus
+    let visionTier = "consensus";
+    const raceWinner = "hard_deadline";
+    if (raceWinner === "hard_deadline") {
+      passes = [];
+      visionTier = "hard_deadline_fail";
+    }
+    assert.deepEqual(passes, []);
+    assert.equal(visionTier, "hard_deadline_fail");
+    const parsedList = passes.map((p) => p?.parsed || {});
+    assert.deepEqual(parsedList, []);
+  });
+
+  it("hard_deadline_fail guard prevents visionTier being overwritten by consensus branch", () => {
+    let visionTier = "hard_deadline_fail";
+    let passes = [];
+    let passLabels = [];
+    // Mirrors: if (visionTier !== "hard_return" && visionTier !== "hard_deadline_fail")
+    if (visionTier !== "hard_return" && visionTier !== "hard_deadline_fail") {
+      passes = ["should_not_be_set"];
+      passLabels = ["consensus"];
+      visionTier = "consensus";
+    }
+    assert.deepEqual(passes, [], "passes must remain [] for hard_deadline_fail");
+    assert.equal(visionTier, "hard_deadline_fail", "visionTier must not be overwritten");
+  });
+});

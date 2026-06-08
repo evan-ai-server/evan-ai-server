@@ -1565,6 +1565,13 @@ const MASTER_LAZY_DELAY_TEXT_MS = Number(process.env.MASTER_LAZY_DELAY_TEXT_MS |
 // from fast/visual, return the seed rather than blocking further.
 const ITEM_VISION_HARD_RETURN_MS = Number(process.env.ITEM_VISION_HARD_RETURN_MS || 5500);
 
+// Phase 4H.2: Hard first-result deadline. When VISION_MASTER_BLOCKS_FIRST_RESULT=false
+// (default), vision returns at VISION_BAD_SCAN_HARD_FAIL_MS even if master hasn't
+// finished. Master continues in background and logs VISION_MASTER_BACKGROUND_COMPLETED.
+const VISION_BAD_SCAN_HARD_FAIL_MS      = Number(process.env.VISION_BAD_SCAN_HARD_FAIL_MS      || 4500);
+const VISION_MASTER_BLOCKS_FIRST_RESULT = String(process.env.VISION_MASTER_BLOCKS_FIRST_RESULT || "false").toLowerCase() === "true";
+const VISION_MASTER_BACKGROUND_ENABLED  = process.env.VISION_MASTER_BACKGROUND_ENABLED !== "false";
+
 // Phase A2.7: Ultra-lean vision query fast path. Runs a dedicated tiny-schema
 // pass (query+variants+confidence+category+brandCertainty only) at t=0 alongside
 // fast/visual_shape. If it returns an accepted result before any other pass,
@@ -19847,9 +19854,33 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         // doesn't hang indefinitely waiting for a launch that never came.
         setTimeout(() => { launchMasterNow(); tryResolve(); }, VISUAL_SHAPE_TIMEOUT_MS).unref?.();
       });
-      Promise.all([masterPromise, visualSettleOrDeadline])
-        .then(() => finish("consensus"))
-        .catch(() => finish("consensus"));
+      // Phase 4H.2: Hard first-result deadline. When VISION_MASTER_BLOCKS_FIRST_RESULT=false
+      // (default), fire "hard_deadline" if master hasn't returned by VISION_BAD_SCAN_HARD_FAIL_MS.
+      // Master keeps running in background and logs VISION_MASTER_BACKGROUND_COMPLETED when done.
+      const _hardDeadlineRemainingMs = VISION_MASTER_BLOCKS_FIRST_RESULT
+        ? null
+        : Math.max(200, VISION_BAD_SCAN_HARD_FAIL_MS - (Date.now() - passT0));
+      console.log("VISION_FIRST_QUERY_DEADLINE_START", {
+        rid: req.rid, hardMs: VISION_BAD_SCAN_HARD_FAIL_MS,
+        remainingMs: _hardDeadlineRemainingMs,
+        masterBlocks: VISION_MASTER_BLOCKS_FIRST_RESULT,
+      });
+      if (_hardDeadlineRemainingMs !== null) {
+        const _hardDeadlineP = new Promise((res) => {
+          const t = setTimeout(() => res(), _hardDeadlineRemainingMs);
+          if (typeof t.unref === "function") t.unref();
+        });
+        Promise.race([
+          Promise.all([masterPromise, visualSettleOrDeadline]).then(() => "master_consensus"),
+          _hardDeadlineP.then(() => "hard_deadline"),
+        ])
+          .then((tag) => finish(tag === "hard_deadline" ? "hard_deadline" : "consensus"))
+          .catch(() => finish("consensus"));
+      } else {
+        Promise.all([masterPromise, visualSettleOrDeadline])
+          .then(() => finish("consensus"))
+          .catch(() => finish("consensus"));
+      }
     });
 
     // Race is done — clear all pending launch timers (no-ops if already fired).
@@ -20119,6 +20150,15 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       // Visual deadline timer above has already aborted if it fired; this is
       // a safety no-op for the case where visual settled naturally.
       try { visualAbortCtrl.abort(); } catch {}
+    } else if (raceWinner === "hard_deadline") {
+      // Hard deadline fired before master returned. Cancel fast/visual to stop any
+      // lingering in-flight requests. Master keeps running if VISION_MASTER_BACKGROUND_ENABLED.
+      try { queryFastAbortCtrl.abort(); } catch {}
+      try { fastAbortCtrl.abort(); } catch {}
+      try { visualAbortCtrl.abort(); } catch {}
+      if (!VISION_MASTER_BACKGROUND_ENABLED) {
+        try { masterAbortCtrl.abort(); } catch {}
+      }
     }
 
     // Path-specific awaits — winner is already settled so awaiting it is
@@ -20148,10 +20188,32 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       fastResult   = await fastPromise;  // already settled — instant
       visualResult = null;               // drain in background
       visualPromise.catch(() => null);
+    } else if (raceWinner === "hard_deadline") {
+      // Peek at what settled — fast/visual are cancelled/null at this point.
+      fastResult   = await Promise.race([fastPromise,   Promise.resolve(null)]).catch(() => null);
+      visualResult = await Promise.race([visualPromise, Promise.resolve(null)]).catch(() => null);
     } else { // visual_early
       fastResult   = null;               // drain in background
       visualResult = await visualPromise; // already settled — instant
       fastPromise.catch(() => null);
+    }
+
+    // Phase 4H.2: hard-deadline observability.
+    if (raceWinner === "hard_deadline") {
+      console.log("VISION_FIRST_QUERY_HARD_TIMEOUT", {
+        rid: req.rid, elapsedMs: Date.now() - passT0, hardMs: VISION_BAD_SCAN_HARD_FAIL_MS,
+        fastCancelled: !!fastResult?.cancelled, visualCancelled: !!visualResult?.cancelled,
+        masterBackgroundEnabled: VISION_MASTER_BACKGROUND_ENABLED, masterLaunched,
+      });
+      if (VISION_MASTER_BACKGROUND_ENABLED && masterLaunched && !masterAbortCtrl.signal.aborted) {
+        console.log("VISION_MASTER_BACKGROUND_STARTED", { rid: req.rid, elapsedMs: Date.now() - passT0 });
+        masterPromise.then((m) => {
+          console.log("VISION_MASTER_BACKGROUND_COMPLETED", {
+            rid: req.rid, query: m?.parsed?.query || null,
+            confidence: m?.parsed?.confidence ?? null, elapsedMs: Date.now() - passT0,
+          });
+        }).catch(() => {});
+      }
     }
 
     // Capture hoisted vars so visionTimings return + logs outside this block can read them.
@@ -20162,8 +20224,9 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       rid:              req.rid,
       mode,
       shouldLaunchMaster: masterLaunched,
-      reason:           raceWinner === "fast"         ? "fast_pass_won"
-                      : raceWinner === "visual_early" ? "visual_early_exit"
+      reason:           raceWinner === "fast"           ? "fast_pass_won"
+                      : raceWinner === "visual_early"  ? "visual_early_exit"
+                      : raceWinner === "hard_deadline" ? "hard_deadline_fired"
                       : "consensus_needed",
       visualConfidence: visualResult
         ? Number(visualResult.parsed?.confidence ?? 0)
@@ -20187,8 +20250,9 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       returnedEarly:     raceWinner === "fast" || raceWinner === "visual_early",
       reason:            raceWinner,
       elapsedMs:         Date.now() - passT0,
-      selectedPass:      raceWinner === "fast"         ? "fast"
-                       : raceWinner === "visual_early" ? "visual_shape"
+      selectedPass:      raceWinner === "fast"          ? "fast"
+                       : raceWinner === "visual_early"  ? "visual_shape"
+                       : raceWinner === "hard_deadline" ? "hard_deadline_fail"
                        : "consensus",
       selectedQuery:     raceWinner === "fast"
                            ? (fastResult?.parsed?.query || null)
@@ -20313,7 +20377,16 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
         // becomes usable. The ceiling must resolve BEFORE awaiting masterPromise
         // so the hard-return branch is actually reachable.
         let master;
-        if (_isItemPropMode) {
+        if (raceWinner === "hard_deadline") {
+          // Hard deadline fired upstream — master is running in background. Do not await.
+          console.log("VISION_MASTER_NOT_BLOCKING_FIRST_RESULT", {
+            rid: req.rid, elapsedMs: Date.now() - passT0, reason: "hard_deadline_no_seed",
+          });
+          master = null;
+          passes = [];
+          passLabels = [];
+          visionTier = "hard_deadline_fail";
+        } else if (_isItemPropMode) {
           const _elapsedMs   = Date.now() - passT0;
           const _remainingMs = Math.max(200, ITEM_VISION_HARD_RETURN_MS - _elapsedMs);
           const _ceilingP    = new Promise((res) => {
@@ -20392,7 +20465,7 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
           master = await masterPromise;
         }
 
-        if (visionTier !== "hard_return") {
+        if (visionTier !== "hard_return" && visionTier !== "hard_deadline_fail") {
           const consensusPasses = [master, visualResult].filter(Boolean);
           passes     = fastResult ? [fastResult, ...consensusPasses] : consensusPasses;
           passLabels = fastResult ? ["fast", "master", "visual_shape"].slice(0, passes.length)
@@ -21932,6 +22005,13 @@ if (!openai) {
           innerWallMs:      shaped?.visionTimings?.visionWallMs || null,
         };
         console.log("⏱️ VISION_ENDPOINT_TIMINGS", _ep);
+        console.log("VISION_FIRST_RESPONSE_TIMING", {
+          rid: req.rid, totalMs: _ep.totalMs, visionWallMs: _ep.innerWallMs,
+          raceWinner: shaped?.visionTimings?.raceWinner ?? null,
+          masterBlocked: shaped?.visionTimings?.raceWinner === "consensus",
+          hardDeadlineFired: shaped?.visionTimings?.raceWinner === "hard_deadline",
+          selectedPass: shaped?.visionTier ?? null,
+        });
         // VISION_CRITICAL_PATH_TIMING — compact single-line breakdown for future audits.
         // Captures the full wall budget from upload to response with pass-level detail.
         try {
