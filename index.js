@@ -9679,6 +9679,10 @@ function applyAircraftModelTierFilter(query, items, scannedPrice = null, _out = 
           console.log("AIRCRAFT_MODEL_TIER_TOY_ONLY_REJECTED", {
             title: it?.title, reason: "only_toys_in_pool_degraded", scanTier, scannedPrice,
           });
+          console.log("AIRCRAFT_PREMIUM_TOY_MAIN_RESULT_BLOCKED", {
+            title: it?.title, scanTier, scannedPrice,
+            reason: "toy_would_be_main_result_for_premium_aircraft_scan_blocked",
+          });
         }
         result = [];
       }
@@ -11211,6 +11215,68 @@ function filterRelevantListings(query, items, _out = null) {
       if (_noCompetitor.length < 2 || (_rejectedModel === 0 && _penalizedModel > 0)) {
         _out.relaxed = true;
       }
+    }
+
+    // Step 6.5: Aircraft family market recovery — when vision failed to extract a
+    // family token, infer one from the surviving market listings. If ≥3 items name
+    // the same family AND that family appears more than 2× the next most common
+    // family, adopt it as the dominant family and re-run the family filter.
+    // This prevents "hawaiian airlines diecast airplane model" (no family) from
+    // accepting A321 / A330 / 777 / Daron toy when 787 items dominate the pool.
+    let _inferredMarketFamily = null;
+    if (requiredAirline && !requiredFamily && preserved.length >= 2) {
+      const _familyCounts = {};
+      for (const it of preserved) {
+        const t = normalizeTitleKey(it?.title || "");
+        const entry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => t.includes(tok)));
+        if (entry) _familyCounts[entry.family] = (_familyCounts[entry.family] || 0) + 1;
+      }
+      const _sorted = Object.entries(_familyCounts).sort((a, b) => b[1] - a[1]);
+      if (_sorted.length > 0) {
+        const [topFamily, topCount] = _sorted[0];
+        const secondCount = _sorted[1]?.[1] || 0;
+        if (topCount >= 3 && topCount >= secondCount * 2) {
+          _inferredMarketFamily = topFamily;
+          const _familyToks = AIRCRAFT_FAMILY_MAP[topFamily] || [];
+          const wrongToks = AIRCRAFT_FAMILY_MATCH
+            .filter(({ family }) => family !== topFamily)
+            .flatMap(({ tokens }) => tokens);
+          const _exactFam = preserved.filter((it) => {
+            const t = normalizeTitleKey(it?.title || "");
+            return _familyToks.some((tok) => t.includes(tok));
+          });
+          const _wrongFam = preserved.filter((it) => {
+            const t = normalizeTitleKey(it?.title || "");
+            return wrongToks.some((tok) => t.includes(tok)) && !_familyToks.some((tok) => t.includes(tok));
+          });
+          console.log("AIRCRAFT_FAMILY_MARKET_RECOVERY_SELECTED", {
+            query: q,
+            inferredFamily: _inferredMarketFamily,
+            topCount,
+            secondCount,
+            familyCounts: _sorted,
+            exactFamilyCount: _exactFam.length,
+            wrongFamilyCount: _wrongFam.length,
+          });
+          if (_exactFam.length >= 2) {
+            for (const it of _wrongFam) {
+              _rejectedModel++;
+              console.log("AIRCRAFT_FAMILY_MIXED_POOL_BLOCKED", {
+                title: it?.title, inferredFamily: _inferredMarketFamily,
+                reason: "wrong_family_in_market_recovery",
+              });
+            }
+            preserved = _exactFam;
+          }
+        }
+      }
+    }
+    if (requiredAirline && !requiredFamily && !_inferredMarketFamily) {
+      console.log("AIRCRAFT_FAMILY_MISSING_MARKET_RECOVERY_STARTED", {
+        query: q, requiredAirline, survivingCount: preserved.length,
+        reason: "airline_only_no_family_token_from_vision",
+        note: "mixed_family_pool_accepted_without_dominant_family",
+      });
     }
 
     console.log("IDENTITY_LOCK_TOKEN_MATCH_POLICY", {
@@ -17756,6 +17822,7 @@ async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid, model
 
   let openaiResult = null;
   let openaiUsage  = null;
+  let _internallyTimedOut = false; // set true when OUR timeout fires; gates Gemini fallback
   try {
 
 const response = await withModelServing(
@@ -17888,6 +17955,12 @@ console.log("🧾 VISION PASS RAW", {
     err?.name === "APIUserAbortError" ||
     err?.type === "abort" ||
     /aborted/i.test(String(err?.message || ""));
+  // _internallyTimedOut: true when OUR timeout signal fired (not an external cancel).
+  // When this is true, Gemini must NOT run — our timeout is a deliberate deadline,
+  // not a transient failure. Running Gemini after our own cutoff (3.5–4s for fast/visual)
+  // was adding ~3s of extra latency on every slow-model scan and was the root cause
+  // of vision taking 13s instead of 4s when the model was under load.
+  _internallyTimedOut = isAbort && !!timeout.signal?.aborted && !externalSignal?.aborted;
   if (isAbort) {
     console.log("⏱️ VISION PASS ABORTED", {
       rid:             rid || "",
@@ -17896,9 +17969,18 @@ console.log("🧾 VISION PASS RAW", {
       errorMessage:    err?.message,
       errorCode:       err?.code,
       cancelledByRace: !!externalSignal?.aborted,
-      timedOut:        !!timeout.signal?.aborted && !externalSignal?.aborted,
+      timedOut:        _internallyTimedOut,
       elapsedMs:       Date.now() - passStartTime,
     });
+    if (_internallyTimedOut) {
+      console.log("VISION_TIMEOUT_HARD_ABORT", {
+        rid: rid || "",
+        pass: passLabel,
+        configuredTimeoutMs: openaiCutoffMs,
+        actualElapsedMs: Date.now() - passStartTime,
+        geminiSuppressed: !!process.env.GEMINI_API_KEY,
+      });
+    }
   } else {
     console.warn("❌ VISION PASS FAILED (OpenAI)", {
       rid:          rid || "",
@@ -17911,8 +17993,10 @@ console.log("🧾 VISION PASS RAW", {
   }
 }
 
-  // Gemini fallback: OpenAI timed out / failed / returned empty query
-  if (process.env.GEMINI_API_KEY && !externalSignal?.aborted) {
+  // Gemini fallback: OpenAI genuinely failed (non-timeout) OR returned empty query.
+  // Do NOT run when _internallyTimedOut: our timeout IS the hard deadline — Gemini
+  // after a self-timeout is the root cause of vision taking 13s instead of 4s.
+  if (process.env.GEMINI_API_KEY && !externalSignal?.aborted && !_internallyTimedOut) {
     try {
       console.log("🔄 VISION PASS → Gemini fallback", { rid: rid || "", pass: passLabel });
       const gemResult = await _callGeminiVisionPass({ base64, mimeType, mode, propContext, passLabel, rid });

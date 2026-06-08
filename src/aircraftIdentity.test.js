@@ -257,6 +257,124 @@ describe("Aircraft refinement — fast pass override logic", () => {
   });
 });
 
+// ── G. Aircraft family market recovery — dominant family inference ────────────
+
+describe("Aircraft family market recovery — dominant family inference", () => {
+  // Mirrors the Step 6.5 logic in filterRelevantListings (identity lock)
+  function inferDominantFamily(items) {
+    const counts = {};
+    for (const it of items) {
+      const t = normalizeTitleKey(it.title || "");
+      const entry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => t.includes(tok)));
+      if (entry) counts[entry.family] = (counts[entry.family] || 0) + 1;
+    }
+    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (!sorted.length) return null;
+    const [topFamily, topCount] = sorted[0];
+    const secondCount = sorted[1]?.[1] || 0;
+    if (topCount >= 3 && topCount >= secondCount * 2) return topFamily;
+    return null;
+  }
+
+  it("787 dominates pool → infers 787 family", () => {
+    const items = [
+      { title: "NG Models Hawaiian Boeing 787-9 Dreamliner 1:400" },
+      { title: "GeminiJets Hawaiian 787-9 Dreamliner Diecast" },
+      { title: "Herpa Hawaiian 787-9 Dreamliner" },
+      { title: "Hawaiian Airlines Boeing 787 diecast model" },
+    ];
+    assert.equal(inferDominantFamily(items), "787");
+  });
+
+  it("mixed pool (787+A330+A321) → no dominant family (no inference)", () => {
+    const items = [
+      { title: "NG Models Hawaiian Boeing 787-9 Dreamliner" },
+      { title: "Skymarks Hawaiian Airbus A330-200 1/200" },
+      { title: "GeminiJets Hawaiian Airlines A321neo" },
+    ];
+    assert.equal(inferDominantFamily(items), null);
+  });
+
+  it("pool without family tokens → no inference", () => {
+    const items = [
+      { title: "Daron Hawaiian Airlines Single Plane" },
+      { title: "Hawaiian Airlines pullback toy airplane" },
+    ];
+    assert.equal(inferDominantFamily(items), null);
+  });
+
+  it("only 2 items in dominant family → below threshold (need ≥3)", () => {
+    const items = [
+      { title: "NG Models Hawaiian Boeing 787-9 1:400" },
+      { title: "GeminiJets Hawaiian Airlines 787-9" },
+      { title: "Skymarks Hawaiian A330" },
+    ];
+    assert.equal(inferDominantFamily(items), null); // 2 < 3
+  });
+
+  it("A380 dominates ANA pool → infers a380", () => {
+    const items = [
+      { title: "ANA Airbus A380 Flying Honu 1:400 Diecast" },
+      { title: "ANA Airbus A380 Sea Turtle Livery 1:200" },
+      { title: "ANA A380 Sea Turtle JA381A Model" },
+    ];
+    assert.equal(inferDominantFamily(items), "a380");
+  });
+});
+
+// ── H. Query identity preservation — collector must not drop airline tokens ──
+
+describe("Query identity guard — collector must not drop identity tokens", () => {
+  // Mirrors the _IDENTITY_GUARD_TOKENS guard in buildCollectorSearchQuery.
+  // visionQuery → collectorQuery: any token in _IDENTITY_GUARD_TOKENS present
+  // in visionQuery must also appear in the collector query.
+  const IDENTITY_GUARD_TOKENS = [
+    "hawaiian", "united", "boeing", "787", "777", "a380", "dreamliner",
+    "jordan", "yeezy", "vaporfly",
+  ];
+
+  function wouldBlock(visionQuery, collectorQuery) {
+    const vNorm = visionQuery.toLowerCase();
+    const cNorm = collectorQuery.toLowerCase();
+    return IDENTITY_GUARD_TOKENS.some((tok) => vNorm.includes(tok) && !cNorm.includes(tok));
+  }
+
+  it("collector drops 'hawaiian' → blocked", () => {
+    assert.equal(
+      wouldBlock("hawaiian airlines diecast airplane model", "diecast airplane model white diecast metal"),
+      true
+    );
+  });
+
+  it("collector drops 'boeing' → blocked", () => {
+    assert.equal(
+      wouldBlock("hawaiian airlines boeing 787 diecast model airplane", "hawaiian airlines diecast"),
+      true
+    );
+  });
+
+  it("collector preserves airline and family → allowed", () => {
+    assert.equal(
+      wouldBlock("hawaiian airlines diecast airplane model", "hawaiian airlines boeing 787 diecast model"),
+      false
+    );
+  });
+
+  it("non-aircraft collector query without identity tokens → allowed", () => {
+    assert.equal(
+      wouldBlock("sunglasses orange lens", "orange lens retro sunglasses 1990s"),
+      false
+    );
+  });
+
+  it("collector drops 'jordan' brand → blocked", () => {
+    assert.equal(
+      wouldBlock("air jordan 1 low og year of the rabbit", "low og year rabbit sneakers"),
+      true
+    );
+  });
+});
+
 // ── F. Non-regression — Prompt 3 trust contract unchanged ─────────────────────
 
 describe("Prompt 3 non-regression — trust/evidence contract", () => {
