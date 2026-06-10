@@ -1566,10 +1566,13 @@ const MASTER_LAZY_DELAY_TEXT_MS = Number(process.env.MASTER_LAZY_DELAY_TEXT_MS |
 // from fast/visual, return the seed rather than blocking further.
 const ITEM_VISION_HARD_RETURN_MS = Number(process.env.ITEM_VISION_HARD_RETURN_MS || 5500);
 
-// Phase 4H.2: Hard first-result deadline. When VISION_MASTER_BLOCKS_FIRST_RESULT=false
-// (default), vision returns at VISION_BAD_SCAN_HARD_FAIL_MS even if master hasn't
-// finished. Master continues in background and logs VISION_MASTER_BACKGROUND_COMPLETED.
-const VISION_BAD_SCAN_HARD_FAIL_MS      = Number(process.env.VISION_BAD_SCAN_HARD_FAIL_MS      || 4500);
+// Phase 4H.5: End-to-end 5-second SLA. Vision must return by VISION_FIRST_QUERY_DEADLINE_MS,
+// leaving the rest of the budget for market. VISION_BAD_SCAN_HARD_FAIL_MS is the canonical
+// variable; VISION_FIRST_QUERY_DEADLINE_MS is the new name — either env var works.
+const SCAN_FIRST_RESPONSE_SLA_MS        = Number(process.env.SCAN_FIRST_RESPONSE_SLA_MS        || 5000);
+const VISION_FIRST_QUERY_DEADLINE_MS    = Number(process.env.VISION_FIRST_QUERY_DEADLINE_MS    || process.env.VISION_BAD_SCAN_HARD_FAIL_MS || 3300);
+const VISION_BAD_SCAN_HARD_FAIL_MS      = VISION_FIRST_QUERY_DEADLINE_MS; // backward compat alias
+const BACKGROUND_MASTER_RESULT_TTL_MS   = Number(process.env.BACKGROUND_MASTER_RESULT_TTL_MS   || 60000);
 const VISION_MASTER_BLOCKS_FIRST_RESULT = String(process.env.VISION_MASTER_BLOCKS_FIRST_RESULT || "false").toLowerCase() === "true";
 const VISION_MASTER_BACKGROUND_ENABLED  = process.env.VISION_MASTER_BACKGROUND_ENABLED !== "false";
 
@@ -5765,7 +5768,11 @@ function _recordStreamMetric(key, value) {
 const ENRICHED_SCAN_CACHE        = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 800 });
 const STREAM_PHASE1_INFLIGHT     = new Map(); // cacheKey → Promise<items[]>
 const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than this many marketplace items
-const MARKET_FIRST_PAYLOAD_DEADLINE_MS = Number(process.env.MARKET_FIRST_PAYLOAD_DEADLINE_MS || 5000);
+// Phase 4H.5: default is now 1700ms (5000ms SLA - 3300ms vision = 1700ms for market).
+// Dynamic deadline is computed per-request from scanStartedAtMs when provided by client.
+const MARKET_FIRST_PAYLOAD_DEADLINE_MS = Number(process.env.MARKET_FIRST_PAYLOAD_DEADLINE_MS || 1700);
+// In-memory store for background master identity results (imageHash/scanId → result).
+const BACKGROUND_VISION_RESULTS = new Map(); // key → {query,variants,confidence,visionIdentity,category,completedAt,elapsedMs}
 // Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
 // Was 8s — that's the entire user-perceived latency on degraded scans where
 // every external auth is dead. The buyOrPass engine now produces an honest
@@ -19582,7 +19589,7 @@ async function prepareVisionBufferWithBudget(buffer, rid, maxEdgePx, budgetMs) {
   return { buffer: result, timedOut: _timedOut };
 }
 
-async function runVisionConsensus({ req, file, mode, propContext }) {
+async function runVisionConsensus({ req, file, mode, propContext, imageHash = null }) {
   // Downscale before encoding. Text-sensitive modes (label/barcode/mark) keep
   // a larger edge for legibility; item/prop use a smaller edge to reduce token
   // count and OpenAI latency without hurting object identification.
@@ -20192,10 +20199,27 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
       if (VISION_MASTER_BACKGROUND_ENABLED && masterLaunched && !masterAbortCtrl.signal.aborted) {
         console.log("VISION_MASTER_BACKGROUND_STARTED", { rid: req.rid, elapsedMs: Date.now() - passT0 });
         masterPromise.then((m) => {
+          const _bgQuery      = m?.parsed?.query || null;
+          const _bgElapsedMs  = Date.now() - passT0;
           console.log("VISION_MASTER_BACKGROUND_COMPLETED", {
-            rid: req.rid, query: m?.parsed?.query || null,
-            confidence: m?.parsed?.confidence ?? null, elapsedMs: Date.now() - passT0,
+            rid: req.rid, query: _bgQuery, confidence: m?.parsed?.confidence ?? null, elapsedMs: _bgElapsedMs,
           });
+          // Phase 4H.5: store usable background identity for frontend salvage polling
+          if (isUsableVisionSeed(_bgQuery) && imageHash) {
+            const _bgEntry = {
+              query: _bgQuery,
+              variants:       Array.isArray(m?.parsed?.variants)          ? m.parsed.variants        : [],
+              confidence:     Number(m?.parsed?.confidence               || 0.7),
+              visionIdentity: m?.parsed?.identity                         || null,
+              category:       String(m?.parsed?.identity?.category || "") || null,
+              completedAt:    Date.now(),
+              elapsedMs:      _bgElapsedMs,
+            };
+            BACKGROUND_VISION_RESULTS.set(imageHash, _bgEntry);
+            console.log("VISION_BACKGROUND_RESULT_STORED", { rid: req.rid, imageHash, query: _bgQuery, elapsedMs: _bgElapsedMs });
+          } else if (_bgQuery) {
+            console.log("VISION_BACKGROUND_RESULT_REJECTED_GENERIC", { rid: req.rid, imageHash, query: _bgQuery });
+          }
         }).catch(() => {});
       }
     }
@@ -21218,6 +21242,30 @@ app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
   });
 });
 
+// Phase 4H.5: Background master salvage endpoint. Client polls after hard_fail_no_seed
+// to see if master eventually identified the item. Keyed by imageHash or scanId.
+app.get("/api/vision/background-result", requireProductAccess, async (req, res) => {
+  const _scanId    = safeStr(req.query?.scanId,    64)  || null;
+  const _imageHash = safeStr(req.query?.imageHash, 128) || null;
+  let _entry = null;
+  if (_scanId)    _entry = BACKGROUND_VISION_RESULTS.get(_scanId);
+  if (!_entry && _imageHash) _entry = BACKGROUND_VISION_RESULTS.get(_imageHash);
+  console.log("VISION_BACKGROUND_RESULT_POLLED", {
+    rid: req.rid, scanId: _scanId, imageHash: _imageHash, found: !!_entry,
+  });
+  if (!_entry) return res.status(200).json({ ready: false });
+  // Lazy TTL eviction
+  if (Date.now() - (_entry.completedAt || 0) > BACKGROUND_MASTER_RESULT_TTL_MS) {
+    if (_scanId)    BACKGROUND_VISION_RESULTS.delete(_scanId);
+    if (_imageHash) BACKGROUND_VISION_RESULTS.delete(_imageHash);
+    return res.status(200).json({ ready: false });
+  }
+  console.log("VISION_BACKGROUND_RESULT_RETURNED", {
+    rid: req.rid, query: _entry.query, elapsedMs: _entry.elapsedMs,
+  });
+  return res.status(200).json({ ready: true, ..._entry });
+});
+
 app.post(
   ["/vision/analyze", "/api/vision/analyze"],
   visionLimiter,
@@ -21228,6 +21276,7 @@ app.post(
     // wall time is going — multer/upload vs pre-consensus work (embedding,
     // preprocess, sourceBudget) vs consensus vs post-consensus features.
     const _epT0 = Date.now();
+    console.log("SCAN_SLA_BUDGET_START", { rid: req.rid, slaMs: SCAN_FIRST_RESPONSE_SLA_MS, visionDeadlineMs: VISION_FIRST_QUERY_DEADLINE_MS, marketDeadlineMs: MARKET_FIRST_PAYLOAD_DEADLINE_MS, startedAt: _epT0 });
     let _epT1FileAccepted   = null;
     let _epT2PreConsensus   = null;
     let _epT3PostConsensus  = null;
@@ -21646,6 +21695,7 @@ if (!openai) {
                   file: preparedFile,
                   mode,
                   propContext,
+                  imageHash: originalHash || null,
                 }),
                 20000,
                 "vision_consensus_timeout"
@@ -29264,6 +29314,37 @@ app.post("/market/search/stream", async (req, res) => {
       return;
     }
 
+    // Phase 4H.5: SLA budget — market only gets remaining time after vision
+    const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
+    const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
+    const _slaMsRemaining  = _scanStartedAtMs ? Math.max(0, _scanSlaMs - (Date.now() - _scanStartedAtMs)) : null;
+
+    if (_slaMsRemaining !== null && _slaMsRemaining <= 800) {
+      console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
+        rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _scanSlaMs - _slaMsRemaining,
+      });
+      send("complete", {
+        items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
+      });
+      endStream();
+      return;
+    }
+
+    // Alias background result by scanId if imageHash mapping exists
+    const _imageHashFromReq = safeStr(req.body?.imageHash, 128) || null;
+    if (scanId && _imageHashFromReq) {
+      const _bgByHash = BACKGROUND_VISION_RESULTS.get(_imageHashFromReq);
+      if (_bgByHash) BACKGROUND_VISION_RESULTS.set(scanId, _bgByHash);
+    }
+
+    const _marketDeadlineMs = _slaMsRemaining !== null
+      ? Math.max(800, Math.min(_slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
+      : MARKET_FIRST_PAYLOAD_DEADLINE_MS;
+    console.log("MARKET_SLA_BUDGET", {
+      rid: req.rid, scanId, marketDeadlineMs: _marketDeadlineMs,
+      remainingMs: _slaMsRemaining, elapsedMs: _slaMsRemaining !== null ? (_scanSlaMs - _slaMsRemaining) : null,
+    });
+
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
     const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
     const variants      = normalizeVariantList([
@@ -29675,11 +29756,11 @@ app.post("/market/search/stream", async (req, res) => {
     const _t1 = Date.now();
     _recordStreamMetric("totalPhase1", 1);
 
-    // Phase 4H.3: hard cap — if no real provisional within 5s, terminate stream
+    // Phase 4H.5: dynamic deadline from SLA budget; Phase 4H.3 hard cap as fallback
     let firstPayloadSent = false;
     const marketDeadlineTimer = setTimeout(() => {
       if (!firstPayloadSent && !clientClosed && !res.writableEnded) {
-        console.log("MARKET_FIRST_PAYLOAD_DEADLINE_FIRED", { rid: req.rid, scanId, elapsedMs: Date.now() - _t1 });
+        console.log("MARKET_FIRST_PAYLOAD_DEADLINE_FIRED", { rid: req.rid, scanId, elapsedMs: Date.now() - _t1, deadlineMs: _marketDeadlineMs });
         send("complete", {
           items: [], status: "complete", enriching: false, dataDepth: "thin",
           reason: "market_first_payload_timeout",
@@ -29689,7 +29770,7 @@ app.post("/market/search/stream", async (req, res) => {
         });
         endStream();
       }
-    }, MARKET_FIRST_PAYLOAD_DEADLINE_MS);
+    }, _marketDeadlineMs);
 
     // Sold comps + local comps fire immediately — independent of marketplace results
     const _ebaySoldPromise   = serpEbaySold(query).catch(() => null);
@@ -29810,14 +29891,21 @@ app.post("/market/search/stream", async (req, res) => {
       itemCount: phase1Items.length, earlyCount: _earlyItems?.length ?? 0, phase1Ms: _phase1Ms,
     });
 
-    // ── Smart oracle decision (Phase 4) ──────────────────────────────────
-    // Phase 4H.3: skip oracle when identity is too weak to generate useful results
+    // ── Smart oracle decision (Phase 4H.5) ───────────────────────────────
+    // Oracle requires: usable query + identity quality ≥ 0.35.
+    // No oracle on generic queries — it fabricates comps for unknown items.
+    const _oracleQueryUsable     = isUsableVisionSeed(query);
     const _oracleIdentityQuality = computeIdentityQuality(visionIdentity || null, attributeCertainty || null);
-    if (_oracleIdentityQuality < 0.35) {
+    if (!_oracleQueryUsable) {
+      console.log("ORACLE_SKIPPED_GENERIC_QUERY", { rid: req.rid, scanId, query });
+    } else if (_oracleIdentityQuality < 0.35) {
       console.log("ORACLE_SKIPPED_LOW_IDENTITY", { rid: req.rid, scanId, identityQuality: _oracleIdentityQuality });
     }
     const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
-    const needsOracle = _oracleIdentityQuality < 0.35 ? false : _oracleDecision.invoke;
+    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35) ? false : _oracleDecision.invoke;
+    if (needsOracle) {
+      console.log("ORACLE_ALLOWED_STRONG_IDENTITY", { rid: req.rid, scanId, query, identityQuality: _oracleIdentityQuality });
+    }
     scanLog("oracle_decision", scanId, {
       invoke: needsOracle, reason: _oracleDecision.reason, factors: _oracleDecision.factors,
     });
@@ -29865,6 +29953,10 @@ app.post("/market/search/stream", async (req, res) => {
         scanId, firstPayloadSource: "stream_provisional",
         firstPayloadMs: Date.now() - _t0, phase1Ms: _phase1Ms,
         itemCount: _provItems.length,
+      });
+      console.log("SCAN_FIRST_RESPONSE_SLA_RESULT", {
+        rid: req.rid, scanId, firstVisibleMs: Date.now() - _t0,
+        resultType: "provisional", underSla: (Date.now() - _t0) <= SCAN_FIRST_RESPONSE_SLA_MS,
       });
       // Phase 4D: capture prediction snapshot from phase1 provisional so it is
       // recorded even when the client disconnects before the complete event.
