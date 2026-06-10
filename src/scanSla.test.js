@@ -113,3 +113,74 @@ test("background master: stores usable aircraft query", () => {
   assert.equal(isUsableVisionSeed("Nike Air Jordan 1 Low OG Bred"), true,
     "background master must store valid sneaker identity");
 });
+
+// ── Phase 4H.6: Background recovery endpoint + aircraft query completeness ───
+
+// Mirror the aircraft family + airline detection logic used by the background store.
+const AIRCRAFT_FAMILY_MATCH_TEST = [
+  { family: "787",      tokens: ["787 9", "787", "dreamliner", "boeing 787"] },
+  { family: "777",      tokens: ["777", "boeing 777"] },
+  { family: "747",      tokens: ["747", "jumbo jet", "boeing 747"] },
+  { family: "a380",     tokens: ["a380", "airbus a380"] },
+  { family: "a330",     tokens: ["a330", "airbus a330"] },
+  { family: "a321",     tokens: ["a321neo", "a321", "airbus a321"] },
+];
+const AIRLINE_KEYWORDS = ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "ana", "jal", "emirates"];
+
+function normalizeQ(t) {
+  return String(t).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+function bgHasFamily(q) {
+  const n = normalizeQ(q);
+  return AIRCRAFT_FAMILY_MATCH_TEST.some(({ tokens }) => tokens.some((tok) => n.includes(tok)));
+}
+function bgHasAirline(q) {
+  const n = normalizeQ(q);
+  return AIRLINE_KEYWORDS.some((kw) => (` ${n} `).includes(` ${kw} `));
+}
+function bgRecoverFamilyFromVariants(mainQuery, variants) {
+  if (!bgHasAirline(mainQuery) || bgHasFamily(mainQuery)) return mainQuery;
+  const hit = variants.find((v) => bgHasFamily(v));
+  return hit || null;
+}
+
+test("aircraft background query: detects incomplete airline-only query", () => {
+  assert.equal(bgHasAirline("Hawaiian Airlines diecast model airplane"), true, "should detect airline");
+  assert.equal(bgHasFamily("Hawaiian Airlines diecast model airplane"), false, "should be missing family");
+});
+
+test("aircraft background query: detects complete airline+family query", () => {
+  assert.equal(bgHasAirline("Hawaiian Airlines Boeing 787-9 diecast model airplane"), true);
+  assert.equal(bgHasFamily("Hawaiian Airlines Boeing 787-9 diecast model airplane"), true);
+});
+
+test("aircraft background query: recovers family from variant", () => {
+  const main = "Hawaiian Airlines diecast model airplane";
+  const variants = ["Hawaiian Airlines 1:400 diecast", "Hawaiian Airlines Boeing 787 diecast model airplane"];
+  const recovered = bgRecoverFamilyFromVariants(main, variants);
+  assert.ok(recovered, "should recover a variant with family");
+  assert.equal(bgHasFamily(recovered), true, "recovered variant must have family token");
+});
+
+test("aircraft background query: returns null when no variant has family", () => {
+  const main = "Hawaiian Airlines diecast model airplane";
+  const variants = ["Hawaiian Airlines 1:400 collectible", "Hawaiian Airlines airplane toy"];
+  const recovered = bgRecoverFamilyFromVariants(main, variants);
+  assert.equal(recovered, null, "no family in any variant → null, needsFamilyRecovery=true");
+});
+
+test("aircraft background query: skips recovery when family already present", () => {
+  const main = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const variants = ["some other query"];
+  const recovered = bgRecoverFamilyFromVariants(main, variants);
+  assert.equal(recovered, main, "family already present → main query returned unchanged");
+});
+
+test("hard-fail response includes imageHash: isUsableVisionSeed gates background store", () => {
+  // The gate before storing a background result is isUsableVisionSeed.
+  // A real aircraft query without family should still pass the seed gate.
+  assert.equal(isUsableVisionSeed("Hawaiian Airlines diecast model airplane"), true,
+    "airline-only aircraft query is usable seed — gets stored and can trigger family recovery");
+  assert.equal(isUsableVisionSeed("model airplane"), false,
+    "generic 2-word query must not reach background store");
+});

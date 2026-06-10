@@ -19755,6 +19755,40 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     // unref so a pending deadline timer can't block process exit during tests.
     if (typeof visualDeadlineTimer.unref === "function") visualDeadlineTimer.unref();
 
+    // Phase 4H.6: Hard-deadline timer is created HERE — before the await new Promise —
+    // so it starts as close to passT0 as possible (minimises event-loop drift).
+    // The remaining budget accounts for time already spent on promise setup above.
+    const _deadlineSetAtMs = Date.now() - passT0;
+    const _hardDeadlineRemainingMs = VISION_MASTER_BLOCKS_FIRST_RESULT
+      ? null
+      : Math.max(200, VISION_BAD_SCAN_HARD_FAIL_MS - _deadlineSetAtMs);
+    console.log("VISION_FIRST_QUERY_DEADLINE_START", {
+      rid: req.rid, hardMs: VISION_BAD_SCAN_HARD_FAIL_MS,
+      remainingMs: _hardDeadlineRemainingMs,
+      setAtMs: _deadlineSetAtMs,
+      masterBlocks: VISION_MASTER_BLOCKS_FIRST_RESULT,
+    });
+    // Pre-create the deadline promise outside the await so the timer starts immediately.
+    const _hardDeadlineP = _hardDeadlineRemainingMs !== null
+      ? new Promise((res) => {
+          const t = setTimeout(() => {
+            const _actualFireMs = Date.now() - passT0;
+            const _driftMs = _actualFireMs - VISION_BAD_SCAN_HARD_FAIL_MS;
+            if (Math.abs(_driftMs) > 200) {
+              console.log("VISION_DEADLINE_TIMER_DRIFT", {
+                rid: req.rid,
+                expectedMs: VISION_BAD_SCAN_HARD_FAIL_MS,
+                actualMs: _actualFireMs,
+                driftMs: _driftMs,
+                setAtMs: _deadlineSetAtMs,
+              });
+            }
+            res();
+          }, _hardDeadlineRemainingMs);
+          if (typeof t.unref === "function") t.unref();
+        })
+      : null;
+
     // ── Race-aware wait ────────────────────────────────────────────────────
     // Resolve immediately when fast is acceptable OR visual_shape clears the
     // master-skip threshold. Falls through to Promise.all(fast, visual) when
@@ -19845,22 +19879,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         // doesn't hang indefinitely waiting for a launch that never came.
         setTimeout(() => { launchMasterNow(); tryResolve(); }, VISUAL_SHAPE_TIMEOUT_MS).unref?.();
       });
-      // Phase 4H.2: Hard first-result deadline. When VISION_MASTER_BLOCKS_FIRST_RESULT=false
-      // (default), fire "hard_deadline" if master hasn't returned by VISION_BAD_SCAN_HARD_FAIL_MS.
-      // Master keeps running in background and logs VISION_MASTER_BACKGROUND_COMPLETED when done.
-      const _hardDeadlineRemainingMs = VISION_MASTER_BLOCKS_FIRST_RESULT
-        ? null
-        : Math.max(200, VISION_BAD_SCAN_HARD_FAIL_MS - (Date.now() - passT0));
-      console.log("VISION_FIRST_QUERY_DEADLINE_START", {
-        rid: req.rid, hardMs: VISION_BAD_SCAN_HARD_FAIL_MS,
-        remainingMs: _hardDeadlineRemainingMs,
-        masterBlocks: VISION_MASTER_BLOCKS_FIRST_RESULT,
-      });
-      if (_hardDeadlineRemainingMs !== null) {
-        const _hardDeadlineP = new Promise((res) => {
-          const t = setTimeout(() => res(), _hardDeadlineRemainingMs);
-          if (typeof t.unref === "function") t.unref();
-        });
+      if (_hardDeadlineP !== null) {
         Promise.race([
           Promise.all([masterPromise, visualSettleOrDeadline]).then(() => "master_consensus"),
           _hardDeadlineP.then(() => "hard_deadline"),
@@ -20204,19 +20223,61 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           console.log("VISION_MASTER_BACKGROUND_COMPLETED", {
             rid: req.rid, query: _bgQuery, confidence: m?.parsed?.confidence ?? null, elapsedMs: _bgElapsedMs,
           });
-          // Phase 4H.5: store usable background identity for frontend salvage polling
+          // Phase 4H.5/4H.6: store usable background identity for frontend salvage polling.
+          // Aircraft queries: if airline is present but no family, try to recover family
+          // from variants before storing. If unrecoverable, mark needsFamilyRecovery.
           if (isUsableVisionSeed(_bgQuery) && imageHash) {
+            const _bgVariants  = Array.isArray(m?.parsed?.variants) ? m.parsed.variants : [];
+            const _bgCategory  = String(m?.parsed?.identity?.category || "") || null;
+            let _storedQuery   = _bgQuery;
+            let _needsFamily   = false;
+
+            const _bgQNorm = normalizeTitleKey(_bgQuery || "");
+            const _bgHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => _bgQNorm.includes(tok)));
+            const _bgAirlineLock = detectAirlineLockInQuery(_bgQNorm);
+            if (_bgAirlineLock && !_bgHasFamily) {
+              console.log("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE", {
+                rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.airline || null,
+              });
+              // Try to recover family from variants
+              let _recoveredQuery = null;
+              for (const v of _bgVariants) {
+                const vNorm = normalizeTitleKey(v);
+                const vHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => vNorm.includes(tok)));
+                if (vHasFamily) {
+                  _recoveredQuery = v;
+                  break;
+                }
+              }
+              if (_recoveredQuery) {
+                _storedQuery = _recoveredQuery;
+                console.log("AIRCRAFT_BACKGROUND_QUERY_FAMILY_RECOVERED", {
+                  rid: req.rid, original: _bgQuery, recovered: _storedQuery,
+                });
+              } else {
+                _needsFamily = true;
+                console.log("AIRCRAFT_BACKGROUND_QUERY_NEEDS_FAMILY_RECOVERY", {
+                  rid: req.rid, query: _bgQuery,
+                });
+              }
+            }
+
             const _bgEntry = {
-              query: _bgQuery,
-              variants:       Array.isArray(m?.parsed?.variants)          ? m.parsed.variants        : [],
-              confidence:     Number(m?.parsed?.confidence               || 0.7),
-              visionIdentity: m?.parsed?.identity                         || null,
-              category:       String(m?.parsed?.identity?.category || "") || null,
-              completedAt:    Date.now(),
-              elapsedMs:      _bgElapsedMs,
+              query:              _storedQuery,
+              variants:           _bgVariants,
+              confidence:         Number(m?.parsed?.confidence || 0.7),
+              visionIdentity:     m?.parsed?.identity || null,
+              category:           _bgCategory,
+              completedAt:        Date.now(),
+              elapsedMs:          _bgElapsedMs,
+              needsFamilyRecovery: _needsFamily || undefined,
             };
             BACKGROUND_VISION_RESULTS.set(imageHash, _bgEntry);
-            console.log("VISION_BACKGROUND_RESULT_STORED", { rid: req.rid, imageHash, query: _bgQuery, elapsedMs: _bgElapsedMs });
+            console.log("VISION_BACKGROUND_RESULT_STORED", {
+              rid: req.rid, imageHash, query: _storedQuery,
+              originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
+              elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
+            });
           } else if (_bgQuery) {
             console.log("VISION_BACKGROUND_RESULT_REJECTED_GENERIC", { rid: req.rid, imageHash, query: _bgQuery });
           }
@@ -20406,17 +20467,24 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               fastUsable: _fastUsable, visualUsable: _visualUsable, hasUsableSeed: _hasUsableSeed,
             });
             if (!_hasUsableSeed) {
+              const _hfWallMs = Date.now() - passT0;
               console.log("VISION_HARD_FAIL_NO_SEED_ABORTING_MARKET", {
                 rid: req.rid, fastQ: _fastQ, visualQ: _visualQ,
+              });
+              console.log("VISION_HARD_FAIL_RESPONSE_WITH_IMAGE_HASH", {
+                rid: req.rid, imageHash: imageHash || null,
+                wallMs: _hfWallMs, deadlineMs: VISION_BAD_SCAN_HARD_FAIL_MS,
+                driftMs: _hfWallMs - VISION_BAD_SCAN_HARD_FAIL_MS,
               });
               return {
                 ok: false,
                 query: null,
                 confidence: 0,
+                imageHash: imageHash || null,
                 visionTier: "hard_fail_no_seed",
                 visionTimings: {
                   fastMs, visualMs, masterMs: null,
-                  visionWallMs: Date.now() - passT0,
+                  visionWallMs: _hfWallMs,
                   raceWinner: "hard_deadline",
                   masterLaunched: true,
                   tier: "hard_fail_no_seed",
@@ -21242,16 +21310,23 @@ app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
   });
 });
 
-// Phase 4H.5: Background master salvage endpoint. Client polls after hard_fail_no_seed
+// Phase 4H.6: Background master salvage endpoint. Client polls after hard_fail_no_seed.
+// No requireProductAccess — the result is short-lived (TTL 60s), keyed by imageHash/scanId,
+// and contains no user-specific data. Stripping auth allows guest scan sessions to poll.
 // to see if master eventually identified the item. Keyed by imageHash or scanId.
-app.get("/api/vision/background-result", requireProductAccess, async (req, res) => {
+app.get("/api/vision/background-result", async (req, res) => {
   const _scanId    = safeStr(req.query?.scanId,    64)  || null;
   const _imageHash = safeStr(req.query?.imageHash, 128) || null;
+  // Require at least one lookup key — no broad listing allowed.
+  if (!_scanId && !_imageHash) {
+    return res.status(400).json({ ok: false, error: "missing_key" });
+  }
   let _entry = null;
   if (_scanId)    _entry = BACKGROUND_VISION_RESULTS.get(_scanId);
   if (!_entry && _imageHash) _entry = BACKGROUND_VISION_RESULTS.get(_imageHash);
   console.log("VISION_BACKGROUND_RESULT_POLLED", {
     rid: req.rid, scanId: _scanId, imageHash: _imageHash, found: !!_entry,
+    userId: getResolvedUserId(req) || null,
   });
   if (!_entry) return res.status(200).json({ ready: false });
   // Lazy TTL eviction
@@ -22090,6 +22165,13 @@ if (!openai) {
           hardDeadlineFired: shaped?.visionTimings?.raceWinner === "hard_deadline",
           selectedPass: shaped?.visionTier ?? null,
         });
+        if (shaped?.visionTier === "hard_fail_no_seed" || shaped?.visionTier === "rejected_generic") {
+          console.log("VISION_HARD_FAIL_RESPONSE_WITH_IMAGE_HASH", {
+            rid: req.rid, visionTier: shaped.visionTier,
+            imageHash: originalHash || null,
+            totalMs: _ep.totalMs,
+          });
+        }
         // VISION_CRITICAL_PATH_TIMING — compact single-line breakdown for future audits.
         // Captures the full wall budget from upload to response with pass-level detail.
         try {
