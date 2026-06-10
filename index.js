@@ -463,6 +463,7 @@ import { buildFakeListingDetectorPayload, scoreFakeListingRisk, scanMarketForFak
 import { buildSeasonalFlipCalendarPayload, computeFlipTiming, getBuySellWindows, getUpcomingDemandEvents } from "./src/seasonalFlipCalendar.js";
 import { buildBrandTierPayload, resolveBrandTier, detectBrandPriceMismatch, findTierAlternatives } from "./src/brandTierClassifier.js";
 import { buildSmartPriceTargetPayload, buildPriceTargets, computeMaxBuyPrice, computeOptimalSellPrice } from "./src/smartPriceTargetEngine.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed } from "./src/queryGuards.js";
 import { buildListingQualityScorerPayload, scoreListingQuality } from "./src/listingQualityScorer.js";
 import { buildMarketMomentumPayload, computePriceMomentum, detectPriceConvergence, computeSellThroughVelocity } from "./src/marketMomentumTracker.js";
 import { buildFlipScorePayload, computeFlipScore } from "./src/flipScoreEngine.js";
@@ -3809,25 +3810,7 @@ function rememberGoodQuery(_q) {
   return;
 }
 
-function isGarbageQuery(q) {
-  const s = String(q || "").trim().toLowerCase();
-  if (!s) return true;
-
-  const junk = new Set([
-    "item",
-    "object",
-    "product",
-    "thing",
-    "stuff",
-    "consumer product",
-    "unknown",
-    "misc",
-    "misc item",
-    "general item",
-  ]);
-
-  return junk.has(s);
-}
+// isGarbageQuery and isGenericGarbageQuery are imported from ./src/queryGuards.js
 
 // Phase A2.6: Checks if a query is usable as a seed for vision recovery.
 // Stricter than just "not garbage" — requires at least 3 words and a letter.
@@ -5782,6 +5765,7 @@ function _recordStreamMetric(key, value) {
 const ENRICHED_SCAN_CACHE        = new TTLCache({ ttlMs: 5 * 60 * 1000, maxSize: 800 });
 const STREAM_PHASE1_INFLIGHT     = new Map(); // cacheKey → Promise<items[]>
 const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than this many marketplace items
+const MARKET_FIRST_PAYLOAD_DEADLINE_MS = Number(process.env.MARKET_FIRST_PAYLOAD_DEADLINE_MS || 5000);
 // Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
 // Was 8s — that's the entire user-perceived latency on degraded scans where
 // every external auth is dead. The buyOrPass engine now produces an honest
@@ -20386,6 +20370,37 @@ async function runVisionConsensus({ req, file, mode, propContext }) {
           passes = [];
           passLabels = [];
           visionTier = "hard_deadline_fail";
+          // Phase 4H.4: hard deadline + no usable seed → fail fast, never build garbage query
+          {
+            const _fastQ   = fastResult?.parsed?.query?.trim() || null;
+            const _visualQ = visualResult?.parsed?.query?.trim() || null;
+            const _fastUsable   = isUsableVisionSeed(_fastQ);
+            const _visualUsable = isUsableVisionSeed(_visualQ);
+            const _hasUsableSeed = _fastUsable || _visualUsable;
+            console.log("VISION_USABLE_SEED_CHECK", {
+              rid: req.rid, fastQ: _fastQ, visualQ: _visualQ,
+              fastUsable: _fastUsable, visualUsable: _visualUsable, hasUsableSeed: _hasUsableSeed,
+            });
+            if (!_hasUsableSeed) {
+              console.log("VISION_HARD_FAIL_NO_SEED_ABORTING_MARKET", {
+                rid: req.rid, fastQ: _fastQ, visualQ: _visualQ,
+              });
+              return {
+                ok: false,
+                query: null,
+                confidence: 0,
+                visionTier: "hard_fail_no_seed",
+                visionTimings: {
+                  fastMs, visualMs, masterMs: null,
+                  visionWallMs: Date.now() - passT0,
+                  raceWinner: "hard_deadline",
+                  masterLaunched: true,
+                  tier: "hard_fail_no_seed",
+                },
+                error: "INSUFFICIENT_IDENTITY",
+              };
+            }
+          }
         } else if (_isItemPropMode) {
           const _elapsedMs   = Date.now() - passT0;
           const _remainingMs = Math.max(200, ITEM_VISION_HARD_RETURN_MS - _elapsedMs);
@@ -20906,11 +20921,24 @@ if (
       rid:      req.rid,
       pass:     visionTier,
       query,
-      accepted: !!query && !isGarbageQuery(query),
-      reason:   !query         ? "null_query"
-              : isGarbageQuery(query) ? "garbage_query"
+      accepted: !!query && !isGarbageQuery(query) && !isGenericGarbageQuery(query),
+      reason:   !query                    ? "null_query"
+              : isGarbageQuery(query)     ? "garbage_query"
+              : isGenericGarbageQuery(query) ? "generic_query"
               : "accepted",
     });
+
+    // Phase 4H.3: enforce generic query rejection — don't let garbage seeds reach market
+    if (isGenericGarbageQuery(query)) {
+      console.log("VISION_QUERY_REJECTED_GENERIC", { rid: req.rid, query });
+      return {
+        ok: false,
+        query: null,
+        confidence: 0,
+        visionTier: "rejected_generic",
+        error: "GENERIC_QUERY",
+      };
+    }
 
     return {
       ok: true,
@@ -27996,6 +28024,17 @@ if (isGenericVisionQuery(query)) {
   }
 }
 
+// Phase 4H.4: post-recovery gate — block even after identity recovery if still generic
+if (isGenericGarbageQuery(query)) {
+  console.warn("MARKET_QUERY_REJECTED_GENERIC_BEFORE_SEARCH", {
+    route: req.path, query, reason: "recovery_produced_generic_query",
+  });
+  return res.status(200).json({
+    ok: false, error: "scan_too_vague", query, blocked: "generic_query_post_recovery",
+    items: [], metaItems: [],
+  });
+}
+
 const visualMatchQueries = extractVisualMatchQueries(req.body?.visualMatches);
 
 // Feature 11: size/variant hint
@@ -29212,6 +29251,19 @@ app.post("/market/search/stream", async (req, res) => {
 
     if (!query) { send("error", { code: "NO_QUERY" }); endStream(); return; }
 
+    // Phase 4H.4: post-recovery gate — block even after identity recovery if still generic
+    if (isGenericGarbageQuery(query)) {
+      console.warn("MARKET_QUERY_REJECTED_GENERIC_BEFORE_SEARCH", {
+        route: req.path, query, reason: "recovery_produced_generic_query",
+      });
+      send("complete", {
+        items: [], reason: "market_first_payload_timeout", displayMode: "rescan_needed", trust: "none",
+        blocked: "generic_query_post_recovery",
+      });
+      endStream();
+      return;
+    }
+
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
     const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
     const variants      = normalizeVariantList([
@@ -29623,6 +29675,22 @@ app.post("/market/search/stream", async (req, res) => {
     const _t1 = Date.now();
     _recordStreamMetric("totalPhase1", 1);
 
+    // Phase 4H.3: hard cap — if no real provisional within 5s, terminate stream
+    let firstPayloadSent = false;
+    const marketDeadlineTimer = setTimeout(() => {
+      if (!firstPayloadSent && !clientClosed && !res.writableEnded) {
+        console.log("MARKET_FIRST_PAYLOAD_DEADLINE_FIRED", { rid: req.rid, scanId, elapsedMs: Date.now() - _t1 });
+        send("complete", {
+          items: [], status: "complete", enriching: false, dataDepth: "thin",
+          reason: "market_first_payload_timeout",
+          displayMode: "rescan_needed",
+          trust: "none",
+          _timing: { phase1Ms: Date.now() - _t1 },
+        });
+        endStream();
+      }
+    }, MARKET_FIRST_PAYLOAD_DEADLINE_MS);
+
     // Sold comps + local comps fire immediately — independent of marketplace results
     const _ebaySoldPromise   = serpEbaySold(query).catch(() => null);
     const _localCompsPromise = userLocation
@@ -29638,6 +29706,8 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _onEarlyItems = async (earlyRaw) => {
       if (clientClosed || _earlyProvSent) return;
+      firstPayloadSent = true;
+      clearTimeout(marketDeadlineTimer);
       const _earlyFiltered = applyPrePayloadAircraftFilter(query, assignItemIds(earlyRaw), scannedPrice, "fast_provisional");
       _earlyItems    = _earlyFiltered;
       _earlyProvSent = true;
@@ -29741,8 +29811,13 @@ app.post("/market/search/stream", async (req, res) => {
     });
 
     // ── Smart oracle decision (Phase 4) ──────────────────────────────────
+    // Phase 4H.3: skip oracle when identity is too weak to generate useful results
+    const _oracleIdentityQuality = computeIdentityQuality(visionIdentity || null, attributeCertainty || null);
+    if (_oracleIdentityQuality < 0.35) {
+      console.log("ORACLE_SKIPPED_LOW_IDENTITY", { rid: req.rid, scanId, identityQuality: _oracleIdentityQuality });
+    }
     const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
-    const needsOracle = _oracleDecision.invoke;
+    const needsOracle = _oracleIdentityQuality < 0.35 ? false : _oracleDecision.invoke;
     scanLog("oracle_decision", scanId, {
       invoke: needsOracle, reason: _oracleDecision.reason, factors: _oracleDecision.factors,
     });
@@ -29755,6 +29830,8 @@ app.post("/market/search/stream", async (req, res) => {
 
     // ── Send provisional from full phase1Items if early provisional not yet sent ─
     if (!_earlyProvSent && phase1Items.length >= 2 && !clientClosed) {
+      firstPayloadSent = true;
+      clearTimeout(marketDeadlineTimer);
       _recordStreamMetric("provisionalSent", 1);
       const _tProvBuild = Date.now();
       const _provItems = applyPrePayloadAircraftFilter(query, phase1Items, scannedPrice, "provisional");
