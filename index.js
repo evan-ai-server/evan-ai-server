@@ -5771,6 +5771,8 @@ const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than t
 // Phase 4H.5: default is now 1700ms (5000ms SLA - 3300ms vision = 1700ms for market).
 // Dynamic deadline is computed per-request from scanStartedAtMs when provided by client.
 const MARKET_FIRST_PAYLOAD_DEADLINE_MS = Number(process.env.MARKET_FIRST_PAYLOAD_DEADLINE_MS || 1700);
+// Background recovery calls have no real-time SLA pressure — give market 6s to find results.
+const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = Number(process.env.MARKET_BACKGROUND_RECOVERY_DEADLINE_MS || 6000);
 // In-memory store for background master identity results (imageHash/scanId → result).
 const BACKGROUND_VISION_RESULTS = new Map(); // key → {query,variants,confidence,visionIdentity,category,completedAt,elapsedMs}
 // Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
@@ -29427,7 +29429,10 @@ app.post("/market/search/stream", async (req, res) => {
       return;
     }
 
-    // Phase 4H.5: SLA budget — market only gets remaining time after vision
+    // Phase 4H.5/4H.7: SLA budget — market only gets remaining time after vision.
+    // isBackgroundRecovery=true means the call came from background master salvage, not
+    // a real-time scan — no SLA pressure, so we give it a generous deadline.
+    const _isBackgroundRecovery = req.body?.isBackgroundRecovery === true;
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
     const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
     const _slaMsRemaining  = _scanStartedAtMs ? Math.max(0, _scanSlaMs - (Date.now() - _scanStartedAtMs)) : null;
@@ -29452,10 +29457,13 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _marketDeadlineMs = _slaMsRemaining !== null
       ? Math.max(800, Math.min(_slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
-      : MARKET_FIRST_PAYLOAD_DEADLINE_MS;
+      : _isBackgroundRecovery
+        ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS   // 6s — no real-time pressure
+        : MARKET_FIRST_PAYLOAD_DEADLINE_MS;         // 1.7s — normal real-time scan
     console.log("MARKET_SLA_BUDGET", {
       rid: req.rid, scanId, marketDeadlineMs: _marketDeadlineMs,
       remainingMs: _slaMsRemaining, elapsedMs: _slaMsRemaining !== null ? (_scanSlaMs - _slaMsRemaining) : null,
+      isBackgroundRecovery: _isBackgroundRecovery,
     });
 
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
