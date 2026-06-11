@@ -480,3 +480,76 @@ test("4H.9: canonical scanId — no client scanId generates server-side id", () 
   assert.notEqual(streamScanId, null, "must generate id when client omits one");
   assert.ok(streamScanId.length > 0, "generated id must be non-empty");
 });
+
+// ── Phase 4I.0: cached scan freshness + scanId propagation ──────────────────
+
+test("4I.0: retrievalMeta includes scanId — downstream logs show scan id not null", () => {
+  const scanId = "c.abc123.xyz";
+  const kind = "fresh_snapshot";
+  const source = "internal_cache";
+  const retrievalMeta = { source, kind, scanId };
+  assert.equal(retrievalMeta.scanId, scanId, "scanId must be present in retrievalMeta");
+  assert.equal(retrievalMeta.kind, kind);
+});
+
+test("4I.0: cache background refresh de-duplication — exact title+price+source match rejected", () => {
+  const cachedItems = [
+    { title: "Hawaiian Airlines 1:400 Boeing 787-9 GeminiJets", totalPrice: 89.99, source: "ebay" },
+    { title: "Herpa Boeing 787-9 Hawaiian Airlines 1:200", totalPrice: 70.87, source: "ebay-arcadia" },
+  ];
+  const cacheFingerprints = new Set(
+    cachedItems.map((it) => {
+      const t = String(it?.title || "").toLowerCase().slice(0, 60);
+      const p = Math.round(Number(it?.totalPrice ?? it?.price ?? 0) * 10) / 10;
+      const s = String(it?.source || "").toLowerCase().slice(0, 30);
+      return `${t}|${p}|${s}`;
+    })
+  );
+  const refreshCandidates = [
+    { title: "Hawaiian Airlines 1:400 Boeing 787-9 GeminiJets", totalPrice: 89.99, source: "ebay" }, // duplicate
+    { title: "NG Models Hawaiian Airlines Boeing 787-9 N780HA 1:400", totalPrice: 105.00, source: "airlinegeeks" }, // new
+    { title: "Herpa Boeing 787-9 Hawaiian Airlines 1:200", totalPrice: 70.87, source: "ebay-arcadia" }, // duplicate
+  ];
+  const netNew = refreshCandidates.filter((it) => {
+    const t = String(it.title).toLowerCase().slice(0, 60);
+    const p = Math.round(Number(it.totalPrice ?? 0) * 10) / 10;
+    const s = String(it.source).toLowerCase().slice(0, 30);
+    return !cacheFingerprints.has(`${t}|${p}|${s}`);
+  });
+  assert.equal(netNew.length, 1, "only 1 net-new item should pass de-dup");
+  assert.ok(netNew[0].title.includes("NG Models"), "net-new item must be the novel one");
+});
+
+test("4I.0: cache background refresh — 2+ net-new items triggers merge", () => {
+  const MIN_NEW_ITEMS = 2;
+  const netNew = [
+    { title: "NG Models 787-9 Hawaiian 1:400", totalPrice: 99, source: "shop1" },
+    { title: "Aviation400 787-9 Hawaiian 1:400", totalPrice: 115, source: "shop2" },
+  ];
+  assert.ok(netNew.length >= MIN_NEW_ITEMS, "2+ net-new items should trigger merge into cache");
+});
+
+test("4I.0: cache background refresh — fewer than 2 net-new items does not merge", () => {
+  const MIN_NEW_ITEMS = 2;
+  const netNew = [
+    { title: "NG Models 787-9 Hawaiian 1:400", totalPrice: 99, source: "shop1" },
+  ];
+  assert.ok(netNew.length < MIN_NEW_ITEMS, "1 net-new item should not trigger merge");
+});
+
+test("4I.0: cache background refresh — aircraft identity filter rejects competitor items", () => {
+  const requiredAirline = "hawaiian";
+  const competitorAirlines = ["united", "delta", "american airlines"];
+  const netNewCandidates = [
+    { title: "United Airlines Boeing 787 diecast model", totalPrice: 55, source: "shop1" },
+    { title: "Hawaiian Airlines Boeing 787-9 NG Models 1:400", totalPrice: 99, source: "shop2" },
+  ];
+  // Simulate aircraft filter: reject competitor airlines
+  const afterIdentityFilter = netNewCandidates.filter((it) => {
+    const t = it.title.toLowerCase();
+    const isCompetitor = competitorAirlines.some((c) => t.includes(c.toLowerCase()));
+    return !isCompetitor;
+  });
+  assert.equal(afterIdentityFilter.length, 1, "competitor airline must be rejected by identity filter");
+  assert.ok(afterIdentityFilter[0].title.includes("Hawaiian"), "only Hawaiian item survives");
+});

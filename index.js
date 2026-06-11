@@ -29678,12 +29678,13 @@ app.post("/market/search/stream", async (req, res) => {
         kind === "stale_snapshot";
 
       const _t_buildResp = Date.now();
+      console.log("CACHE_SCANID_PROPAGATED", { rid: req.rid, scanId, kind, source });
       const payload = await buildMarketSearchResponsePayload({
         query, searchedQueries, variants, items, scannedPrice,
         visionConfidence: cv2, category, visionIdentity,
         authenticityFlags: _authFlags, conditionFlags: _condFlags,
         categoryPrior:    _categoryPrior,
-        retrievalMeta: { source, kind },
+        retrievalMeta: { source, kind, scanId },
         persistSnapshot: !isOracleOnly,
         lite:             _isLite || deferEnrichments,
         identitySummaryFromRoute,
@@ -29889,36 +29890,136 @@ app.post("/market/search/stream", async (req, res) => {
         if (_internalReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "internal", query, kind: internalHit.kind });
-          const [payload, ebaySold, localC] = await Promise.all([
+
+          // Phase 4I: send cache as provisional immediately, then background-refresh
+          // for 2+ net-new items. Frontend sees cached results in ~200ms; if the
+          // refresh finds new listings they arrive in the complete event 3-6s later.
+          const [_cachePayload, ebaySold, localC] = await Promise.all([
             _buildPayload(_internalItems, { source: internalHit.source, kind: internalHit.kind }),
             serpEbaySold(query).catch(() => null),
             userLocation ? serpLocalShopping(query, userLocation).catch(() => null) : Promise.resolve(null),
           ]);
-          if (ebaySold) payload.ebaySoldComps = ebaySold;
-          if (localC)   payload.localComps    = localC;
+          if (ebaySold) _cachePayload.ebaySoldComps = ebaySold;
+          if (localC)   _cachePayload.localComps    = localC;
           ENRICHED_SCAN_CACHE.set(cacheKey, { items: _internalItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
-          const _totalMs = Date.now() - _t0;
+
           const _cacheVerdict =
-            normalizeVerdict(payload?.buyOrPass?.verdict) ||
-            normalizeVerdict(payload?.profitIntel?.verdict) ||
+            normalizeVerdict(_cachePayload?.buyOrPass?.verdict) ||
+            normalizeVerdict(_cachePayload?.profitIntel?.verdict) ||
             "HOLD";
-          try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "complete", count: (payload?.items||[]).length, top5: (payload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
-          // ── Phase 2C.8: mark cacheHit + populate cross-route cache ────────
+
           try {
             const _ctxCache = getCurrentSerpBudgetCtx();
             if (_ctxCache) {
               _ctxCache.cacheHit = true;
-              _ctxCache._finalItemCount = Array.isArray(payload?.items) ? payload.items.length : null;
-              setMarketScanResult(_ctxCache, { payload, route: "/market/search/stream", layer: "internal" });
+              _ctxCache._finalItemCount = Array.isArray(_cachePayload?.items) ? _cachePayload.items.length : null;
+              setMarketScanResult(_ctxCache, { payload: _cachePayload, route: "/market/search/stream", layer: "internal" });
             }
           } catch {}
-          send("complete", {
-            ...payload,
-            verdict: _cacheVerdict,   // canonical-only top-level verdict
-            status: "complete", enriching: false,
-            dataDepth: _internalItems.length < 3 ? "thin" : "normal",
-            _timing: { totalMs: _totalMs }, _scanTotalMs: _totalMs,
+
+          // Emit provisional so the frontend shows cached items immediately.
+          send("provisional", {
+            ..._cachePayload,
+            verdict: _cacheVerdict,
+            status: "provisional", enriching: true, source: "cache",
+            _timing: { totalMs: Date.now() - _t0 },
           });
+          console.log("CACHE_FIRST_PAYLOAD_RETURNED", {
+            rid: req.rid, scanId, query,
+            itemCount: (_cachePayload?.items || []).length, kind: internalHit.kind,
+          });
+          try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "provisional", count: (_cachePayload?.items||[]).length, top5: (_cachePayload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+
+          // Build fingerprint set of cached items for de-dup.
+          const _cacheFingerprints = new Set(
+            _internalItems.map((it) => {
+              const t = String(it?.title || "").toLowerCase().slice(0, 60);
+              const p = Math.round(Number(it?.totalPrice ?? it?.price ?? 0) * 10) / 10;
+              const s = String(it?.source || "").toLowerCase().slice(0, 30);
+              return `${t}|${p}|${s}`;
+            })
+          );
+
+          // Background refresh: non-blocking SerpAPI call, no SLA pressure.
+          console.log("CACHE_BACKGROUND_REFRESH_STARTED", {
+            rid: req.rid, scanId, query, cachedCount: _internalItems.length,
+          });
+          let _refreshRaw = [];
+          try {
+            _refreshRaw = await mergeCheapestSources(query, variants, visionIdentity, {
+              skipOracle: true,
+              phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+            });
+          } catch (_re) {
+            console.warn("CACHE_BACKGROUND_REFRESH_ERROR", { rid: req.rid, scanId, error: _re?.message });
+          }
+
+          // De-dupe: reject anything whose title+price+source fingerprint is already cached.
+          const _dedupedNew = (_refreshRaw || []).filter((it) => {
+            if (!it?.title) return false;
+            const t = String(it.title).toLowerCase().slice(0, 60);
+            const p = Math.round(Number(it?.totalPrice ?? it?.price ?? 0) * 10) / 10;
+            const s = String(it?.source || "").toLowerCase().slice(0, 30);
+            return !_cacheFingerprints.has(`${t}|${p}|${s}`);
+          });
+          const _rejectedDupes = (_refreshRaw || []).length - _dedupedNew.length;
+          if (_rejectedDupes > 0) {
+            console.log("CACHE_BACKGROUND_REFRESH_REJECTED_DUPES", {
+              rid: req.rid, scanId, query, rejectedCount: _rejectedDupes,
+            });
+          }
+
+          // Run identity/aircraft filter on net-new candidates.
+          const _filteredNew = applyPrePayloadAircraftFilter(query, assignItemIds(_dedupedNew), scannedPrice, "cache_refresh");
+          const _netNew = _filteredNew.filter((it) => it?.title);
+
+          if (_netNew.length >= 2) {
+            const _mergedItems = assignItemIds([..._internalItems, ..._netNew]).slice(0, 24);
+            // Update internal cache with merged items so next scan benefits.
+            INSTANT_SCAN_CACHE.set(cacheKey, packMarketItemsWithIdentity(_mergedItems, null));
+            ENRICHED_SCAN_CACHE.set(cacheKey, { items: _mergedItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
+
+            const _refreshPayload = await _buildPayload(_mergedItems, {
+              source: internalHit.source, kind: internalHit.kind,
+            });
+            const _refreshVerdict = normalizeVerdict(_refreshPayload?.buyOrPass?.verdict) || _cacheVerdict;
+
+            console.log("CACHE_BACKGROUND_REFRESH_NEW_ITEMS_FOUND", {
+              rid: req.rid, scanId, query, netNewCount: _netNew.length,
+              top3: _netNew.slice(0, 3).map((i) => i?.title?.slice(0, 50)),
+            });
+            console.log("CACHE_BACKGROUND_REFRESH_MERGED", {
+              rid: req.rid, scanId, query, totalAfterMerge: _mergedItems.length,
+            });
+            try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "complete_refreshed", count: (_refreshPayload?.items||[]).length, top5: (_refreshPayload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
+
+            if (!clientClosed) {
+              send("complete", {
+                ..._refreshPayload,
+                verdict: _refreshVerdict,
+                status: "complete", enriching: false,
+                dataDepth: _mergedItems.length < 3 ? "thin" : "normal",
+                _timing: { totalMs: Date.now() - _t0 }, _scanTotalMs: Date.now() - _t0,
+              });
+            }
+          } else {
+            console.log("CACHE_BACKGROUND_REFRESH_INSUFFICIENT_NEW_ITEMS", {
+              rid: req.rid, scanId, query,
+              rawNewFound: (_refreshRaw || []).length,
+              netNewAfterFilter: _netNew.length,
+              reason: (_refreshRaw || []).length === 0 ? "no_results_from_serp" : "all_duplicates_or_identity_rejected",
+            });
+            if (!clientClosed) {
+              send("complete", {
+                ..._cachePayload,
+                verdict: _cacheVerdict,
+                status: "complete", enriching: false,
+                dataDepth: _internalItems.length < 3 ? "thin" : "normal",
+                _timing: { totalMs: Date.now() - _t0 }, _scanTotalMs: Date.now() - _t0,
+              });
+            }
+          }
+
           _recordStreamMetric("totalCompleted", 1);
           endStream(); return;
         }
