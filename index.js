@@ -20237,7 +20237,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
             const _bgAirlineLock = detectAirlineLockInQuery(_bgQNorm);
             if (_bgAirlineLock && !_bgHasFamily) {
               console.log("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE", {
-                rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.airline || null,
+                rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.requiredAirline || null,
               });
               // Try to recover family from variants
               let _recoveredQuery = null;
@@ -21310,33 +21310,64 @@ app.get(["/vision/analyze", "/api/vision/analyze"], (_req, res) => {
   });
 });
 
-// Phase 4H.6: Background master salvage endpoint. Client polls after hard_fail_no_seed.
-// No requireProductAccess — the result is short-lived (TTL 60s), keyed by imageHash/scanId,
-// and contains no user-specific data. Stripping auth allows guest scan sessions to poll.
-// to see if master eventually identified the item. Keyed by imageHash or scanId.
+// Phase 4H.7: Background master salvage endpoint with long-poll support.
+// No requireProductAccess — result is short-lived (TTL 60s), keyed by imageHash/scanId.
+// ?waitMs=<ms> (max 15000) holds the connection and polls every 250ms until ready.
+const BACKGROUND_LONGPOLL_MAX_MS      = 15000;
+const BACKGROUND_LONGPOLL_INTERVAL_MS = 250;
 app.get("/api/vision/background-result", async (req, res) => {
   const _scanId    = safeStr(req.query?.scanId,    64)  || null;
   const _imageHash = safeStr(req.query?.imageHash, 128) || null;
-  // Require at least one lookup key — no broad listing allowed.
+  const _waitMs    = Math.min(BACKGROUND_LONGPOLL_MAX_MS, Math.max(0, Number(req.query?.waitMs) || 0));
   if (!_scanId && !_imageHash) {
     return res.status(400).json({ ok: false, error: "missing_key" });
   }
-  let _entry = null;
-  if (_scanId)    _entry = BACKGROUND_VISION_RESULTS.get(_scanId);
-  if (!_entry && _imageHash) _entry = BACKGROUND_VISION_RESULTS.get(_imageHash);
+
+  const _lookupEntry = () => {
+    let e = null;
+    if (_scanId)             e = BACKGROUND_VISION_RESULTS.get(_scanId);
+    if (!e && _imageHash)    e = BACKGROUND_VISION_RESULTS.get(_imageHash);
+    if (!e) return null;
+    if (Date.now() - (e.completedAt || 0) > BACKGROUND_MASTER_RESULT_TTL_MS) {
+      if (_scanId)    BACKGROUND_VISION_RESULTS.delete(_scanId);
+      if (_imageHash) BACKGROUND_VISION_RESULTS.delete(_imageHash);
+      return null;
+    }
+    return e;
+  };
+
+  let _entry = _lookupEntry();
+
+  if (!_entry && _waitMs > 0) {
+    const _lpStart = Date.now();
+    console.log("VISION_BACKGROUND_RESULT_LONGPOLL_START", {
+      rid: req.rid, scanId: _scanId, imageHash: _imageHash, waitMs: _waitMs,
+    });
+    while (!_entry && (Date.now() - _lpStart) < _waitMs) {
+      if (res.destroyed || req.socket?.destroyed) break;
+      await new Promise((r) => { const t = setTimeout(r, BACKGROUND_LONGPOLL_INTERVAL_MS); if (typeof t.unref === "function") t.unref(); });
+      _entry = _lookupEntry();
+    }
+    const _lpElapsedMs = Date.now() - _lpStart;
+    if (_entry) {
+      console.log("VISION_BACKGROUND_RESULT_LONGPOLL_READY", {
+        rid: req.rid, query: _entry.query, waitedMs: _lpElapsedMs,
+      });
+    } else {
+      console.log("VISION_BACKGROUND_RESULT_LONGPOLL_TIMEOUT", {
+        rid: req.rid, waitedMs: _lpElapsedMs,
+      });
+    }
+  }
+
   console.log("VISION_BACKGROUND_RESULT_POLLED", {
     rid: req.rid, scanId: _scanId, imageHash: _imageHash, found: !!_entry,
     userId: getResolvedUserId(req) || null,
   });
   if (!_entry) return res.status(200).json({ ready: false });
-  // Lazy TTL eviction
-  if (Date.now() - (_entry.completedAt || 0) > BACKGROUND_MASTER_RESULT_TTL_MS) {
-    if (_scanId)    BACKGROUND_VISION_RESULTS.delete(_scanId);
-    if (_imageHash) BACKGROUND_VISION_RESULTS.delete(_imageHash);
-    return res.status(200).json({ ready: false });
-  }
   console.log("VISION_BACKGROUND_RESULT_RETURNED", {
     rid: req.rid, query: _entry.query, elapsedMs: _entry.elapsedMs,
+    needsFamilyRecovery: _entry.needsFamilyRecovery || false,
   });
   return res.status(200).json({ ready: true, ..._entry });
 });

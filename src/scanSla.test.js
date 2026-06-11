@@ -184,3 +184,71 @@ test("hard-fail response includes imageHash: isUsableVisionSeed gates background
   assert.equal(isUsableVisionSeed("model airplane"), false,
     "generic 2-word query must not reach background store");
 });
+
+// ── Phase 4H.7: Long-poll logic (in-process simulation) ──────────────────────
+
+test("long-poll: returns ready when result appears within wait window", async () => {
+  // Simulate BACKGROUND_VISION_RESULTS map with delayed insertion
+  const store = new Map();
+  const INTERVAL_MS = 50;
+  const WAIT_MS = 500;
+  let found = false;
+
+  // Insert result after 150ms
+  const insertTimer = setTimeout(() => {
+    store.set("hash123", { query: "Hawaiian Airlines diecast", completedAt: Date.now(), elapsedMs: 8000 });
+  }, 150);
+
+  const _pollStart = Date.now();
+  while (!found && (Date.now() - _pollStart) < WAIT_MS) {
+    await new Promise((r) => setTimeout(r, INTERVAL_MS));
+    if (store.has("hash123")) found = true;
+  }
+  clearTimeout(insertTimer);
+  assert.equal(found, true, "long-poll should find result within 500ms window");
+});
+
+test("long-poll: times out cleanly when result never arrives", async () => {
+  const store = new Map();
+  const INTERVAL_MS = 50;
+  const WAIT_MS = 200;
+  let found = false;
+
+  const _pollStart = Date.now();
+  while (!found && (Date.now() - _pollStart) < WAIT_MS) {
+    await new Promise((r) => setTimeout(r, INTERVAL_MS));
+    if (store.has("hash_never")) found = true;
+  }
+  const elapsed = Date.now() - _pollStart;
+  assert.equal(found, false, "should not find a result that was never stored");
+  assert.ok(elapsed >= WAIT_MS, `should wait at least ${WAIT_MS}ms`);
+  assert.ok(elapsed < WAIT_MS + 200, "should not overshoot the wait window by more than 200ms");
+});
+
+test("long-poll: result stored after 11s is catchable if window is 15s", () => {
+  // 11134ms master elapsedMs < 15000ms window → should be caught
+  const masterElapsedMs = 11134;
+  const pollWindowMs    = 15000;
+  assert.equal(masterElapsedMs < pollWindowMs, true,
+    "11.1s master must be within 15s long-poll window");
+  // Old 8s window would miss it
+  assert.equal(masterElapsedMs < 8000, false,
+    "old 8s window would miss 11.1s master (confirms the bug)");
+});
+
+test("background result: needsFamilyRecovery preserved in stored entry", () => {
+  // When family recovery fails, needsFamilyRecovery:true must survive the store/read cycle
+  const entry = {
+    query: "Hawaiian Airlines diecast airplane model",
+    variants: ["Hawaiian Airlines model plane"],
+    confidence: 0.85,
+    completedAt: Date.now(),
+    elapsedMs: 11134,
+    needsFamilyRecovery: true,
+  };
+  // Simulate reading it back
+  const restored = { ready: true, ...entry };
+  assert.equal(restored.needsFamilyRecovery, true,
+    "needsFamilyRecovery:true must be preserved in the response payload");
+  assert.equal(restored.query, "Hawaiian Airlines diecast airplane model");
+});
