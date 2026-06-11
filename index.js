@@ -5773,6 +5773,9 @@ const SCAN_STREAM_ORACLE_THRESHOLD = 3;       // invoke oracle when fewer than t
 const MARKET_FIRST_PAYLOAD_DEADLINE_MS = Number(process.env.MARKET_FIRST_PAYLOAD_DEADLINE_MS || 1700);
 // Background recovery calls have no real-time SLA pressure — give market 6s to find results.
 const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = Number(process.env.MARKET_BACKGROUND_RECOVERY_DEADLINE_MS || 6000);
+// High-confidence exact identity (query_fast ≥ 0.85): raise market floor to 3s so
+// SerpAPI has enough time even when vision used most of the 5s SLA window.
+const MARKET_EXACT_IDENTITY_MIN_MS = Number(process.env.MARKET_EXACT_IDENTITY_MIN_MS || 3000);
 // In-memory store for background master identity results (imageHash/scanId → result).
 const BACKGROUND_VISION_RESULTS = new Map(); // key → {query,variants,confidence,visionIdentity,category,completedAt,elapsedMs}
 // Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
@@ -14616,6 +14619,31 @@ merged = [...merged].sort((a, b) => {
     INSTANT_SCAN_CACHE.set(instantKey, packMarketItemsWithIdentity(merged, identitySummaryOut));
   }
 
+  // Phase 4H.9: block competitor airline items before logging cheapest and before
+  // any summary computation uses merged[0]. applyPrePayloadAircraftFilter runs later
+  // in the stream route but this earlier guard prevents a competitor item (e.g.,
+  // "American Airlines A320") from appearing as cheapest in logs or being used
+  // as a price anchor inside mergeCheapestSources.
+  {
+    const _cheapestLock = detectAirlineLockInQuery(normalizedQuery);
+    if (_cheapestLock?.requiredAirline && Array.isArray(_cheapestLock.competitors)) {
+      const _beforeLen = merged.length;
+      merged = merged.filter((it) => {
+        const t = String(it?.title || "").toLowerCase();
+        return !_cheapestLock.competitors.some((c) => {
+          const words = c.split(/\s+/).filter(Boolean);
+          return words.length >= 1 && words.every((w) => t.includes(w));
+        });
+      });
+      if (merged.length < _beforeLen) {
+        console.log("COMPETITOR_ITEM_BLOCKED_FROM_CHEAPEST", {
+          query: normalizedQuery, blockedCount: _beforeLen - merged.length,
+          requiredAirline: _cheapestLock.requiredAirline,
+        });
+      }
+    }
+  }
+
   console.log("🔥 MARKET MERGED CHEAPEST", {
     query: normalizedQuery,
     finalQuery,
@@ -20109,20 +20137,41 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         marketSegment:        null,
       };
 
+      // Phase 4H.9: aircraft diecast from query_fast — treat airline as brand and
+      // family as model so computeIdentityQuality produces a meaningful score instead
+      // of 0.18 (which happens because brand=null, model=null in the minimal identity).
+      const _qfAirlineLock = detectAirlineLockInQuery(normalizeTitleKey(_finalQuery || ""));
+      const _qfAttrCert = {
+        brand:            qfBrand,
+        model:            0,
+        category:         qfConf,
+        condition:        0,
+        authenticity:     0,
+        resaleConfidence: qfConf,
+      };
+      if (_qfAirlineLock?.requiredAirline && _qfAirlineLock?.requiredFamily) {
+        qfIdentity.brand = _qfAirlineLock.requiredAirline;
+        qfIdentity.model = _qfAirlineLock.requiredFamily;
+        qfIdentity.visibleText = [
+          _qfAirlineLock.requiredAirline,
+          _qfAirlineLock.requiredFamily,
+          ...qfVariants.slice(0, 2),
+        ].filter(Boolean);
+        _qfAttrCert.brand = qfConf;
+        _qfAttrCert.model = qfConf;
+        console.log("AIRCRAFT_IDENTITY_QUALITY_UPGRADED", {
+          rid: req.rid, airline: _qfAirlineLock.requiredAirline,
+          family: _qfAirlineLock.requiredFamily, qfConf,
+        });
+      }
+
       return {
         ok:         true,
         query:      _finalQuery,
         variants:   uniqueQueries([qfQuery, ...qfVariants]).filter((v) => v !== _finalQuery).slice(0, 8),
         confidence: qfConf,
         identity:   qfIdentity,
-        attributeCertainty: {
-          brand:            qfBrand,
-          model:            0,
-          category:         qfConf,
-          condition:        0,
-          authenticity:     0,
-          resaleConfidence: qfConf,
-        },
+        attributeCertainty: _qfAttrCert,
         visionSource: qfResult?.source || "openai",
         visionTier:   "query_fast",
         visionTimings: {
@@ -29271,7 +29320,11 @@ app.post("/market/search/stream", async (req, res) => {
   req.on("close", () => { clientClosed = true; });
 
   const _t0    = Date.now();
-  const scanId = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 6)}`;
+  // Prefer the client-provided scanId so stream + fallback share the same key
+  // across budget tracking, payload logs, and scan review. Generate one only when
+  // the client didn't send one.
+  const _clientScanId = safeStr(req.body?.scanId, 64) || null;
+  const scanId = _clientScanId || `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 6)}`;
   _recordStreamMetric("totalRequests", 1);
 
   const send = (name, data) => {
@@ -29346,6 +29399,10 @@ app.post("/market/search/stream", async (req, res) => {
         });
       } catch {}
     });
+
+    if (_clientScanId) {
+      console.log("SCAN_ID_CANONICALIZED", { rid: req.rid, scanId, source: "client" });
+    }
 
     query = bestHistoricalQuery(query);
     query = canonicalizeQuery(query);
@@ -29453,15 +29510,30 @@ app.post("/market/search/stream", async (req, res) => {
       if (_bgByHash) BACKGROUND_VISION_RESULTS.set(scanId, _bgByHash);
     }
 
-    const _marketDeadlineMs = _slaMsRemaining !== null
+    const _marketDeadlineBase = _slaMsRemaining !== null
       ? Math.max(800, Math.min(_slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
       : _isBackgroundRecovery
         ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS   // 6s — no real-time pressure
         : MARKET_FIRST_PAYLOAD_DEADLINE_MS;         // 1.7s — normal real-time scan
+    // Phase 4H.9: when query_fast returns high-confidence exact identity, the market
+    // floor is raised to MARKET_EXACT_IDENTITY_MIN_MS (3s) so SerpAPI has enough
+    // time even when vision used most of the 5s SLA window. This trades a few hundred
+    // ms of wall time for a first card with real results instead of a fallback chain.
+    const _visionConf = clamp01(Number(req.body?.visionConfidence ?? req.body?.confidence ?? 0));
+    const _isHighConfExactIdentity = _visionConf >= 0.85 && !_isBackgroundRecovery;
+    const _marketDeadlineMs = _isHighConfExactIdentity
+      ? Math.max(_marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
+      : _marketDeadlineBase;
+    if (_isHighConfExactIdentity && _marketDeadlineMs > _marketDeadlineBase) {
+      console.log("STREAM_MARKET_BUDGET_UPGRADED_FOR_EXACT_IDENTITY", {
+        rid: req.rid, scanId, from: _marketDeadlineBase, to: _marketDeadlineMs,
+        visionConfidence: _visionConf, remainingMs: _slaMsRemaining,
+      });
+    }
     console.log("MARKET_SLA_BUDGET", {
       rid: req.rid, scanId, marketDeadlineMs: _marketDeadlineMs,
       remainingMs: _slaMsRemaining, elapsedMs: _slaMsRemaining !== null ? (_scanSlaMs - _slaMsRemaining) : null,
-      isBackgroundRecovery: _isBackgroundRecovery,
+      isBackgroundRecovery: _isBackgroundRecovery, visionConfidence: _visionConf,
     });
 
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;

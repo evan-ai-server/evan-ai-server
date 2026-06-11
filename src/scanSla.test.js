@@ -337,3 +337,126 @@ test("4H.8: background recovery market gets 6000ms deadline, not 4500ms", () => 
   assert.ok(marketDeadlineMs > MARKET_PHASE1_DEFAULT_MS,
     "background recovery phase1 budget must exceed the old 4500ms default");
 });
+
+// ── Phase 4H.9: stream-first market success ──────────────────────────────────
+
+test("4H.9: high-confidence query_fast (≥0.85) upgrades stream budget to ≥3000ms", () => {
+  const MARKET_FIRST_PAYLOAD_DEADLINE_MS  = 1700;
+  const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = 6000;
+  const MARKET_EXACT_IDENTITY_MIN_MS      = 3000;
+
+  // Simulate: SLA started, vision took 2941ms, 2272ms remaining
+  const slaMsRemaining = 2272;
+  const isBackgroundRecovery = false;
+  const visionConfidence = 0.95; // query_fast exact identity
+
+  const marketDeadlineBase = slaMsRemaining !== null
+    ? Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
+    : isBackgroundRecovery ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS : MARKET_FIRST_PAYLOAD_DEADLINE_MS;
+
+  const isHighConf = visionConfidence >= 0.85 && !isBackgroundRecovery;
+  const marketDeadlineMs = isHighConf
+    ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
+    : marketDeadlineBase;
+
+  assert.equal(marketDeadlineBase, 1700,
+    "base deadline is capped at 1700ms (confirms the old bug)");
+  assert.equal(marketDeadlineMs, 3000,
+    "high-confidence identity upgrades budget to 3000ms minimum");
+  assert.ok(marketDeadlineMs > marketDeadlineBase,
+    "upgrade must exceed base deadline");
+});
+
+test("4H.9: low-confidence scan does NOT get budget upgrade", () => {
+  const MARKET_FIRST_PAYLOAD_DEADLINE_MS = 1700;
+  const MARKET_EXACT_IDENTITY_MIN_MS     = 3000;
+  const slaMsRemaining = 2272;
+  const visionConfidence = 0.60; // normal scan
+
+  const marketDeadlineBase = Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS));
+  const isHighConf = visionConfidence >= 0.85;
+  const marketDeadlineMs = isHighConf
+    ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
+    : marketDeadlineBase;
+
+  assert.equal(marketDeadlineMs, 1700, "low-confidence scan keeps 1700ms cap");
+});
+
+test("4H.9: aircraft query_fast identity quality — airline+family yields non-low score", () => {
+  // Mirror computeIdentityQuality logic with enriched aircraft identity
+  function computeIdentityQualityMirror(visionIdentity, attributeCertainty) {
+    if (!visionIdentity) return 0;
+    let score = 0;
+    const brandConf = attributeCertainty?.brand ?? (visionIdentity.brand ? 0.55 : 0);
+    score += Math.min(brandConf, 1) * 0.30;
+    const modelConf = attributeCertainty?.model ?? (visionIdentity.model ? 0.50 : 0);
+    score += Math.min(modelConf, 1) * 0.20;
+    const catConf = attributeCertainty?.category ?? (visionIdentity.category ? 0.70 : 0);
+    score += Math.min(catConf, 1) * 0.15;
+    const visibleTextCount = Array.isArray(visionIdentity.visibleText)
+      ? visionIdentity.visibleText.filter((t) => t && String(t).length >= 2).length
+      : 0;
+    score += Math.min(visibleTextCount / 3, 1) * 0.15;
+    const attrCount = (visionIdentity.itemType ? 1 : 0);
+    score += Math.min(attrCount / 4, 1) * 0.10;
+    if (visionIdentity.exactQuery) score += 0.05;
+    if (visionIdentity.brand) {
+      const brandStr = String(visionIdentity.brand).toLowerCase();
+      const brandInVisText = (visionIdentity.visibleText || []).some(t => String(t).toLowerCase().includes(brandStr));
+      if (brandConf > 0.65 && !brandInVisText) score -= 0.15;
+    }
+    return Math.min(1, Math.max(0, Math.round(score * 100) / 100));
+  }
+
+  // OLD: query_fast returns brand=null, model=null
+  const oldIdentity = {
+    itemType: "diecast model airplane", category: "diecast model airplane",
+    brand: null, model: null, colors: [], visibleText: [], exactQuery: "Hawaiian Airlines Boeing 787 diecast model airplane",
+  };
+  const oldAttrCert = { brand: 0, model: 0, category: 0.95, condition: 0, authenticity: 0, resaleConfidence: 0.95 };
+  const oldScore = computeIdentityQualityMirror(oldIdentity, oldAttrCert);
+  assert.ok(oldScore < 0.30, `old score should be low, got ${oldScore}`);
+
+  // NEW: enriched with airline=brand, family=model
+  const newIdentity = {
+    itemType: "diecast model airplane", category: "diecast model airplane",
+    brand: "hawaiian", model: "787", colors: [],
+    visibleText: ["hawaiian", "787", "Hawaiian Airlines Boeing 787 diecast model airplane"],
+    exactQuery: "Hawaiian Airlines Boeing 787 diecast model airplane",
+  };
+  const newAttrCert = { brand: 0.95, model: 0.95, category: 0.95, condition: 0, authenticity: 0, resaleConfidence: 0.95 };
+  const newScore = computeIdentityQualityMirror(newIdentity, newAttrCert);
+  assert.ok(newScore >= 0.45, `enriched score should be moderate/high, got ${newScore}`);
+});
+
+test("4H.9: competitor airline item blocked from cheapest — American Airlines removed from Hawaiian query", () => {
+  const requiredAirline = "hawaiian";
+  const competitors = ["american airlines", "united", "delta", "southwest"];
+  const items = [
+    { title: "American Airlines Airbus A320 Diecast Model 1:500", price: 12 },
+    { title: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400", price: 89 },
+    { title: "United Airlines 777 diecast model", price: 45 },
+  ];
+  const filtered = items.filter((it) => {
+    const t = it.title.toLowerCase();
+    return !competitors.some((c) => {
+      const words = c.split(/\s+/).filter(Boolean);
+      return words.length >= 1 && words.every((w) => t.includes(w));
+    });
+  });
+  assert.equal(filtered.length, 1, "only Hawaiian Airlines item should remain");
+  assert.ok(filtered[0].title.includes("Hawaiian"), "remaining item must be Hawaiian");
+});
+
+test("4H.9: canonical scanId — client scanId is preserved as stream scanId", () => {
+  const clientScanId = "abc123.xyz9";
+  const streamScanId = clientScanId || `${Date.now().toString(36)}.fallback`;
+  assert.equal(streamScanId, clientScanId, "client scanId must be used as stream scanId");
+});
+
+test("4H.9: canonical scanId — no client scanId generates server-side id", () => {
+  const clientScanId = null;
+  const streamScanId = clientScanId || `${Date.now().toString(36)}.fallback`;
+  assert.notEqual(streamScanId, null, "must generate id when client omits one");
+  assert.ok(streamScanId.length > 0, "generated id must be non-empty");
+});
