@@ -340,46 +340,66 @@ test("4H.8: background recovery market gets 6000ms deadline, not 4500ms", () => 
 
 // ── Phase 4H.9: stream-first market success ──────────────────────────────────
 
-test("4H.9: high-confidence query_fast (≥0.85) upgrades stream budget to ≥3000ms", () => {
+// Mirror token-based exact identity detection (Phase 4H.9b)
+const AIRLINE_KEYWORDS_BUDGET = ["hawaiian", "united", "delta", "american airlines", "southwest", "alaska", "ana", "jal", "emirates"];
+const FAMILY_TOKENS_BUDGET = ["787", "777", "747", "737", "a380", "a350", "a330", "a320", "a321", "dreamliner"];
+function normBudget(t) { return String(t).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim(); }
+function budgetHasAirline(q) { const n = normBudget(q); return AIRLINE_KEYWORDS_BUDGET.some((a) => (` ${n} `).includes(` ${a} `)); }
+function budgetHasFamily(q)  { const n = normBudget(q); return FAMILY_TOKENS_BUDGET.some((f) => n.includes(f)); }
+function isExactAircraftIdentity(q) { return budgetHasAirline(q) && budgetHasFamily(q); }
+
+test("4H.9b: exact aircraft identity detected from query tokens (not visionConfidence)", () => {
+  const q = "hawaiian airlines boeing 787 diecast model airplane";
+  assert.equal(isExactAircraftIdentity(q), true, "airline + family present → exact identity");
+  // Even when client sends low confidence (the 4H.9b bug scenario)
+  const clientVisionConf = 0.69; // client downscaled from 0.95
   const MARKET_FIRST_PAYLOAD_DEADLINE_MS  = 1700;
   const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = 6000;
   const MARKET_EXACT_IDENTITY_MIN_MS      = 3000;
-
-  // Simulate: SLA started, vision took 2941ms, 2272ms remaining
   const slaMsRemaining = 2272;
-  const isBackgroundRecovery = false;
-  const visionConfidence = 0.95; // query_fast exact identity
 
-  const marketDeadlineBase = slaMsRemaining !== null
-    ? Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
-    : isBackgroundRecovery ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS : MARKET_FIRST_PAYLOAD_DEADLINE_MS;
+  const marketDeadlineBase = Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS));
+  const isHighConf = (isExactAircraftIdentity(q) || clientVisionConf >= 0.85);
+  const marketDeadlineMs = isHighConf ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS) : marketDeadlineBase;
 
-  const isHighConf = visionConfidence >= 0.85 && !isBackgroundRecovery;
-  const marketDeadlineMs = isHighConf
-    ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
-    : marketDeadlineBase;
-
-  assert.equal(marketDeadlineBase, 1700,
-    "base deadline is capped at 1700ms (confirms the old bug)");
-  assert.equal(marketDeadlineMs, 3000,
-    "high-confidence identity upgrades budget to 3000ms minimum");
-  assert.ok(marketDeadlineMs > marketDeadlineBase,
-    "upgrade must exceed base deadline");
+  assert.equal(marketDeadlineBase, 1700, "base is still 1700ms");
+  assert.equal(marketDeadlineMs, 3000,   "token detection upgrades despite low reported visionConfidence");
 });
 
-test("4H.9: low-confidence scan does NOT get budget upgrade", () => {
+test("4H.9b: generic query without airline+family does NOT trigger upgrade", () => {
+  const q = "nike air jordan 1 low"; // no airline, no family
+  assert.equal(isExactAircraftIdentity(q), false, "no airline → not exact aircraft identity");
   const MARKET_FIRST_PAYLOAD_DEADLINE_MS = 1700;
   const MARKET_EXACT_IDENTITY_MIN_MS     = 3000;
   const slaMsRemaining = 2272;
-  const visionConfidence = 0.60; // normal scan
-
   const marketDeadlineBase = Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS));
-  const isHighConf = visionConfidence >= 0.85;
-  const marketDeadlineMs = isHighConf
-    ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
-    : marketDeadlineBase;
+  const isHighConf = isExactAircraftIdentity(q) || 0.60 >= 0.85;
+  const marketDeadlineMs = isHighConf ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS) : marketDeadlineBase;
+  assert.equal(marketDeadlineMs, 1700, "non-aircraft query keeps standard 1700ms cap");
+});
 
-  assert.equal(marketDeadlineMs, 1700, "low-confidence scan keeps 1700ms cap");
+test("4H.9b: airline present but no family does NOT trigger upgrade", () => {
+  const q = "hawaiian airlines diecast model airplane"; // airline, no 787
+  assert.equal(isExactAircraftIdentity(q), false, "airline only (no family) is incomplete identity");
+  const MARKET_FIRST_PAYLOAD_DEADLINE_MS = 1700;
+  const MARKET_EXACT_IDENTITY_MIN_MS     = 3000;
+  const slaMsRemaining = 2272;
+  const marketDeadlineBase = Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS));
+  const isHighConf = isExactAircraftIdentity(q) || 0.60 >= 0.85;
+  const marketDeadlineMs = isHighConf ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS) : marketDeadlineBase;
+  assert.equal(marketDeadlineMs, 1700, "incomplete aircraft identity keeps 1700ms cap");
+});
+
+test("4H.9: low-confidence non-aircraft scan does NOT get budget upgrade", () => {
+  const MARKET_FIRST_PAYLOAD_DEADLINE_MS = 1700;
+  const MARKET_EXACT_IDENTITY_MIN_MS     = 3000;
+  const slaMsRemaining = 2272;
+  const visionConfidence = 0.60;
+  const q = "used leather couch brown";
+  const marketDeadlineBase = Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS));
+  const isHighConf = isExactAircraftIdentity(q) || visionConfidence >= 0.85;
+  const marketDeadlineMs = isHighConf ? Math.max(marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS) : marketDeadlineBase;
+  assert.equal(marketDeadlineMs, 1700, "low-confidence non-aircraft scan keeps 1700ms cap");
 });
 
 test("4H.9: aircraft query_fast identity quality — airline+family yields non-low score", () => {

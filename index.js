@@ -29515,25 +29515,34 @@ app.post("/market/search/stream", async (req, res) => {
       : _isBackgroundRecovery
         ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS   // 6s — no real-time pressure
         : MARKET_FIRST_PAYLOAD_DEADLINE_MS;         // 1.7s — normal real-time scan
-    // Phase 4H.9: when query_fast returns high-confidence exact identity, the market
-    // floor is raised to MARKET_EXACT_IDENTITY_MIN_MS (3s) so SerpAPI has enough
-    // time even when vision used most of the 5s SLA window. This trades a few hundred
-    // ms of wall time for a first card with real results instead of a fallback chain.
+    // Phase 4H.9 / 4H.9b: raise market floor to MARKET_EXACT_IDENTITY_MIN_MS when
+    // the query carries an exact aircraft identity (airline + family both present).
+    // We detect this from query tokens rather than trusting req.body.visionConfidence,
+    // which the client transforms/downscales before sending (observed: 0.95 → 0.69).
+    // Token detection is reliable: query_fast produces "Hawaiian Airlines Boeing 787 ..."
+    // which has both requiredAirline and requiredFamily; generic queries don't.
     const _visionConf = clamp01(Number(req.body?.visionConfidence ?? req.body?.confidence ?? 0));
-    const _isHighConfExactIdentity = _visionConf >= 0.85 && !_isBackgroundRecovery;
+    const _queryNormForBudget = normalizeTitleKey(query);
+    const _airlineLockForBudget = detectAirlineLockInQuery(_queryNormForBudget);
+    const _isExactAircraftIdentity = !!_airlineLockForBudget?.requiredAirline && !!_airlineLockForBudget?.requiredFamily;
+    const _isHighConfExactIdentity = (_isExactAircraftIdentity || _visionConf >= 0.85) && !_isBackgroundRecovery;
     const _marketDeadlineMs = _isHighConfExactIdentity
       ? Math.max(_marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
       : _marketDeadlineBase;
     if (_isHighConfExactIdentity && _marketDeadlineMs > _marketDeadlineBase) {
       console.log("STREAM_MARKET_BUDGET_UPGRADED_FOR_EXACT_IDENTITY", {
         rid: req.rid, scanId, from: _marketDeadlineBase, to: _marketDeadlineMs,
-        visionConfidence: _visionConf, remainingMs: _slaMsRemaining,
+        visionConfidence: _visionConf, isExactAircraftIdentity: _isExactAircraftIdentity,
+        requiredAirline: _airlineLockForBudget?.requiredAirline || null,
+        requiredFamily:  _airlineLockForBudget?.requiredFamily  || null,
+        remainingMs: _slaMsRemaining,
       });
     }
     console.log("MARKET_SLA_BUDGET", {
       rid: req.rid, scanId, marketDeadlineMs: _marketDeadlineMs,
       remainingMs: _slaMsRemaining, elapsedMs: _slaMsRemaining !== null ? (_scanSlaMs - _slaMsRemaining) : null,
       isBackgroundRecovery: _isBackgroundRecovery, visionConfidence: _visionConf,
+      isExactAircraftIdentity: _isExactAircraftIdentity,
     });
 
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
