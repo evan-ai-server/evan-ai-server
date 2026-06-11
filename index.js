@@ -13615,7 +13615,7 @@ function buildExpansionVariants(query) {
   return kept;
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null } = {}) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null, skipInstantCache = false } = {}) {
 
   // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
   // phase1TimeoutMs is passed from the stream route — background recovery gets
@@ -13649,7 +13649,7 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   const instantKey = scanFingerprint(normalizedQuery, incomingVariants);
   const instantHit = INSTANT_SCAN_CACHE.get(instantKey);
 
-  if (instantHit != null) {
+  if (!skipInstantCache && instantHit != null) {
     const _instantUnpacked = unpackMarketItemsWithIdentity(instantHit);
     if (Array.isArray(_instantUnpacked.items) && _instantUnpacked.items.length) {
       console.log("⚡ INSTANT SCAN CACHE HIT", {
@@ -13666,6 +13666,16 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   }
 
   const runtimePlan = String(identity?.plan || "free").toLowerCase();
+
+  // Log once per call when Etsy is in cooldown so the reason is clear without spam.
+  const _etsyCurrentlyCooling = hasEtsyApi() && (Date.now() < ETSY_COOLDOWN_UNTIL || isSourceCoolingDown("etsy"));
+  if (_etsyCurrentlyCooling) {
+    console.log("ETSY_AUTH_COOLDOWN_ACTIVE", {
+      query: normalizedQuery,
+      cooldownUntil: ETSY_COOLDOWN_UNTIL > Date.now() ? new Date(ETSY_COOLDOWN_UNTIL).toISOString() : "source_failure_gate",
+      reason: "etsy_in_cooldown_skip_this_scan",
+    });
+  }
 
   const canUseEtsy =
     hasEtsyApi() &&
@@ -22529,7 +22539,15 @@ function _isValidMerchantUrl(url) {
 }
 
 async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) {
-  if (!serpApiKey || budget <= 0 || !_googleProductApiAvailable) return {};
+  if (!serpApiKey || budget <= 0 || !_googleProductApiAvailable) {
+    if (!_googleProductApiAvailable) {
+      console.log("DIRECT_URL_RECOVERY_DISABLED_PLAN_LIMIT", {
+        note: "google_product engine disabled after 401 — SerpAPI plan does not include this engine",
+        upgradeNote: "Upgrade SerpAPI plan to re-enable merchant URL recovery",
+      });
+    }
+    return {};
+  }
   // ── Phase 2C.8: direct URL recovery is an EXTRA paid call per item. Block
   // it entirely unless DEV_BYPASS_SERP_BUDGET is set OR no scan context is
   // active (e.g. background batch job). Production scan context always has
@@ -22550,7 +22568,15 @@ async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) 
   const candidates = items
     .filter(it => !it.clickable && it._productId)
     .slice(0, budget);
-  if (!candidates.length) return {};
+  if (!candidates.length) {
+    console.log("DIRECT_URL_RECOVERY_SKIPPED_NO_PRODUCT_ENGINE", {
+      totalItems: items.length,
+      clickableItems: items.filter(it => it.clickable).length,
+      reason: "no_product_ids",
+      note: "SerpAPI Shopping results did not include _productId fields — google_product recovery skipped",
+    });
+    return {};
+  }
 
   const results = await Promise.allSettled(
     candidates.map(async (it) => {
@@ -29944,15 +29970,26 @@ app.post("/market/search/stream", async (req, res) => {
           console.log("CACHE_BACKGROUND_REFRESH_STARTED", {
             rid: req.rid, scanId, query, cachedCount: _internalItems.length,
           });
+          // Phase 4I.1: background refresh must bypass INSTANT_SCAN_CACHE so it
+          // actually calls SerpAPI rather than returning the same 9 cached items.
+          // skipInstantCache=true skips the early-return inside mergeCheapestSources.
+          console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_STARTED", {
+            rid: req.rid, scanId, query, cachedCount: _internalItems.length,
+            skipInstantCache: true, phase1BudgetMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+          });
           let _refreshRaw = [];
           try {
             _refreshRaw = await mergeCheapestSources(query, variants, visionIdentity, {
               skipOracle: true,
               phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+              skipInstantCache: true,
             });
           } catch (_re) {
             console.warn("CACHE_BACKGROUND_REFRESH_ERROR", { rid: req.rid, scanId, error: _re?.message });
           }
+          console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_RESULT", {
+            rid: req.rid, scanId, query, rawResultCount: (_refreshRaw || []).length,
+          });
 
           // De-dupe: reject anything whose title+price+source fingerprint is already cached.
           const _dedupedNew = (_refreshRaw || []).filter((it) => {
@@ -29974,9 +30011,43 @@ app.post("/market/search/stream", async (req, res) => {
           const _netNew = _filteredNew.filter((it) => it?.title);
 
           if (_netNew.length >= 2) {
-            const _mergedItems = assignItemIds([..._internalItems, ..._netNew]).slice(0, 24);
-            // Update internal cache with merged items so next scan benefits.
-            INSTANT_SCAN_CACHE.set(cacheKey, packMarketItemsWithIdentity(_mergedItems, null));
+            // Phase 4I.1: preserve existing identity from current INSTANT_SCAN_CACHE entry
+            // rather than passing null which drops aircraft lock metadata.
+            const _existingCachePacked = INSTANT_SCAN_CACHE.get(cacheKey);
+            const _existingIdentity = _existingCachePacked
+              ? unpackMarketItemsWithIdentity(_existingCachePacked).identitySummary
+              : null;
+            console.log("CACHE_BACKGROUND_REFRESH_IDENTITY_METADATA_PRESERVED", {
+              rid: req.rid, scanId,
+              source: _existingIdentity ? "existing_cache_identity" : "none",
+              requiredAirline: _existingIdentity?.requiredAirline || null,
+              requiredFamily: _existingIdentity?.requiredFamily || null,
+              appliedLocks: _existingIdentity?.appliedLocks || [],
+            });
+
+            // Phase 4I.1: rerank merged items so verified/direct evidence beats pricing-only.
+            // Priority: verified_direct(0) > merchant_direct(1) > marketplace_direct(2) > other(3) > pricing_only(4)
+            const _evidenceRank = (item) => {
+              const q = item?.urlQuality || "";
+              if (item?.isVerifiedListing === true || q === "verified_direct") return 0;
+              if (q === "merchant_direct" || q === "merchant_resolved") return 1;
+              if (q === "marketplace_direct" || q === "ebay_direct") return 2;
+              if (q === "google_product") return 3;
+              return 4; // unknown_legacy_no_url, google_unresolved, pricing-only
+            };
+            const _mergedRaw = assignItemIds([..._internalItems, ..._netNew]).slice(0, 24);
+            const _mergedItems = [..._mergedRaw].sort((a, b) => _evidenceRank(a) - _evidenceRank(b));
+            console.log("CACHE_BACKGROUND_REFRESH_RERANKED", {
+              rid: req.rid, scanId, query, totalAfterMerge: _mergedItems.length,
+              top5: _mergedItems.slice(0, 5).map((i) => ({
+                title: i?.title?.slice(0, 50),
+                urlQuality: i?.urlQuality || "unknown",
+                rank: _evidenceRank(i),
+              })),
+            });
+
+            // Update internal cache with merged + reranked items.
+            INSTANT_SCAN_CACHE.set(cacheKey, packMarketItemsWithIdentity(_mergedItems, _existingIdentity));
             ENRICHED_SCAN_CACHE.set(cacheKey, { items: _mergedItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
 
             const _refreshPayload = await _buildPayload(_mergedItems, {
