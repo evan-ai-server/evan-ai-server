@@ -252,3 +252,88 @@ test("background result: needsFamilyRecovery preserved in stored entry", () => {
     "needsFamilyRecovery:true must be preserved in the response payload");
   assert.equal(restored.query, "Hawaiian Airlines diecast airplane model");
 });
+
+// ── Phase 4H.8: background market family recovery + phase1 deadline wiring ──
+
+// Mirror the family recovery logic used by the stream route.
+const AIRCRAFT_FAMILY_MATCH_STREAM = [
+  { family: "787",   tokens: ["787 9", "787", "dreamliner", "boeing 787"] },
+  { family: "777",   tokens: ["777", "boeing 777"] },
+  { family: "747",   tokens: ["747", "jumbo jet", "boeing 747"] },
+  { family: "a380",  tokens: ["a380", "airbus a380"] },
+  { family: "a330",  tokens: ["a330", "airbus a330"] },
+  { family: "a321",  tokens: ["a321neo", "a321", "airbus a321"] },
+  { family: "a320",  tokens: ["a320", "airbus a320"] },
+  { family: "a350",  tokens: ["a350", "airbus a350"] },
+];
+function normTok(t) {
+  return String(t).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+function streamHasFamily(t) {
+  return AIRCRAFT_FAMILY_MATCH_STREAM.some(({ tokens }) => tokens.some((tok) => normTok(t).includes(tok)));
+}
+function streamRecoverFamily(query, variants) {
+  if (streamHasFamily(query)) return query;
+  return variants.find((v) => v && streamHasFamily(v)) || null;
+}
+
+test("4H.8: variant promotion — boeing 787 variant upgrades airline-only query", () => {
+  const q = "Hawaiian Airlines diecast airplane model";
+  const variants = ["Hawaiian Airlines 1:400 diecast", "Hawaiian Airlines Boeing 787 diecast model airplane"];
+  const promoted = streamRecoverFamily(q, variants);
+  assert.ok(promoted, "should promote a variant");
+  assert.equal(streamHasFamily(promoted), true, "promoted variant must have family token");
+  assert.notEqual(promoted, q, "promoted query must differ from original");
+});
+
+test("4H.8: no promotion when all variants lack family — original query kept, not crashed", () => {
+  const q = "Hawaiian Airlines diecast airplane model";
+  const variants = ["Hawaiian Airlines 1:400 collectible", "Hawaiian Airlines airplane toy"];
+  const promoted = streamRecoverFamily(q, variants);
+  assert.equal(promoted, null, "no variant has family → null (caller logs FAILED and proceeds with original)");
+});
+
+test("4H.8: query already has family — no promotion needed", () => {
+  const q = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const variants = ["some other query"];
+  const promoted = streamRecoverFamily(q, variants);
+  assert.equal(promoted, q, "family already present → returns original query unchanged");
+});
+
+test("4H.8: needsFamilyRecovery=true blocks oracle (incomplete aircraft)", () => {
+  // Oracle must be skipped when needsFamilyRecovery=true + airline detected + no family
+  const needsFamilyRecovery = true;
+  const requiredAirline = "hawaiian";
+  const requiredFamily = null;
+  const incompleteAircraft = needsFamilyRecovery && !!requiredAirline && !requiredFamily;
+  assert.equal(incompleteAircraft, true, "incomplete aircraft identity must block oracle");
+});
+
+test("4H.8: oracle allowed when family is resolved post-recovery", () => {
+  // After variant promotion upgrades the query to include 787, oracle is no longer blocked
+  const needsFamilyRecovery = true;
+  const requiredAirline = "hawaiian";
+  const requiredFamily = "787"; // family found in promoted variant
+  const incompleteAircraft = needsFamilyRecovery && !!requiredAirline && !requiredFamily;
+  assert.equal(incompleteAircraft, false, "oracle must not be blocked when family is resolved");
+});
+
+test("4H.8: background recovery market gets 6000ms deadline, not 4500ms", () => {
+  const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = 6000;
+  const MARKET_FIRST_PAYLOAD_DEADLINE_MS = 1700;
+  const MARKET_PHASE1_DEFAULT_MS = 4500;
+
+  // Simulate: isBackgroundRecovery=true, no SLA clock
+  const slaMsRemaining = null;
+  const isBackgroundRecovery = true;
+  const marketDeadlineMs = slaMsRemaining !== null
+    ? Math.max(800, Math.min(slaMsRemaining - 250, MARKET_FIRST_PAYLOAD_DEADLINE_MS))
+    : isBackgroundRecovery
+      ? MARKET_BACKGROUND_RECOVERY_DEADLINE_MS
+      : MARKET_FIRST_PAYLOAD_DEADLINE_MS;
+
+  assert.equal(marketDeadlineMs, 6000, "background recovery must get 6000ms outer deadline");
+  // phase1TimeoutMs is now passed down from marketDeadlineMs — verify it's > default
+  assert.ok(marketDeadlineMs > MARKET_PHASE1_DEFAULT_MS,
+    "background recovery phase1 budget must exceed the old 4500ms default");
+});

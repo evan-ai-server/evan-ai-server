@@ -13612,21 +13612,19 @@ function buildExpansionVariants(query) {
   return kept;
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null } = {}) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null } = {}) {
 
   // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
-  // A 6s kill timer added ~1.5s of dead wait after SerpAPI either landed or
-  // timed out. 4.5s matches the SerpAPI lane budget so the kill fires exactly
-  // when the last possible SERP response would arrive. Partial results are
-  // buffered reactively (each Tier B promise pushes into _tierBAccum as it
-  // resolves) so the kill never returns [] when real data exists.
+  // phase1TimeoutMs is passed from the stream route — background recovery gets
+  // 6000ms, real-time scans get 4500ms. Falls back to env var for non-stream callers.
   const _partialBudget = { items: [] };
   // Declared in outer scope so the killTimer .then handler can read counts
   // without a ReferenceError (the worker IIFE where _tierBAccum was previously
   // declared is a different closure from the Promise.race .then at the bottom).
   const _tierBAccum = { amazon: [], resale: [], shop: [] };
+  const _phase1KillMs = phase1TimeoutMs ?? Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500);
   const killTimer = new Promise((resolve) =>
-    setTimeout(() => resolve("__timeout__"), Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500))
+    setTimeout(() => resolve("__timeout__"), _phase1KillMs)
   );
 
   const worker = (async () => {
@@ -14666,7 +14664,6 @@ return merged;
 
 return Promise.race([worker, killTimer]).then((r) => {
   if (r === "__timeout__") {
-    const budgetMs = Number(process.env.MARKET_PHASE1_TIMEOUT_MS || 4500);
     const rescued = Array.isArray(_partialBudget.items) ? _partialBudget.items : [];
     const tierBCount = (
       (_tierBAccum?.amazon?.length ?? 0) +
@@ -14674,7 +14671,7 @@ return Promise.race([worker, killTimer]).then((r) => {
       (_tierBAccum?.shop?.length ?? 0)
     );
     console.warn("MARKETPLACE_PHASE1_TIMEOUT", {
-      timeoutMs:     budgetMs,
+      timeoutMs:     _phase1KillMs,
       partialCount:  rescued.length,
       tierBAccumCount: tierBCount,
     });
@@ -29433,6 +29430,7 @@ app.post("/market/search/stream", async (req, res) => {
     // isBackgroundRecovery=true means the call came from background master salvage, not
     // a real-time scan — no SLA pressure, so we give it a generous deadline.
     const _isBackgroundRecovery = req.body?.isBackgroundRecovery === true;
+    const _needsFamilyRecovery  = req.body?.needsFamilyRecovery === true;
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
     const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
     const _slaMsRemaining  = _scanStartedAtMs ? Math.max(0, _scanSlaMs - (Date.now() - _scanStartedAtMs)) : null;
@@ -29482,6 +29480,30 @@ app.post("/market/search/stream", async (req, res) => {
     const _authFlags         = Array.isArray(req.body?.authenticityFlags) ? req.body.authenticityFlags : [];
     const _condFlags         = Array.isArray(req.body?.conditionFlags)    ? req.body.conditionFlags    : [];
     const attributeCertainty = req.body?.attributeCertainty || null;
+
+    // Phase 4H.8: background aircraft family recovery.
+    // Master returned airline-only query (e.g. "Hawaiian Airlines diecast airplane model")
+    // with no family token (787/777/A380 etc.). Try to promote a variant that has a
+    // family token so the market search is specific rather than vague.
+    if (_isBackgroundRecovery && _needsFamilyRecovery) {
+      const _normTok = (t) => String(t).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+      const _hasFamily = (t) => AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => _normTok(t).includes(tok)));
+      console.log("AIRCRAFT_BACKGROUND_FAMILY_RECOVERY_STARTED", {
+        rid: req.rid, scanId, query, variantCount: variants.length,
+      });
+      const _familyVariant = variants.find((v) => v && _hasFamily(v));
+      if (_familyVariant) {
+        console.log("AIRCRAFT_BACKGROUND_FAMILY_RECOVERY_VARIANT_SELECTED", {
+          rid: req.rid, scanId, from: query, to: _familyVariant,
+        });
+        query = _familyVariant;
+      } else {
+        console.log("AIRCRAFT_BACKGROUND_FAMILY_RECOVERY_FAILED", {
+          rid: req.rid, scanId, query, variantCount: variants.length,
+          note: "no_variant_has_family_token — proceeding with original query",
+        });
+      }
+    }
 
     let searchedQueries = buildServerQueryVariants(query, variants, "item", visionIdentity);
     if (!searchedQueries.length) searchedQueries.push(query);
@@ -29987,6 +30009,7 @@ app.post("/market/search/stream", async (req, res) => {
       phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
         skipOracle: true, earlyItemsCb: _onEarlyItemsWrapped,
         identitySummaryOut: _retrievalIdentitySummary,
+        phase1TimeoutMs: _marketDeadlineMs,
       });
       STREAM_PHASE1_INFLIGHT.set(cacheKey, phase1Promise);
       phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
@@ -30017,13 +30040,19 @@ app.post("/market/search/stream", async (req, res) => {
     // No oracle on generic queries — it fabricates comps for unknown items.
     const _oracleQueryUsable     = isUsableVisionSeed(query);
     const _oracleIdentityQuality = computeIdentityQuality(visionIdentity || null, attributeCertainty || null);
+    const _oracleAirlineLock     = detectAirlineLockInQuery(query);
+    const _incompleteAircraft    = _needsFamilyRecovery && !!_oracleAirlineLock?.requiredAirline && !_oracleAirlineLock?.requiredFamily;
     if (!_oracleQueryUsable) {
       console.log("ORACLE_SKIPPED_GENERIC_QUERY", { rid: req.rid, scanId, query });
     } else if (_oracleIdentityQuality < 0.35) {
       console.log("ORACLE_SKIPPED_LOW_IDENTITY", { rid: req.rid, scanId, identityQuality: _oracleIdentityQuality });
+    } else if (_incompleteAircraft) {
+      console.log("ORACLE_SKIPPED_INCOMPLETE_AIRCRAFT_IDENTITY", {
+        rid: req.rid, scanId, query, requiredAirline: _oracleAirlineLock.requiredAirline,
+      });
     }
     const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
-    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35) ? false : _oracleDecision.invoke;
+    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35 || _incompleteAircraft) ? false : _oracleDecision.invoke;
     if (needsOracle) {
       console.log("ORACLE_ALLOWED_STRONG_IDENTITY", { rid: req.rid, scanId, query, identityQuality: _oracleIdentityQuality });
     }
