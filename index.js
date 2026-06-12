@@ -13615,7 +13615,7 @@ function buildExpansionVariants(query) {
   return kept;
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null, skipInstantCache = false } = {}) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null, skipInstantCache = false, forceSourceRefresh = false } = {}) {
 
   // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
   // phase1TimeoutMs is passed from the stream route — background recovery gets
@@ -13674,6 +13674,16 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
       query: normalizedQuery,
       cooldownUntil: ETSY_COOLDOWN_UNTIL > Date.now() ? new Date(ETSY_COOLDOWN_UNTIL).toISOString() : "source_failure_gate",
       reason: "etsy_in_cooldown_skip_this_scan",
+    });
+  }
+
+  if (forceSourceRefresh) {
+    console.log("CACHE_REFRESH_FORCE_SOURCE_REFRESH_ACTIVE", {
+      query: normalizedQuery,
+      skipInstantCache,
+      forceSourceRefresh,
+      serpCooling: isSourceCoolingDown("serpapi"),
+      etsyCooling: _etsyCurrentlyCooling,
     });
   }
 
@@ -14114,14 +14124,17 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
       ...buildSearchIntentLadder(normalizedQuery, { broad: true }),
     ]).slice(0, 10);
 
+    // Re-check Etsy cooling before rescue — prior source calls may have triggered a 403.
+    // Limit to the first rescue query only to prevent 10× parallel Etsy calls all failing.
+    const _etsyAllowedInRescue = canUseEtsy && !isSourceCoolingDown("etsy") && Date.now() >= ETSY_COOLDOWN_UNTIL;
     const rescueResults = await Promise.all(
-      rescueQueries.map(async (q) => {
+      rescueQueries.map(async (q, idx) => {
         const [ebayItems, walmartItems, bestBuyItems, etsyItems] =
           await Promise.all([
             ebayAdapterSearch(q).catch(() => []),
             canUseWalmart ? walmartCatalogSearch(q).catch(() => []) : Promise.resolve([]),
             canUseBestBuy ? bestBuySearch(q).catch(() => []) : Promise.resolve([]),
-            canUseEtsy ? etsySearch(q).catch(() => []) : Promise.resolve([]),
+            (_etsyAllowedInRescue && idx === 0) ? etsySearch(q).catch(() => []) : Promise.resolve([]),
           ]);
 
         return [...ebayItems, ...walmartItems, ...bestBuyItems, ...etsyItems];
@@ -29966,29 +29979,93 @@ app.post("/market/search/stream", async (req, res) => {
             })
           );
 
-          // Background refresh: non-blocking SerpAPI call, no SLA pressure.
+          // Phase 4I.2: background refresh uses an isolated budget context so it
+          // never inherits cacheHit:true or an exhausted budget from the parent scan.
+          const refreshScanId = `${scanId}:cache_refresh`;
           console.log("CACHE_BACKGROUND_REFRESH_STARTED", {
             rid: req.rid, scanId, query, cachedCount: _internalItems.length,
           });
-          // Phase 4I.1: background refresh must bypass INSTANT_SCAN_CACHE so it
-          // actually calls SerpAPI rather than returning the same 9 cached items.
-          // skipInstantCache=true skips the early-return inside mergeCheapestSources.
+
+          // Pre-flight: if SerpAPI is rate-limited and no other live API is available,
+          // skip the refresh call entirely and log the honest reason.
+          const _serpCoolingNow  = isSourceCoolingDown("serpapi");
+          const _etsyCoolingNow  = Date.now() < ETSY_COOLDOWN_UNTIL || isSourceCoolingDown("etsy");
+          const _ebayAvailNow    = hasEbayApi() && !isSourceCoolingDown("ebay");
+          console.log("CACHE_BACKGROUND_REFRESH_CONTEXT_CREATED", {
+            rid: req.rid, parentScanId: scanId, refreshScanId, query,
+            serpCooling: _serpCoolingNow, etsyCooling: _etsyCoolingNow, ebayAvail: _ebayAvailNow,
+          });
+
+          if (_serpCoolingNow && !_ebayAvailNow) {
+            console.log("CACHE_BACKGROUND_REFRESH_SERP_BLOCKED", {
+              rid: req.rid, parentScanId: scanId, refreshScanId, query,
+              reason: "serpapi_rate_limited",
+            });
+            console.log("CACHE_BACKGROUND_REFRESH_SKIPPED_SOURCE_UNAVAILABLE", {
+              rid: req.rid, scanId, refreshScanId, query,
+              reason: "serpapi_rate_limited",
+              serpCooling: _serpCoolingNow, etsyCooling: _etsyCoolingNow,
+            });
+            if (!clientClosed) {
+              send("complete", {
+                ..._cachePayload,
+                verdict: _cacheVerdict,
+                status: "complete", enriching: false,
+                dataDepth: _internalItems.length < 3 ? "thin" : "normal",
+                _timing: { totalMs: Date.now() - _t0 }, _scanTotalMs: Date.now() - _t0,
+              });
+            }
+            _recordStreamMetric("totalCompleted", 1);
+            endStream(); return;
+          }
+
+          // Isolated refresh budget context — does not inherit cacheHit:true or prior calls.
+          const _refreshCtx = {
+            scanId: refreshScanId,
+            route: "/market/search/stream/cache_refresh",
+            query,
+            max: 1,
+            callsUsed: 0,
+            blockedExtraCalls: 0,
+            cacheHit: false,
+            key: `scan:${refreshScanId}`,
+          };
+
           console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_STARTED", {
-            rid: req.rid, scanId, query, cachedCount: _internalItems.length,
-            skipInstantCache: true, phase1BudgetMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+            rid: req.rid, parentScanId: scanId, refreshScanId, query,
+            cachedCount: _internalItems.length,
+            skipInstantCache: true, forceSourceRefresh: true,
+            phase1BudgetMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
           });
           let _refreshRaw = [];
           try {
-            _refreshRaw = await mergeCheapestSources(query, variants, visionIdentity, {
-              skipOracle: true,
-              phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
-              skipInstantCache: true,
-            });
+            _refreshRaw = await SERP_BUDGET_STORE.run(_refreshCtx, () =>
+              mergeCheapestSources(query, variants, visionIdentity, {
+                skipOracle: true,
+                phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+                skipInstantCache: true,
+                forceSourceRefresh: true,
+              })
+            );
           } catch (_re) {
             console.warn("CACHE_BACKGROUND_REFRESH_ERROR", { rid: req.rid, scanId, error: _re?.message });
           }
+
+          // Log whether SerpAPI was actually called or served from cache/cooldown.
+          if (_refreshCtx.callsUsed > 0) {
+            console.log("CACHE_BACKGROUND_REFRESH_SERP_ATTEMPTED", {
+              rid: req.rid, parentScanId: scanId, refreshScanId, query, callsUsed: _refreshCtx.callsUsed,
+            });
+          } else if (!_serpCoolingNow) {
+            console.log("CACHE_BACKGROUND_REFRESH_SERP_BLOCKED", {
+              rid: req.rid, parentScanId: scanId, refreshScanId, query,
+              reason: "source_served_from_hardened_cache_or_cooldown",
+            });
+          }
           console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_RESULT", {
-            rid: req.rid, scanId, query, rawResultCount: (_refreshRaw || []).length,
+            rid: req.rid, parentScanId: scanId, refreshScanId, query,
+            rawResultCount: (_refreshRaw || []).length,
+            refreshBudgetUsed: _refreshCtx.callsUsed,
           });
 
           // De-dupe: reject anything whose title+price+source fingerprint is already cached.
@@ -30089,11 +30166,18 @@ app.post("/market/search/stream", async (req, res) => {
               });
             }
           } else {
+            const _insuffReason = (_refreshRaw || []).length === 0
+              ? (_refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
+              : (_netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
             console.log("CACHE_BACKGROUND_REFRESH_INSUFFICIENT_NEW_ITEMS", {
-              rid: req.rid, scanId, query,
+              rid: req.rid, parentScanId: scanId, refreshScanId, query,
               rawNewFound: (_refreshRaw || []).length,
+              duplicateRejected: _rejectedDupes,
+              identityRejected: _dedupedNew.length - _netNew.length,
               netNewAfterFilter: _netNew.length,
-              reason: (_refreshRaw || []).length === 0 ? "no_results_from_serp" : "all_duplicates_or_identity_rejected",
+              minRequired: 2,
+              refreshBudgetUsed: _refreshCtx.callsUsed,
+              reason: _insuffReason,
             });
             if (!clientClosed) {
               send("complete", {

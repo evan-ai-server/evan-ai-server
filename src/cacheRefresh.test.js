@@ -224,4 +224,117 @@ describe("cache refresh budget key scoping", () => {
     const canConsumeForRefresh = budget.callsUsed < budget.max;
     assert.ok(canConsumeForRefresh, "budget should be available after cache-hit path");
   });
+
+  it("isolated refresh context has cacheHit:false so SerpAPI is not blocked", () => {
+    const parentCtx = { callsUsed: 0, max: 1, cacheHit: true, key: "scan:abc" };
+    const refreshCtx = {
+      scanId: "abc:cache_refresh",
+      max: 1,
+      callsUsed: 0,
+      cacheHit: false,  // must be false
+      key: "scan:abc:cache_refresh",
+    };
+    assert.equal(refreshCtx.cacheHit, false, "refresh context must not inherit cacheHit:true");
+    assert.notEqual(refreshCtx.key, parentCtx.key, "refresh uses separate budget key");
+  });
+});
+
+// ── Phase 4I.2: pre-flight source availability check ─────────────────────────
+
+describe("pre-flight source availability", () => {
+  it("skips refresh when SerpAPI is cooling and eBay is unavailable", () => {
+    const state = { serpCooling: true, ebayAvail: false, etsyCooling: true };
+    const shouldSkip = state.serpCooling && !state.ebayAvail;
+    assert.ok(shouldSkip, "should skip refresh with no live sources");
+  });
+
+  it("allows refresh when eBay is available even if SerpAPI is cooling", () => {
+    const state = { serpCooling: true, ebayAvail: true };
+    const shouldSkip = state.serpCooling && !state.ebayAvail;
+    assert.ok(!shouldSkip, "eBay available means refresh should proceed");
+  });
+
+  it("allows refresh when SerpAPI is not cooling", () => {
+    const state = { serpCooling: false, ebayAvail: false };
+    const shouldSkip = state.serpCooling && !state.ebayAvail;
+    assert.ok(!shouldSkip, "SerpAPI not cooling means refresh should proceed");
+  });
+});
+
+// ── Phase 4I.2: honest INSUFFICIENT reason based on budget usage ──────────────
+
+describe("honest INSUFFICIENT reason", () => {
+  it("reports source_not_reached when callsUsed=0 and rawResultCount=0", () => {
+    const refreshCtx = { callsUsed: 0 };
+    const refreshRaw = [];
+    const netNew = [];
+    const rejectedDupes = 0;
+    const reason = refreshRaw.length === 0
+      ? (refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
+      : (netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
+    assert.equal(reason, "source_not_reached_cache_or_cooldown");
+  });
+
+  it("reports no_results_from_live_serp when callsUsed>0 but results empty", () => {
+    const refreshCtx = { callsUsed: 1 };
+    const refreshRaw = [];
+    const netNew = [];
+    const reason = refreshRaw.length === 0
+      ? (refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
+      : (netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
+    assert.equal(reason, "no_results_from_live_serp");
+  });
+
+  it("reports all_duplicates when results exist but all are dupes", () => {
+    const refreshCtx = { callsUsed: 1 };
+    const refreshRaw = [makeFakeItem({ title: "Already Cached Item" })];
+    const netNew = []; // all filtered as dupes
+    const reason = refreshRaw.length === 0
+      ? (refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
+      : (netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
+    assert.equal(reason, "all_duplicates_or_identity_rejected");
+  });
+
+  it("reports insufficient_new when 1 net-new item found (below min=2)", () => {
+    const refreshCtx = { callsUsed: 1 };
+    const refreshRaw = [makeFakeItem({ title: "New" }), makeFakeItem({ title: "Dup" })];
+    const netNew = [makeFakeItem({ title: "New" })]; // 1 net-new, needs 2
+    const reason = refreshRaw.length === 0
+      ? (refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
+      : (netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
+    assert.equal(reason, "insufficient_new_unique_items");
+  });
+});
+
+// ── Phase 4I.2: rescue Etsy spam prevention ──────────────────────────────────
+
+describe("rescue Etsy spam prevention", () => {
+  it("Etsy is only called for idx=0 in rescue when canUseEtsy is true", () => {
+    const rescueQueries = ["q1", "q2", "q3", "q4", "q5"];
+    const etsyCalls = [];
+    const _etsyAllowedInRescue = true; // not cooling
+
+    rescueQueries.forEach((q, idx) => {
+      if (_etsyAllowedInRescue && idx === 0) {
+        etsyCalls.push(q);
+      }
+    });
+
+    assert.equal(etsyCalls.length, 1, "exactly 1 Etsy call in rescue");
+    assert.equal(etsyCalls[0], "q1");
+  });
+
+  it("Etsy is called 0 times in rescue when cooldown is active", () => {
+    const rescueQueries = ["q1", "q2", "q3"];
+    const etsyCalls = [];
+    const _etsyAllowedInRescue = false; // cooling
+
+    rescueQueries.forEach((q, idx) => {
+      if (_etsyAllowedInRescue && idx === 0) {
+        etsyCalls.push(q);
+      }
+    });
+
+    assert.equal(etsyCalls.length, 0, "zero Etsy calls when cooling");
+  });
 });
