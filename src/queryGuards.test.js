@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed } from "./queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery } from "./queryGuards.js";
 
 // ── isGenericGarbageQuery ─────────────────────────────────────────────────────
 
@@ -100,4 +100,70 @@ test('oracle guard — all oracle-triggering garbage queries are caught', () => 
       `Oracle guard: "${q}" must be blocked by isGenericGarbageQuery`
     );
   }
+});
+
+// ── isGenericAircraftToyQuery — Phase 4J.1 ────────────────────────────────────
+
+test('isGenericAircraftToyQuery — true for generic aircraft queries', () => {
+  const generic = [
+    "white plastic model airplane toy",
+    "model airplane",
+    "toy airplane",
+    "plastic airplane model",
+    "model plane",
+    "airplane toy",
+    "plastic airplane",
+    "aircraft model",
+  ];
+  for (const q of generic) {
+    assert.equal(isGenericAircraftToyQuery(q), true, `"${q}" should be generic aircraft`);
+  }
+});
+
+test('isGenericAircraftToyQuery — false when specific identity present', () => {
+  const specific = [
+    "Hawaiian Airlines Boeing 787 diecast model airplane",
+    "ANA Airbus A380 Sea Turtle 1:400 model airplane",
+    "Boeing 747-400 Pokemon ANA 1:200 model airplane",
+    "GeminiJets 787-9 Hawaiian Airlines diecast model",
+    "Herpa Boeing 787-9 Hawaiian Airlines aircraft model 1:200",
+    "United Airlines Boeing 737 diecast model airplane",
+    "Emirates Airbus A380 model airplane 1:400",
+  ];
+  for (const q of specific) {
+    assert.equal(isGenericAircraftToyQuery(q), false, `"${q}" should NOT be generic aircraft`);
+  }
+});
+
+test('isGenericAircraftToyQuery — false for non-aircraft queries', () => {
+  const nonAircraft = [
+    "Nike Vaporfly 2 running shoes",
+    "Air Jordan 1 Low OG",
+    "vintage watch Omega Seamaster",
+    "white plastic toy car",
+  ];
+  for (const q of nonAircraft) {
+    assert.equal(isGenericAircraftToyQuery(q), false, `"${q}" should not be generic aircraft`);
+  }
+});
+
+test('oracle guard — generic premium aircraft query skips oracle', () => {
+  const query = "white plastic model airplane toy";
+  const scannedPrice = 165.99;
+  const isGenericPremium = isGenericAircraftToyQuery(query) && scannedPrice >= 50;
+  assert.equal(isGenericPremium, true, "generic aircraft at premium price should skip oracle");
+});
+
+test('oracle guard — low price generic aircraft toy does not skip oracle', () => {
+  const query = "white plastic model airplane toy";
+  const scannedPrice = 10;
+  const isGenericPremium = isGenericAircraftToyQuery(query) && scannedPrice >= 50;
+  assert.equal(isGenericPremium, false, "cheap toy airplane should not skip oracle");
+});
+
+test('oracle guard — specific aircraft query does not skip oracle', () => {
+  const query = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const scannedPrice = 165.99;
+  const isGenericPremium = isGenericAircraftToyQuery(query) && scannedPrice >= 50;
+  assert.equal(isGenericPremium, false, "specific aircraft should not skip oracle");
 });

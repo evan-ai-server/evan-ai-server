@@ -463,7 +463,7 @@ import { buildFakeListingDetectorPayload, scoreFakeListingRisk, scanMarketForFak
 import { buildSeasonalFlipCalendarPayload, computeFlipTiming, getBuySellWindows, getUpcomingDemandEvents } from "./src/seasonalFlipCalendar.js";
 import { buildBrandTierPayload, resolveBrandTier, detectBrandPriceMismatch, findTierAlternatives } from "./src/brandTierClassifier.js";
 import { buildSmartPriceTargetPayload, buildPriceTargets, computeMaxBuyPrice, computeOptimalSellPrice } from "./src/smartPriceTargetEngine.js";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed } from "./src/queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery } from "./src/queryGuards.js";
 import { buildListingQualityScorerPayload, scoreListingQuality } from "./src/listingQualityScorer.js";
 import { buildMarketMomentumPayload, computePriceMomentum, detectPriceConvergence, computeSellThroughVelocity } from "./src/marketMomentumTracker.js";
 import { buildFlipScorePayload, computeFlipScore } from "./src/flipScoreEngine.js";
@@ -19647,6 +19647,13 @@ function shouldAcceptFastVisionResult(result) {
   const cat = String(id.category || "").trim().toLowerCase();
   if (cat && isTrueHighStakesVisionCategory(cat)) return false;
 
+  // Phase 4J.1: reject generic aircraft toy fast passes (e.g. "white plastic
+  // model airplane toy") — these lack airline/family identity and produce garbage
+  // market results for premium diecast models. Allow master/query_fast to win.
+  if (isGenericAircraftToyQuery(id.itemType || "") || isGenericAircraftToyQuery(parsed.query || "")) {
+    return false;
+  }
+
   return true;
 }
 
@@ -20468,6 +20475,20 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         rid:        req.rid,
         confidence: Number(fastResult.parsed?.confidence ?? 0).toFixed(2),
         category:   fastResult.parsed?.identity?.category || null,
+      });
+    } else if (fastResult && (
+      isGenericAircraftToyQuery(fastResult?.parsed?.identity?.itemType || "") ||
+      isGenericAircraftToyQuery(fastResult?.parsed?.query || "")
+    )) {
+      // Phase 4J.1: fast pass returned a generic aircraft query with no identity.
+      // Don't accept it — allow master/query_fast to provide a specific result.
+      console.log("GENERIC_AIRCRAFT_FAST_PASS_REJECTED", {
+        rid:         req.rid,
+        query:       fastResult?.parsed?.query || null,
+        itemType:    fastResult?.parsed?.identity?.itemType || null,
+        confidence:  Number(fastResult?.parsed?.confidence ?? 0),
+        reason:      "generic_aircraft_no_airline_or_family",
+        masterLaunched,
       });
     } else if (visualAcceptable) {
       // Skip waiting for master — visual_shape already gave us a high-confidence
@@ -28527,6 +28548,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
     retrievalMeta: {
       source: internalHit.source,
       kind: internalHit.kind,
+      scanId: _budgetScanIdEarly,
       snapshotAgeMs: internalHit?.snapshotState?.ageMs ?? null,
       snapshotRefreshedAt: internalHit?.snapshotState?.refreshedAt ?? null,
       counts: internalHit?.counts || null,
@@ -28687,6 +28709,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
     retrievalMeta: {
       source: "l1_route_cache",
       kind: "route_cache_hit",
+      scanId: _budgetScanIdEarly,
     },
     persistSnapshot: false,
     reviewContext: _reviewCtx,
@@ -28903,8 +28926,23 @@ if ((!Array.isArray(items) || items.length === 0) && internalHit?.snapshot?.item
 
 // ── GPT-4.1 Oracle fallback at route level (outside 7s kill timer) ─────────────
 // Fires when ALL marketplace sources + internal cache return nothing.
+// Phase 4J.1: skip oracle for generic aircraft toy queries at premium price —
+// oracle generates toy comps that get blocked by AIRCRAFT_PREMIUM_TOY_MAIN_RESULT_BLOCKED.
+const _nonStreamGenericPremiumAircraft = isGenericAircraftToyQuery(query) && Number(scannedPrice || 0) >= 50;
+if (_nonStreamGenericPremiumAircraft) {
+  console.log("MARKET_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
+    route: "/market/search", query, scannedPrice,
+    reason: "generic_aircraft_no_identity_premium_price",
+  });
+}
 let _oracleOnlyResult = false;
 if (!Array.isArray(items) || items.length < 4) {
+  if (_nonStreamGenericPremiumAircraft) {
+    console.log("ORACLE_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
+      route: "/market/search", query, scannedPrice,
+      reason: "generic_aircraft_no_identity_premium_price",
+    });
+  } else {
   console.log("🧠 Route-level oracle fallback for:", query);
   const _oracleVi = visionIdentity ? { ...visionIdentity } : {};
   const oracleItems = await gptMarketOracle(query, _oracleVi).catch(() => []);
@@ -28918,6 +28956,7 @@ if (!Array.isArray(items) || items.length < 4) {
     }
     console.log(`✅ Route oracle injected ${oracleItems.length} items for "${query}"`);
   }
+  } // end else !_nonStreamGenericPremiumAircraft
 }
 
 if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
@@ -29006,6 +29045,7 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     retrievalMeta: {
       source: _oracleOnlyResult ? "gpt_oracle" : (Array.isArray(items) && items.length > 0 ? "live_market" : "empty"),
       kind:   _oracleOnlyResult ? "oracle"     : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
+      scanId: _budgetScanIdEarly,
     },
     persistSnapshot: !_oracleOnlyResult, // don't pollute snapshot with oracle-only data
     identitySummaryFromRetrieval: _nonStreamRetrievalSummary,
@@ -30457,8 +30497,17 @@ app.post("/market/search/stream", async (req, res) => {
         rid: req.rid, scanId, query, requiredAirline: _oracleAirlineLock.requiredAirline,
       });
     }
+    // Phase 4J.1: generic aircraft toy query with premium scannedPrice would produce
+    // toy comps (e.g. "white plastic model airplane toy" for a $165 diecast model).
+    const _isGenericPremiumAircraft = isGenericAircraftToyQuery(query) && Number(scannedPrice || 0) >= 50;
+    if (_isGenericPremiumAircraft) {
+      console.log("ORACLE_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
+        rid: req.rid, scanId, query, scannedPrice,
+        reason: "generic_aircraft_no_identity_premium_price",
+      });
+    }
     const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
-    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35 || _incompleteAircraft) ? false : _oracleDecision.invoke;
+    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35 || _incompleteAircraft || _isGenericPremiumAircraft) ? false : _oracleDecision.invoke;
     if (needsOracle) {
       console.log("ORACLE_ALLOWED_STRONG_IDENTITY", { rid: req.rid, scanId, query, identityQuality: _oracleIdentityQuality });
     }
