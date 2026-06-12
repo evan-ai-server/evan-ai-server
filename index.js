@@ -13649,6 +13649,17 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   const instantKey = scanFingerprint(normalizedQuery, incomingVariants);
   const instantHit = INSTANT_SCAN_CACHE.get(instantKey);
 
+  if (skipInstantCache && instantHit != null) {
+    // Phase 4I.3: forceSourceRefresh bypasses INSTANT_SCAN_CACHE so the refresh
+    // actually reaches the SerpAPI layer instead of returning stale cached items.
+    console.log("CACHE_REFRESH_BYPASS_INSTANT_CACHE", {
+      query: normalizedQuery, instantKey,
+      cachedItemCount: (() => {
+        try { return unpackMarketItemsWithIdentity(instantHit).items?.length ?? 0; } catch { return 0; }
+      })(),
+    });
+  }
+
   if (!skipInstantCache && instantHit != null) {
     const _instantUnpacked = unpackMarketItemsWithIdentity(instantHit);
     if (Array.isArray(_instantUnpacked.items) && _instantUnpacked.items.length) {
@@ -13842,16 +13853,29 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   // single Promise.all is that Tier A results are accessible before Tier B resolves.
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // Phase 4I.3: when forceSourceRefresh=true, bypass SERP_HARDENED_CACHE so the
+  // background refresh makes a real network call rather than returning the same
+  // hardened-cache result that was already served to the original scan.
+  const _serpOpts = forceSourceRefresh
+    ? { softFail: true, bypassHardenedCache: true }
+    : { softFail: true };
+  if (forceSourceRefresh) {
+    console.log("CACHE_REFRESH_BYPASS_SOURCE_CACHE", {
+      query: normalizedQuery, source: "SERP_HARDENED_CACHE", bypassHardenedCache: true,
+      note: "forceSourceRefresh forces live SerpAPI call; SINGLEFLIGHT+PAYLOAD_CACHE bypassed via direct call",
+    });
+  }
+
   // Start Tier B (slow SerpAPI) promises immediately — fire and collect later
   const _amazonP = canUseAmazonSerp
-    ? runBudgetedSourceLane("serpapi", () => serpAmazon(normalizedQuery, { softFail: true }), { plan: runtimePlan, costUnits: 4 }).catch(() => [])
+    ? runBudgetedSourceLane("serpapi", () => serpAmazon(normalizedQuery, _serpOpts), { plan: runtimePlan, costUnits: 4 }).catch(() => [])
     : Promise.resolve([]);
 
   const _resaleP = resaleSitesForSerp.length
     ? Promise.all(
         resaleSitesForSerp.map(({ site, label }) =>
           marketSearchConcurrency(() =>
-            runBudgetedSourceLane("serpapi", () => serpScopedSearch(normalizedQuery, site, { softFail: true, label }), { plan: runtimePlan, costUnits: 2 })
+            runBudgetedSourceLane("serpapi", () => serpScopedSearch(normalizedQuery, site, { ...(_serpOpts), label }), { plan: runtimePlan, costUnits: 2 })
           )
         )
       )
@@ -13859,7 +13883,7 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
 
   // SerpAPI Google Shopping Wave 1 — starts immediately, collected after Tier A
   const _serpShopP = canUseSerpForce
-    ? runBudgetedSourceLane("serpapi", () => serpShopping(normalizedQuery, { softFail: true }), { plan: runtimePlan, costUnits: 6 }).catch(() => [])
+    ? runBudgetedSourceLane("serpapi", () => serpShopping(normalizedQuery, _serpOpts), { plan: runtimePlan, costUnits: 6 }).catch(() => [])
     : Promise.resolve([]);
 
   // Reactive partial-buffer: each Tier B promise pushes into a shared
@@ -30051,17 +30075,30 @@ app.post("/market/search/stream", async (req, res) => {
             console.warn("CACHE_BACKGROUND_REFRESH_ERROR", { rid: req.rid, scanId, error: _re?.message });
           }
 
-          // Log whether SerpAPI was actually called or served from cache/cooldown.
+          // Phase 4I: Cached scan refreshes must attempt live source freshness and merge
+          // only when 2+ net-new clean items are found. Verified/direct items must outrank
+          // pricing-only cached items.
+
+          // Log whether SerpAPI was actually reached (budget consumed = real network call).
           if (_refreshCtx.callsUsed > 0) {
-            console.log("CACHE_BACKGROUND_REFRESH_SERP_ATTEMPTED", {
+            console.log("CACHE_REFRESH_LIVE_SOURCE_ATTEMPTED", {
               rid: req.rid, parentScanId: scanId, refreshScanId, query, callsUsed: _refreshCtx.callsUsed,
             });
           } else if (!_serpCoolingNow) {
-            console.log("CACHE_BACKGROUND_REFRESH_SERP_BLOCKED", {
+            // SerpAPI wasn't cooling but callsUsed=0 — SERP_HARDENED_CACHE likely served result
+            // even with bypassHardenedCache:true (e.g., very recent entry or miss path returned [])
+            console.log("CACHE_REFRESH_LIVE_SOURCE_NOT_ATTEMPTED", {
               rid: req.rid, parentScanId: scanId, refreshScanId, query,
-              reason: "source_served_from_hardened_cache_or_cooldown",
+              reason: "source_returned_without_budget_consumed",
+              refreshBudgetUsed: 0,
             });
           }
+          console.log("CACHE_REFRESH_LIVE_SOURCE_RESULT", {
+            rid: req.rid, parentScanId: scanId, refreshScanId, query,
+            rawResultCount: (_refreshRaw || []).length,
+            refreshBudgetUsed: _refreshCtx.callsUsed,
+          });
+          // Keep legacy name for grep compatibility
           console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_RESULT", {
             rid: req.rid, parentScanId: scanId, refreshScanId, query,
             rawResultCount: (_refreshRaw || []).length,
@@ -30087,9 +30124,20 @@ app.post("/market/search/stream", async (req, res) => {
           const _filteredNew = applyPrePayloadAircraftFilter(query, assignItemIds(_dedupedNew), scannedPrice, "cache_refresh");
           const _netNew = _filteredNew.filter((it) => it?.title);
 
+          // Phase 4I: net-new merge policy gate — require 2+ items that are not dupes,
+          // not oracle-only, and pass identity/aircraft/sneaker filters.
+          console.log("CACHE_REFRESH_NET_NEW_POLICY", {
+            rid: req.rid, parentScanId: scanId, refreshScanId, query,
+            rawResultCount: (_refreshRaw || []).length,
+            duplicateRejected: _rejectedDupes,
+            identityRejected: _dedupedNew.length - _netNew.length,
+            netNewCount: _netNew.length,
+            minRequired: 2,
+            willMerge: _netNew.length >= 2,
+          });
+
           if (_netNew.length >= 2) {
-            // Phase 4I.1: preserve existing identity from current INSTANT_SCAN_CACHE entry
-            // rather than passing null which drops aircraft lock metadata.
+            // Preserve existing identity from current INSTANT_SCAN_CACHE entry.
             const _existingCachePacked = INSTANT_SCAN_CACHE.get(cacheKey);
             const _existingIdentity = _existingCachePacked
               ? unpackMarketItemsWithIdentity(_existingCachePacked).identitySummary
@@ -30102,24 +30150,19 @@ app.post("/market/search/stream", async (req, res) => {
               appliedLocks: _existingIdentity?.appliedLocks || [],
             });
 
-            // Phase 4I.1: rerank merged items so verified/direct evidence beats pricing-only.
-            // Priority: verified_direct(0) > merchant_direct(1) > marketplace_direct(2) > other(3) > pricing_only(4)
+            // Rerank: evidence tier asc, price asc within tier, then slice 24, assign IDs.
             const _evidenceRank = (item) => {
               const q = item?.urlQuality || "";
               if (item?.isVerifiedListing === true || q === "verified_direct") return 0;
               if (q === "merchant_direct" || q === "merchant_resolved") return 1;
               if (q === "marketplace_direct" || q === "ebay_direct") return 2;
               if (q === "google_product") return 3;
-              return 4; // unknown_legacy_no_url, google_unresolved, pricing-only
+              return 4;
             };
-            // Phase 4I.1 follow-up: rank before slicing so strong evidence items are not
-            // accidentally cut off just because they were appended after cached items.
-            // IDs are assigned after final rank so item ids match display order.
             const _combinedItems = [..._internalItems, ..._netNew];
             const _rankedItems = [..._combinedItems].sort((a, b) => {
               const evidenceDelta = _evidenceRank(a) - _evidenceRank(b);
               if (evidenceDelta !== 0) return evidenceDelta;
-              // Tie-break inside the same evidence tier by cheaper normalized price.
               const priceA = Number.isFinite(Number(a?.price)) ? Number(a.price) : Infinity;
               const priceB = Number.isFinite(Number(b?.price)) ? Number(b.price) : Infinity;
               if (priceA !== priceB) return priceA - priceB;
@@ -30138,7 +30181,6 @@ app.post("/market/search/stream", async (req, res) => {
               })),
             });
 
-            // Update internal cache with merged + reranked items.
             INSTANT_SCAN_CACHE.set(cacheKey, packMarketItemsWithIdentity(_mergedItems, _existingIdentity));
             ENRICHED_SCAN_CACHE.set(cacheKey, { items: _mergedItems, ebaySoldComps: ebaySold || null, localComps: localC || null });
 
@@ -30147,12 +30189,10 @@ app.post("/market/search/stream", async (req, res) => {
             });
             const _refreshVerdict = normalizeVerdict(_refreshPayload?.buyOrPass?.verdict) || _cacheVerdict;
 
-            console.log("CACHE_BACKGROUND_REFRESH_NEW_ITEMS_FOUND", {
-              rid: req.rid, scanId, query, netNewCount: _netNew.length,
-              top3: _netNew.slice(0, 3).map((i) => i?.title?.slice(0, 50)),
-            });
-            console.log("CACHE_BACKGROUND_REFRESH_MERGED", {
-              rid: req.rid, scanId, query, totalAfterMerge: _mergedItems.length,
+            console.log("CACHE_REFRESH_NET_NEW_MERGED", {
+              rid: req.rid, parentScanId: scanId, refreshScanId, query,
+              netNewCount: _netNew.length, totalAfterMerge: _mergedItems.length,
+              top3netNew: _netNew.slice(0, 3).map((i) => i?.title?.slice(0, 50)),
             });
             try { console.log("SSE_SEND_ITEMS", { cacheLayer: "internal", status: "complete_refreshed", count: (_refreshPayload?.items||[]).length, top5: (_refreshPayload?.items||[]).slice(0,5).map((i)=>({title:i?.title,price:i?.price,source:i?.source})) }); } catch {}
 
@@ -30169,12 +30209,12 @@ app.post("/market/search/stream", async (req, res) => {
             const _insuffReason = (_refreshRaw || []).length === 0
               ? (_refreshCtx.callsUsed === 0 ? "source_not_reached_cache_or_cooldown" : "no_results_from_live_serp")
               : (_netNew.length === 0 ? "all_duplicates_or_identity_rejected" : "insufficient_new_unique_items");
-            console.log("CACHE_BACKGROUND_REFRESH_INSUFFICIENT_NEW_ITEMS", {
+            console.log("CACHE_REFRESH_NET_NEW_MERGE_SKIPPED", {
               rid: req.rid, parentScanId: scanId, refreshScanId, query,
-              rawNewFound: (_refreshRaw || []).length,
+              rawResultCount: (_refreshRaw || []).length,
               duplicateRejected: _rejectedDupes,
               identityRejected: _dedupedNew.length - _netNew.length,
-              netNewAfterFilter: _netNew.length,
+              netNewCount: _netNew.length,
               minRequired: 2,
               refreshBudgetUsed: _refreshCtx.callsUsed,
               reason: _insuffReason,

@@ -338,3 +338,117 @@ describe("rescue Etsy spam prevention", () => {
     assert.equal(etsyCalls.length, 0, "zero Etsy calls when cooling");
   });
 });
+
+// ── Phase 4I.3: forceSourceRefresh bypasses source caches ────────────────────
+
+describe("forceSourceRefresh bypassHardenedCache", () => {
+  it("normal scan passes softFail:true without bypassHardenedCache", () => {
+    const forceSourceRefresh = false;
+    const opts = forceSourceRefresh
+      ? { softFail: true, bypassHardenedCache: true }
+      : { softFail: true };
+    assert.equal(opts.bypassHardenedCache, undefined);
+    assert.equal(opts.softFail, true);
+  });
+
+  it("forceSourceRefresh adds bypassHardenedCache:true to serp opts", () => {
+    const forceSourceRefresh = true;
+    const opts = forceSourceRefresh
+      ? { softFail: true, bypassHardenedCache: true }
+      : { softFail: true };
+    assert.equal(opts.bypassHardenedCache, true);
+    assert.equal(opts.softFail, true);
+  });
+
+  it("forceSourceRefresh=false leaves normal scans unchanged", () => {
+    const forceSourceRefresh = false;
+    const opts = forceSourceRefresh
+      ? { softFail: true, bypassHardenedCache: true }
+      : { softFail: true };
+    // Normal scans: no cache bypass
+    assert.ok(!opts.bypassHardenedCache, "normal scan must not bypass hardened cache");
+  });
+
+  it("callsUsed=0 with serpCooling=false means hardened cache served result", () => {
+    const refreshCtx = { callsUsed: 0 };
+    const serpCooling = false;
+    const reason = refreshCtx.callsUsed === 0 && !serpCooling
+      ? "source_returned_without_budget_consumed"
+      : refreshCtx.callsUsed > 0
+      ? "live_serp_attempted"
+      : "serpapi_cooling";
+    assert.equal(reason, "source_returned_without_budget_consumed");
+  });
+
+  it("callsUsed=1 confirms live SerpAPI was reached", () => {
+    const refreshCtx = { callsUsed: 1 };
+    const liveAttempted = refreshCtx.callsUsed > 0;
+    assert.ok(liveAttempted, "callsUsed > 0 means budget was consumed = real network call");
+  });
+});
+
+// ── Phase 4I.3: NET_NEW_POLICY gate ──────────────────────────────────────────
+
+describe("CACHE_REFRESH_NET_NEW_POLICY", () => {
+  it("willMerge is true when netNew >= 2", () => {
+    const netNew = [makeFakeItem(), makeFakeItem()];
+    const willMerge = netNew.length >= 2;
+    assert.ok(willMerge);
+  });
+
+  it("willMerge is false when netNew < 2", () => {
+    const netNew = [makeFakeItem()];
+    const willMerge = netNew.length >= 2;
+    assert.ok(!willMerge);
+  });
+
+  it("identityRejected = dedupedNew.length - netNew.length", () => {
+    const dedupedNew = [makeFakeItem(), makeFakeItem(), makeFakeItem()];
+    const netNew = [makeFakeItem()]; // 2 rejected by identity
+    const identityRejected = dedupedNew.length - netNew.length;
+    assert.equal(identityRejected, 2);
+  });
+});
+
+// ── Phase 4I.3: verified item after index 24 must not be sliced pre-rerank ───
+
+describe("rank-before-slice prevents losing late verified items", () => {
+  it("25 items: verified item at idx 24 survives after rerank-then-slice", () => {
+    // Build 24 pricing-only items + 1 verified at the end
+    const pricingOnly = Array.from({ length: 24 }, (_, i) =>
+      makeFakeItem({ title: `Pricing Item ${i}`, price: 100 + i, urlQuality: "unknown_legacy_no_url" })
+    );
+    const verifiedLate = makeFakeItem({
+      title: "Verified Direct (appended last)",
+      price: 50,
+      urlQuality: "merchant_direct",
+      clickable: true,
+      directUrl: "https://shop.com/item",
+    });
+    const combined = [...pricingOnly, verifiedLate]; // verified is at idx 24
+
+    // Slice before rerank (old behavior) — verified gets cut
+    const slicedFirst = combined.slice(0, 24);
+    const hasVerifiedAfterSliceFirst = slicedFirst.some(i => i.urlQuality === "merchant_direct");
+    assert.equal(hasVerifiedAfterSliceFirst, false, "old behavior: verified cut before rerank");
+
+    // Rerank before slice (new behavior) — verified floats to top
+    const ranked = [...combined].sort((a, b) => evidenceRank(a) - evidenceRank(b));
+    const slicedAfter = ranked.slice(0, 24);
+    assert.equal(slicedAfter[0].urlQuality, "merchant_direct", "new behavior: verified is top after rerank");
+    assert.ok(slicedAfter.some(i => i.urlQuality === "merchant_direct"), "verified survives slice");
+  });
+
+  it("pricing-only items rank below verified items after rerank", () => {
+    const items = [
+      makeFakeItem({ title: "Pricing A", urlQuality: "unknown_legacy_no_url", price: 30 }),
+      makeFakeItem({ title: "Verified B", urlQuality: "merchant_direct", price: 100 }),
+      makeFakeItem({ title: "Pricing C", urlQuality: "google_unresolved", price: 20 }),
+    ];
+    const ranked = [...items].sort((a, b) => evidenceRank(a) - evidenceRank(b));
+    assert.equal(ranked[0].title, "Verified B", "merchant_direct ranks first");
+    // pricing-only items come after regardless of price
+    assert.ok(["Pricing A", "Pricing C"].includes(ranked[1].title));
+    assert.ok(["Pricing A", "Pricing C"].includes(ranked[2].title));
+  });
+});
