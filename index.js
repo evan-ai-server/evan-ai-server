@@ -30035,14 +30035,29 @@ app.post("/market/search/stream", async (req, res) => {
               if (q === "google_product") return 3;
               return 4; // unknown_legacy_no_url, google_unresolved, pricing-only
             };
-            const _mergedRaw = assignItemIds([..._internalItems, ..._netNew]).slice(0, 24);
-            const _mergedItems = [..._mergedRaw].sort((a, b) => _evidenceRank(a) - _evidenceRank(b));
+            // Phase 4I.1 follow-up: rank before slicing so strong evidence items are not
+            // accidentally cut off just because they were appended after cached items.
+            // IDs are assigned after final rank so item ids match display order.
+            const _combinedItems = [..._internalItems, ..._netNew];
+            const _rankedItems = [..._combinedItems].sort((a, b) => {
+              const evidenceDelta = _evidenceRank(a) - _evidenceRank(b);
+              if (evidenceDelta !== 0) return evidenceDelta;
+              // Tie-break inside the same evidence tier by cheaper normalized price.
+              const priceA = Number.isFinite(Number(a?.price)) ? Number(a.price) : Infinity;
+              const priceB = Number.isFinite(Number(b?.price)) ? Number(b.price) : Infinity;
+              if (priceA !== priceB) return priceA - priceB;
+              return 0;
+            });
+            const _mergedItems = assignItemIds(_rankedItems.slice(0, 24));
             console.log("CACHE_BACKGROUND_REFRESH_RERANKED", {
-              rid: req.rid, scanId, query, totalAfterMerge: _mergedItems.length,
+              rid: req.rid, scanId, query,
+              totalBeforeSlice: _combinedItems.length, totalAfterMerge: _mergedItems.length,
               top5: _mergedItems.slice(0, 5).map((i) => ({
                 title: i?.title?.slice(0, 50),
+                price: i?.price ?? null,
                 urlQuality: i?.urlQuality || "unknown",
                 rank: _evidenceRank(i),
+                isVerifiedListing: i?.isVerifiedListing === true,
               })),
             });
 
