@@ -1482,6 +1482,8 @@ const WALMART_TENANT_ID = process.env.WALMART_TENANT_ID || "0";
 const BESTBUY_API_KEY = process.env.BESTBUY_API_KEY || "";
 
 let ETSY_COOLDOWN_UNTIL = 0;
+// Dev-only helper to clear local Etsy cooldown state for testing.
+function resetEtsyCooldown() { ETSY_COOLDOWN_UNTIL = 0; }
 
 const VISION_MODEL =
   process.env.VISION_MODEL || "gpt-4.1";
@@ -20000,9 +20002,11 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       let _refinementMs      = 0;
 
       // Identity completeness check — aircraft diecast requires airline + family.
+      // Use detectAirlineLockInQuery for hasAirline so it matches VISION_QUERY_FAST_BRAND_POLICY.
+      const _completenessLock = detectAirlineLockInQuery(qfQuery || "");
       console.log("AIRCRAFT_IDENTITY_COMPLETENESS_CHECK", {
         rid: req.rid, query: qfQuery, category: qfCategory,
-        hasAirline: qfAcceptance.needsAircraftFamilyRefinement || false,
+        hasAirline: !!_completenessLock?.requiredAirline,
         hasFamilyInQuery: !qfAcceptance.needsAircraftFamilyRefinement,
         needsRefinement: !!(qfAcceptance.needsAircraftFamilyRefinement && AIRCRAFT_IDENTITY_REFINE_ENABLED),
         refinementEnabled: AIRCRAFT_IDENTITY_REFINE_ENABLED,
@@ -25993,6 +25997,22 @@ app.post("/api/alert/set", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 4C — DEV/INTERNAL scan accuracy review endpoints.
+// Phase 4I.5: dev-only source cooldown reset.
+// Clears LOCAL in-memory source cooldown flags so live refresh testing works
+// after a SerpAPI 429 or Etsy 403. Does NOT clear external provider limits.
+app.post("/api/dev/source-cooldown/reset", requireDevReviewAccess, (req, res) => {
+  const sources = ["serpapi", "etsy", "ebay", "walmart", "bestbuy"];
+  for (const s of sources) {
+    try { markSourceSuccess(s, 0); } catch {}
+  }
+  resetEtsyCooldown();
+  console.log("DEV_SOURCE_COOLDOWN_RESET", {
+    sources, ts: new Date().toISOString(),
+    note: "local in-memory cooldown cleared; external provider limits unchanged",
+  });
+  return res.json({ reset: true, sources, ts: new Date().toISOString() });
+});
+
 // Guarded by requireDevReviewAccess (open in dev/local; dev-token-gated + fail-
 // closed in production). These expose the scan-review JSONL artifacts so scans
 // can be reviewed and corrected by hand. They never touch verdict math,
@@ -28609,7 +28629,7 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   // every /market/search request through the catch handler). Pulling the
   // const up here keeps the later re-declaration site as a no-op intentionally
   // removed below.
-  const _scanIdA = responsePayload.scanId || null;
+  const _scanIdA = responsePayload.scanId || _budgetScanIdEarly || null;
   // Issue 5: per-minute scan rate limit (bench bypass honored)
   if (_userId && !isBenchBypass(req) && !isPaidPlan(_planA)) {
     const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_FREE_PER_MIN).catch(() => true);
@@ -28767,7 +28787,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   }
   const _planB = getResolvedPlan(req);
   // Hoisted (TDZ fix — same pattern as _scanIdA / _scanIdC).
-  const _scanIdB = responsePayload.scanId || null;
+  const _scanIdB = responsePayload.scanId || _budgetScanIdEarly || null;
   // Issue 5: per-minute scan rate limit (bench bypass honored)
   if (_userId && !isBenchBypass(req)) {
     const _rlLimitB = isPaidPlan(_planB) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
@@ -29134,7 +29154,7 @@ if (Array.isArray(items) && items.length >= 2 && visionIdentity?.brand && vision
 const _planC = getResolvedPlan(req);
 // Hoisted: applyCategoryDomination reads `_scanIdC` before the later
 // declaration (TDZ violation — same pattern as _scanIdA above).
-const _scanIdC = responsePayload.scanId || null;
+const _scanIdC = responsePayload.scanId || _budgetScanIdEarly || null;
 // Issue 5: per-minute scan rate limit (bench bypass honored)
 if (_userId && !isBenchBypass(req)) {
   const _rlLimitC = isPaidPlan(_planC) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
@@ -29890,7 +29910,7 @@ app.post("/market/search/stream", async (req, res) => {
       }).catch(() => {});
       _bp_log("applyCategoryIntelligence", _t_catIntel);
       // Phase 2: Category Domination Engine
-      const _scanIdD = payload.scanId || null;
+      const _scanIdD = payload.scanId || scanId || null;
       const _t_catDom = Date.now();
       await applyCategoryDomination(redis, payload, {
         identity:         visionIdentity || {},
@@ -30083,6 +30103,12 @@ app.post("/market/search/stream", async (req, res) => {
               rid: req.rid, scanId, refreshScanId, query,
               reason: "serpapi_rate_limited",
               serpCooling: _serpCoolingNow, etsyCooling: _etsyCoolingNow,
+            });
+            console.log("CACHE_REFRESH_SKIPPED_DUE_TO_SOURCE_COOLDOWN", {
+              rid: req.rid, parentScanId: scanId, refreshScanId, query,
+              serpCooling: _serpCoolingNow, etsyCooling: _etsyCoolingNow, ebayAvail: _ebayAvailNow,
+              serpCooldownUntil: (() => { try { const h = getSourceHealth("serpapi"); return h.cooldownUntil > Date.now() ? new Date(h.cooldownUntil).toISOString() : null; } catch { return null; } })(),
+              hint: "wait for cooldown or POST /api/dev/source-cooldown/reset (dev only) to clear local state",
             });
             if (!clientClosed) {
               send("complete", {
@@ -41138,6 +41164,20 @@ app.post("/api/profile/flip", async (req, res) => {
   } else if (missing.length) {
     console.log(`ℹ️  Marketplace APIs: ${liveCount}/${Object.keys(sources).length} live (${Object.entries(sources).filter(([,on])=>on).map(([k])=>k).join(", ")}); missing ${missing.join(", ")}`);
   }
+
+  // Phase 4I.5: emit source cooldown state at startup so ops can see if any
+  // source is already cooling before the first scan.
+  try {
+    const _serpHealth = getSourceHealth("serpapi");
+    const _etsyHealth = getSourceHealth("etsy");
+    console.log("SOURCE_COOLDOWN_STATUS", {
+      ts: new Date().toISOString(),
+      serpapi: { cooling: isSourceCoolingDown("serpapi"), cooldownUntil: _serpHealth.cooldownUntil > Date.now() ? new Date(_serpHealth.cooldownUntil).toISOString() : null, failures: _serpHealth.failures || 0 },
+      etsy: { cooling: Date.now() < ETSY_COOLDOWN_UNTIL || isSourceCoolingDown("etsy"), cooldownUntil: ETSY_COOLDOWN_UNTIL > Date.now() ? new Date(ETSY_COOLDOWN_UNTIL).toISOString() : (_etsyHealth.cooldownUntil > Date.now() ? new Date(_etsyHealth.cooldownUntil).toISOString() : null), failures: _etsyHealth.failures || 0 },
+      ebay: { available: hasEbayApi(), cooling: isSourceCoolingDown("ebay") },
+      hint: "POST /api/dev/source-cooldown/reset to clear local cooldown in dev",
+    });
+  } catch {}
 
   // Production safety: warn loudly if any of the new env-overridable rate
   // limits or abuse thresholds are set above safe ceilings. These knobs
