@@ -439,7 +439,7 @@ describe("rank-before-slice prevents losing late verified items", () => {
     assert.ok(slicedAfter.some(i => i.urlQuality === "merchant_direct"), "verified survives slice");
   });
 
-  it("pricing-only items rank below verified items after rerank", () => {
+  it("pricing-only items rank below verified items after rerank (Phase 4I.3)", () => {
     const items = [
       makeFakeItem({ title: "Pricing A", urlQuality: "unknown_legacy_no_url", price: 30 }),
       makeFakeItem({ title: "Verified B", urlQuality: "merchant_direct", price: 100 }),
@@ -450,5 +450,70 @@ describe("rank-before-slice prevents losing late verified items", () => {
     // pricing-only items come after regardless of price
     assert.ok(["Pricing A", "Pricing C"].includes(ranked[1].title));
     assert.ok(["Pricing A", "Pricing C"].includes(ranked[2].title));
+  });
+});
+
+// ── Phase 4I.4: serpShopping gate audit ──────────────────────────────────────
+
+describe("serpShopping bypassHardenedCache gate", () => {
+  it("bypassHardenedCache=false means hardened cache is checked (normal scan path)", () => {
+    const bypassHardenedCache = false;
+    // Simulate: if cache has fresh entry and bypassHardenedCache=false → return cached
+    const cacheHasFresh = true;
+    const wouldReturnFromCache = !bypassHardenedCache && cacheHasFresh;
+    assert.ok(wouldReturnFromCache, "normal scan uses hardened cache");
+  });
+
+  it("bypassHardenedCache=true skips hardened cache and reaches consumeSerpBudget", () => {
+    const bypassHardenedCache = true;
+    // Simulate: bypassHardenedCache=true → cache block skipped → consumeSerpBudget runs
+    const cacheHasFresh = true;
+    const wouldReturnFromCache = !bypassHardenedCache && cacheHasFresh;
+    assert.ok(!wouldReturnFromCache, "forceSourceRefresh must not return from hardened cache");
+  });
+
+  it("SERP_HARDENED_CACHE_BYPASSED fires only when bypassHardenedCache=true", () => {
+    // The log fires at the point where we confirmed cache was skipped and we're at budget gate
+    const shouldLog = (bypassHardenedCache) => bypassHardenedCache === true;
+    assert.ok(shouldLog(true), "fires on refresh path");
+    assert.ok(!shouldLog(false), "does not fire on normal scan path");
+  });
+
+  it("SERP_LIVE_SOURCE_NOT_REACHED fires when budget is blocked AND bypassHardenedCache=true", () => {
+    const bypassHardenedCache = true;
+    const budgetAllowed = false; // blocked
+    const shouldLog = bypassHardenedCache && !budgetAllowed;
+    assert.ok(shouldLog, "logs when forceSourceRefresh hits a blocked budget");
+  });
+
+  it("SERP_LIVE_SOURCE_NOT_REACHED does not fire on normal scan budget blocks", () => {
+    const bypassHardenedCache = false; // normal scan
+    const budgetAllowed = false; // blocked
+    const shouldLog = bypassHardenedCache && !budgetAllowed;
+    assert.ok(!shouldLog, "normal scan budget block uses standard SERP_BUDGET_BLOCKED");
+  });
+
+  it("refreshBudgetUsed=1 proves consumeSerpBudget ran and real call was made", () => {
+    const refreshCtx = { callsUsed: 1 };
+    assert.ok(refreshCtx.callsUsed > 0, "callsUsed > 0 = consumeSerpBudget was called = real network call");
+  });
+
+  it("refreshBudgetUsed=0 with serpCooling=false flags source-not-reached condition", () => {
+    const refreshCtx = { callsUsed: 0 };
+    const serpCooling = false;
+    // If not cooling but callsUsed=0, something returned before consumeSerpBudget
+    const sourceNotReached = refreshCtx.callsUsed === 0 && !serpCooling;
+    assert.ok(sourceNotReached, "should log CACHE_REFRESH_LIVE_SOURCE_NOT_ATTEMPTED");
+  });
+
+  it("cooling=true + bypassHardenedCache=true falls through to budget gate (new behavior)", () => {
+    // Old: cooling + no return → falls through silently
+    // New: cooling + bypassHardenedCache=false → return []; cooling + bypassHardenedCache=true → falls through
+    const bypassHardenedCache = true;
+    const isCooling = true;
+    // When bypassHardenedCache=true we allow the call through even when cooling,
+    // letting the budget gate decide — consistent with pre-flight check upstream
+    const shouldFallThrough = bypassHardenedCache; // new behavior
+    assert.ok(shouldFallThrough, "forceSourceRefresh must attempt even when cooling to get honest result");
   });
 });

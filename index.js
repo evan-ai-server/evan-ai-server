@@ -23060,8 +23060,9 @@ async function serpShopping(query, opts = {}) {
   if (!SERPAPI_KEY) return [];
   if (process.env.DISABLE_SERP === "true") return [];
   if (!bypassCooldown && isSourceCoolingDown("serpapi")) {
-  console.warn("⚠️ SerpAPI cooling — allowing fallback queries");
-}
+    console.warn("⚠️ SerpAPI cooling — allowing fallback queries");
+    if (!bypassHardenedCache) return []; // let forceSourceRefresh fall through to budget gate
+  }
 
   // ── Phase 6: stale-while-revalidate ────────────────────────────────────
   // Fresh hit → instant return. Stale hit → instant return + background
@@ -23097,12 +23098,25 @@ async function serpShopping(query, opts = {}) {
     }
   }
 
+  // Phase 4I.3/4I.4: log when SERP_HARDENED_CACHE was intentionally bypassed
+  // (forceSourceRefresh path). This confirms the refresh reached the budget gate.
+  if (bypassHardenedCache) {
+    console.log("SERP_HARDENED_CACHE_BYPASSED", {
+      query, reason: "force_source_refresh", bypassHardenedCache: true,
+    });
+  }
+
   // ── Phase 2C.8: per-scan SerpAPI budget gate ─────────────────────────────────
   // Cache hits above this point are free (no budget consumed). A real network
   // call beyond this point requires the scan to have at least 1 unit left.
   // If budget is spent, return [] and log SERP_BUDGET_BLOCKED with the route /
   // query that triggered the would-be call.
   if (!consumeSerpBudget("serpShopping", { engine: "google_shopping", query })) {
+    if (bypassHardenedCache) {
+      console.log("SERP_LIVE_SOURCE_NOT_REACHED", {
+        query, reason: "budget_blocked", bypassHardenedCache,
+      });
+    }
     return [];
   }
 
