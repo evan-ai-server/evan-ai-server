@@ -15749,6 +15749,17 @@ function markSourceSuccess(source, latencyMs = 0) {
   setMetric("source_cooling", 0, { source: key });
 }
 
+// Dev-only: hard-resets ALL counters + cooldown for a source so a subsequent
+// failure doesn't immediately re-trigger cooldown from accumulated strikes.
+// Must only be called from the /api/dev/source-cooldown/reset route.
+function resetSourceCooldown(source) {
+  const key = String(source || "unknown").toLowerCase();
+  const fresh = { ...defaultSourceHealth(), updatedAt: Date.now() };
+  SOURCE_HEALTH.set(key, fresh);
+  try { mirrorStateWrite(sourceHealthCacheKey(key), fresh, STATE_MIRROR_TTL_SEC); } catch {}
+  setMetric("source_cooling", 0, { source: key });
+}
+
 function markSourceFailure(source, reason = "error") {
   const key = String(source || "unknown").toLowerCase();
   const h = {
@@ -25997,20 +26008,49 @@ app.post("/api/alert/set", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase 4C — DEV/INTERNAL scan accuracy review endpoints.
-// Phase 4I.5: dev-only source cooldown reset.
-// Clears LOCAL in-memory source cooldown flags so live refresh testing works
-// after a SerpAPI 429 or Etsy 403. Does NOT clear external provider limits.
+// Phase 4I.5: dev-only source cooldown tools.
+// POST /reset — hard-resets all local in-memory source cooldown state (zeros failures,
+//   timeouts, cooldownUntil). Does NOT clear external provider limits (SerpAPI 429
+//   recovery still needs actual time if the external ban is active).
+// GET  /status — returns current cooldown state without mutating anything.
+
+function _buildSourceCooldownStatus() {
+  const sources = ["serpapi", "etsy", "ebay", "walmart", "bestbuy"];
+  const status = {};
+  for (const s of sources) {
+    const h = getSourceHealth(s);
+    const etsyExtra = s === "etsy" ? Date.now() < ETSY_COOLDOWN_UNTIL : false;
+    const cooldownUntilMs = s === "etsy"
+      ? Math.max(h.cooldownUntil || 0, ETSY_COOLDOWN_UNTIL)
+      : (h.cooldownUntil || 0);
+    status[s] = {
+      cooling: isSourceCoolingDown(s) || etsyExtra,
+      cooldownUntil: cooldownUntilMs > Date.now() ? new Date(cooldownUntilMs).toISOString() : null,
+      failures: h.failures || 0,
+      timeouts: h.timeouts || 0,
+    };
+  }
+  return status;
+}
+
 app.post("/api/dev/source-cooldown/reset", requireDevReviewAccess, (req, res) => {
   const sources = ["serpapi", "etsy", "ebay", "walmart", "bestbuy"];
   for (const s of sources) {
-    try { markSourceSuccess(s, 0); } catch {}
+    try { resetSourceCooldown(s); } catch {}
   }
   resetEtsyCooldown();
+  const status = _buildSourceCooldownStatus();
   console.log("DEV_SOURCE_COOLDOWN_RESET", {
     sources, ts: new Date().toISOString(),
-    note: "local in-memory cooldown cleared; external provider limits unchanged",
+    note: "local in-memory cooldown + failure counters zeroed; external provider limits unchanged",
   });
-  return res.json({ reset: true, sources, ts: new Date().toISOString() });
+  console.log("SOURCE_COOLDOWN_STATUS", { ts: new Date().toISOString(), ...status });
+  return res.json({ reset: true, sources, status, ts: new Date().toISOString() });
+});
+
+app.get("/api/dev/source-cooldown/status", requireDevReviewAccess, (req, res) => {
+  const status = _buildSourceCooldownStatus();
+  return res.json({ ts: new Date().toISOString(), status });
 });
 
 // Guarded by requireDevReviewAccess (open in dev/local; dev-token-gated + fail-
