@@ -640,6 +640,111 @@ test("4K: late generic aircraft result is rejected (isGenericAircraftToyQuery)",
   assert.equal(isGenericAircraftToyQuery(q), true, "generic aircraft query must be rejected from late storage");
 });
 
+// ── Phase 4K.1: quality-aware late-storage guard ──────────────────────────────
+
+test("4K.1: complete late result overwrites incomplete — prince arrives before gate closes", () => {
+  // Simulate: fast stored incomplete, then query_fast stored complete.
+  const store = new Map();
+  const imageHash = "abc123";
+
+  // Simulate _storeLateResult quality guard logic
+  const tryStore = (entry) => {
+    const existing = store.get(imageHash);
+    if (existing && !existing.needsFamilyRecovery) return false; // existing complete — skip
+    if (existing?.needsFamilyRecovery && entry.needsFamilyRecovery) return false; // both incomplete — first wins
+    store.set(imageHash, entry);
+    return true;
+  };
+
+  // fast stores incomplete result first
+  const incompleteEntry = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true };
+  assert.equal(tryStore(incompleteEntry), true, "incomplete fast result should store");
+  assert.equal(store.get(imageHash)?.needsFamilyRecovery, true);
+
+  // query_fast arrives later with complete result — should overwrite
+  const completeEntry = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", needsFamilyRecovery: false };
+  assert.equal(tryStore(completeEntry), true, "complete query_fast result must overwrite incomplete fast");
+  assert.equal(store.get(imageHash)?.query, "Hawaiian Airlines Boeing 787 diecast model airplane");
+  assert.equal(store.get(imageHash)?.needsFamilyRecovery, false);
+});
+
+test("4K.1: second incomplete result does not overwrite first incomplete — first wins", () => {
+  const store = new Map();
+  const imageHash = "abc456";
+
+  const tryStore = (entry) => {
+    const existing = store.get(imageHash);
+    if (existing && !existing.needsFamilyRecovery) return false;
+    if (existing?.needsFamilyRecovery && entry.needsFamilyRecovery) return false;
+    store.set(imageHash, entry);
+    return true;
+  };
+
+  const first  = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true };
+  const second = { query: "United Airlines diecast airplane model",   needsFamilyRecovery: true };
+  assert.equal(tryStore(first),  true,  "first incomplete stores");
+  assert.equal(tryStore(second), false, "second incomplete must NOT overwrite first");
+  assert.equal(store.get(imageHash)?.query, first.query);
+});
+
+test("4K.1: complete existing result blocks any new result — don't downgrade", () => {
+  const store = new Map();
+  const imageHash = "abc789";
+
+  const tryStore = (entry) => {
+    const existing = store.get(imageHash);
+    if (existing && !existing.needsFamilyRecovery) return false;
+    if (existing?.needsFamilyRecovery && entry.needsFamilyRecovery) return false;
+    store.set(imageHash, entry);
+    return true;
+  };
+
+  // Master stored a complete result
+  store.set(imageHash, { query: "Hawaiian Airlines Boeing 787 diecast model airplane", needsFamilyRecovery: false });
+
+  // Late fast tries to store something (even if complete) — should be blocked
+  const lateEntry = { query: "Hawaiian Airlines Boeing 787-9 1:400", needsFamilyRecovery: false };
+  assert.equal(tryStore(lateEntry), false, "complete existing must not be overwritten by any late result");
+});
+
+test("4K.1: no existing entry — first result (even incomplete) stores freely", () => {
+  const store = new Map();
+  const imageHash = "abc000";
+
+  const tryStore = (entry) => {
+    const existing = store.get(imageHash);
+    if (existing && !existing.needsFamilyRecovery) return false;
+    if (existing?.needsFamilyRecovery && entry.needsFamilyRecovery) return false;
+    store.set(imageHash, entry);
+    return true;
+  };
+
+  const entry = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true };
+  assert.equal(tryStore(entry), true, "first result should always store when no existing entry");
+});
+
+test("4K.1: frontend poll continues after marketReady:false — does not stop forever", () => {
+  // Simulate the client-side gate: marketReady:false falls through to retry (no return)
+  let pollRetryScheduled = false;
+  const simulatePoll = (d) => {
+    if (d?.ready && d?.query && d?.marketReady !== false) {
+      // market search path — stops polling
+      return "market_search";
+    }
+    if (d?.ready && d?.query && d?.marketReady === false) {
+      // incomplete — show toast but continue
+      pollRetryScheduled = true;
+      // falls through to retry (no return)
+    }
+    // retry scheduled here
+    return "retry";
+  };
+
+  const result = simulatePoll({ ready: true, query: "Hawaiian Airlines diecast airplane model", marketReady: false });
+  assert.equal(result, "retry", "incomplete result must schedule retry, not stop polling");
+  assert.equal(pollRetryScheduled, true);
+});
+
 test("4K: startup selftests are gated behind RUN_STARTUP_SELFTESTS env", () => {
   // The selftest blocks are now wrapped in `if (process.env.RUN_STARTUP_SELFTESTS === "true")`.
   // During normal startup (env not set), these blocks do not run.

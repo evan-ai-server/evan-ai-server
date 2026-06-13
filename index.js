@@ -20333,7 +20333,6 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         if (imageHash) {
           const _storeLateResult = (passLabel, prom) => {
             prom.then((r) => {
-              if (BACKGROUND_VISION_RESULTS.has(imageHash)) return; // master already won
               const _lateQ   = r?.parsed?.query || null;
               const _lateMs  = Date.now() - passT0;
               const _logKey  = passLabel === "query_fast" ? "VISION_LATE_QUERY_FAST_RESULT_STORED"
@@ -20349,6 +20348,12 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               }
               const _lateCheck = detectIncompleteAircraftIdentityQuery(_lateQ);
               const _lateNeedsFamily = _lateCheck.incomplete;
+              // Phase 4K.1: quality-aware guard — complete result beats incomplete;
+              // incomplete must not block a later complete result from being stored.
+              const _existingEntry = BACKGROUND_VISION_RESULTS.get(imageHash);
+              if (_existingEntry && !_existingEntry.needsFamilyRecovery) return; // existing complete — don't downgrade
+              if (_existingEntry?.needsFamilyRecovery && _lateNeedsFamily) return; // both incomplete — first wins
+              // Fall through: no existing, OR existing incomplete + new is complete → store
               BACKGROUND_VISION_RESULTS.set(imageHash, {
                 query: _lateQ,
                 variants: Array.isArray(r?.parsed?.variants) ? r.parsed.variants : [],
