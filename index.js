@@ -20327,9 +20327,27 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           pendingQueryFast: true, pendingFast: true, pendingVisual: true,
           masterLaunched, reason: "no_seed_keep_background_candidates_alive",
         });
+        // Phase 4K.2: quality score for background vision entries.
+        // Higher score = more specific / more market-useful identity.
+        const _scoreBackgroundVisionEntry = (entry) => {
+          const q = String(entry?.query || "").toLowerCase();
+          let score = 0;
+          if (!entry?.needsFamilyRecovery) score += 100; else score -= 50;
+          score += Math.round(Number(entry?.confidence || 0) * 20);
+          if (/\b(hawaiian|united|delta|american airlines|southwest|alaska|jetblue|ana|jal|lufthansa|emirates|british airways|air france|klm|qantas|singapore|cathay|air canada)\b/.test(q)) score += 20;
+          if (/\b(boeing|airbus|embraer|bombardier|lockheed|mcdonnell|douglas)\b/.test(q)) score += 20;
+          if (/\b(787|787-9|787 9|747|777|737|a380|a350|a330|a320|a321|a319|dreamliner|concorde)\b/.test(q)) score += 25;
+          if (/\b1\s*[:/]\s*\d{2,3}\b/.test(q)) score += 18;
+          if (/\b(geminijets?|herpa|ng model|aviation400|jc wings|phoenix|hogan|inflight|aeroclassics)\b/.test(q)) score += 18;
+          if (/\b(diecast|die-cast|collectible|model airplane|aircraft model)\b/.test(q)) score += 10;
+          if (isGenericAircraftToyQuery(q)) score -= 80;
+          score += Math.min(20, Math.floor(q.length / 12));
+          return score;
+        };
+
         // Phase 4K Part A+B: store first late result so frontend poll resolves fast.
         // Passes fire in order: fast (~3500ms) → visual (~4000ms) → queryFast (~4500ms).
-        // Master overwrites at ~11s if it returns a more complete result.
+        // Master overwrites at ~11s with the most complete result.
         if (imageHash) {
           const _storeLateResult = (passLabel, prom) => {
             prom.then((r) => {
@@ -20348,22 +20366,56 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               }
               const _lateCheck = detectIncompleteAircraftIdentityQuery(_lateQ);
               const _lateNeedsFamily = _lateCheck.incomplete;
-              // Phase 4K.1: quality-aware guard — complete result beats incomplete;
-              // incomplete must not block a later complete result from being stored.
-              const _existingEntry = BACKGROUND_VISION_RESULTS.get(imageHash);
-              if (_existingEntry && !_existingEntry.needsFamilyRecovery) return; // existing complete — don't downgrade
-              if (_existingEntry?.needsFamilyRecovery && _lateNeedsFamily) return; // both incomplete — first wins
-              // Fall through: no existing, OR existing incomplete + new is complete → store
-              BACKGROUND_VISION_RESULTS.set(imageHash, {
-                query: _lateQ,
-                variants: Array.isArray(r?.parsed?.variants) ? r.parsed.variants : [],
-                confidence: Number(r?.parsed?.confidence || 0.5),
-                visionIdentity: r?.parsed?.identity || null,
-                category: String(r?.parsed?.identity?.category || "") || null,
-                completedAt: Date.now(),
-                elapsedMs: _lateMs,
+              const _incomingEntry = {
+                query:               _lateQ,
+                variants:            Array.isArray(r?.parsed?.variants) ? r.parsed.variants : [],
+                confidence:          Number(r?.parsed?.confidence || 0.5),
+                visionIdentity:      r?.parsed?.identity || null,
+                category:            String(r?.parsed?.identity?.category || "") || null,
+                completedAt:         Date.now(),
+                elapsedMs:           _lateMs,
                 needsFamilyRecovery: _lateNeedsFamily || undefined,
-              });
+              };
+              // Phase 4K.2: quality-score guard — specific identity beats generic identity.
+              const _existingEntry = BACKGROUND_VISION_RESULTS.get(imageHash);
+              if (_existingEntry) {
+                const _existScore = _scoreBackgroundVisionEntry(_existingEntry);
+                const _inScore   = _scoreBackgroundVisionEntry(_incomingEntry);
+                // Incomplete can never overwrite complete.
+                if (!_existingEntry.needsFamilyRecovery && _lateNeedsFamily) {
+                  console.log("VISION_LATE_RESULT_SKIPPED_DOWNGRADE", {
+                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
+                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
+                    reason: "incoming_incomplete_existing_complete",
+                  });
+                  return;
+                }
+                // Both incomplete: incoming must be substantially stronger (+15) to overwrite.
+                if (_existingEntry.needsFamilyRecovery && _lateNeedsFamily && _inScore < _existScore + 15) {
+                  console.log("VISION_LATE_RESULT_SKIPPED_WEAKER_INCOMPLETE", {
+                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
+                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
+                    reason: "both_incomplete_incoming_not_substantially_better",
+                  });
+                  return;
+                }
+                // Both complete: incoming must be clearly stronger (+10) to overwrite.
+                if (!_existingEntry.needsFamilyRecovery && !_lateNeedsFamily && _inScore < _existScore + 10) {
+                  console.log("VISION_LATE_RESULT_SKIPPED_WEAKER_COMPLETE", {
+                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
+                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
+                    reason: "incoming_complete_not_stronger",
+                  });
+                  return;
+                }
+                console.log("VISION_LATE_RESULT_REPLACING_BACKGROUND_ENTRY", {
+                  rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
+                  incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
+                  existingNeedsFamilyRecovery: !!_existingEntry.needsFamilyRecovery,
+                  incomingNeedsFamilyRecovery: !!_lateNeedsFamily,
+                });
+              }
+              BACKGROUND_VISION_RESULTS.set(imageHash, _incomingEntry);
               console.log(_logKey, { rid: req.rid, query: _lateQ, elapsedMs: _lateMs, needsFamilyRecovery: _lateNeedsFamily || false });
               console.log("VISION_LATE_RESULT_MARKET_READY", {
                 rid: req.rid, pass: passLabel, query: _lateQ,

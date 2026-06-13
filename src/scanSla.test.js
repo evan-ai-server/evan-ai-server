@@ -723,6 +723,127 @@ test("4K.1: no existing entry — first result (even incomplete) stores freely",
   assert.equal(tryStore(entry), true, "first result should always store when no existing entry");
 });
 
+// ── Phase 4K.2: quality-score guard ──────────────────────────────────────────
+// Mirrors the _scoreBackgroundVisionEntry + guard logic from index.js.
+
+function scoreEntry(entry, isGenericAircraftFn) {
+  const q = String(entry?.query || "").toLowerCase();
+  let score = 0;
+  if (!entry?.needsFamilyRecovery) score += 100; else score -= 50;
+  score += Math.round(Number(entry?.confidence || 0) * 20);
+  if (/\b(hawaiian|united|delta|american airlines|southwest|alaska|jetblue|ana|jal|lufthansa|emirates|british airways|air france|klm|qantas|singapore|cathay|air canada)\b/.test(q)) score += 20;
+  if (/\b(boeing|airbus|embraer|bombardier|lockheed|mcdonnell|douglas)\b/.test(q)) score += 20;
+  if (/\b(787|787-9|787 9|747|777|737|a380|a350|a330|a320|a321|a319|dreamliner|concorde)\b/.test(q)) score += 25;
+  if (/\b1\s*[:/]\s*\d{2,3}\b/.test(q)) score += 18;
+  if (/\b(geminijets?|herpa|ng model|aviation400|jc wings|phoenix|hogan|inflight|aeroclassics)\b/.test(q)) score += 18;
+  if (/\b(diecast|die-cast|collectible|model airplane|aircraft model)\b/.test(q)) score += 10;
+  if (isGenericAircraftFn && isGenericAircraftFn(q)) score -= 80;
+  score += Math.min(20, Math.floor(q.length / 12));
+  return score;
+}
+
+function tryStoreQuality(store, imageHash, incomingEntry) {
+  const existing = store.get(imageHash);
+  if (!existing) { store.set(imageHash, incomingEntry); return { stored: true, reason: "no_existing" }; }
+  const existScore = scoreEntry(existing, isGenericAircraftToyQuery);
+  const inScore    = scoreEntry(incomingEntry, isGenericAircraftToyQuery);
+  // Incomplete cannot overwrite complete
+  if (!existing.needsFamilyRecovery && incomingEntry.needsFamilyRecovery)
+    return { stored: false, reason: "incoming_incomplete_existing_complete" };
+  // Both incomplete: need +15 to overwrite
+  if (existing.needsFamilyRecovery && incomingEntry.needsFamilyRecovery && inScore < existScore + 15)
+    return { stored: false, reason: "both_incomplete_incoming_not_substantially_better" };
+  // Both complete: need +10 to overwrite
+  if (!existing.needsFamilyRecovery && !incomingEntry.needsFamilyRecovery && inScore < existScore + 10)
+    return { stored: false, reason: "incoming_complete_not_stronger" };
+  store.set(imageHash, incomingEntry);
+  return { stored: true, reason: "replacing" };
+}
+
+test("4K.2: score — complete entry scores much higher than incomplete", () => {
+  const complete   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  const incomplete = { query: "Hawaiian Airlines diecast airplane model",            confidence: 0.85, needsFamilyRecovery: true };
+  const cs = scoreEntry(complete,   isGenericAircraftToyQuery);
+  const is = scoreEntry(incomplete, isGenericAircraftToyQuery);
+  assert.ok(cs > is + 100, `complete (${cs}) must score >100 pts above incomplete (${is})`);
+});
+
+test("4K.2: score — collector model beats generic diecast query", () => {
+  const collector = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.9, needsFamilyRecovery: false };
+  const generic   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane",           confidence: 0.85, needsFamilyRecovery: false };
+  const cs = scoreEntry(collector, isGenericAircraftToyQuery);
+  const gs = scoreEntry(generic,   isGenericAircraftToyQuery);
+  assert.ok(cs > gs, `collector (${cs}) must outscore generic (${gs})`);
+});
+
+test("4K.2: incomplete existing + complete incoming → overwrite", () => {
+  const store = new Map();
+  const hash  = "h1";
+  const inc = { query: "Hawaiian Airlines diecast airplane model",            confidence: 0.7, needsFamilyRecovery: true };
+  const comp = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, inc);
+  const result = tryStoreQuality(store, hash, comp);
+  assert.equal(result.stored, true, "complete must overwrite incomplete");
+  assert.equal(store.get(hash)?.query, comp.query);
+});
+
+test("4K.2: weak complete existing + stronger complete incoming → overwrite", () => {
+  const store = new Map();
+  const hash  = "h2";
+  const weak   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane",             confidence: 0.75, needsFamilyRecovery: false };
+  const strong = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.90, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, weak);
+  const result = tryStoreQuality(store, hash, strong);
+  assert.equal(result.stored, true, "stronger complete must overwrite weaker complete");
+  assert.equal(store.get(hash)?.query, strong.query);
+});
+
+test("4K.2: strong complete existing + weaker complete incoming → skip", () => {
+  const store = new Map();
+  const hash  = "h3";
+  const strong = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.90, needsFamilyRecovery: false };
+  const weak   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane",             confidence: 0.75, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, strong);
+  const result = tryStoreQuality(store, hash, weak);
+  assert.equal(result.stored, false, "weaker complete must not overwrite stronger complete");
+  assert.equal(store.get(hash)?.query, strong.query);
+});
+
+test("4K.2: complete existing + incomplete incoming → skip (never downgrade)", () => {
+  const store = new Map();
+  const hash  = "h4";
+  const comp = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  const inc  = { query: "Hawaiian Airlines diecast airplane model",            confidence: 0.95, needsFamilyRecovery: true };
+  tryStoreQuality(store, hash, comp);
+  const result = tryStoreQuality(store, hash, inc);
+  assert.equal(result.stored, false, "incomplete must never overwrite complete, even at higher confidence");
+  assert.equal(store.get(hash)?.needsFamilyRecovery, false);
+});
+
+test("4K.2: two incomplete — second not substantially better (+15) → skip", () => {
+  const store = new Map();
+  const hash  = "h5";
+  const first  = { query: "Hawaiian Airlines diecast airplane model", confidence: 0.7, needsFamilyRecovery: true };
+  const second = { query: "United Airlines diecast airplane model",   confidence: 0.7, needsFamilyRecovery: true };
+  tryStoreQuality(store, hash, first);
+  const result = tryStoreQuality(store, hash, second);
+  assert.equal(result.stored, false, "similarly scored incomplete must not overwrite first");
+  assert.equal(store.get(hash)?.query, first.query);
+});
+
+test("4K.2: generic aircraft toy query gets large penalty and cannot beat specific result", () => {
+  const specific = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  const generic  = { query: "white plastic model airplane toy",                    confidence: 0.99, needsFamilyRecovery: false };
+  const ss = scoreEntry(specific, isGenericAircraftToyQuery);
+  const gs = scoreEntry(generic,  isGenericAircraftToyQuery);
+  assert.ok(gs < ss, `generic toy (${gs}) must score below specific aircraft (${ss})`);
+  const store = new Map();
+  const hash = "h6";
+  tryStoreQuality(store, hash, specific);
+  const result = tryStoreQuality(store, hash, generic);
+  assert.equal(result.stored, false, "generic toy must not overwrite specific aircraft result");
+});
+
 test("4K.1: frontend poll continues after marketReady:false — does not stop forever", () => {
   // Simulate the client-side gate: marketReady:false falls through to retry (no return)
   let pollRetryScheduled = false;
