@@ -509,4 +509,57 @@ describe("Background result marketReady — Phase 4J.2", () => {
     const entry = { query: "Nike Air Jordan 1 Low OG Year of the Rabbit" };
     assert.equal(computeMarketReady(entry), true);
   });
+
+  it("spread order: entry.marketReady=true cannot overwrite computed marketReady:false", () => {
+    // Proves { ..._entry, ready: true, marketReady: _bgMarketReady } is correct order.
+    // If the entry already has marketReady:true, the computed false must still win.
+    const entry = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true, marketReady: true };
+    const computed = computeMarketReady(entry);
+    // Simulate spread: { ...entry, ready: true, marketReady: computed }
+    const response = { ...entry, ready: true, marketReady: computed };
+    assert.equal(computed, false, "computed marketReady must be false for incomplete query");
+    assert.equal(response.marketReady, false, "response.marketReady must not be overwritten by entry.marketReady");
+  });
+
+  it("spread order: entry without marketReady key — computed value is preserved correctly", () => {
+    const entry = { query: "Hawaiian Airlines Boeing 787 diecast model airplane" };
+    const computed = computeMarketReady(entry);
+    const response = { ...entry, ready: true, marketReady: computed };
+    assert.equal(response.marketReady, true);
+    assert.equal(response.ready, true);
+  });
+});
+
+// ── K. Frontend marketReady guard logic — Phase 4J.2 ─────────────────────────
+// Mirrors the client gate: `_d?.ready && _d?.query && _d?.marketReady !== false`
+
+describe("Frontend marketReady gate — Phase 4J.2", () => {
+  function shouldRunMarketSearch(d) {
+    return !!(d?.ready && d?.query && d?.marketReady !== false);
+  }
+
+  it("marketReady:false → market search is NOT called", () => {
+    const d = { ready: true, query: "Hawaiian Airlines diecast airplane model", marketReady: false };
+    assert.equal(shouldRunMarketSearch(d), false);
+  });
+
+  it("marketReady:true → market search IS called", () => {
+    const d = { ready: true, query: "Hawaiian Airlines Boeing 787 diecast model airplane", marketReady: true };
+    assert.equal(shouldRunMarketSearch(d), true);
+  });
+
+  it("marketReady missing (old server) → market search IS called (backwards compat)", () => {
+    const d = { ready: true, query: "Hawaiian Airlines Boeing 787 diecast model airplane" };
+    assert.equal(shouldRunMarketSearch(d), true);
+  });
+
+  it("ready:false → market search is NOT called", () => {
+    const d = { ready: false, query: "Hawaiian Airlines Boeing 787 diecast model airplane", marketReady: true };
+    assert.equal(shouldRunMarketSearch(d), false);
+  });
+
+  it("no query → market search is NOT called", () => {
+    const d = { ready: true, query: null, marketReady: true };
+    assert.equal(shouldRunMarketSearch(d), false);
+  });
 });

@@ -21510,7 +21510,7 @@ app.get("/api/vision/background-result", async (req, res) => {
       requiredFamily: null, reason: "incomplete_aircraft_identity_missing_family",
     });
   }
-  return res.status(200).json({ ready: true, marketReady: _bgMarketReady, ..._entry });
+  return res.status(200).json({ ..._entry, ready: true, marketReady: _bgMarketReady });
 });
 
 app.post(
