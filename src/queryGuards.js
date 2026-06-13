@@ -128,6 +128,35 @@ export function isGenericAircraftToyQuery(query) {
  *                             "ANA Airbus A380 Sea Turtle 1:400"
  *                             "white plastic model airplane toy"  (no airline → incomplete=false)
  */
+/**
+ * Returns true when an incomplete-identity aircraft query should still be allowed
+ * to run an APPROXIMATE market search with the "family unconfirmed" label.
+ * Only applies to safe, low-stakes collectibles (diecast/model aircraft).
+ * High-stakes categories (luxury, sneakers, electronics, trading cards) stay blocked.
+ */
+export function isApproximateMarketAllowedQuery(query, visionCategory) {
+  const q   = String(query || "").toLowerCase();
+  const cat = String(visionCategory || "").toLowerCase();
+
+  // Must be a diecast / model aircraft context
+  const hasDiecastAircraftContext = (
+    /\b(diecast|die-cast|model airplane|aircraft model|model plane|collectible airplane|airplane model|model aircraft)\b/.test(q) ||
+    /\b(diecast|model airplane|aircraft model|model plane|collectible airplane|aviation model)\b/.test(cat)
+  );
+  if (!hasDiecastAircraftContext) return false;
+
+  // Block high-stakes categories regardless of diecast context
+  const isHighStakes = (
+    /\b(luxury|designer|rolex|omega|gucci|prada|louis vuitton|chanel|hermes|cartier)\b/.test(q) ||
+    /\b(nike|jordan|yeezy|supreme|off-white|balenciaga)\b/.test(q) ||
+    /\b(pokemon|trading card|graded card|psa|bgs|sgc|mtg|magic the gathering)\b/.test(q) ||
+    /\b(luxury|watch|sneaker|electronics|trading card|designer|collectible card)\b/.test(cat)
+  );
+  if (isHighStakes) return false;
+
+  return true;
+}
+
 export function detectIncompleteAircraftIdentityQuery(query) {
   const q = String(query || "").toLowerCase().trim();
   if (!q) return { incomplete: false };

@@ -463,7 +463,7 @@ import { buildFakeListingDetectorPayload, scoreFakeListingRisk, scanMarketForFak
 import { buildSeasonalFlipCalendarPayload, computeFlipTiming, getBuySellWindows, getUpcomingDemandEvents } from "./src/seasonalFlipCalendar.js";
 import { buildBrandTierPayload, resolveBrandTier, detectBrandPriceMismatch, findTierAlternatives } from "./src/brandTierClassifier.js";
 import { buildSmartPriceTargetPayload, buildPriceTargets, computeMaxBuyPrice, computeOptimalSellPrice } from "./src/smartPriceTargetEngine.js";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./src/queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery, isApproximateMarketAllowedQuery } from "./src/queryGuards.js";
 import { buildListingQualityScorerPayload, scoreListingQuality } from "./src/listingQualityScorer.js";
 import { buildMarketMomentumPayload, computePriceMomentum, detectPriceConvergence, computeSellThroughVelocity } from "./src/marketMomentumTracker.js";
 import { buildFlipScorePayload, computeFlipScore } from "./src/flipScoreEngine.js";
@@ -20308,6 +20308,10 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       };
     }
 
+    // When grace rescues query_fast, Block 0 (if raceWinner==="query_fast") has already
+    // been evaluated. We store the rescued result here and treat it as a "fast" win in Block 2.
+    let _graceRescuedFastResult = null;
+
     // Cancel the losers in-flight. Aborting masterAbortCtrl before master
     // launches → abort event fires → masterPromise resolves(null) immediately
     // (no OpenAI request sent). Aborting after launch → real in-flight cancel.
@@ -20329,42 +20333,55 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // a safety no-op for the case where visual settled naturally.
       try { visualAbortCtrl.abort(); } catch {}
     } else if (raceWinner === "hard_deadline") {
-      // Phase 4K Part C: grace window — give late fast/query_fast/visual a short window
-      // before committing to hard_fail_no_seed. A 5ms drift miss becomes a rescue.
-      const _noSeedGraceMs = Number(process.env.VISION_NO_SEED_GRACE_MS || 650);
+      // Phase 4K Part C / 4L: grace window — give late fast/query_fast/visual a chance
+      // before committing to hard_fail_no_seed. Default 1000ms catches query_fast which
+      // typically returns ~150-800ms after the hard deadline fires.
+      const _noSeedGraceMs = Number(process.env.VISION_NO_SEED_GRACE_MS || 1000);
       if (_noSeedGraceMs > 0) {
         const _graceT0 = Date.now();
         console.log("VISION_NO_SEED_GRACE_STARTED", {
           rid: req.rid, graceMs: _noSeedGraceMs, elapsedMs: Date.now() - passT0,
         });
+        // Phase 4L: query_fast is now watched by grace. When it rescues, its result is
+        // stored in _graceRescuedFastResult and raceWinner is set to "fast" so Block 2
+        // picks it up correctly (Block 0 for "query_fast" has already been evaluated).
+        console.log("VISION_QUERY_FAST_GRACE_WATCHED", { rid: req.rid, graceMs: _noSeedGraceMs });
         const _graceTimeoutP = new Promise((res) => {
           const t = setTimeout(res, _noSeedGraceMs);
           if (typeof t.unref === "function") t.unref();
         });
         // Each wrapper resolves ONLY when the pass returns a usable, non-cancelled result.
         // Non-usable results leave the wrapper pending so the timeout can win cleanly.
-        // query_fast is NOT included: its Block 0 path (line ~19993) has already been
-        // skipped by the time grace runs — a grace-rescued query_fast would have no
-        // downstream handler and produce a null response. Let Part A handle it via
-        // late storage instead.
         const _graceWrap = (src, p) => new Promise((res) => {
           p.then((r) => {
             if (r && !r.cancelled && isUsableVisionSeed(r?.parsed?.query)) res({ src, r });
           }).catch(() => {});
         });
         const _graceWon = await Promise.race([
-          _graceWrap("fast",   fastPromise),
-          _graceWrap("visual", visualPromise),
+          _graceWrap("fast",       fastPromise),
+          _graceWrap("visual",     visualPromise),
+          _graceWrap("query_fast", queryFastPromise),
           _graceTimeoutP.then(() => null),
         ]);
         const _graceElapsedMs = Date.now() - _graceT0;
         if (_graceWon) {
+          if (_graceWon.src === "query_fast") {
+            // Block 0 (if raceWinner==="query_fast") already passed — route through "fast" path.
+            raceWinner = "fast";
+            _graceRescuedFastResult = _graceWon.r;
+            console.log("VISION_QUERY_FAST_LIVE_SEED_ACCEPTED", {
+              rid: req.rid, query: _graceWon.r.parsed.query,
+              confidence: _graceWon.r.parsed.confidence ?? null,
+              graceMs: _noSeedGraceMs, elapsedMs: _graceElapsedMs,
+            });
+          } else {
+            raceWinner = _graceWon.src === "visual" ? "visual_early" : _graceWon.src;
+          }
           console.log("VISION_NO_SEED_GRACE_RESULT", {
             rid: req.rid, source: _graceWon.src, query: _graceWon.r.parsed.query,
             confidence: _graceWon.r.parsed.confidence ?? null,
             graceMs: _noSeedGraceMs, elapsedMs: _graceElapsedMs,
           });
-          raceWinner = _graceWon.src === "visual" ? "visual_early" : _graceWon.src;
         } else {
           console.log("VISION_NO_SEED_GRACE_EXPIRED", {
             rid: req.rid, graceMs: _noSeedGraceMs, elapsedMs: _graceElapsedMs,
@@ -20431,8 +20448,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           _storeLateResult("query_fast", queryFastPromise);
         }
       } else {
-        // Grace rescued fast or visual_early — abort the non-winning passes.
-        // query_fast was never in the grace race, so always abort it here.
+        // Grace rescued fast, visual_early, or query_fast (routed through "fast").
+        // Abort non-winning passes. If query_fast rescued, it already resolved so aborting is a no-op.
         try { queryFastAbortCtrl.abort(); } catch {}
         if (raceWinner !== "fast")         try { fastAbortCtrl.abort(); } catch {}
         if (raceWinner !== "visual_early") try { visualAbortCtrl.abort(); } catch {}
@@ -20464,7 +20481,9 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       fastResult   = await graceP(fastPromise);
       visualResult = await graceP(visualPromise);
     } else if (raceWinner === "fast") {
-      fastResult   = await fastPromise;  // already settled — instant
+      // _graceRescuedFastResult is set when grace rescued query_fast (routed through "fast").
+      // In that case fastPromise may be null/aborted — use the rescued result instead.
+      fastResult   = _graceRescuedFastResult ?? await fastPromise;
       visualResult = null;               // drain in background
       visualPromise.catch(() => null);
     } else if (raceWinner === "hard_deadline") {
@@ -21654,19 +21673,31 @@ app.get("/api/vision/background-result", async (req, res) => {
   if (!_entry) return res.status(200).json({ ready: false });
   const _bgMarketReady = !(_entry.needsFamilyRecovery ||
     detectIncompleteAircraftIdentityQuery(_entry.query).incomplete);
+  // Phase 4L: if not market-ready, check if this is a safe collectible that allows
+  // approximate market search (e.g. "Hawaiian Airlines diecast model airplane").
+  const _bgApproxAllowed = !_bgMarketReady &&
+    isApproximateMarketAllowedQuery(_entry.query, _entry.category || "");
   console.log("VISION_BACKGROUND_RESULT_RETURNED", {
     rid: req.rid, query: _entry.query, elapsedMs: _entry.elapsedMs,
     needsFamilyRecovery: _entry.needsFamilyRecovery || false,
-    marketReady: _bgMarketReady,
+    marketReady: _bgMarketReady, approximateAllowed: _bgApproxAllowed,
   });
   if (!_bgMarketReady) {
+    const _incompleteCheck = detectIncompleteAircraftIdentityQuery(_entry.query);
     console.log("VISION_BACKGROUND_RESULT_NOT_MARKET_READY", {
       rid: req.rid, query: _entry.query,
-      requiredAirline: detectIncompleteAircraftIdentityQuery(_entry.query).requiredAirline || null,
+      requiredAirline: _incompleteCheck.requiredAirline || null,
       requiredFamily: null, reason: "incomplete_aircraft_identity_missing_family",
+      approximateAllowed: _bgApproxAllowed,
     });
+    if (_bgApproxAllowed) {
+      console.log("VISION_APPROX_MARKET_ALLOWED", {
+        rid: req.rid, query: _entry.query, category: _entry.category || null,
+        reason: "safe_collectible_family_unconfirmed",
+      });
+    }
   }
-  return res.status(200).json({ ..._entry, ready: true, marketReady: _bgMarketReady });
+  return res.status(200).json({ ..._entry, ready: true, marketReady: _bgMarketReady, approximateAllowed: _bgApproxAllowed });
 });
 
 app.post(
@@ -29845,6 +29876,14 @@ app.post("/market/search/stream", async (req, res) => {
     // a real-time scan — no SLA pressure, so we give it a generous deadline.
     const _isBackgroundRecovery = req.body?.isBackgroundRecovery === true;
     const _needsFamilyRecovery  = req.body?.needsFamilyRecovery === true;
+    // Phase 4L: approximate mode — run market on incomplete-aircraft identity as "approximate range".
+    // Triggered when client passes approximateMode:true (from background poll or grace-rescued query_fast).
+    const _approximateMode = req.body?.approximateMode === true;
+    if (_approximateMode) {
+      console.log("VISION_APPROX_MARKET_ALLOWED", {
+        rid: req.rid, scanId, query, reason: "approximate_mode_requested",
+      });
+    }
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
     const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
     const _slaMsRemaining  = _scanStartedAtMs ? Math.max(0, _scanSlaMs - (Date.now() - _scanStartedAtMs)) : null;
@@ -31131,6 +31170,8 @@ app.post("/market/search/stream", async (req, res) => {
       status: "complete", enriching: false,
       dataDepth: enrichedItems.length < 3 ? "thin" : "normal",
       ...(_degraded ? { degraded: true, degradedReason: _degradedReason } : {}),
+      // Phase 4L: label approximate results — oracle already blocked by 4J guard.
+      ...(_approximateMode ? { approximateMarket: true, familyUnconfirmed: true } : {}),
       _diff,
       _timing: {
         phase1Ms: _phase1Ms, phase2Ms: _phase2Ms,

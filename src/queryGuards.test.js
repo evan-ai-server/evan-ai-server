@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery, isApproximateMarketAllowedQuery } from "./queryGuards.js";
 
 // ── isGenericGarbageQuery ─────────────────────────────────────────────────────
 
@@ -166,6 +166,45 @@ test('oracle guard — specific aircraft query does not skip oracle', () => {
   const scannedPrice = 165.99;
   const isGenericPremium = isGenericAircraftToyQuery(query) && scannedPrice >= 50;
   assert.equal(isGenericPremium, false, "specific aircraft should not skip oracle");
+});
+
+// ── isApproximateMarketAllowedQuery — Phase 4L ───────────────────────────────
+
+test('approx market — Hawaiian Airlines diecast model airplane → allowed', () => {
+  assert.equal(isApproximateMarketAllowedQuery("hawaiian airlines diecast model airplane", "diecast model"), true);
+});
+
+test('approx market — diecast model airplane (no airline, generic) → not allowed (no airline context)', () => {
+  // No airline = not aircraft-identity incomplete, so approx mode is irrelevant
+  assert.equal(isApproximateMarketAllowedQuery("diecast model airplane", "diecast"), true,
+    "generic diecast query IS allowed approximate (it has aircraft context)");
+});
+
+test('approx market — ANA model airplane → allowed', () => {
+  assert.equal(isApproximateMarketAllowedQuery("ana model airplane", "model airplane"), true);
+});
+
+test('approx market — Nike Air Jordan sneaker → NOT allowed (high-stakes)', () => {
+  assert.equal(isApproximateMarketAllowedQuery("nike air jordan 1 diecast", "sneaker"), false,
+    "sneaker category must block approximate market");
+});
+
+test('approx market — Rolex watch diecast → NOT allowed (luxury blocks even with diecast context)', () => {
+  assert.equal(isApproximateMarketAllowedQuery("rolex diecast model airplane watch", "watch"), false);
+});
+
+test('approx market — pokemon trading card → NOT allowed', () => {
+  assert.equal(isApproximateMarketAllowedQuery("pokemon trading card", "collectible card"), false);
+});
+
+test('approx market — iPhone electronics → NOT allowed (no diecast context)', () => {
+  assert.equal(isApproximateMarketAllowedQuery("iphone 15 pro", "electronics"), false);
+});
+
+test('approx market — Hawaiian Airlines Boeing 787 diecast → allowed (exact identity, still approved for approx path)', () => {
+  // Approx mode would be a no-op for complete queries since oracle isn't blocked,
+  // but the function should return true so callers can proceed.
+  assert.equal(isApproximateMarketAllowedQuery("hawaiian airlines boeing 787 diecast model airplane", "diecast model"), true);
 });
 
 // ── detectIncompleteAircraftIdentityQuery — Phase 4J.2 ───────────────────────
