@@ -145,6 +145,12 @@ export function isApproximateMarketAllowedQuery(query, visionCategory) {
   );
   if (!hasDiecastAircraftContext) return false;
 
+  // Approximate market is only meaningful when airline/livery is known but family is missing.
+  // Generic "diecast model airplane" with no airline doesn't benefit — it would just return
+  // random toy comps with no identity anchor. Require an airline name.
+  const hasAirline = /\b(hawaiian|united|delta|american airlines|southwest|alaska|jetblue|spirit|frontier|ana|jal|lufthansa|emirates|british airways|air france|klm|qantas|singapore|cathay|air canada|etihad|qatar|korean air|virgin)\b/.test(q);
+  if (!hasAirline) return false;
+
   // Block high-stakes categories regardless of diecast context
   const isHighStakes = (
     /\b(luxury|designer|rolex|omega|gucci|prada|louis vuitton|chanel|hermes|cartier)\b/.test(q) ||

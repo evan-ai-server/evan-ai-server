@@ -20368,7 +20368,9 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           if (_graceWon.src === "query_fast") {
             // Block 0 (if raceWinner==="query_fast") already passed — route through "fast" path.
             raceWinner = "fast";
-            _graceRescuedFastResult = _graceWon.r;
+            // Preserve source identity for downstream telemetry — logs/scoring can still
+            // distinguish a query_fast grace rescue from a native fast-pass win.
+            _graceRescuedFastResult = { ..._graceWon.r, source: "query_fast", rescuedByGrace: true };
             console.log("VISION_QUERY_FAST_LIVE_SEED_ACCEPTED", {
               rid: req.rid, query: _graceWon.r.parsed.query,
               confidence: _graceWon.r.parsed.confidence ?? null,
@@ -29876,12 +29878,24 @@ app.post("/market/search/stream", async (req, res) => {
     // a real-time scan — no SLA pressure, so we give it a generous deadline.
     const _isBackgroundRecovery = req.body?.isBackgroundRecovery === true;
     const _needsFamilyRecovery  = req.body?.needsFamilyRecovery === true;
-    // Phase 4L: approximate mode — run market on incomplete-aircraft identity as "approximate range".
-    // Triggered when client passes approximateMode:true (from background poll or grace-rescued query_fast).
-    const _approximateMode = req.body?.approximateMode === true;
+    // Phase 4L: approximate mode — server revalidates regardless of what client sent.
+    // Client flag is a hint; the backend confirms both conditions independently.
+    const _approximateModeRequested = req.body?.approximateMode === true;
+    const _approxIncompleteAircraft = detectIncompleteAircraftIdentityQuery(query);
+    const _approxSafeCategory      = isApproximateMarketAllowedQuery(query, category || "");
+    const _approximateMode = _approximateModeRequested &&
+      _approxIncompleteAircraft.incomplete && _approxSafeCategory;
+    if (_approximateModeRequested && !_approximateMode) {
+      console.log("VISION_APPROX_MARKET_BLOCKED", {
+        rid: req.rid, scanId, query,
+        reason: !_approxIncompleteAircraft.incomplete ? "not_incomplete_aircraft"
+              : "approx_not_allowed_for_category",
+      });
+    }
     if (_approximateMode) {
       console.log("VISION_APPROX_MARKET_ALLOWED", {
-        rid: req.rid, scanId, query, reason: "approximate_mode_requested",
+        rid: req.rid, scanId, query, reason: "approximate_mode_server_validated",
+        requiredAirline: _approxIncompleteAircraft.requiredAirline || null,
       });
     }
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;

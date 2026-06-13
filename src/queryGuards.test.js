@@ -170,26 +170,41 @@ test('oracle guard — specific aircraft query does not skip oracle', () => {
 
 // ── isApproximateMarketAllowedQuery — Phase 4L ───────────────────────────────
 
-test('approx market — Hawaiian Airlines diecast model airplane → allowed', () => {
+// ── isApproximateMarketAllowedQuery — Phase 4L (tightened in 4L.1) ──────────
+// Rule: "airline/livery known, family unknown" → allowed for safe diecast.
+// Generic no-airline aircraft → NOT allowed (no identity anchor for pricing).
+
+test('approx market — Hawaiian Airlines diecast model airplane → allowed (airline known, family missing)', () => {
   assert.equal(isApproximateMarketAllowedQuery("hawaiian airlines diecast model airplane", "diecast model"), true);
 });
 
-test('approx market — diecast model airplane (no airline, generic) → not allowed (no airline context)', () => {
-  // No airline = not aircraft-identity incomplete, so approx mode is irrelevant
-  assert.equal(isApproximateMarketAllowedQuery("diecast model airplane", "diecast"), true,
-    "generic diecast query IS allowed approximate (it has aircraft context)");
-});
-
-test('approx market — ANA model airplane → allowed', () => {
+test('approx market — ANA model airplane → allowed (airline known, diecast context)', () => {
   assert.equal(isApproximateMarketAllowedQuery("ana model airplane", "model airplane"), true);
 });
 
-test('approx market — Nike Air Jordan sneaker → NOT allowed (high-stakes)', () => {
+test('approx market — diecast model airplane (no airline) → NOT allowed (no identity anchor)', () => {
+  // The approximate path is for "airline known, family unknown" — generic diecast
+  // with no airline would just return random toy comps with no useful pricing anchor.
+  assert.equal(isApproximateMarketAllowedQuery("diecast model airplane", "diecast"), false,
+    "generic diecast with no airline must NOT be approximate allowed");
+});
+
+test('approx market — white toy airplane (no airline, no diecast) → NOT allowed', () => {
+  assert.equal(isApproximateMarketAllowedQuery("white toy airplane", "toy"), false);
+});
+
+test('approx market — Hawaiian Airlines Boeing 787 diecast → allowed (function returns true; server blocks via incomplete check)', () => {
+  // The function says "safe category for approximate mode" — it's the server that
+  // enforces !incomplete check. Exact queries pass this function but are blocked upstream.
+  assert.equal(isApproximateMarketAllowedQuery("hawaiian airlines boeing 787 diecast model airplane", "diecast model"), true);
+});
+
+test('approx market — Nike Air Jordan sneaker (diecast context irrelevant) → NOT allowed', () => {
   assert.equal(isApproximateMarketAllowedQuery("nike air jordan 1 diecast", "sneaker"), false,
     "sneaker category must block approximate market");
 });
 
-test('approx market — Rolex watch diecast → NOT allowed (luxury blocks even with diecast context)', () => {
+test('approx market — Rolex watch → NOT allowed (luxury)', () => {
   assert.equal(isApproximateMarketAllowedQuery("rolex diecast model airplane watch", "watch"), false);
 });
 
@@ -197,14 +212,28 @@ test('approx market — pokemon trading card → NOT allowed', () => {
   assert.equal(isApproximateMarketAllowedQuery("pokemon trading card", "collectible card"), false);
 });
 
-test('approx market — iPhone electronics → NOT allowed (no diecast context)', () => {
+test('approx market — iPhone → NOT allowed (no diecast context)', () => {
   assert.equal(isApproximateMarketAllowedQuery("iphone 15 pro", "electronics"), false);
 });
 
-test('approx market — Hawaiian Airlines Boeing 787 diecast → allowed (exact identity, still approved for approx path)', () => {
-  // Approx mode would be a no-op for complete queries since oracle isn't blocked,
-  // but the function should return true so callers can proceed.
-  assert.equal(isApproximateMarketAllowedQuery("hawaiian airlines boeing 787 diecast model airplane", "diecast model"), true);
+test('approx market — server blocks when query is exact (not incomplete aircraft)', () => {
+  // Server revalidation: approximateMode:true is blocked if detectIncompleteAircraftIdentityQuery returns incomplete:false
+  const query = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const incomplete = detectIncompleteAircraftIdentityQuery(query).incomplete;
+  const approxAllowed = isApproximateMarketAllowedQuery(query, "diecast model");
+  // Function returns true (safe category) but server blocks because not incomplete
+  const _approximateMode = true && incomplete && approxAllowed; // mirrors server logic
+  assert.equal(incomplete, false, "exact aircraft is not incomplete");
+  assert.equal(approxAllowed, true,  "safe category returns true");
+  assert.equal(_approximateMode, false, "server blocks: not_incomplete_aircraft");
+});
+
+test('approx market — server validates sneaker approximateMode:true → blocked', () => {
+  const query = "nike air jordan 1 low og";
+  const incomplete = detectIncompleteAircraftIdentityQuery(query).incomplete;
+  const approxAllowed = isApproximateMarketAllowedQuery(query, "sneaker");
+  const _approximateMode = true && incomplete && approxAllowed;
+  assert.equal(_approximateMode, false, "sneaker approximate must be server-blocked");
 });
 
 // ── detectIncompleteAircraftIdentityQuery — Phase 4J.2 ───────────────────────

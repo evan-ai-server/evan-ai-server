@@ -925,6 +925,54 @@ test("4K.1: frontend poll continues after marketReady:false — does not stop fo
   assert.equal(pollRetryScheduled, true);
 });
 
+// ── Phase 4L.1 safety patches ─────────────────────────────────────────────────
+
+test("4L.1: grace rescue preserves query_fast source metadata", () => {
+  // When grace rescues query_fast, _graceRescuedFastResult must include
+  // source:"query_fast" and rescuedByGrace:true for telemetry.
+  const _graceWon = { src: "query_fast", r: { parsed: { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.9 }, source: "openai" } };
+  const _graceRescuedFastResult = { ..._graceWon.r, source: "query_fast", rescuedByGrace: true };
+  assert.equal(_graceRescuedFastResult.source, "query_fast");
+  assert.equal(_graceRescuedFastResult.rescuedByGrace, true);
+  assert.equal(_graceRescuedFastResult.parsed?.query, "Hawaiian Airlines Boeing 787 diecast model airplane");
+});
+
+test("4L.1: frontend primary-result logic — exact selected query does not activate approximate mode", () => {
+  // Mirrors the _primaryVisionResult derivation in runScan.
+  // If vision results have one exact and one incomplete candidate, the exact one wins.
+  const rawVisionQuery = "hawaiian airlines boeing 787 diecast model airplane"; // exact one selected
+  const visionResults = [
+    { query: "Hawaiian Airlines Boeing 787 diecast model airplane", needsFamilyRecovery: false, confidence: 0.9 },
+  ];
+  const _primaryVisionResult = rawVisionQuery
+    ? (visionResults.find(v => String(v?.query || "").toLowerCase().trim() === rawVisionQuery.toLowerCase().trim()) || visionResults[0] || null)
+    : null;
+  const _visionNeedsFamilyRecovery = _primaryVisionResult?.needsFamilyRecovery === true;
+  assert.equal(_visionNeedsFamilyRecovery, false, "exact selected query must not trigger approximate mode");
+});
+
+test("4L.1: frontend primary-result logic — incomplete selected query activates approximate mode", () => {
+  const rawVisionQuery = "hawaiian airlines diecast airplane model";
+  const visionResults = [
+    { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true, confidence: 0.9 },
+  ];
+  const _primaryVisionResult = rawVisionQuery
+    ? (visionResults.find(v => String(v?.query || "").toLowerCase().trim() === rawVisionQuery.toLowerCase().trim()) || visionResults[0] || null)
+    : null;
+  const _visionNeedsFamilyRecovery = _primaryVisionResult?.needsFamilyRecovery === true;
+  assert.equal(_visionNeedsFamilyRecovery, true, "incomplete selected query must trigger approximate mode");
+});
+
+test("4L.1: frontend primary-result — no rawVisionQuery means no approximate mode (deterministic fallback)", () => {
+  const rawVisionQuery = null; // vision failed, using deterministic
+  const visionResults = [];
+  const _primaryVisionResult = rawVisionQuery
+    ? (visionResults.find(v => String(v?.query || "").toLowerCase().trim() === String(rawVisionQuery).toLowerCase().trim()) || visionResults[0] || null)
+    : null;
+  const _visionNeedsFamilyRecovery = _primaryVisionResult?.needsFamilyRecovery === true;
+  assert.equal(_visionNeedsFamilyRecovery, false, "deterministic fallback must not trigger approximate mode");
+});
+
 test("4K: startup selftests are gated behind RUN_STARTUP_SELFTESTS env", () => {
   // The selftest blocks are now wrapped in `if (process.env.RUN_STARTUP_SELFTESTS === "true")`.
   // During normal startup (env not set), these blocks do not run.
