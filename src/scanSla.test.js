@@ -844,6 +844,65 @@ test("4K.2: generic aircraft toy query gets large penalty and cannot beat specif
   assert.equal(result.stored, false, "generic toy must not overwrite specific aircraft result");
 });
 
+// ── Phase 4K.3: master storage obeys the same guard ──────────────────────────
+// Uses the same tryStoreQuality helper from 4K.2 tests above (mirrors setBackgroundVisionResultIfBetter).
+
+test("4K.3: late complete strong stored → master incomplete skipped (SKIPPED_DOWNGRADE)", () => {
+  const store = new Map();
+  const hash = "m1";
+  const lateStrong = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.9, needsFamilyRecovery: false };
+  const masterWeak = { query: "Hawaiian Airlines diecast airplane model", confidence: 0.85, needsFamilyRecovery: true };
+  tryStoreQuality(store, hash, lateStrong);
+  const result = tryStoreQuality(store, hash, masterWeak);
+  assert.equal(result.stored, false, "master incomplete must not downgrade strong late complete");
+  assert.equal(result.reason, "incoming_incomplete_existing_complete");
+  assert.equal(store.get(hash)?.query, lateStrong.query);
+});
+
+test("4K.3: late weak complete stored → master strong complete overwrites (REPLACED_WITH_BETTER)", () => {
+  const store = new Map();
+  const hash = "m2";
+  const lateWeak   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.75, needsFamilyRecovery: false };
+  const masterStrong = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.92, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, lateWeak);
+  const result = tryStoreQuality(store, hash, masterStrong);
+  assert.equal(result.stored, true, "master strong complete must overwrite late weak complete");
+  assert.equal(store.get(hash)?.query, masterStrong.query);
+});
+
+test("4K.3: late strong complete stored → master weak complete skipped (SKIPPED_WEAKER_COMPLETE)", () => {
+  const store = new Map();
+  const hash = "m3";
+  const lateStrong   = { query: "Hawaiian Airlines Boeing 787-9 GeminiJets 1:400 diecast model", confidence: 0.92, needsFamilyRecovery: false };
+  const masterWeak   = { query: "Hawaiian Airlines Boeing 787 diecast model airplane",            confidence: 0.75, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, lateStrong);
+  const result = tryStoreQuality(store, hash, masterWeak);
+  assert.equal(result.stored, false, "master weak complete must not downgrade strong late result");
+  assert.equal(result.reason, "incoming_complete_not_stronger");
+});
+
+test("4K.3: existing incomplete → master complete overwrites (always)", () => {
+  const store = new Map();
+  const hash = "m4";
+  const lateInc    = { query: "Hawaiian Airlines diecast airplane model",            confidence: 0.7, needsFamilyRecovery: true };
+  const masterComp = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, lateInc);
+  const result = tryStoreQuality(store, hash, masterComp);
+  assert.equal(result.stored, true, "master complete must always overwrite incomplete");
+  assert.equal(store.get(hash)?.needsFamilyRecovery, false);
+});
+
+test("4K.3: generic toy master result cannot overwrite specific aircraft result", () => {
+  const store = new Map();
+  const hash = "m5";
+  const specific = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85, needsFamilyRecovery: false };
+  const generic  = { query: "white plastic model airplane toy",                    confidence: 0.99, needsFamilyRecovery: false };
+  tryStoreQuality(store, hash, specific);
+  const result = tryStoreQuality(store, hash, generic);
+  assert.equal(result.stored, false, "generic toy master result must not overwrite specific aircraft");
+  assert.equal(store.get(hash)?.query, specific.query);
+});
+
 test("4K.1: frontend poll continues after marketReady:false — does not stop forever", () => {
   // Simulate the client-side gate: marketReady:false falls through to retry (no return)
   let pollRetryScheduled = false;

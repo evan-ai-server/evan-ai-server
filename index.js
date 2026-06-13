@@ -5780,6 +5780,64 @@ const MARKET_BACKGROUND_RECOVERY_DEADLINE_MS = Number(process.env.MARKET_BACKGRO
 const MARKET_EXACT_IDENTITY_MIN_MS = Number(process.env.MARKET_EXACT_IDENTITY_MIN_MS || 3000);
 // In-memory store for background master identity results (imageHash/scanId → result).
 const BACKGROUND_VISION_RESULTS = new Map(); // key → {query,variants,confidence,visionIdentity,category,completedAt,elapsedMs}
+
+// Phase 4K.2/4K.3: quality score for background vision entries.
+// Higher = more market-useful. Used by setBackgroundVisionResultIfBetter.
+function scoreBackgroundVisionEntry(entry) {
+  const q = String(entry?.query || "").toLowerCase();
+  let score = 0;
+  if (!entry?.needsFamilyRecovery) score += 100; else score -= 50;
+  score += Math.round(Number(entry?.confidence || 0) * 20);
+  if (/\b(hawaiian|united|delta|american airlines|southwest|alaska|jetblue|ana|jal|lufthansa|emirates|british airways|air france|klm|qantas|singapore|cathay|air canada)\b/.test(q)) score += 20;
+  if (/\b(boeing|airbus|embraer|bombardier|lockheed|mcdonnell|douglas)\b/.test(q)) score += 20;
+  if (/\b(787|787-9|787 9|747|777|737|a380|a350|a330|a320|a321|a319|dreamliner|concorde)\b/.test(q)) score += 25;
+  if (/\b1\s*[:/]\s*\d{2,3}\b/.test(q)) score += 18;
+  if (/\b(geminijets?|herpa|ng model|aviation400|jc wings|phoenix|hogan|inflight|aeroclassics)\b/.test(q)) score += 18;
+  if (/\b(diecast|die-cast|collectible|model airplane|aircraft model)\b/.test(q)) score += 10;
+  if (isGenericAircraftToyQuery(q)) score -= 80;
+  score += Math.min(20, Math.floor(q.length / 12));
+  return score;
+}
+
+// Quality-aware setter for BACKGROUND_VISION_RESULTS.
+// Returns true if the entry was stored, false if an existing entry won.
+// meta: { pass, keyKind } — for log context only.
+function setBackgroundVisionResultIfBetter(key, incomingEntry, meta = {}) {
+  if (!key || !incomingEntry) return false;
+  const existing = BACKGROUND_VISION_RESULTS.get(key);
+  if (existing) {
+    const existScore = scoreBackgroundVisionEntry(existing);
+    const inScore    = scoreBackgroundVisionEntry(incomingEntry);
+    const logCtx = { keyKind: meta.keyKind || null, pass: meta.pass || null,
+                     existingQuery: existing.query, incomingQuery: incomingEntry.query,
+                     existingScore: existScore, incomingScore: inScore };
+    // Incomplete never overwrites complete.
+    if (!existing.needsFamilyRecovery && incomingEntry.needsFamilyRecovery) {
+      console.log("VISION_BACKGROUND_RESULT_SKIPPED_DOWNGRADE",
+        { ...logCtx, reason: "incoming_incomplete_existing_complete" });
+      return false;
+    }
+    // Both incomplete: incoming needs +15 to overwrite.
+    if (existing.needsFamilyRecovery && incomingEntry.needsFamilyRecovery && inScore < existScore + 15) {
+      console.log("VISION_BACKGROUND_RESULT_SKIPPED_WEAKER_INCOMPLETE",
+        { ...logCtx, reason: "both_incomplete_incoming_not_substantially_better" });
+      return false;
+    }
+    // Both complete: incoming needs +10 to overwrite.
+    if (!existing.needsFamilyRecovery && !incomingEntry.needsFamilyRecovery && inScore < existScore + 10) {
+      console.log("VISION_BACKGROUND_RESULT_SKIPPED_WEAKER_COMPLETE",
+        { ...logCtx, reason: "incoming_complete_not_stronger" });
+      return false;
+    }
+    console.log("VISION_BACKGROUND_RESULT_REPLACED_WITH_BETTER", {
+      ...logCtx,
+      existingNeedsFamilyRecovery: !!existing.needsFamilyRecovery,
+      incomingNeedsFamilyRecovery: !!incomingEntry.needsFamilyRecovery,
+    });
+  }
+  BACKGROUND_VISION_RESULTS.set(key, incomingEntry);
+  return true;
+}
 // Oracle is the GPT-fabricated synthetic-comp fallback used when phase1 is thin.
 // Was 8s — that's the entire user-perceived latency on degraded scans where
 // every external auth is dead. The buyOrPass engine now produces an honest
@@ -20327,24 +20385,6 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           pendingQueryFast: true, pendingFast: true, pendingVisual: true,
           masterLaunched, reason: "no_seed_keep_background_candidates_alive",
         });
-        // Phase 4K.2: quality score for background vision entries.
-        // Higher score = more specific / more market-useful identity.
-        const _scoreBackgroundVisionEntry = (entry) => {
-          const q = String(entry?.query || "").toLowerCase();
-          let score = 0;
-          if (!entry?.needsFamilyRecovery) score += 100; else score -= 50;
-          score += Math.round(Number(entry?.confidence || 0) * 20);
-          if (/\b(hawaiian|united|delta|american airlines|southwest|alaska|jetblue|ana|jal|lufthansa|emirates|british airways|air france|klm|qantas|singapore|cathay|air canada)\b/.test(q)) score += 20;
-          if (/\b(boeing|airbus|embraer|bombardier|lockheed|mcdonnell|douglas)\b/.test(q)) score += 20;
-          if (/\b(787|787-9|787 9|747|777|737|a380|a350|a330|a320|a321|a319|dreamliner|concorde)\b/.test(q)) score += 25;
-          if (/\b1\s*[:/]\s*\d{2,3}\b/.test(q)) score += 18;
-          if (/\b(geminijets?|herpa|ng model|aviation400|jc wings|phoenix|hogan|inflight|aeroclassics)\b/.test(q)) score += 18;
-          if (/\b(diecast|die-cast|collectible|model airplane|aircraft model)\b/.test(q)) score += 10;
-          if (isGenericAircraftToyQuery(q)) score -= 80;
-          score += Math.min(20, Math.floor(q.length / 12));
-          return score;
-        };
-
         // Phase 4K Part A+B: store first late result so frontend poll resolves fast.
         // Passes fire in order: fast (~3500ms) → visual (~4000ms) → queryFast (~4500ms).
         // Master overwrites at ~11s with the most complete result.
@@ -20376,51 +20416,14 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                 elapsedMs:           _lateMs,
                 needsFamilyRecovery: _lateNeedsFamily || undefined,
               };
-              // Phase 4K.2: quality-score guard — specific identity beats generic identity.
-              const _existingEntry = BACKGROUND_VISION_RESULTS.get(imageHash);
-              if (_existingEntry) {
-                const _existScore = _scoreBackgroundVisionEntry(_existingEntry);
-                const _inScore   = _scoreBackgroundVisionEntry(_incomingEntry);
-                // Incomplete can never overwrite complete.
-                if (!_existingEntry.needsFamilyRecovery && _lateNeedsFamily) {
-                  console.log("VISION_LATE_RESULT_SKIPPED_DOWNGRADE", {
-                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
-                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
-                    reason: "incoming_incomplete_existing_complete",
-                  });
-                  return;
-                }
-                // Both incomplete: incoming must be substantially stronger (+15) to overwrite.
-                if (_existingEntry.needsFamilyRecovery && _lateNeedsFamily && _inScore < _existScore + 15) {
-                  console.log("VISION_LATE_RESULT_SKIPPED_WEAKER_INCOMPLETE", {
-                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
-                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
-                    reason: "both_incomplete_incoming_not_substantially_better",
-                  });
-                  return;
-                }
-                // Both complete: incoming must be clearly stronger (+10) to overwrite.
-                if (!_existingEntry.needsFamilyRecovery && !_lateNeedsFamily && _inScore < _existScore + 10) {
-                  console.log("VISION_LATE_RESULT_SKIPPED_WEAKER_COMPLETE", {
-                    rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
-                    incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
-                    reason: "incoming_complete_not_stronger",
-                  });
-                  return;
-                }
-                console.log("VISION_LATE_RESULT_REPLACING_BACKGROUND_ENTRY", {
-                  rid: req.rid, pass: passLabel, existingQuery: _existingEntry.query,
-                  incomingQuery: _lateQ, existingScore: _existScore, incomingScore: _inScore,
-                  existingNeedsFamilyRecovery: !!_existingEntry.needsFamilyRecovery,
-                  incomingNeedsFamilyRecovery: !!_lateNeedsFamily,
+              const _stored = setBackgroundVisionResultIfBetter(imageHash, _incomingEntry, { pass: passLabel, keyKind: "imageHash" });
+              if (_stored) {
+                console.log(_logKey, { rid: req.rid, query: _lateQ, elapsedMs: _lateMs, needsFamilyRecovery: _lateNeedsFamily || false });
+                console.log("VISION_LATE_RESULT_MARKET_READY", {
+                  rid: req.rid, pass: passLabel, query: _lateQ,
+                  marketReady: !_lateNeedsFamily, needsFamilyRecovery: _lateNeedsFamily || false,
                 });
               }
-              BACKGROUND_VISION_RESULTS.set(imageHash, _incomingEntry);
-              console.log(_logKey, { rid: req.rid, query: _lateQ, elapsedMs: _lateMs, needsFamilyRecovery: _lateNeedsFamily || false });
-              console.log("VISION_LATE_RESULT_MARKET_READY", {
-                rid: req.rid, pass: passLabel, query: _lateQ,
-                marketReady: !_lateNeedsFamily, needsFamilyRecovery: _lateNeedsFamily || false,
-              });
             }).catch(() => {});
           };
           _storeLateResult("fast",       fastPromise);
@@ -20538,12 +20541,16 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               elapsedMs:          _bgElapsedMs,
               needsFamilyRecovery: _needsFamily || undefined,
             };
-            BACKGROUND_VISION_RESULTS.set(imageHash, _bgEntry);
-            console.log("VISION_BACKGROUND_RESULT_STORED", {
-              rid: req.rid, imageHash, query: _storedQuery,
-              originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
-              elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
-            });
+            // Phase 4K.3: master uses the same quality-aware setter so it cannot
+            // blindly assassinate a stronger late result stored by fast/visual/query_fast.
+            const _masterStored = setBackgroundVisionResultIfBetter(imageHash, _bgEntry, { pass: "master", keyKind: "imageHash" });
+            if (_masterStored) {
+              console.log("VISION_BACKGROUND_RESULT_STORED", {
+                rid: req.rid, imageHash, query: _storedQuery,
+                originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
+                elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
+              });
+            }
           } else if (_bgQuery) {
             console.log("VISION_BACKGROUND_RESULT_REJECTED_GENERIC", { rid: req.rid, imageHash, query: _bgQuery });
           }
