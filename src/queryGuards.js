@@ -2,6 +2,18 @@
 // Phase 4H.4 — query guard functions extracted for testability.
 // node --test src/queryGuards.test.js
 
+// Airline names (mirrors AIRLINE_COMPETITOR_MAP keys + extended list from isGenericAircraftToyQuery).
+// Multi-word names tested as phrases before single-token fallback.
+const _AIRLINE_PHRASES = ["american airlines", "korean air", "british airways", "air france", "air canada"];
+const _AIRLINE_TOKENS  = /\b(hawaiian|united|delta|southwest|alaska|jetblue|spirit|frontier|ana|jal|lufthansa|emirates|qatar|etihad|aeromexico|qantas|virgin|cathay|iberia|turkish|thai|klm|singapore)\b/;
+
+// Aircraft family identifiers (mirrors AIRCRAFT_FAMILY_MATCH tokens + extras).
+// Presence of any of these in the query means requiredFamily is known.
+const _FAMILY_PATTERN = /\b(787|777|747|737|757|767|727|717|a380|a350|a330|a321|a321neo|a320|a319|a318|a300|a310|a340|concorde|dreamliner|jumbo)\b/;
+
+// Terms that place the query firmly in aircraft/diecast context.
+const _AIRCRAFT_TERM = /\b(airplane|aircraft|airliner|diecast|die-cast|model airplane|model plane|aircraft model|collectible airplane)\b|\bplane\b/;
+
 /**
  * Catches single-word literal junk ("item", "product", "thing", etc.).
  * Does NOT catch multi-word vague phrases — use isGenericGarbageQuery for that.
@@ -104,4 +116,41 @@ export function isGenericAircraftToyQuery(query) {
   if (/\b(geminijets?|herpa|ng model|aviation400|hogan|jc wings|dragon wings|inflight|phoenix|aeroclassics)\b/.test(q)) return false;
 
   return true;
+}
+
+/**
+ * Returns { incomplete: true } when the query identifies a specific airline but
+ * lacks any aircraft family token (787, A380, 747, etc.).
+ * These queries produce vague market results and must never trigger GPT oracle.
+ *
+ * Examples → incomplete: "Hawaiian Airlines diecast airplane model"
+ * Examples → not incomplete: "Hawaiian Airlines Boeing 787 diecast model airplane"
+ *                             "ANA Airbus A380 Sea Turtle 1:400"
+ *                             "white plastic model airplane toy"  (no airline → incomplete=false)
+ */
+export function detectIncompleteAircraftIdentityQuery(query) {
+  const q = String(query || "").toLowerCase().trim();
+  if (!q) return { incomplete: false };
+
+  // Detect airline (phrases first, then single-token)
+  let requiredAirline = null;
+  for (const phrase of _AIRLINE_PHRASES) {
+    if (q.includes(phrase)) { requiredAirline = phrase; break; }
+  }
+  if (!requiredAirline) {
+    const m = q.match(_AIRLINE_TOKENS);
+    if (m) requiredAirline = m[0];
+  }
+
+  if (!requiredAirline) return { incomplete: false };
+
+  // Not incomplete if there's a specific family/model identifier
+  const hasFamily = _FAMILY_PATTERN.test(q);
+  if (hasFamily) return { incomplete: false, requiredAirline, requiredFamily: q.match(_FAMILY_PATTERN)?.[0] || null };
+
+  // Not incomplete unless the query is aircraft-ish
+  const hasAircraftTerm = _AIRCRAFT_TERM.test(q);
+  if (!hasAircraftTerm) return { incomplete: false };
+
+  return { incomplete: true, requiredAirline, requiredFamily: null, reason: "airline_present_family_missing" };
 }

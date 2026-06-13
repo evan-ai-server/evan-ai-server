@@ -463,7 +463,7 @@ import { buildFakeListingDetectorPayload, scoreFakeListingRisk, scanMarketForFak
 import { buildSeasonalFlipCalendarPayload, computeFlipTiming, getBuySellWindows, getUpcomingDemandEvents } from "./src/seasonalFlipCalendar.js";
 import { buildBrandTierPayload, resolveBrandTier, detectBrandPriceMismatch, findTierAlternatives } from "./src/brandTierClassifier.js";
 import { buildSmartPriceTargetPayload, buildPriceTargets, computeMaxBuyPrice, computeOptimalSellPrice } from "./src/smartPriceTargetEngine.js";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery } from "./src/queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./src/queryGuards.js";
 import { buildListingQualityScorerPayload, scoreListingQuality } from "./src/listingQualityScorer.js";
 import { buildMarketMomentumPayload, computePriceMomentum, detectPriceConvergence, computeSellThroughVelocity } from "./src/marketMomentumTracker.js";
 import { buildFlipScorePayload, computeFlipScore } from "./src/flipScoreEngine.js";
@@ -21496,11 +21496,21 @@ app.get("/api/vision/background-result", async (req, res) => {
     userId: getResolvedUserId(req) || null,
   });
   if (!_entry) return res.status(200).json({ ready: false });
+  const _bgMarketReady = !(_entry.needsFamilyRecovery ||
+    detectIncompleteAircraftIdentityQuery(_entry.query).incomplete);
   console.log("VISION_BACKGROUND_RESULT_RETURNED", {
     rid: req.rid, query: _entry.query, elapsedMs: _entry.elapsedMs,
     needsFamilyRecovery: _entry.needsFamilyRecovery || false,
+    marketReady: _bgMarketReady,
   });
-  return res.status(200).json({ ready: true, ..._entry });
+  if (!_bgMarketReady) {
+    console.log("VISION_BACKGROUND_RESULT_NOT_MARKET_READY", {
+      rid: req.rid, query: _entry.query,
+      requiredAirline: detectIncompleteAircraftIdentityQuery(_entry.query).requiredAirline || null,
+      requiredFamily: null, reason: "incomplete_aircraft_identity_missing_family",
+    });
+  }
+  return res.status(200).json({ ready: true, marketReady: _bgMarketReady, ..._entry });
 });
 
 app.post(
@@ -28986,9 +28996,17 @@ if ((!Array.isArray(items) || items.length === 0) && internalHit?.snapshot?.item
 
 // ── GPT-4.1 Oracle fallback at route level (outside 7s kill timer) ─────────────
 // Fires when ALL marketplace sources + internal cache return nothing.
-// Phase 4J.1: skip oracle for generic aircraft toy queries at premium price —
-// oracle generates toy comps that get blocked by AIRCRAFT_PREMIUM_TOY_MAIN_RESULT_BLOCKED.
+// Phase 4J.1: skip oracle for generic aircraft toy queries at premium price.
+// Phase 4J.2: skip oracle for airline-present but family-missing aircraft queries.
+const _nonStreamIncompleteAircraft     = detectIncompleteAircraftIdentityQuery(query);
 const _nonStreamGenericPremiumAircraft = isGenericAircraftToyQuery(query) && Number(scannedPrice || 0) >= 50;
+if (_nonStreamIncompleteAircraft.incomplete) {
+  console.log("MARKET_SKIPPED_INCOMPLETE_AIRCRAFT_QUERY", {
+    route: "/market/search", query,
+    requiredAirline: _nonStreamIncompleteAircraft.requiredAirline,
+    reason: _nonStreamIncompleteAircraft.reason,
+  });
+}
 if (_nonStreamGenericPremiumAircraft) {
   console.log("MARKET_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
     route: "/market/search", query, scannedPrice,
@@ -28997,7 +29015,13 @@ if (_nonStreamGenericPremiumAircraft) {
 }
 let _oracleOnlyResult = false;
 if (!Array.isArray(items) || items.length < 4) {
-  if (_nonStreamGenericPremiumAircraft) {
+  if (_nonStreamIncompleteAircraft.incomplete) {
+    console.log("ORACLE_SKIPPED_INCOMPLETE_AIRCRAFT_IDENTITY", {
+      route: "/market/search", query,
+      requiredAirline: _nonStreamIncompleteAircraft.requiredAirline,
+      requiredFamily: null, reason: "airline_present_family_missing",
+    });
+  } else if (_nonStreamGenericPremiumAircraft) {
     console.log("ORACLE_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
       route: "/market/search", query, scannedPrice,
       reason: "generic_aircraft_no_identity_premium_price",
@@ -29016,7 +29040,7 @@ if (!Array.isArray(items) || items.length < 4) {
     }
     console.log(`✅ Route oracle injected ${oracleItems.length} items for "${query}"`);
   }
-  } // end else !_nonStreamGenericPremiumAircraft
+  } // end else
 }
 
 if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
@@ -30547,20 +30571,35 @@ app.post("/market/search/stream", async (req, res) => {
       itemCount: phase1Items.length, earlyCount: _earlyItems?.length ?? 0, phase1Ms: _phase1Ms,
     });
 
-    // ── Smart oracle decision (Phase 4H.5) ───────────────────────────────
+    // ── Smart oracle decision (Phase 4H.5 / 4J.2) ───────────────────────
     // Oracle requires: usable query + identity quality ≥ 0.35.
     // No oracle on generic queries — it fabricates comps for unknown items.
+    // No oracle on incomplete aircraft identity (airline present, family missing).
+    // No oracle when primary source is cooling and there are zero market items.
     const _oracleQueryUsable     = isUsableVisionSeed(query);
     const _oracleIdentityQuality = computeIdentityQuality(visionIdentity || null, attributeCertainty || null);
     const _oracleAirlineLock     = detectAirlineLockInQuery(query);
-    const _incompleteAircraft    = _needsFamilyRecovery && !!_oracleAirlineLock?.requiredAirline && !_oracleAirlineLock?.requiredFamily;
+    // Phase 4J.2: detect incomplete aircraft directly from query string (not just body flag).
+    // "Hawaiian Airlines diecast airplane model" has airline but no family → incomplete.
+    const _incompleteAircraftIdentity = detectIncompleteAircraftIdentityQuery(query);
+    const _incompleteAircraft = _incompleteAircraftIdentity.incomplete ||
+      (_needsFamilyRecovery && !!_oracleAirlineLock?.requiredAirline && !_oracleAirlineLock?.requiredFamily);
+    if (_incompleteAircraftIdentity.incomplete) {
+      console.log("MARKET_SKIPPED_INCOMPLETE_AIRCRAFT_QUERY", {
+        rid: req.rid, scanId, query,
+        requiredAirline: _incompleteAircraftIdentity.requiredAirline,
+        reason: _incompleteAircraftIdentity.reason,
+      });
+    }
     if (!_oracleQueryUsable) {
       console.log("ORACLE_SKIPPED_GENERIC_QUERY", { rid: req.rid, scanId, query });
     } else if (_oracleIdentityQuality < 0.35) {
       console.log("ORACLE_SKIPPED_LOW_IDENTITY", { rid: req.rid, scanId, identityQuality: _oracleIdentityQuality });
     } else if (_incompleteAircraft) {
       console.log("ORACLE_SKIPPED_INCOMPLETE_AIRCRAFT_IDENTITY", {
-        rid: req.rid, scanId, query, requiredAirline: _oracleAirlineLock.requiredAirline,
+        rid: req.rid, scanId, query,
+        requiredAirline: _incompleteAircraftIdentity.requiredAirline || _oracleAirlineLock?.requiredAirline || null,
+        requiredFamily: null, reason: "airline_present_family_missing",
       });
     }
     // Phase 4J.1: generic aircraft toy query with premium scannedPrice would produce
@@ -30572,8 +30611,22 @@ app.post("/market/search/stream", async (req, res) => {
         reason: "generic_aircraft_no_identity_premium_price",
       });
     }
+    // Phase 4J.2: if primary live source is rate-limited and there are zero market items,
+    // skip oracle — it would fabricate comps with no real market evidence to anchor on.
+    const _primarySourceUnavailable = isSourceCoolingDown("serpapi") && !hasEbayApi();
+    const _sourceUnavailableNoData  = _primarySourceUnavailable &&
+      (!Array.isArray(phase1Items) || phase1Items.length === 0);
+    if (_sourceUnavailableNoData) {
+      console.log("ORACLE_SKIPPED_SOURCE_UNAVAILABLE_NO_MARKET_DATA", {
+        rid: req.rid, scanId, query, reason: "primary_source_rate_limited_no_market_evidence",
+        serpCooling: isSourceCoolingDown("serpapi"), ebayAvailable: hasEbayApi(),
+      });
+    }
     const _oracleDecision = shouldInvokeOracle(phase1Items, { visionIdentity, category, scanId });
-    const needsOracle = (!_oracleQueryUsable || _oracleIdentityQuality < 0.35 || _incompleteAircraft || _isGenericPremiumAircraft) ? false : _oracleDecision.invoke;
+    const needsOracle = (
+      !_oracleQueryUsable || _oracleIdentityQuality < 0.35 ||
+      _incompleteAircraft || _isGenericPremiumAircraft || _sourceUnavailableNoData
+    ) ? false : _oracleDecision.invoke;
     if (needsOracle) {
       console.log("ORACLE_ALLOWED_STRONG_IDENTITY", { rid: req.rid, scanId, query, identityQuality: _oracleIdentityQuality });
     }

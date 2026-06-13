@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery } from "./queryGuards.js";
+import { isGarbageQuery, isGenericGarbageQuery, isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./queryGuards.js";
 
 // ── isGenericGarbageQuery ─────────────────────────────────────────────────────
 
@@ -166,4 +166,88 @@ test('oracle guard — specific aircraft query does not skip oracle', () => {
   const scannedPrice = 165.99;
   const isGenericPremium = isGenericAircraftToyQuery(query) && scannedPrice >= 50;
   assert.equal(isGenericPremium, false, "specific aircraft should not skip oracle");
+});
+
+// ── detectIncompleteAircraftIdentityQuery — Phase 4J.2 ───────────────────────
+
+test('incomplete aircraft — "Hawaiian Airlines diecast airplane model" has airline, no family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Hawaiian Airlines diecast airplane model");
+  assert.equal(r.incomplete, true, "should be incomplete: airline present, no family");
+  assert.equal(r.requiredAirline, "hawaiian");
+  assert.equal(r.requiredFamily, null);
+  assert.equal(r.reason, "airline_present_family_missing");
+});
+
+test('incomplete aircraft — "hawaiian airlines diecast airplane model" (lowercase) has airline, no family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("hawaiian airlines diecast airplane model");
+  assert.equal(r.incomplete, true);
+  assert.equal(r.requiredAirline, "hawaiian");
+});
+
+test('not incomplete — "Hawaiian Airlines Boeing 787 diecast model airplane" has airline + family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Hawaiian Airlines Boeing 787 diecast model airplane");
+  assert.equal(r.incomplete, false, "should NOT be incomplete: has 787 family");
+});
+
+test('not incomplete — "ANA Airbus A380 Sea Turtle 1:400" has airline + family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("ANA Airbus A380 Sea Turtle 1:400");
+  assert.equal(r.incomplete, false, "should NOT be incomplete: has a380 family");
+});
+
+test('not incomplete — "white plastic model airplane toy" has no airline', () => {
+  const r = detectIncompleteAircraftIdentityQuery("white plastic model airplane toy");
+  assert.equal(r.incomplete, false, "no airline → not incomplete aircraft identity");
+});
+
+test('not incomplete — "Emirates Airbus A380 diecast model" has airline + family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Emirates Airbus A380 diecast model");
+  assert.equal(r.incomplete, false);
+});
+
+test('not incomplete — "United Airlines Boeing 777 diecast" has airline + family', () => {
+  const r = detectIncompleteAircraftIdentityQuery("United Airlines Boeing 777 diecast");
+  assert.equal(r.incomplete, false);
+});
+
+test('not incomplete — "Hawaiian Airlines shirt" has airline but not an aircraft query', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Hawaiian Airlines shirt");
+  assert.equal(r.incomplete, false, "no aircraft term → not an aircraft query");
+});
+
+test('oracle guard — incomplete aircraft blocks oracle', () => {
+  const query = "Hawaiian Airlines diecast airplane model";
+  const identityQuality = 0.47;
+  const phase1Items = [];
+  const _incomplete = detectIncompleteAircraftIdentityQuery(query);
+  // Simulate: needsOracle = _incomplete.incomplete ? false : oracleDecision.invoke
+  const needsOracle = _incomplete.incomplete ? false : (phase1Items.length === 0 && identityQuality >= 0.35);
+  assert.equal(needsOracle, false, "incomplete aircraft identity must block oracle");
+});
+
+test('oracle guard — exact aircraft query does not block oracle due to incomplete check', () => {
+  const query = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const _incomplete = detectIncompleteAircraftIdentityQuery(query);
+  assert.equal(_incomplete.incomplete, false, "exact aircraft must not be flagged as incomplete");
+});
+
+test('oracle guard — source unavailable + no market data blocks oracle', () => {
+  const serpCooling = true;
+  const ebayAvailable = false;
+  const phase1Items = [];
+  const _primarySourceUnavailable = serpCooling && !ebayAvailable;
+  const _sourceUnavailableNoData = _primarySourceUnavailable && phase1Items.length === 0;
+  const oracleDecisionInvoke = true; // oracle would normally fire
+  const needsOracle = _sourceUnavailableNoData ? false : oracleDecisionInvoke;
+  assert.equal(needsOracle, false, "source unavailable + no market data must block oracle");
+});
+
+test('oracle guard — source unavailable but has items still allows oracle', () => {
+  const serpCooling = true;
+  const ebayAvailable = false;
+  const phase1Items = [{ title: "item1" }, { title: "item2" }];
+  const _primarySourceUnavailable = serpCooling && !ebayAvailable;
+  const _sourceUnavailableNoData = _primarySourceUnavailable && phase1Items.length === 0;
+  const oracleDecisionInvoke = true;
+  const needsOracle = _sourceUnavailableNoData ? false : oracleDecisionInvoke;
+  assert.equal(needsOracle, true, "source unavailable but items present → oracle still allowed");
 });

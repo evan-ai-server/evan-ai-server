@@ -1,4 +1,5 @@
 // src/aircraftIdentity.test.js
+// node --test src/aircraftIdentity.test.js
 // Tests for aircraft identity completeness detection, family token detection,
 // query preservation, and aircraft family lock non-regression.
 //
@@ -12,6 +13,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { evaluateAffiliateEligibility } from "./affiliateGate.js";
+import { detectIncompleteAircraftIdentityQuery } from "./queryGuards.js";
 
 // ── Mirrors of the index.js aircraft data structures ─────────────────────────
 // Keep these in sync if AIRCRAFT_FAMILY_MATCH or AIRLINE_COMPETITOR_MAP change.
@@ -466,5 +468,45 @@ describe("Vision hard deadline — master cannot block first result", () => {
     }
     assert.deepEqual(passes, [], "passes must remain [] for hard_deadline_fail");
     assert.equal(visionTier, "hard_deadline_fail", "visionTier must not be overwritten");
+  });
+});
+
+// ── J. Background result marketReady — Phase 4J.2 ────────────────────────────
+// Mirrors the logic in GET /api/vision/background-result:
+//   marketReady = !(entry.needsFamilyRecovery || detectIncompleteAircraftIdentityQuery(query).incomplete)
+
+describe("Background result marketReady — Phase 4J.2", () => {
+  function computeMarketReady(entry) {
+    return !(entry.needsFamilyRecovery || detectIncompleteAircraftIdentityQuery(entry.query).incomplete);
+  }
+
+  it("needsFamilyRecovery:true → marketReady:false", () => {
+    const entry = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: true };
+    assert.equal(computeMarketReady(entry), false);
+  });
+
+  it("incomplete query without needsFamilyRecovery flag → marketReady:false", () => {
+    const entry = { query: "Hawaiian Airlines diecast airplane model", needsFamilyRecovery: false };
+    assert.equal(computeMarketReady(entry), false);
+  });
+
+  it("recovered query with family present → marketReady:true", () => {
+    const entry = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", needsFamilyRecovery: false };
+    assert.equal(computeMarketReady(entry), true);
+  });
+
+  it("recovered query with family — needsFamilyRecovery undefined → marketReady:true", () => {
+    const entry = { query: "Hawaiian Airlines Boeing 787 diecast model airplane" };
+    assert.equal(computeMarketReady(entry), true);
+  });
+
+  it("ANA A380 exact query → marketReady:true", () => {
+    const entry = { query: "ANA Airbus A380 Sea Turtle diecast model airplane" };
+    assert.equal(computeMarketReady(entry), true);
+  });
+
+  it("non-aircraft query → marketReady:true (not flagged as incomplete)", () => {
+    const entry = { query: "Nike Air Jordan 1 Low OG Year of the Rabbit" };
+    assert.equal(computeMarketReady(entry), true);
   });
 });
