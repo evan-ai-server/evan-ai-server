@@ -9417,12 +9417,8 @@ try {
 }
 
 // ── Phase 2C.9 — Cross-route SerpAPI budget key reuse self-test ──────────────
-// Asserts: a scanId on /market/search/stream produces the same budget key as
-// a follow-up /market/search WITHOUT scanId when the same imageHash is supplied
-// (key-derivation falls back from scanId → imageHash). Also asserts that
-// `_makeBudgetKey` produces an "img:" prefix when no scanId is present, so the
-// existing budget entry from the stream call is found by the follow-up.
-try {
+// Gated behind RUN_STARTUP_SELFTESTS=true to keep normal startup output clean.
+if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
   let _crossPass = 0;
   let _crossTotal = 0;
 
@@ -9475,7 +9471,7 @@ try {
   });
 } catch (_e) {
   console.warn("CROSS_ROUTE_KEY_SELFTEST_ERROR", { error: String(_e) });
-}
+} // end RUN_STARTUP_SELFTESTS cross-route
 
 // ── Phase 2C.10 — Multi-key MARKET_SCAN_RESULT_CACHE self-test ───────────────
 // Asserts that a scan's result pool is found via ANY of its identities — the
@@ -10183,11 +10179,8 @@ try {
 }
 
 // ── Phase 2C.8 — Per-scan SerpAPI budget self-test ───────────────────────────
-// Asserts the budget enforces exactly one SerpAPI call per scan and blocks
-// every extra. Tests the AsyncLocalStorage propagation, the cache-first
-// order (cache hits cost zero budget), the dev-bypass flag, and the cross-
-// route cache key collapse (same scanId ⇒ shared budget).
-try {
+// Gated behind RUN_STARTUP_SELFTESTS=true to keep normal startup output clean.
+if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
   let _budgetPass = 0;
   let _budgetTotal = 0;
 
@@ -10318,7 +10311,7 @@ try {
   });
 } catch (_e) {
   console.warn("SERP_BUDGET_SELFTEST_ERROR", { error: String(_e) });
-}
+} // end RUN_STARTUP_SELFTESTS budget
 
 // ── SERP fanout query builder ─────────────────────────────────────────────────
 // Generates safe, category-aware SERP query variants for retrieval expansion.
@@ -20278,13 +20271,101 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // a safety no-op for the case where visual settled naturally.
       try { visualAbortCtrl.abort(); } catch {}
     } else if (raceWinner === "hard_deadline") {
-      // Hard deadline fired before master returned. Cancel fast/visual to stop any
-      // lingering in-flight requests. Master keeps running if VISION_MASTER_BACKGROUND_ENABLED.
-      try { queryFastAbortCtrl.abort(); } catch {}
-      try { fastAbortCtrl.abort(); } catch {}
-      try { visualAbortCtrl.abort(); } catch {}
-      if (!VISION_MASTER_BACKGROUND_ENABLED) {
-        try { masterAbortCtrl.abort(); } catch {}
+      // Phase 4K Part C: grace window — give late fast/query_fast/visual a short window
+      // before committing to hard_fail_no_seed. A 5ms drift miss becomes a rescue.
+      const _noSeedGraceMs = Number(process.env.VISION_NO_SEED_GRACE_MS || 650);
+      if (_noSeedGraceMs > 0) {
+        const _graceT0 = Date.now();
+        console.log("VISION_NO_SEED_GRACE_STARTED", {
+          rid: req.rid, graceMs: _noSeedGraceMs, elapsedMs: Date.now() - passT0,
+        });
+        const _graceTimeoutP = new Promise((res) => {
+          const t = setTimeout(res, _noSeedGraceMs);
+          if (typeof t.unref === "function") t.unref();
+        });
+        // Each wrapper resolves ONLY when the pass returns a usable, non-cancelled result.
+        // Non-usable results leave the wrapper pending so the timeout can win cleanly.
+        const _graceWrap = (src, p) => new Promise((res) => {
+          p.then((r) => {
+            if (r && !r.cancelled && isUsableVisionSeed(r?.parsed?.query)) res({ src, r });
+          }).catch(() => {});
+        });
+        const _graceWon = await Promise.race([
+          _graceWrap("query_fast", queryFastPromise),
+          _graceWrap("fast",       fastPromise),
+          _graceWrap("visual",     visualPromise),
+          _graceTimeoutP.then(() => null),
+        ]);
+        const _graceElapsedMs = Date.now() - _graceT0;
+        if (_graceWon) {
+          console.log("VISION_NO_SEED_GRACE_RESULT", {
+            rid: req.rid, source: _graceWon.src, query: _graceWon.r.parsed.query,
+            confidence: _graceWon.r.parsed.confidence ?? null,
+            graceMs: _noSeedGraceMs, elapsedMs: _graceElapsedMs,
+          });
+          raceWinner = _graceWon.src === "visual" ? "visual_early" : _graceWon.src;
+        } else {
+          console.log("VISION_NO_SEED_GRACE_EXPIRED", {
+            rid: req.rid, graceMs: _noSeedGraceMs, elapsedMs: _graceElapsedMs,
+          });
+        }
+      }
+
+      if (raceWinner === "hard_deadline") {
+        // Grace failed — abort visual (about to time out anyway).
+        // Keep queryFast + fast alive for Phase 4K Part A late storage:
+        // they may still return usable seeds before master (which takes ~11s),
+        // cutting background poll wait from 11s down to 3.5–5s.
+        try { visualAbortCtrl.abort(); } catch {}
+        if (!VISION_MASTER_BACKGROUND_ENABLED) {
+          try { masterAbortCtrl.abort(); } catch {}
+        }
+        // Phase 4K Part A+B: store first late result so frontend poll resolves fast.
+        if (imageHash) {
+          const _storeLateResult = (passLabel, prom) => {
+            prom.then((r) => {
+              if (BACKGROUND_VISION_RESULTS.has(imageHash)) return; // master already stored
+              const _lateQ   = r?.parsed?.query || null;
+              const _lateMs  = Date.now() - passT0;
+              const _logKey  = passLabel === "query_fast" ? "VISION_LATE_QUERY_FAST_RESULT_STORED"
+                             : passLabel === "fast"       ? "VISION_LATE_FAST_RESULT_STORED"
+                             :                             "VISION_LATE_VISUAL_RESULT_STORED";
+              if (!r || r.cancelled || !isUsableVisionSeed(_lateQ) || isGenericAircraftToyQuery(_lateQ || "")) {
+                console.log("VISION_LATE_RESULT_REJECTED", {
+                  rid: req.rid, pass: passLabel, query: _lateQ, elapsedMs: _lateMs,
+                  reason: !_lateQ ? "missing_query" : r?.cancelled ? "cancelled"
+                    : isGenericAircraftToyQuery(_lateQ || "") ? "generic_aircraft" : "garbage_query",
+                });
+                return;
+              }
+              const _lateCheck = detectIncompleteAircraftIdentityQuery(_lateQ);
+              const _lateNeedsFamily = _lateCheck.incomplete;
+              BACKGROUND_VISION_RESULTS.set(imageHash, {
+                query: _lateQ,
+                variants: Array.isArray(r?.parsed?.variants) ? r.parsed.variants : [],
+                confidence: Number(r?.parsed?.confidence || 0.5),
+                visionIdentity: r?.parsed?.identity || null,
+                category: String(r?.parsed?.identity?.category || "") || null,
+                completedAt: Date.now(),
+                elapsedMs: _lateMs,
+                needsFamilyRecovery: _lateNeedsFamily || undefined,
+              });
+              console.log(_logKey, { rid: req.rid, query: _lateQ, elapsedMs: _lateMs, needsFamilyRecovery: _lateNeedsFamily || false });
+              console.log("VISION_LATE_RESULT_MARKET_READY", {
+                rid: req.rid, pass: passLabel, query: _lateQ,
+                marketReady: !_lateNeedsFamily, needsFamilyRecovery: _lateNeedsFamily || false,
+              });
+            }).catch(() => {});
+          };
+          _storeLateResult("query_fast", queryFastPromise);
+          _storeLateResult("fast",       fastPromise);
+        }
+      } else {
+        // Grace rescued — abort non-winning passes.
+        if (raceWinner !== "query_fast")   try { queryFastAbortCtrl.abort(); } catch {}
+        if (raceWinner !== "fast")         try { fastAbortCtrl.abort(); } catch {}
+        if (raceWinner !== "visual_early") try { visualAbortCtrl.abort(); } catch {}
+        if (!VISION_MASTER_BACKGROUND_ENABLED) try { masterAbortCtrl.abort(); } catch {}
       }
     }
 
@@ -20319,6 +20400,12 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // Peek at what settled — fast/visual are cancelled/null at this point.
       fastResult   = await Promise.race([fastPromise,   Promise.resolve(null)]).catch(() => null);
       visualResult = await Promise.race([visualPromise, Promise.resolve(null)]).catch(() => null);
+    } else if (raceWinner === "query_fast") {
+      // Grace rescued query_fast — fast and visual were aborted.
+      fastResult   = null;
+      visualResult = null;
+      fastPromise.catch(() => null);
+      visualPromise.catch(() => null);
     } else { // visual_early
       fastResult   = null;               // drain in background
       visualResult = await visualPromise; // already settled — instant

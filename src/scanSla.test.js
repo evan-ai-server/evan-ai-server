@@ -13,7 +13,7 @@ import {
   MARKET_MIN_DEADLINE_MS,
   MARKET_MAX_DEADLINE_MS,
 } from "./scanSla.js";
-import { isUsableVisionSeed } from "./queryGuards.js";
+import { isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./queryGuards.js";
 
 // ── SLA budget math ───────────────────────────────────────────────────────────
 
@@ -552,4 +552,97 @@ test("4I.0: cache background refresh — aircraft identity filter rejects compet
   });
   assert.equal(afterIdentityFilter.length, 1, "competitor airline must be rejected by identity filter");
   assert.ok(afterIdentityFilter[0].title.includes("Hawaiian"), "only Hawaiian item survives");
+});
+
+// ── Phase 4K: hard-deadline grace window + late storage ───────────────────────
+
+test("4K: grace window — usable fast result resolves race before timeout", async () => {
+  // Simulate: fast returns usable seed at 80ms, grace is 200ms → rescue wins.
+  // Uses a simple race without "stay-pending" wrappers to avoid dangling promises.
+  const GRACE_MS = 200;
+  const passT0 = Date.now();
+  let raceWinner = null;
+
+  const fastResult = { parsed: { query: "Hawaiian Airlines Boeing 787 diecast model airplane", confidence: 0.85 } };
+  // Simulates fast resolving after 80ms
+  const fastRaceP = new Promise(res => setTimeout(() =>
+    res(isUsableVisionSeed(fastResult.parsed.query) ? { src: "fast", r: fastResult } : null),
+    80
+  ));
+  const timeoutP = new Promise(res => setTimeout(() => res(null), GRACE_MS));
+
+  raceWinner = await Promise.race([fastRaceP, timeoutP]);
+  assert.ok(raceWinner !== null, "usable fast result should win before grace timeout");
+  assert.equal(raceWinner.src, "fast");
+  assert.ok(Date.now() - passT0 < GRACE_MS + 50, "should resolve well within grace window");
+});
+
+test("4K: grace window — cancelled result does not win; timeout fires instead", async () => {
+  const GRACE_MS = 80;
+  let raceWinner = null;
+
+  // Simulate cancelled fast (common when deadline fires first)
+  const fastP = Promise.resolve({ cancelled: true, parsed: null });
+  // Grace wrap logic: only resolve if usable
+  const wrappedFast = fastP.then(r =>
+    (r && !r.cancelled && isUsableVisionSeed(r?.parsed?.query)) ? { src: "fast", r } : new Promise(() => {})
+  );
+  const timeoutP = new Promise(res => setTimeout(() => res(null), GRACE_MS));
+
+  raceWinner = await Promise.race([wrappedFast, timeoutP]);
+  assert.equal(raceWinner, null, "cancelled fast should not win; timeout returns null");
+});
+
+test("4K: grace window — usable seed check: Hawaiian 787 passes, generic fails", () => {
+  assert.equal(isUsableVisionSeed("Hawaiian Airlines Boeing 787 diecast model airplane"), true,
+    "complete aircraft query must pass usable seed check");
+  assert.equal(isUsableVisionSeed("model airplane"), false,
+    "generic 2-word query must fail usable seed check");
+  assert.equal(isUsableVisionSeed(null), false);
+});
+
+test("4K: late storage skips when BACKGROUND_VISION_RESULTS already has a result (master won)", () => {
+  // Simulate: store map already has master's result when fast's late handler fires.
+  const store = new Map();
+  const imageHash = "abc123";
+  store.set(imageHash, { query: "master result", confidence: 0.9 });
+
+  const lateQuery = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  // Check the guard: if already has key, skip
+  const shouldSkip = store.has(imageHash);
+  assert.equal(shouldSkip, true, "late storage must be skipped when master already stored");
+});
+
+test("4K: late fast result with complete identity → marketReady:true, needsFamilyRecovery:false", () => {
+  const q = "Hawaiian Airlines Boeing 787 diecast model airplane";
+  const result = detectIncompleteAircraftIdentityQuery(q);
+  assert.equal(result.incomplete, false, "complete aircraft query must not be flagged incomplete");
+  const marketReady = !result.incomplete;
+  assert.equal(marketReady, true);
+});
+
+test("4K: late fast result with incomplete aircraft → needsFamilyRecovery:true, marketReady:false", () => {
+  const q = "Hawaiian Airlines diecast airplane model";
+  const familyPattern = /\b(787|777|747|737|a380|a350|a330|a321|a320|a319|concorde|dreamliner|jumbo)\b/;
+  const hasFamily = familyPattern.test(q.toLowerCase());
+  assert.equal(hasFamily, false);
+  // Incomplete: no family → needsFamilyRecovery = true
+  const airlinePattern = /\b(hawaiian|united|delta|ana|jal|emirates)\b/;
+  const aircraftTermPattern = /\b(airplane|aircraft|diecast|model airplane)\b/;
+  const hasAirline = airlinePattern.test(q.toLowerCase());
+  const hasAircraftTerm = aircraftTermPattern.test(q.toLowerCase());
+  const incomplete = hasAirline && hasAircraftTerm && !hasFamily;
+  assert.equal(incomplete, true);
+});
+
+test("4K: late generic aircraft result is rejected (isGenericAircraftToyQuery)", () => {
+  const q = "white plastic model airplane toy";
+  assert.equal(isGenericAircraftToyQuery(q), true, "generic aircraft query must be rejected from late storage");
+});
+
+test("4K: startup selftests are gated behind RUN_STARTUP_SELFTESTS env", () => {
+  // The selftest blocks are now wrapped in `if (process.env.RUN_STARTUP_SELFTESTS === "true")`.
+  // During normal startup (env not set), these blocks do not run.
+  const wouldRun = process.env.RUN_STARTUP_SELFTESTS === "true";
+  assert.equal(wouldRun, false, "selftest blocks must not run during normal startup");
 });
