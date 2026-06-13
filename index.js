@@ -20285,15 +20285,18 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         });
         // Each wrapper resolves ONLY when the pass returns a usable, non-cancelled result.
         // Non-usable results leave the wrapper pending so the timeout can win cleanly.
+        // query_fast is NOT included: its Block 0 path (line ~19993) has already been
+        // skipped by the time grace runs — a grace-rescued query_fast would have no
+        // downstream handler and produce a null response. Let Part A handle it via
+        // late storage instead.
         const _graceWrap = (src, p) => new Promise((res) => {
           p.then((r) => {
             if (r && !r.cancelled && isUsableVisionSeed(r?.parsed?.query)) res({ src, r });
           }).catch(() => {});
         });
         const _graceWon = await Promise.race([
-          _graceWrap("query_fast", queryFastPromise),
-          _graceWrap("fast",       fastPromise),
-          _graceWrap("visual",     visualPromise),
+          _graceWrap("fast",   fastPromise),
+          _graceWrap("visual", visualPromise),
           _graceTimeoutP.then(() => null),
         ]);
         const _graceElapsedMs = Date.now() - _graceT0;
@@ -20312,19 +20315,25 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       }
 
       if (raceWinner === "hard_deadline") {
-        // Grace failed — abort visual (about to time out anyway).
-        // Keep queryFast + fast alive for Phase 4K Part A late storage:
-        // they may still return usable seeds before master (which takes ~11s),
-        // cutting background poll wait from 11s down to 3.5–5s.
-        try { visualAbortCtrl.abort(); } catch {}
+        // Grace failed — keep query_fast, fast, AND visual alive for late storage.
+        // visual fires ~50ms after grace expires (4000ms timeout vs 3950ms expiry);
+        // query_fast fires at ~4500ms; fast at ~3500ms. All three are worth capturing.
+        // Only abort master if background is disabled.
         if (!VISION_MASTER_BACKGROUND_ENABLED) {
           try { masterAbortCtrl.abort(); } catch {}
         }
+        console.log("VISION_HARD_DEADLINE_NO_SEED_BACKGROUND_CONTINUED", {
+          rid: req.rid, elapsedMs: Date.now() - passT0, imageHash: imageHash || null,
+          pendingQueryFast: true, pendingFast: true, pendingVisual: true,
+          masterLaunched, reason: "no_seed_keep_background_candidates_alive",
+        });
         // Phase 4K Part A+B: store first late result so frontend poll resolves fast.
+        // Passes fire in order: fast (~3500ms) → visual (~4000ms) → queryFast (~4500ms).
+        // Master overwrites at ~11s if it returns a more complete result.
         if (imageHash) {
           const _storeLateResult = (passLabel, prom) => {
             prom.then((r) => {
-              if (BACKGROUND_VISION_RESULTS.has(imageHash)) return; // master already stored
+              if (BACKGROUND_VISION_RESULTS.has(imageHash)) return; // master already won
               const _lateQ   = r?.parsed?.query || null;
               const _lateMs  = Date.now() - passT0;
               const _logKey  = passLabel === "query_fast" ? "VISION_LATE_QUERY_FAST_RESULT_STORED"
@@ -20357,12 +20366,14 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               });
             }).catch(() => {});
           };
-          _storeLateResult("query_fast", queryFastPromise);
           _storeLateResult("fast",       fastPromise);
+          _storeLateResult("visual",     visualPromise);
+          _storeLateResult("query_fast", queryFastPromise);
         }
       } else {
-        // Grace rescued — abort non-winning passes.
-        if (raceWinner !== "query_fast")   try { queryFastAbortCtrl.abort(); } catch {}
+        // Grace rescued fast or visual_early — abort the non-winning passes.
+        // query_fast was never in the grace race, so always abort it here.
+        try { queryFastAbortCtrl.abort(); } catch {}
         if (raceWinner !== "fast")         try { fastAbortCtrl.abort(); } catch {}
         if (raceWinner !== "visual_early") try { visualAbortCtrl.abort(); } catch {}
         if (!VISION_MASTER_BACKGROUND_ENABLED) try { masterAbortCtrl.abort(); } catch {}
@@ -20400,12 +20411,6 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // Peek at what settled — fast/visual are cancelled/null at this point.
       fastResult   = await Promise.race([fastPromise,   Promise.resolve(null)]).catch(() => null);
       visualResult = await Promise.race([visualPromise, Promise.resolve(null)]).catch(() => null);
-    } else if (raceWinner === "query_fast") {
-      // Grace rescued query_fast — fast and visual were aborted.
-      fastResult   = null;
-      visualResult = null;
-      fastPromise.catch(() => null);
-      visualPromise.catch(() => null);
     } else { // visual_early
       fastResult   = null;               // drain in background
       visualResult = await visualPromise; // already settled — instant
