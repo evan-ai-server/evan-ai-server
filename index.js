@@ -29878,25 +29878,32 @@ app.post("/market/search/stream", async (req, res) => {
     // a real-time scan — no SLA pressure, so we give it a generous deadline.
     const _isBackgroundRecovery = req.body?.isBackgroundRecovery === true;
     const _needsFamilyRecovery  = req.body?.needsFamilyRecovery === true;
-    // Phase 4L: approximate mode — server revalidates regardless of what client sent.
-    // Client flag is a hint; the backend confirms both conditions independently.
+    // Phase 4L: approximate mode — server revalidates only when client requests it.
+    // Uses req.body category hint because the scoped `category` var is declared later.
+    // Exact scans (approximateMode=false) never touch this block.
     const _approximateModeRequested = req.body?.approximateMode === true;
-    const _approxIncompleteAircraft = detectIncompleteAircraftIdentityQuery(query);
-    const _approxSafeCategory      = isApproximateMarketAllowedQuery(query, category || "");
-    const _approximateMode = _approximateModeRequested &&
-      _approxIncompleteAircraft.incomplete && _approxSafeCategory;
-    if (_approximateModeRequested && !_approximateMode) {
-      console.log("VISION_APPROX_MARKET_BLOCKED", {
-        rid: req.rid, scanId, query,
-        reason: !_approxIncompleteAircraft.incomplete ? "not_incomplete_aircraft"
-              : "approx_not_allowed_for_category",
-      });
-    }
-    if (_approximateMode) {
-      console.log("VISION_APPROX_MARKET_ALLOWED", {
-        rid: req.rid, scanId, query, reason: "approximate_mode_server_validated",
-        requiredAirline: _approxIncompleteAircraft.requiredAirline || null,
-      });
+    let _approximateMode = false;
+    if (_approximateModeRequested) {
+      const _approxCategoryHint =
+        req.body?.category ||
+        req.body?.visionCategory ||
+        req.body?.visionIdentity?.category ||
+        "";
+      const _approxIncompleteAircraft = detectIncompleteAircraftIdentityQuery(query);
+      const _approxSafeCategory       = isApproximateMarketAllowedQuery(query, _approxCategoryHint);
+      _approximateMode = _approxIncompleteAircraft.incomplete && _approxSafeCategory;
+      if (!_approximateMode) {
+        console.log("VISION_APPROX_MARKET_BLOCKED", {
+          rid: req.rid, scanId, query,
+          reason: !_approxIncompleteAircraft.incomplete ? "not_incomplete_aircraft"
+                : "approx_not_allowed_for_category",
+        });
+      } else {
+        console.log("VISION_APPROX_MARKET_ALLOWED", {
+          rid: req.rid, scanId, query, reason: "approximate_mode_server_validated",
+          requiredAirline: _approxIncompleteAircraft.requiredAirline || null,
+        });
+      }
     }
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
     const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
