@@ -1588,6 +1588,15 @@ const QUERY_FAST_TIMEOUT_MS         = Number(process.env.QUERY_FAST_TIMEOUT_MS  
 const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_TOKENS  || 160);
 const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
 const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
+// Slice V2: env-gated image detail for the query_fast pass ONLY. "low"/"high"
+// attach an explicit detail to the image input; "auto", unset, or any invalid
+// value preserve current behavior (no detail param → OpenAI default). No other
+// vision pass (fast/visual_shape/master) is affected.
+const QUERY_FAST_IMAGE_DETAIL_RAW = String(process.env.VISION_QUERY_FAST_IMAGE_DETAIL || "").trim().toLowerCase();
+const QUERY_FAST_IMAGE_DETAIL = (QUERY_FAST_IMAGE_DETAIL_RAW === "low" || QUERY_FAST_IMAGE_DETAIL_RAW === "high")
+  ? QUERY_FAST_IMAGE_DETAIL_RAW
+  : null; // null → do not set detail (auto/unset, current behavior)
+const QUERY_FAST_IMAGE_DETAIL_LABEL = QUERY_FAST_IMAGE_DETAIL || "auto/unset";
 
 // A2.10 — Aircraft family refinement: when query_fast wins on an aircraft collectible
 // but its query lacks an aircraft family token (787/777/A320/etc.), wait briefly for
@@ -19518,15 +19527,16 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
   const passStartTime = Date.now();
 
   // Slice V1 instrumentation: hoist the prompt so we can measure promptChars
-  // without rebuilding it, and label the image detail actually sent (none → the
-  // OpenAI "auto" default). Behavior is unchanged — the same prompt is sent.
+  // without rebuilding it. Slice V2: _qfImageDetail is the effective label
+  // ("low"/"high"/"auto/unset") driven by VISION_QUERY_FAST_IMAGE_DETAIL.
   const _qfPrompt = buildUltraLeanVisionPrompt(mode, propContext);
-  const _qfImageDetail = "auto/unset";
+  const _qfImageDetail = QUERY_FAST_IMAGE_DETAIL_LABEL;
 
   console.log("VISION_QUERY_FAST_PROFILE", {
     rid, mode, model,
     timeoutMs: openaiCutoffMs,
     maxOutputTokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
+    imageDetail: _qfImageDetail,
   });
 
   try {
@@ -19558,7 +19568,13 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
                   role: "user",
                   content: [
                     { type: "input_text", text: _qfPrompt },
-                    { type: "input_image", image_url: dataUrl },
+                    // Slice V2: attach detail only when explicitly "low"/"high";
+                    // otherwise omit it entirely to preserve OpenAI default behavior.
+                    {
+                      type: "input_image",
+                      image_url: dataUrl,
+                      ...(QUERY_FAST_IMAGE_DETAIL ? { detail: QUERY_FAST_IMAGE_DETAIL } : {}),
+                    },
                   ],
                 },
               ],
@@ -20278,7 +20294,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           queryFastInputTokens:     _qfDiagUsage.inputTokens,
           queryFastCachedTokens:    _qfDiagUsage.cachedInputTokens,
           queryFastOutputTokens:    _qfDiagUsage.outputTokens,
-          queryFastDetail:          "auto/unset",
+          queryFastDetail:          QUERY_FAST_IMAGE_DETAIL_LABEL,
           queryFastMaxOutputTokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
         });
       }
