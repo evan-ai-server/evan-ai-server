@@ -19481,6 +19481,28 @@ function buildResaleFallbackQuery(identity = null) {
   return null;
 }
 
+// Vision speed instrumentation (Slice V1): normalize OpenAI token usage across
+// both Responses API (input_tokens / output_tokens / input_tokens_details.cached_tokens)
+// and Chat Completions (prompt_tokens / completion_tokens / prompt_tokens_details)
+// shapes. Returns null for any missing field rather than throwing.
+function extractOpenAiUsage(usage) {
+  const _num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  if (!usage || typeof usage !== "object") {
+    return { inputTokens: null, cachedInputTokens: null, outputTokens: null, totalTokens: null };
+  }
+  const inputTokens  = _num(usage.input_tokens  ?? usage.prompt_tokens);
+  const outputTokens = _num(usage.output_tokens ?? usage.completion_tokens);
+  const cachedInputTokens = _num(
+    usage.input_tokens_details?.cached_tokens ??
+    usage.prompt_tokens_details?.cached_tokens
+  );
+  let totalTokens = _num(usage.total_tokens);
+  if (totalTokens === null && (inputTokens !== null || outputTokens !== null)) {
+    totalTokens = (inputTokens || 0) + (outputTokens || 0);
+  }
+  return { inputTokens, cachedInputTokens, outputTokens, totalTokens };
+}
+
 // Phase A2.7: Ultra-lean vision pass that only asks for a search query + 4 fields.
 // Generates ~80-130 tokens, returns in ~2-3s on gpt-4.1-mini warm cache.
 // Used only for item/prop mode — text modes (label/barcode/mark) still use the
@@ -19494,6 +19516,12 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
     ? AbortSignal.any([timeout.signal, externalSignal])
     : timeout.signal;
   const passStartTime = Date.now();
+
+  // Slice V1 instrumentation: hoist the prompt so we can measure promptChars
+  // without rebuilding it, and label the image detail actually sent (none → the
+  // OpenAI "auto" default). Behavior is unchanged — the same prompt is sent.
+  const _qfPrompt = buildUltraLeanVisionPrompt(mode, propContext);
+  const _qfImageDetail = "auto/unset";
 
   console.log("VISION_QUERY_FAST_PROFILE", {
     rid, mode, model,
@@ -19529,7 +19557,7 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
                 {
                   role: "user",
                   content: [
-                    { type: "input_text", text: buildUltraLeanVisionPrompt(mode, propContext) },
+                    { type: "input_text", text: _qfPrompt },
                     { type: "input_image", image_url: dataUrl },
                   ],
                 },
@@ -19577,6 +19605,24 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
 
     const elapsedMs = Date.now() - passStartTime;
     console.log("VISION_QUERY_FAST_TIMING", { rid, elapsedMs, timedOut: false, cancelled: false, ok: true });
+
+    // Slice V1: token-level usage diagnostic — no image data, no raw prompt text.
+    const _qfUsage = extractOpenAiUsage(response?.usage);
+    console.log("VISION_QUERY_FAST_USAGE", {
+      rid, model, elapsedMs, timedOut: false,
+      inputTokens:       _qfUsage.inputTokens,
+      cachedInputTokens: _qfUsage.cachedInputTokens,
+      outputTokens:      _qfUsage.outputTokens,
+      totalTokens:       _qfUsage.totalTokens,
+      imageDetail:       _qfImageDetail,
+      maxOutputTokens:   QUERY_FAST_MAX_OUTPUT_TOKENS,
+      promptProfile:     "ultra_lean",
+      promptChars:       _qfPrompt.length,
+      outputChars:       String(rawText || "").length,
+      parsedQuery:       parsed.query,
+      parsedCategory:    parsed.category,
+      parsedConfidence:  parsed.confidence,
+    });
 
     return { rawText, parsed, source: "openai", model, usage: response?.usage || null };
 
@@ -20219,6 +20265,23 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         masterLaunched: _refinementApplied && _refinementSource === "visual_or_master",
         masterLaunchedEarlyMs: null,
       });
+
+      // Slice V1: single-line speed summary for the query_fast-won path.
+      {
+        const _qfDiagUsage = extractOpenAiUsage(qfResult?.usage);
+        console.log("VISION_SPEED_DIAG_SUMMARY", {
+          rid: req.rid,
+          selectedPass:             "query_fast",
+          selectedQuery:            _finalQuery,
+          visionWallMs:             qfWallMs,
+          queryFastMs,
+          queryFastInputTokens:     _qfDiagUsage.inputTokens,
+          queryFastCachedTokens:    _qfDiagUsage.cachedInputTokens,
+          queryFastOutputTokens:    _qfDiagUsage.outputTokens,
+          queryFastDetail:          "auto/unset",
+          queryFastMaxOutputTokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
+        });
+      }
 
       recordVisionTiming({
         rid:                req.rid,
