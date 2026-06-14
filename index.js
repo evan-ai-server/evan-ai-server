@@ -1317,7 +1317,7 @@ import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordV
 import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
-import { register as similarityRegister, findSimilar as similarityFindSimilar, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
+import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
@@ -1618,6 +1618,13 @@ const VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED   = String(process.env.VISION_S
 const VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD = Math.min(0.999, Math.max(0.80, Number(process.env.VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD || 0.92)));
 const VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS = Math.min(600, Math.max(40, Number(process.env.VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS || 180)));
 const VISION_SIMILARITY_PROVISIONAL_SEED_CONF_CAP  = Math.min(0.95, Math.max(0.3, Number(process.env.VISION_SIMILARITY_PROVISIONAL_SEED_CONF_CAP || 0.75)));
+// V3.2: self-heal — when the background verify returns a real query that
+// CONTRADICTS the cached seed (not a timeout), forget the offending entry so it
+// stops serving a wrong provisional seed. Default ON (only reachable when
+// provisional seeds are enabled). Min-confidence guards against deleting on a
+// junk/low-confidence verify read.
+const VISION_SIMILARITY_SELF_HEAL_ENABLED  = String(process.env.VISION_SIMILARITY_SELF_HEAL_ENABLED || "true").trim().toLowerCase() !== "false";
+const VISION_SIMILARITY_SELF_HEAL_MIN_CONF = Math.min(0.95, Math.max(0, Number(process.env.VISION_SIMILARITY_SELF_HEAL_MIN_CONF || 0.5)));
 // Hard budget for the prepareVisionBuffer Sharp call inside runVisionConsensus.
 // On cold Sharp init this can spike to 3+ seconds; if it exceeds the budget we
 // fall through to the original buffer (prepareVisionBuffer still runs but we
@@ -19523,16 +19530,18 @@ function extractOpenAiUsage(usage) {
 
 // Phase V3: fire-and-forget background verification for a provisional similarity
 // seed. Runs the real query_fast pass on the downscaled image and logs whether
-// OpenAI agrees with the cached identity. NEVER blocks the response; log-only —
-// it does not mutate the similarity cache in this slice (a disagreement is
-// surfaced for a future cache-correction slice).
-function _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery, similarity }) {
+// OpenAI agrees with the cached identity. NEVER blocks the response.
+// V3.2: on a genuine disagreement (a real verifiedQuery that differs from the
+// seed) it self-heals — forgets the offending cache entry so it stops serving a
+// wrong provisional seed. Timeouts/no-result never mutate the cache.
+function _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery, seedImageHash, similarity }) {
   if (!file?.buffer) return;
   const rid = req?.rid || null;
   (async () => {
     const _t0 = Date.now();
     console.log("VISION_SIMILARITY_BACKGROUND_VERIFY_STARTED", {
-      rid, seedQuery, similarity: Number(Number(similarity).toFixed(4)),
+      rid, seedQuery, seedImageHash: seedImageHash || null,
+      similarity: Number(Number(similarity).toFixed(4)),
     });
     try {
       const visionBuffer = await prepareVisionBuffer(file.buffer, rid || "", VISION_MAX_EDGE_PX).catch(() => file.buffer);
@@ -19540,6 +19549,7 @@ function _launchProvisionalSeedVerification({ req, file, mode, propContext, seed
       const dataUrl = `data:${mime};base64,${visionBuffer.toString("base64")}`;
       const verifyRes = await runUltraLeanVisionPass({ dataUrl, mode, propContext, rid: rid || "" });
       const verifiedQuery = verifyRes?.parsed?.query || null;
+      const verifiedConfidence = clamp01(Number(verifyRes?.parsed?.confidence ?? 0));
       // V3.1: distinguish a verification TIMEOUT/no-result (verifiedQuery null —
       // the pass timed out, was cancelled, or returned nothing) from a genuine
       // OpenAI disagreement (a real verifiedQuery that differs from the seed).
@@ -19553,11 +19563,37 @@ function _launchProvisionalSeedVerification({ req, file, mode, propContext, seed
         note   = "openai_confirms_seed";
       } else {
         status = "disagree"; agree = false;
-        note   = "openai_disagrees_log_only_no_cache_mutation";
+        note   = "openai_disagrees";
       }
+
+      // V3.2: self-heal on a confident disagreement only — forget the entry that
+      // produced the contradicted seed (durable: removed from memory + disk).
+      let _selfHealed = false;
+      if (
+        status === "disagree" &&
+        VISION_SIMILARITY_SELF_HEAL_ENABLED &&
+        seedImageHash &&
+        verifiedConfidence >= VISION_SIMILARITY_SELF_HEAL_MIN_CONF
+      ) {
+        const _existed = similarityRemove(seedImageHash);
+        _selfHealed = true;
+        note = "openai_disagrees_self_healed_entry_removed";
+        console.log("VISION_SIMILARITY_CACHE_SELF_HEALED", {
+          rid, removedImageHash: seedImageHash,
+          seedQuery, verifiedQuery, verifiedConfidence,
+          entryWasInMemory: _existed,
+          reason: "openai_verify_contradicted_cached_seed",
+        });
+      } else if (status === "disagree") {
+        note = verifiedConfidence < VISION_SIMILARITY_SELF_HEAL_MIN_CONF
+          ? "openai_disagrees_below_self_heal_min_conf_no_mutation"
+          : "openai_disagrees_self_heal_disabled_no_mutation";
+      }
+
       console.log("VISION_SIMILARITY_BACKGROUND_VERIFY_RESULT", {
         rid, seedQuery, verifiedQuery, status, agree,
-        verifiedConfidence: clamp01(Number(verifyRes?.parsed?.confidence ?? 0)),
+        verifiedConfidence,
+        selfHealed: _selfHealed,
         elapsedMs: Date.now() - _t0,
         note,
       });
@@ -22071,8 +22107,9 @@ if (!openai) {
                   similarityScore: Number(hit.similarity.toFixed(4)),
                   confidence: _seedConf, provisional: true,
                 });
-                // Verify in the background — never blocks this response.
-                _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery, similarity: hit.similarity });
+                // Verify in the background — never blocks this response. Pass the
+                // hit's imageHash so a disagreement can self-heal that exact entry.
+                _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery, seedImageHash: hit.imageHash, similarity: hit.similarity });
                 _provisionalSeedReturned = true;
                 return res.status(200).json({
                   ...hit.payload,

@@ -21,7 +21,7 @@ import { cosineSimilarity } from "../intelligence/vision/embeddingSearch.js";
 const MAX_ENTRIES          = Number(process.env.SCAN_SIMILARITY_MAX_ENTRIES || 500);
 const SIMILARITY_THRESHOLD = Number(process.env.SCAN_SIMILARITY_THRESHOLD || 0.92);
 const ENTRY_TTL_MS         = Number(process.env.SCAN_SIMILARITY_TTL_MS || 24 * 60 * 60 * 1000);
-const STORAGE_DIR          = path.resolve("storage/scan-similarity");
+const STORAGE_DIR          = path.resolve(process.env.SCAN_SIMILARITY_STORAGE_DIR || "storage/scan-similarity");
 // Bump when the payload shape (vision query/identity/variants) changes
 // incompatibly. Old persisted entries are skipped at load + lookup time
 // instead of being replayed and re-injecting stale vision queries (which
@@ -30,7 +30,7 @@ const PAYLOAD_VERSION      = String(process.env.SCAN_SIMILARITY_PAYLOAD_VERSION 
 
 const _index = new Map(); // imageHash → { vector, payload, ts }
 
-let _stats = { hits: 0, misses: 0, registrations: 0, loaded: 0 };
+let _stats = { hits: 0, misses: 0, registrations: 0, removals: 0, loaded: 0 };
 
 let _dirReady = null;
 async function _ensureDir() {
@@ -156,6 +156,22 @@ export function findSimilar(vector, threshold = SIMILARITY_THRESHOLD) {
   return best;
 }
 
+/**
+ * Remove a single entry by imageHash from BOTH memory and disk. Used by the V3.2
+ * self-heal: when an OpenAI background verify contradicts the cached seed an entry
+ * produced, that entry is forgotten so it stops serving a wrong provisional seed —
+ * and the disk delete makes the removal durable across restarts (otherwise
+ * loadFromDisk would replay it at boot). Disk unlink is best-effort/fire-and-forget.
+ * Returns true if the entry was present in memory.
+ */
+export function remove(imageHash) {
+  if (!imageHash) return false;
+  const existed = _index.delete(imageHash);
+  _stats.removals = (_stats.removals || 0) + 1;
+  fs.unlink(_entryPath(imageHash)).catch(() => {});
+  return existed;
+}
+
 export function getStats() {
   const total = _stats.hits + _stats.misses;
   return {
@@ -170,5 +186,5 @@ export function getStats() {
 
 export function clear() {
   _index.clear();
-  _stats = { hits: 0, misses: 0, registrations: 0 };
+  _stats = { hits: 0, misses: 0, registrations: 0, removals: 0 };
 }
