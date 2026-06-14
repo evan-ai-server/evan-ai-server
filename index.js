@@ -41490,6 +41490,77 @@ app.post("/api/profile/flip", async (req, res) => {
     });
   } catch {}
 
+  // Phase 4I.6: eBay enablement diagnostic — disambiguates why eBay is off so
+  // the unlock path is unambiguous: get production keyset, remove DISABLE_EBAY.
+  try {
+    const _disableFlag   = process.env.DISABLE_EBAY === "true";
+    const _clientId      = EBAY_CLIENT_ID  || "";
+    const _secret        = EBAY_CLIENT_SECRET || "";
+    const _idPresent     = _clientId.length > 0;
+    const _secPresent    = _secret.length  > 0;
+    const _idPlaceholder  = _clientId.length < 12;
+    const _secPlaceholder = _secret.length  < 12;
+    let _ebayStatus;
+    if (_disableFlag && _idPlaceholder && _secPlaceholder) _ebayStatus = "disabled_flag_and_placeholder_creds";
+    else if (_disableFlag)                                  _ebayStatus = "disabled_by_flag";
+    else if (!_idPresent || !_secPresent)                   _ebayStatus = "missing_creds";
+    else if (_idPlaceholder || _secPlaceholder)             _ebayStatus = "placeholder_creds";
+    else                                                    _ebayStatus = "ready";
+    const _ebayRemediations = {
+      disabled_flag_and_placeholder_creds: "Set real EBAY_CLIENT_ID and EBAY_CLIENT_SECRET from an eBay developer production keyset, then remove or set DISABLE_EBAY=false.",
+      disabled_by_flag:   "EBAY_CLIENT_ID and EBAY_CLIENT_SECRET appear valid — remove or set DISABLE_EBAY=false to enable.",
+      missing_creds:      "Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET from an eBay developer production keyset at developer.ebay.com.",
+      placeholder_creds:  "Replace placeholder EBAY_CLIENT_ID / EBAY_CLIENT_SECRET with real production keyset values from developer.ebay.com.",
+      ready:              "eBay API credentials are configured and available.",
+    };
+    console.log("EBAY_ENABLEMENT_DIAGNOSTIC", {
+      disableEbayFlag:             _disableFlag,
+      clientIdPresent:             _idPresent,
+      clientSecretPresent:         _secPresent,
+      clientIdLooksPlaceholder:    _idPlaceholder,
+      clientSecretLooksPlaceholder: _secPlaceholder,
+      hasEbayApi:                  hasEbayApi(),
+      status:                      _ebayStatus,
+      remediation:                 _ebayRemediations[_ebayStatus],
+    });
+  } catch (_e) {
+    console.warn("EBAY_ENABLEMENT_DIAGNOSTIC_ERROR", { error: String(_e) });
+  }
+
+  // Phase 4I.6: verified-pipeline selftest — proves a real eBay item URL becomes
+  // isVerifiedListing:true and a null-URL oracle item stays false. Runs at every
+  // boot so a future regression in the URL classifier breaks loudly here first.
+  try {
+    const _vA = sanitizeOutboundListingForClient(
+      normalizeItem({ title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast", extracted_price: 79.99,
+        source: "eBay", link: "https://www.ebay.com/itm/123456789012" }),
+      { scanId: "selftest" }
+    );
+    if (!_vA.isVerifiedListing || _vA.urlQuality !== "merchant_direct" || !_vA.clickable || !_vA.directUrl) {
+      console.error("EBAY_VERIFIED_PIPELINE_SELFTEST_FAIL", {
+        case: "verified_case", isVerifiedListing: _vA.isVerifiedListing,
+        urlQuality: _vA.urlQuality, clickable: _vA.clickable, hasDirectUrl: !!_vA.directUrl,
+        error: "Real eBay item URL should classify as isVerifiedListing:true with urlQuality:merchant_direct",
+      });
+    } else {
+      const _vB = sanitizeOutboundListingForClient(
+        normalizeItem({ title: "Hawaiian Airlines Boeing 787 diecast model airplane - estimated comp",
+          extracted_price: 79.99, source: "eBay - fake_oracle_seller", link: null }),
+        { scanId: "selftest" }
+      );
+      if (_vB.isVerifiedListing || _vB.directUrl) {
+        console.error("EBAY_VERIFIED_PIPELINE_SELFTEST_FAIL", {
+          case: "oracle_case", isVerifiedListing: _vB.isVerifiedListing, hasDirectUrl: !!_vB.directUrl,
+          error: "Null-URL oracle item must not classify as isVerifiedListing:true",
+        });
+      } else {
+        console.log("EBAY_VERIFIED_PIPELINE_SELFTEST_PASS", { verifiedCase: true, oracleCase: false });
+      }
+    }
+  } catch (_e) {
+    console.warn("EBAY_VERIFIED_PIPELINE_SELFTEST_ERROR", { error: String(_e) });
+  }
+
   // Production safety: warn loudly if any of the new env-overridable rate
   // limits or abuse thresholds are set above safe ceilings. These knobs
   // exist so the bench can crank them locally, but in prod they should stay
