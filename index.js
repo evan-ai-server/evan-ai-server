@@ -19540,13 +19540,26 @@ function _launchProvisionalSeedVerification({ req, file, mode, propContext, seed
       const dataUrl = `data:${mime};base64,${visionBuffer.toString("base64")}`;
       const verifyRes = await runUltraLeanVisionPass({ dataUrl, mode, propContext, rid: rid || "" });
       const verifiedQuery = verifyRes?.parsed?.query || null;
-      const agree = !!verifiedQuery && !!seedQuery &&
-        normalizeTitleKey(verifiedQuery) === normalizeTitleKey(seedQuery);
+      // V3.1: distinguish a verification TIMEOUT/no-result (verifiedQuery null —
+      // the pass timed out, was cancelled, or returned nothing) from a genuine
+      // OpenAI disagreement (a real verifiedQuery that differs from the seed).
+      // Only the latter is "disagree"; a null result is NOT a disagreement.
+      let status, agree, note;
+      if (!verifiedQuery) {
+        status = "timeout_or_no_result"; agree = null;
+        note   = "background_verify_timeout_or_no_result_log_only";
+      } else if (normalizeTitleKey(verifiedQuery) === normalizeTitleKey(seedQuery)) {
+        status = "confirmed"; agree = true;
+        note   = "openai_confirms_seed";
+      } else {
+        status = "disagree"; agree = false;
+        note   = "openai_disagrees_log_only_no_cache_mutation";
+      }
       console.log("VISION_SIMILARITY_BACKGROUND_VERIFY_RESULT", {
-        rid, seedQuery, verifiedQuery, agree,
+        rid, seedQuery, verifiedQuery, status, agree,
         verifiedConfidence: clamp01(Number(verifyRes?.parsed?.confidence ?? 0)),
         elapsedMs: Date.now() - _t0,
-        note: agree ? "openai_confirms_seed" : "openai_disagrees_log_only_no_cache_mutation",
+        note,
       });
     } catch (e) {
       console.warn("provisional_seed_verify_error", e?.message || e);
@@ -22083,6 +22096,14 @@ if (!openai) {
             } catch (e) {
               console.warn("provisional_seed_lookup_error", e?.message || e);
             }
+          } else {
+            // V3.1: embed not ready within the seed budget — no provisional seed
+            // this scan. Falls through to the normal background path below.
+            console.log("VISION_SIMILARITY_PROVISIONAL_SEED_TIMEOUT", {
+              rid: req.rid, mode,
+              budgetMs: VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS,
+              reason: "embed_not_ready_within_seed_budget",
+            });
           }
         }
 
@@ -30095,11 +30116,23 @@ app.post("/market/search/stream", async (req, res) => {
     }
     const _scanStartedAtMs = Number(req.body?.scanStartedAtMs || 0) || null;
     const _scanSlaMs       = Number(req.body?.scanSlaMs || SCAN_FIRST_RESPONSE_SLA_MS) || SCAN_FIRST_RESPONSE_SLA_MS;
-    const _slaMsRemaining  = _scanStartedAtMs ? Math.max(0, _scanSlaMs - (Date.now() - _scanStartedAtMs)) : null;
+    // V3.1: clamp elapsed to >= 0. A client scanStartedAtMs in the FUTURE (clock
+    // skew) would otherwise make elapsed negative and inflate remaining budget
+    // beyond the configured SLA. Clamping elapsed caps remaining at _scanSlaMs.
+    const _rawElapsedMs     = _scanStartedAtMs ? (Date.now() - _scanStartedAtMs) : null;
+    const _clampedElapsedMs = _rawElapsedMs !== null ? Math.max(0, _rawElapsedMs) : null;
+    if (_rawElapsedMs !== null && _rawElapsedMs < 0) {
+      console.warn("MARKET_SLA_CLOCK_SKEW_CLAMPED", {
+        rid: req.rid, scanId,
+        rawElapsedMs: _rawElapsedMs, clampedElapsedMs: 0,
+        reason: "client_scan_started_at_in_future",
+      });
+    }
+    const _slaMsRemaining  = _clampedElapsedMs !== null ? Math.max(0, _scanSlaMs - _clampedElapsedMs) : null;
 
     if (_slaMsRemaining !== null && _slaMsRemaining <= 800) {
       console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
-        rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _scanSlaMs - _slaMsRemaining,
+        rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
       });
       send("complete", {
         items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
@@ -30145,7 +30178,7 @@ app.post("/market/search/stream", async (req, res) => {
     }
     console.log("MARKET_SLA_BUDGET", {
       rid: req.rid, scanId, marketDeadlineMs: _marketDeadlineMs,
-      remainingMs: _slaMsRemaining, elapsedMs: _slaMsRemaining !== null ? (_scanSlaMs - _slaMsRemaining) : null,
+      remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
       isBackgroundRecovery: _isBackgroundRecovery, visionConfidence: _visionConf,
       isExactAircraftIdentity: _isExactAircraftIdentity,
     });
