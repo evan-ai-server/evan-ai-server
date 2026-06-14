@@ -1319,6 +1319,7 @@ import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, 
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
+import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -20538,9 +20539,15 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           if (_graceWon.src === "query_fast") {
             // Block 0 (if raceWinner==="query_fast") already passed — route through "fast" path.
             raceWinner = "fast";
-            // Preserve source identity for downstream telemetry — logs/scoring can still
-            // distinguish a query_fast grace rescue from a native fast-pass win.
-            _graceRescuedFastResult = { ..._graceWon.r, source: "query_fast", rescuedByGrace: true };
+            // V3.3: query_fast returns category FLAT (parsed.category); downstream
+            // fast-accept + seed-recovery read parsed.identity.category. Mirror it so
+            // the grace-rescued seed isn't falsely rejected for "no_category" (which
+            // forced a wait to the ~5.5s hard-return ceiling and starved market SLA).
+            const _qfMirroredParsed = mirrorQueryFastSeedIdentity(_graceWon.r?.parsed || {});
+            _graceRescuedFastResult = { ..._graceWon.r, parsed: _qfMirroredParsed, source: "query_fast", rescuedByGrace: true };
+            console.log("VISION_QUERY_FAST_GRACE_CATEGORY_PRESERVED", {
+              rid: req.rid, category: _qfMirroredParsed.identity.category,
+            });
             console.log("VISION_QUERY_FAST_LIVE_SEED_ACCEPTED", {
               rid: req.rid, query: _graceWon.r.parsed.query,
               confidence: _graceWon.r.parsed.confidence ?? null,
@@ -20878,7 +20885,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       if (_isItemPropMode) {
         const _seedCandidates = [
           { r: visualResult, sourcePass: "visual_shape", minConf: 0.70 },
-          { r: fastResult,   sourcePass: "fast",         minConf: 0.72 },
+          { r: fastResult,   sourcePass: fastResult?.rescuedByGrace ? "query_fast_grace" : "fast", minConf: 0.72 },
         ];
         for (const { r, sourcePass, minConf } of _seedCandidates) {
           if (!r || r.cancelled) continue;
@@ -20897,6 +20904,14 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               rid: req.rid, sourcePass, query: q, confidence: conf, category: cat,
               reason: "confidence_above_recovery_threshold",
             });
+            if (r?.rescuedByGrace) {
+              // V3.3: a grace-rescued query_fast seed returned immediately instead of
+              // waiting for master/hard_return — the fix for the no-result regression.
+              console.log("VISION_QUERY_FAST_GRACE_RETURN_USED", {
+                rid: req.rid, query: q, category: cat, confidence: conf,
+                elapsedMs: Date.now() - passT0,
+              });
+            }
             break;
           } else {
             console.log("VISION_SEED_RECOVERY_REJECTED", {
@@ -30168,6 +30183,22 @@ app.post("/market/search/stream", async (req, res) => {
     const _slaMsRemaining  = _clampedElapsedMs !== null ? Math.max(0, _scanSlaMs - _clampedElapsedMs) : null;
 
     if (_slaMsRemaining !== null && _slaMsRemaining <= 800) {
+      // V3.3: SLA is exhausted, so we must NOT spend any SerpAPI/eBay/Etsy calls.
+      // But a ZERO-COST in-memory cached pool (same scan/query/user/imageHash) beats
+      // an empty result — serve it instead of forcing a rescan when one exists.
+      let _slaCached = null;
+      try { _slaCached = getMarketScanResult({ scanId, imageHash, query, userId: _budgetUserIdStream }); } catch {}
+      const _slaFallback = slaFallbackPayload(_slaCached);
+      if (_slaFallback) {
+        console.log("MARKET_SLA_EXHAUSTED_CACHE_FALLBACK_HIT", {
+          rid: req.rid, scanId, hitKey: _slaCached?.hitKey || null,
+          itemCount: _slaFallback.items.length, elapsedMs: _clampedElapsedMs,
+        });
+        send("complete", { ..._slaFallback, cacheFallback: true, slaExhausted: true });
+        endStream();
+        return;
+      }
+      console.log("MARKET_SLA_EXHAUSTED_CACHE_FALLBACK_MISS", { rid: req.rid, scanId });
       console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
         rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
       });
