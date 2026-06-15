@@ -1321,6 +1321,7 @@ import { register as similarityRegister, findSimilar as similarityFindSimilar, r
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
+import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -30267,33 +30268,11 @@ app.post("/market/search/stream", async (req, res) => {
       });
     }
     const _slaMsRemaining  = _clampedElapsedMs !== null ? Math.max(0, _scanSlaMs - _clampedElapsedMs) : null;
-
-    if (_slaMsRemaining !== null && _slaMsRemaining <= 800) {
-      // V3.3: SLA is exhausted, so we must NOT spend any SerpAPI/eBay/Etsy calls.
-      // But a ZERO-COST in-memory cached pool (same scan/query/user/imageHash) beats
-      // an empty result — serve it instead of forcing a rescan when one exists.
-      let _slaCached = null;
-      try { _slaCached = getMarketScanResult({ scanId, imageHash, query, userId: _budgetUserIdStream }); } catch {}
-      const _slaFallback = slaFallbackPayload(_slaCached);
-      if (_slaFallback) {
-        console.log("MARKET_SLA_EXHAUSTED_CACHE_FALLBACK_HIT", {
-          rid: req.rid, scanId, hitKey: _slaCached?.hitKey || null,
-          itemCount: _slaFallback.items.length, elapsedMs: _clampedElapsedMs,
-        });
-        send("complete", { ..._slaFallback, cacheFallback: true, slaExhausted: true });
-        endStream();
-        return;
-      }
-      console.log("MARKET_SLA_EXHAUSTED_CACHE_FALLBACK_MISS", { rid: req.rid, scanId });
-      console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
-        rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
-      });
-      send("complete", {
-        items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
-      });
-      endStream();
-      return;
-    }
+    // V3.5: the SLA-exhausted fallback runs AFTER _buildPayload is defined (search
+    // "V3.5: market SLA-exhausted cache fallback") so it can reuse the exact
+    // identity-filtered payload builder AND consult the persistent internal market
+    // snapshot — not just the in-memory cross-route cache the V3.3 guard checked.
+    // Nothing between here and that block fires a paid call, so deferring is safe.
 
     // Alias background result by scanId if imageHash mapping exists
     const _imageHashFromReq = safeStr(req.body?.imageHash, 128) || null;
@@ -30620,6 +30599,99 @@ app.post("/market/search/stream", async (req, res) => {
       _bp_log("buildPayload_total", _bp_t0);
       return payload;
     };
+
+    // ── V3.5: market SLA-exhausted cache fallback ─────────────────────────
+    // When the scan SLA is (nearly) exhausted we must NOT spend any paid
+    // SerpAPI/eBay/Etsy call. But an empty result that forces a rescan is worse
+    // than a zero-cost cached pool when one exists. Try, in order: the in-memory
+    // cross-route payload/query cache, then the PERSISTENT internal market
+    // snapshot (redis/disk — survives restarts; the V3.3 guard never checked it).
+    // Identity filters are preserved (resolveAircraftCachePolicy +
+    // computeCleanRetrievalPool + the payload builder's own locks); no
+    // oracle/fake listings enter, and the snapshot is read directly so no SWR
+    // refresh (paid) is scheduled.
+    if (isSlaExhausted(_slaMsRemaining)) {
+      // 1) zero-cost in-memory cross-route cache (payload by scan/img, or query+user).
+      let _slaCached = null;
+      try { _slaCached = getMarketScanResult({ scanId, imageHash, query, userId: _budgetUserIdStream }); } catch {}
+      const _slaInMemory = slaFallbackPayload(_slaCached);
+      if (_slaInMemory) {
+        const _inMemDecision = selectSlaFallbackSource({ inMemoryHit: true, inMemoryHitKey: _slaCached?.hitKey || null });
+        console.log(_inMemDecision.log, {
+          rid: req.rid, scanId, hitKey: _slaCached?.hitKey || null,
+          keyKind: classifyBudgetCacheKey(_slaCached?.hitKey),
+          itemCount: _slaInMemory.items.length, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
+        });
+        _recordStreamMetric("cacheHits", 1);
+        send("complete", { ..._slaInMemory, cacheFallback: true, slaExhausted: true, status: "complete", source: "cache" });
+        endStream();
+        return;
+      }
+
+      // 2) persistent internal market snapshot — direct read (no SWR refresh), then
+      //    the same identity/family/clean-pool gates the normal stale path applies.
+      let _slaSnapItems = [];
+      try {
+        const _slaSnap = await readInternalMarketSnapshot(query);
+        _slaSnapItems = Array.isArray(_slaSnap?.items)
+          ? _slaSnap.items.map(hydrateMarketSnapshotItem).filter((x) => x?.title)
+          : [];
+      } catch {}
+      let _slaCleanCount = 0;
+      let _slaPolicyItems = [];
+      if (_slaSnapItems.length >= 4) {
+        const _slaPolicy = resolveAircraftCachePolicy(query, _slaSnapItems, scannedPrice, "sla_exhausted_snapshot");
+        if (_slaPolicy.action !== "bypass_stale_cache") {
+          _slaPolicyItems = _slaPolicy.items;
+          _slaCleanCount = computeCleanRetrievalPool(query, _slaPolicyItems, scannedPrice, "sla_exhausted_snapshot").cleanCount;
+        }
+      }
+
+      const _slaDecision = selectSlaFallbackSource({
+        inMemoryHit: false,
+        snapshotCleanCount: _slaCleanCount,
+        minCleanTarget: MIN_CLEAN_RESULTS_TARGET,
+      });
+
+      if (_slaDecision.source === "internal_snapshot") {
+        const _slaPayload = await _buildPayload(_slaPolicyItems, { source: "market_snapshot", kind: "stale_snapshot" });
+        const _slaVerdict =
+          normalizeVerdict(_slaPayload?.buyOrPass?.verdict) ||
+          normalizeVerdict(_slaPayload?.profitIntel?.verdict) ||
+          "HOLD";
+        try {
+          const _ctxCache = getCurrentSerpBudgetCtx();
+          if (_ctxCache) {
+            _ctxCache.cacheHit = true;
+            _ctxCache._finalItemCount = Array.isArray(_slaPayload?.items) ? _slaPayload.items.length : null;
+            setMarketScanResult(_ctxCache, { payload: _slaPayload, route: "/market/search/stream", layer: "internal" });
+          }
+        } catch {}
+        console.log(_slaDecision.log, {
+          rid: req.rid, scanId, query,
+          itemCount: (_slaPayload?.items || []).length, cleanCount: _slaCleanCount,
+          remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
+        });
+        _recordStreamMetric("cacheHits", 1);
+        send("complete", { ..._slaPayload, verdict: _slaVerdict, cacheFallback: true, slaExhausted: true, status: "complete", source: "cache" });
+        endStream();
+        return;
+      }
+
+      // 3) all zero-cost sources missed → honest empty (no paid call spent).
+      console.log(_slaDecision.log, {
+        rid: req.rid, scanId, query,
+        snapshotItems: _slaSnapItems.length, cleanCount: _slaCleanCount,
+      });
+      console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
+        rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
+      });
+      send("complete", {
+        items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
+      });
+      endStream();
+      return;
+    }
 
     // ── L0: enriched tuple cache (items + comps, 5-min TTL) ──────────────
     const enrichedHit = ENRICHED_SCAN_CACHE.get(cacheKey);
