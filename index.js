@@ -1320,6 +1320,7 @@ import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
+import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -17985,6 +17986,7 @@ async function runVisionPass({ dataUrl, mode, propContext, passLabel, rid, model
   let openaiResult = null;
   let openaiUsage  = null;
   let _internallyTimedOut = false; // set true when OUR timeout fires; gates Gemini fallback
+  let _passError = null;           // Phase V3.4: captured so the failure object can carry MODEL_CIRCUIT_OPEN
   try {
 
 const response = await withModelServing(
@@ -18094,6 +18096,7 @@ console.log("🧾 VISION PASS RAW", {
 
 } catch (err) {
   timeout.cancel?.();
+  _passError = err; // Phase V3.4: retain for the failure object's circuit-open marker
 
   // Caller cancelled via externalSignal — detect this BEFORE checking
   // err.name, because OpenAI's SDK throws APIUserAbortError (not AbortError)
@@ -18172,7 +18175,19 @@ console.log("🧾 VISION PASS RAW", {
     }
   }
 
-  return openaiResult || { rawText: "", parsed: {}, error: "vision_pass_failed", source: "openai", model: visionModel };
+  // Phase V3.4: preserve the underlying error code/message so the model-circuit-open
+  // fail-safe can distinguish a breaker outage from an ordinary parse/timeout miss.
+  return openaiResult || {
+    rawText: "",
+    parsed: {},
+    error: "vision_pass_failed",
+    errorCode: _passError?.code || null,
+    errorMessage: _passError?.message ? String(_passError.message) : null,
+    circuitOpen: String(_passError?.code || "").toUpperCase() === "MODEL_CIRCUIT_OPEN"
+      || /model_circuit_open/i.test(String(_passError?.message || "")),
+    source: "openai",
+    model: visionModel,
+  };
 }
 
 async function runVisionRecoveryPass({ req, file, mode, propContext }) {
@@ -19755,6 +19770,11 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
       source: "openai",
       model,
       cancelled: !!externalSignal?.aborted,
+      // Phase V3.4: preserve circuit-open state for the fail-safe summarizer.
+      errorCode: err?.code || null,
+      errorMessage: err?.message ? String(err.message) : null,
+      circuitOpen: String(err?.code || "").toUpperCase() === "MODEL_CIRCUIT_OPEN"
+        || /model_circuit_open/i.test(String(err?.message || "")),
     };
   }
 }
@@ -19926,6 +19946,10 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
   // time is captured even if we don't end up using its result.
   const passT0 = Date.now();
   let fastMs = null, visualMs = null, masterMs = null, queryFastMs = null;
+  // Phase V3.4: capture the settled query_fast result at function scope so the
+  // model-circuit-open fail-safe can consider it at the final query gate (it is
+  // usually NOT part of the assembled `passes` array in the consensus path).
+  let _queryFastSettled = null;
   const timed = (p, on) => p.then((v) => { on(Date.now() - passT0); return v; }, (e) => { on(Date.now() - passT0); throw e; });
 
   // Per-scan cohort assignment for the master-skip rollout. The dice roll is
@@ -19976,6 +20000,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           (ms) => { queryFastMs = ms; }
         ).catch(() => null)
       : Promise.resolve(null);
+    // Phase V3.4: remember the settled query_fast result for the fail-safe summarizer.
+    queryFastPromise.then((r) => { _queryFastSettled = r; }).catch(() => {});
 
     const fastPromise   = timed(
       runVisionPass({
@@ -21502,16 +21528,59 @@ if (
       ? mergeAttributeCertaintyMaps(rawCertaintyMaps)
       : inferAttributeCertaintyFromIdentity(mergedIdentity, confidence);
 
+    // Phase V3.4: map the assembled consensus passes back to their labels so the
+    // fail-safe can inspect each pass's settled result (fast/visual_shape/master).
+    const _passByLabel = (label) => {
+      const idx = Array.isArray(passLabels) ? passLabels.indexOf(label) : -1;
+      return idx >= 0 ? (passes?.[idx] ?? null) : null;
+    };
+
+    const _qualityGateReason =
+        !query                      ? "null_query"
+      : isGarbageQuery(query)       ? "garbage_query"
+      : isGenericGarbageQuery(query) ? "generic_query"
+      : "accepted";
+
     console.log("VISION_QUERY_QUALITY_GATE", {
       rid:      req.rid,
       pass:     visionTier,
       query,
-      accepted: !!query && !isGarbageQuery(query) && !isGenericGarbageQuery(query),
-      reason:   !query                    ? "null_query"
-              : isGarbageQuery(query)     ? "garbage_query"
-              : isGenericGarbageQuery(query) ? "generic_query"
-              : "accepted",
+      accepted: _qualityGateReason === "accepted",
+      reason:   _qualityGateReason,
     });
+
+    // Phase V3.4: model-circuit-open fail-safe. When EVERY attempted vision pass
+    // was blocked by the breaker AND we have no usable query, do NOT fabricate a
+    // generic seed or emit a `rejected_generic` hard-fail (which makes the client
+    // long-poll background-result for 12s). Return a typed, retryable
+    // `vision_unavailable` payload instead — nothing fabricated reaches market.
+    if (_qualityGateReason !== "accepted") {
+      const _failSafeFailures = summarizeVisionPassFailures({
+        queryFastResult: _queryFastSettled,
+        fastResult:      _passByLabel("fast"),
+        visualResult:    _passByLabel("visual_shape"),
+        masterResult:    _passByLabel("master"),
+      });
+      if (shouldReturnVisionUnavailable({ query, qualityGateReason: _qualityGateReason, failures: _failSafeFailures })) {
+        console.log("VISION_MODEL_CIRCUIT_OPEN_FAILSAFE", {
+          rid: req.rid,
+          mode,
+          circuitOpen: _failSafeFailures.circuitOpen,
+          circuitOpenCount: _failSafeFailures.circuitOpenCount,
+          consideredCount: _failSafeFailures.consideredCount,
+          qualityGateReason: _qualityGateReason,
+        });
+        if (_qualityGateReason === "generic_query") {
+          console.log("VISION_GENERIC_FALLBACK_SUPPRESSED", { rid: req.rid, query });
+        }
+        return buildVisionUnavailablePayload({
+          rid: req.rid,
+          imageHash,
+          mode,
+          reason: "model_circuit_open_all_passes",
+        });
+      }
+    }
 
     // Phase 4H.3: enforce generic query rejection — don't let garbage seeds reach market
     if (isGenericGarbageQuery(query)) {
@@ -22401,6 +22470,23 @@ if (!openai) {
         )
       );
       _epT3PostConsensus = Date.now();
+
+      // Phase V3.4: model-circuit-open fail-safe. runVisionConsensus returns a
+      // typed, retryable unavailable payload when every pass was blocked by the
+      // breaker. Return it verbatim — do NOT cache (transient), enrich, register
+      // similarity, or run the post-consensus pipeline. The client reads
+      // visionUnavailable/noBackgroundPoll and shows a retry state instead of
+      // long-polling /api/vision/background-result for 12s.
+      if (result?.visionUnavailable === true) {
+        console.log("VISION_UNAVAILABLE_RESPONSE", {
+          rid: req.rid,
+          imageHash: originalHash || result.imageHash || null,
+          visionTier: result.visionTier || "model_circuit_open",
+          reason: result.reason || "model_circuit_open_all_passes",
+          totalMs: Date.now() - _epT0,
+        });
+        return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
+      }
 
       // Embedding is background-only; scanEmbedding/visualMatches stay null for immediate response
       scanEmbedding = null;
