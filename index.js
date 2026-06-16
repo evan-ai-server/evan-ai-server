@@ -1322,6 +1322,7 @@ import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
 import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
+import { approximateMarketDecision, rescueOracleDecision } from "./src/incompleteAircraftMarketPolicy.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -14251,7 +14252,24 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
 
   // ── GPT-4.1 Oracle fallback — fires when all marketplace APIs return nothing ─
   // skipOracle=true: stream endpoint uses this to get Phase 1 results without blocking on GPT
-  if ((!rawMerged.length || rawMerged.length < 4) && !skipOracle) {
+  // Phase V3.7: the route/stream oracle paths already refuse incomplete-aircraft
+  // queries, but this in-merge rescue oracle did not — so a family-missing aircraft
+  // query (e.g. "hawaiian airlines diecast airplane model" with no 787) reached here
+  // via the non-stream /market/search (which does not pass skipOracle) and fabricated
+  // a mixed-family junk pool. Block it here too.
+  const _rescueIncompleteAircraft = detectIncompleteAircraftIdentityQuery(normalizedQuery);
+  const _rescueOracle = rescueOracleDecision({
+    itemCount: rawMerged.length,
+    skipOracle,
+    incompleteAircraft: _rescueIncompleteAircraft.incomplete,
+  });
+  if (_rescueOracle.blocked) {
+    console.log("ORACLE_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_HARD", {
+      query: normalizedQuery,
+      requiredAirline: _rescueIncompleteAircraft.requiredAirline || null,
+      reason: "airline_present_family_missing_rescue_oracle",
+    });
+  } else if (_rescueOracle.run) {
     console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
     const oracleItems = await gptMarketOracle(normalizedQuery, identity).catch(() => []);
     if (oracleItems.length) {
@@ -21928,12 +21946,29 @@ app.get("/api/vision/background-result", async (req, res) => {
     userId: getResolvedUserId(req) || null,
   });
   if (!_entry) return res.status(200).json({ ready: false });
-  const _bgMarketReady = !(_entry.needsFamilyRecovery ||
-    detectIncompleteAircraftIdentityQuery(_entry.query).incomplete);
+  const _bgIncompleteAircraft = detectIncompleteAircraftIdentityQuery(_entry.query);
+  const _bgMarketReady = !(_entry.needsFamilyRecovery || _bgIncompleteAircraft.incomplete);
   // Phase 4L: if not market-ready, check if this is a safe collectible that allows
   // approximate market search (e.g. "Hawaiian Airlines diecast model airplane").
-  const _bgApproxAllowed = !_bgMarketReady &&
-    isApproximateMarketAllowedQuery(_entry.query, _entry.category || "");
+  // Phase V3.7: but NEVER allow approximate market for an incomplete aircraft
+  // identity (airline present, family/model missing). Approximate pricing on an
+  // airline-only query yields a mixed-family pool and, when live sources are rate-
+  // limited, falls to the rescue oracle which fabricates generic junk comps. This is
+  // the root that greenlit the wasteful airline-only market search. Non-aircraft safe
+  // collectibles are unaffected (incomplete=false for them).
+  const _bgApproxDecision = approximateMarketDecision({
+    marketReady: _bgMarketReady,
+    incompleteAircraft: _bgIncompleteAircraft.incomplete,
+    baseApproxAllowed: isApproximateMarketAllowedQuery(_entry.query, _entry.category || ""),
+  });
+  const _bgApproxAllowed = _bgApproxDecision.allowed;
+  if (_bgApproxDecision.blocked) {
+    console.log("BACKGROUND_AIRCRAFT_INCOMPLETE_MARKET_BLOCKED", {
+      rid: req.rid, query: _entry.query,
+      requiredAirline: _bgIncompleteAircraft.requiredAirline || null,
+      reason: "airline_present_family_missing_no_approx_market",
+    });
+  }
   console.log("VISION_BACKGROUND_RESULT_RETURNED", {
     rid: req.rid, query: _entry.query, elapsedMs: _entry.elapsedMs,
     needsFamilyRecovery: _entry.needsFamilyRecovery || false,
