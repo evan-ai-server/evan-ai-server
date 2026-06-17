@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { evaluateProvisionalSeed, isSafeProvisionalCategory } from "./provisionalSeed.js";
 
 const T = 0.92;
@@ -120,14 +122,13 @@ test("V3.10A — late seed: high-stakes category (sneakers) → rejected regardl
   assert.equal(r.reason, "unsafe_or_unknown_category");
 });
 
-test("V3.10A — late seed missing: null _similarityVec means no late check (hard_fail remains)", () => {
-  // When _similarityVec is null (embed didn't finish or returned null), the late seed
-  // block is gated by `&& _similarityVec` and skipped entirely. The grace race
+test("V3.10A — late seed missing: null _embedPromise means no late check (hard_fail remains)", () => {
+  // When _embedPromise is null (not passed to runVisionConsensus), the late seed
+  // block is gated by `&& _embedPromise` and skipped entirely. The grace race
   // proceeds normally and eventually expires → hard_fail_no_seed.
-  // This test models the guard: null vec → no hit to evaluate.
-  const _similarityVec = null;
-  const lateSeedSkipped = !_similarityVec;
-  assert.equal(lateSeedSkipped, true, "null vec → late seed skipped, grace race proceeds");
+  const _embedPromise = null;
+  const lateSeedSkipped = !_embedPromise;
+  assert.equal(lateSeedSkipped, true, "null promise → late seed skipped, grace race proceeds");
 });
 
 test("V3.10A — late seed disabled when PROVISIONAL_SEED flag is off", () => {
@@ -145,4 +146,40 @@ test("V3.10A — query_fast wins before grace starts: late seed block never reac
   const raceWinner = "fast"; // query_fast returned before hard deadline
   const graceBlockEntered = raceWinner === "hard_deadline";
   assert.equal(graceBlockEntered, false, "fast win → grace block skipped → late seed never runs");
+});
+
+// ── V3.10A.2 regression guard — static source-code scope check ───────────────
+// node --check passes even when variables are used out-of-scope (ReferenceError is
+// only caught at runtime). This test reads the grace-window late-seed block from
+// index.js and asserts no known out-of-scope identifiers are referenced there.
+// Both crashes so far (skipCaches → V3.10A.1, _similarityVec → V3.10A.2) would
+// have been caught by this.
+
+test("V3.10A.2 static scope guard — grace window late-seed block has no known out-of-scope identifiers", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  // Extract the late-seed block: from VISION_SIMILARITY_LATE_SEED block start to end
+  const startMarker = "if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && _embedPromise)";
+  const startIdx = src.indexOf(startMarker);
+  assert.ok(startIdx !== -1, "late-seed block must exist in index.js");
+
+  // Check a narrow window around that block (2000 chars is enough for the whole block)
+  const blockSlice = src.slice(startIdx, startIdx + 2000);
+
+  // These identifiers are known to be OUT OF SCOPE inside runVisionConsensus:
+  // - _similarityVec: declared in the outer request handler, not passed as a param
+  // - skipCaches: declared in the outer request handler AFTER runVisionConsensus returns
+  assert.ok(
+    !blockSlice.includes("_similarityVec") || blockSlice.includes("const _lateSimilarityVec"),
+    "block must not reference out-of-scope _similarityVec (use _lateSimilarityVec from await _embedPromise)"
+  );
+  assert.ok(
+    !blockSlice.includes("skipCaches"),
+    "block must not reference out-of-scope skipCaches (use isBenchBypass(req) or gate by _embedPromise)"
+  );
+
+  // And confirm the in-scope replacement is present
+  assert.ok(blockSlice.includes("_embedPromise"), "block must use _embedPromise (in-scope param)");
+  assert.ok(blockSlice.includes("_lateSimilarityVec"), "block must derive vector from await _embedPromise");
 });

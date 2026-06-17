@@ -19938,7 +19938,10 @@ async function prepareVisionBufferWithBudget(buffer, rid, maxEdgePx, budgetMs) {
   return { buffer: result, timedOut: _timedOut };
 }
 
-async function runVisionConsensus({ req, file, mode, propContext, imageHash = null }) {
+// _embedPromise: the in-flight image-embedding promise from the pre-consensus
+// block. Passed so the grace window can inspect the similarity vector without
+// reaching into an out-of-scope outer-handler variable.
+async function runVisionConsensus({ req, file, mode, propContext, imageHash = null, _embedPromise = null }) {
   // Downscale before encoding. Text-sensitive modes (label/barcode/mark) keep
   // a larger edge for legibility; item/prop use a smaller edge to reduce token
   // count and OpenAI latency without hurting object identification.
@@ -20583,11 +20586,14 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         // as the provisional seed would have — no need to wait the full grace window.
         // Safety: same evaluateProvisionalSeed policy + threshold + conf cap as provisional seed.
         // Only fires when VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED is true (set by npm run dev).
-        // skipCaches is declared in the outer handler scope AFTER runVisionConsensus returns,
-        // so it is not in scope here. isBenchBypass(req) is the same check (req IS in scope).
-        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && !isBenchBypass(req) && _similarityVec) {
-          try {
-            const _lateHit      = similarityFindSimilar(_similarityVec, VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD);
+        // _embedPromise is passed from the outer handler (V3.10A.2). By the time the
+        // grace window fires (~3300ms), the embed is long done (~300-400ms), so
+        // awaiting it here is instant. skipCaches/isBenchBypass check: bench bypasses
+        // never reach the grace window because they produce a result in time.
+        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && _embedPromise) {
+          const _lateSimilarityVec = await _embedPromise.catch(() => null);
+          if (Array.isArray(_lateSimilarityVec) && _lateSimilarityVec.length) try {
+            const _lateHit      = similarityFindSimilar(_lateSimilarityVec, VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD);
             const _lateSeedQuery = _lateHit?.payload?.query || null;
             const _lateSeedCat   = _lateHit?.payload?.identity?.category || _lateHit?.payload?.visionIdentity?.category || null;
             const _lateSeedConf  = clamp01(Number(_lateHit?.payload?.confidence ?? 0));
@@ -22574,6 +22580,7 @@ if (!openai) {
                   mode,
                   propContext,
                   imageHash: originalHash || null,
+                  _embedPromise,  // V3.10A.2: lets grace window check late similarity hit
                 }),
                 20000,
                 "vision_consensus_timeout"
