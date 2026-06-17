@@ -1323,6 +1323,8 @@ import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
 import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
 import { approximateMarketDecision, rescueOracleDecision } from "./src/incompleteAircraftMarketPolicy.js";
+// Phase V3.9A — URL evidence audit (logging-only; pure field-presence summaries).
+import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } from "./src/urlEvidenceAudit.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -15442,6 +15444,23 @@ async function saveInternalMarketSnapshot(query, payload = {}) {
 
   INTERNAL_MARKET_SNAPSHOT_L1.set(q, doc);
 
+  // Phase V3.9A — audit: how much URL/recovery evidence the write-compaction
+  // (compactMarketSnapshotItem) drops. A positive droppedProductId is the reason
+  // re-served snapshots later log DIRECT_URL_RECOVERY_ELIGIBLE reason:no_product_ids.
+  // Logging-only — does not change what is stored.
+  try {
+    const _inItems = Array.isArray(payload?.items) ? payload.items : [];
+    const _evDiff = diffUrlEvidence(_inItems, doc.items);
+    if (_evDiff.anyRecoveryFieldDropped || _inItems.length > 0) {
+      console.log("URL_EVIDENCE_CACHE_WRITE_SUMMARY", {
+        query: q,
+        beforeCompaction: summarizeUrlEvidence(_inItems),
+        afterCompaction:  summarizeUrlEvidence(doc.items),
+        dropped: _evDiff,
+      });
+    }
+  } catch {}
+
   try {
     await cacheSet(
       internalMarketSnapshotRedisKey(q),
@@ -15476,6 +15495,8 @@ async function readInternalMarketSnapshot(query = "") {
     const l2 = await cacheGet(internalMarketSnapshotRedisKey(q));
     if (l2?.items?.length && versionMatches(l2)) {
       INTERNAL_MARKET_SNAPSHOT_L1.set(q, l2);
+      // Phase V3.9A — audit cold (redis) snapshot load. Deduped by L1 above.
+      try { console.log("URL_EVIDENCE_CACHE_READ_SUMMARY", { query: q, source: "redis", evidence: summarizeUrlEvidence(l2.items) }); } catch {}
       return l2;
     }
   } catch {}
@@ -15483,6 +15504,8 @@ async function readInternalMarketSnapshot(query = "") {
   const disk = await readJson(internalMarketSnapshotDiskKey(q));
   if (disk?.items?.length && versionMatches(disk)) {
     INTERNAL_MARKET_SNAPSHOT_L1.set(q, disk);
+    // Phase V3.9A — audit cold (disk) snapshot load. Deduped by L1 above.
+    try { console.log("URL_EVIDENCE_CACHE_READ_SUMMARY", { query: q, source: "disk", evidence: summarizeUrlEvidence(disk.items) }); } catch {}
 
     try {
       await cacheSet(
@@ -25050,6 +25073,31 @@ async function buildMarketSearchResponsePayload({
         : it;
       return sanitizeOutboundListingForClient(_itToSanitize, { scanId: retrievalMeta?.scanId || null });
     });
+
+  // Phase V3.9A — audit: URL/recovery-field presence on the INBOUND items (before
+  // identity/quality filtering). Shows whether _productId/directUrl/urlQuality
+  // actually arrived for this kind of pool. When the pool came from a snapshot,
+  // also emit a legacy-snapshot summary — that is where the evidence was lost.
+  try {
+    const _evKind = retrievalMeta?.kind || null;
+    const _inboundItems = Array.isArray(items) ? items.filter(Boolean) : [];
+    console.log("URL_EVIDENCE_NORMALIZATION_SUMMARY", {
+      scanId: retrievalMeta?.scanId || null,
+      kind: _evKind,
+      query: baseQuery,
+      inbound: summarizeUrlEvidence(_inboundItems),
+    });
+    if (typeof _evKind === "string" && /snapshot|cache/i.test(_evKind)) {
+      console.log("LEGACY_SNAPSHOT_URL_EVIDENCE_SUMMARY", {
+        scanId: retrievalMeta?.scanId || null,
+        kind: _evKind,
+        query: baseQuery,
+        evidence: summarizeUrlEvidence(_inboundItems),
+        note: "snapshot-sourced pool — recovery fields absent here were dropped at snapshot write (see URL_EVIDENCE_CACHE_WRITE_SUMMARY)",
+      });
+    }
+  } catch {}
+
   // Phase 4B.2: accumulate per-reason identity rejection counts from sneaker/Jordan locks.
   const _inFunctionIdentitySummary = createEmptyIdentitySummary();
   _inFunctionIdentitySummary.rawCount = _rawSourceItems.length;
@@ -25196,6 +25244,25 @@ async function buildMarketSearchResponsePayload({
         ? (_eligibleCount > 0 ? "url_verification_will_attempt" : "no_product_ids_in_clean_pool")
         : (_eligibleCount > 0 ? "url_verification_disabled_has_candidates" : "no_product_ids"),
     });
+
+    // Phase V3.9A — audit: WHY candidates are/aren't preserved. Distinguishes
+    // "no _productId" (evidence lost upstream) from "all already clickable".
+    const _recSummary = recoveryEligibilitySummary(uiItems);
+    if (_recSummary.eligible > 0) {
+      console.log("RECOVERY_CANDIDATE_PRESERVED", {
+        scanId: retrievalMeta?.scanId || null,
+        kind:   retrievalMeta?.kind || null,
+        query:  baseQuery,
+        ..._recSummary,
+      });
+    } else {
+      console.log("RECOVERY_CANDIDATE_MISSING_REASON", {
+        scanId: retrievalMeta?.scanId || null,
+        kind:   retrievalMeta?.kind || null,
+        query:  baseQuery,
+        ..._recSummary,
+      });
+    }
   } catch {}
 
   // Phase 4B: opt-in verified listing upgrade (URL_VERIFICATION_ENABLED=true).
