@@ -1325,6 +1325,8 @@ import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from 
 import { approximateMarketDecision, rescueOracleDecision } from "./src/incompleteAircraftMarketPolicy.js";
 // Phase V3.9A — URL evidence audit (logging-only; pure field-presence summaries).
 import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } from "./src/urlEvidenceAudit.js";
+// Phase V3.9B — extracted compactMarketSnapshotItem with recovery metadata preserved.
+import { compactMarketSnapshotItem } from "./src/marketSnapshotCompact.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -15271,8 +15273,11 @@ function hashString(s = "") {
 // Bump when the merge pipeline, filter thresholds, or item shape change in
 // a way that should invalidate previously persisted snapshots. Snapshots
 // without a matching version are treated as cache misses on read.
+// V3.9B: bumped v6→v7 to invalidate snapshots that dropped URL recovery metadata
+// (_productId/_serpapiProductApiUrl/urlQuality). Old v6 snapshots will miss and
+// force a fresh SerpAPI fetch that captures the full recovery field set.
 const INTERNAL_MARKET_SNAPSHOT_VERSION = String(
-  process.env.INTERNAL_MARKET_SNAPSHOT_VERSION || "v6",
+  process.env.INTERNAL_MARKET_SNAPSHOT_VERSION || "v7",
 );
 
 const INTERNAL_MARKET_SNAPSHOT_FRESH_MS = Math.max(
@@ -15329,43 +15334,8 @@ function sanitizeVisionIdentityForSnapshot(identity = null) {
   return cleaned;
 }
 
-function compactMarketSnapshotItem(it = {}) {
-  const price = finitePrice(it?.totalPrice ?? it?.price);
-
-  return {
-    title: it?.title || null,
-    source: it?.source || null,
-    price,
-    totalPrice: price,
-    url: it?.url || it?.buyLink || it?.link || null,
-    link: it?.link || it?.url || it?.buyLink || null,
-    buyLink: it?.buyLink || it?.url || it?.link || null,
-    image: it?.image || null,
-    rating: typeof it?.rating === "number" ? it.rating : null,
-    reviews: typeof it?.reviews === "number" ? it.reviews : null,
-    dealScore: Number(it?.dealScore || 0),
-    flipScore: Number(it?.flipScore || 0),
-    sellerScore: Number(it?.sellerScore || 0),
-    trust:
-      Number(
-        it?.trust ??
-          it?.trustModelScore ??
-          it?.__trustScore ??
-          0
-      ) || 0,
-    authRisk: Number(it?.authRisk || 0),
-    visualScore:
-      Number(
-        it?.visualScore ??
-          it?.__imageScore ??
-          it?.__visualBoost ??
-          0
-      ) || 0,
-    linkVerified: it?.linkVerified !== false,
-    sold: it?.sold === true,
-    status: it?.status || null,
-  };
-}
+// compactMarketSnapshotItem is imported from src/marketSnapshotCompact.js (Phase V3.9B).
+// See import at the top of this file. The function is tested directly there.
 
 function hydrateMarketSnapshotItem(it = {}) {
   const price = finitePrice(it?.totalPrice ?? it?.price);
