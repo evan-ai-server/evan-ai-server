@@ -46,20 +46,27 @@ export function approximateMarketDecision({
  * merged pool is thin (< minItems) and the caller did not opt out via skipOracle.
  * V3.7 blocks it for an incomplete aircraft identity so a family-missing aircraft
  * query never fabricates comps — matching the route/stream oracle guards.
+ * V3.9C adds sourceUnavailableNoData: when primary sources (SerpAPI + eBay) are
+ * both unavailable AND there are zero real items, oracle is skipped here too,
+ * matching the route guard (V3.9B.1) and the stream guard.
  *
  * @returns {{ run: boolean, blocked: boolean, reason: string }}
- *   run=true → fire the oracle. blocked=true → it would have fired but was refused
- *   for incomplete aircraft identity. Both false → not needed / skipOracle.
+ *   run=true → fire the oracle.
+ *   blocked=true → it would have fired but was refused for incomplete aircraft identity.
+ *   run=false blocked=false reason="source_unavailable_no_market_data" → skipped
+ *     because primary sources are rate-limited and there is no real evidence to anchor on.
  */
 export function rescueOracleDecision({
   itemCount = 0,
   skipOracle = false,
   incompleteAircraft = false,
+  sourceUnavailableNoData = false,
   minItems = 4,
 } = {}) {
   const count = Number(itemCount) || 0;
   const wouldRun = (count <= 0 || count < minItems) && !skipOracle;
   if (!wouldRun) return { run: false, blocked: false, reason: skipOracle ? "skip_oracle" : "pool_sufficient" };
   if (incompleteAircraft) return { run: false, blocked: true, reason: "incomplete_aircraft_identity" };
+  if (sourceUnavailableNoData) return { run: false, blocked: false, reason: "source_unavailable_no_market_data" };
   return { run: true, blocked: false, reason: "ok" };
 }

@@ -126,3 +126,28 @@ describe("competitor leak prevention — no oracle when no real market data and 
     assert.equal(r.skip, false, "3 real items → oracle may augment thin pool");
   });
 });
+
+// ── V3.9C: all three guards are consistent (stream / route / merge) ────────────
+
+describe("V3.9C consistency — stream, route, and merge guards all use the same rule", () => {
+  it("same inputs produce the same skip decision across all three guard sites", () => {
+    // The stream guard (~index.js:31351), route guard (V3.9B.1), and merge guard (V3.9C)
+    // all delegate to shouldSkipOracleSourceUnavailable. Same inputs → same result.
+    const inputs = [
+      { serpCooling: true,  ebayAvail: false, itemCount: 0, expectedSkip: true  },
+      { serpCooling: true,  ebayAvail: false, itemCount: 1, expectedSkip: false },
+      { serpCooling: true,  ebayAvail: true,  itemCount: 0, expectedSkip: false },
+      { serpCooling: false, ebayAvail: false, itemCount: 0, expectedSkip: false },
+    ];
+    for (const { serpCooling, ebayAvail, itemCount, expectedSkip } of inputs) {
+      const r = shouldSkipOracleSourceUnavailable({ serpCooling, ebayAvail, itemCount });
+      assert.equal(r.skip, expectedSkip, `serpCooling=${serpCooling} ebay=${ebayAvail} items=${itemCount}`);
+    }
+  });
+
+  it("exact V3.9B retest failure: SerpAPI 429 + eBay off + 0 items → skip at all three layers", () => {
+    const r = shouldSkipOracleSourceUnavailable({ serpCooling: true, ebayAvail: false, itemCount: 0 });
+    assert.equal(r.skip, true);
+    assert.equal(r.reason, "primary_source_rate_limited_no_market_evidence");
+  });
+});

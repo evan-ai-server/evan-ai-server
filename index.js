@@ -1327,7 +1327,7 @@ import { approximateMarketDecision, rescueOracleDecision } from "./src/incomplet
 import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } from "./src/urlEvidenceAudit.js";
 // Phase V3.9B — extracted compactMarketSnapshotItem with recovery metadata preserved.
 import { compactMarketSnapshotItem } from "./src/marketSnapshotCompact.js";
-// Phase V3.9B.1 — pure oracle-skip guard for source-unavailable condition.
+// Phase V3.9B.1/V3.9C — pure oracle-skip guard for source-unavailable condition.
 import { shouldSkipOracleSourceUnavailable } from "./src/marketOracleGuard.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
@@ -14264,16 +14264,32 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
   // via the non-stream /market/search (which does not pass skipOracle) and fabricated
   // a mixed-family junk pool. Block it here too.
   const _rescueIncompleteAircraft = detectIncompleteAircraftIdentityQuery(normalizedQuery);
+  // Phase V3.9C: source-unavailability check mirrors the stream guard (~31351) and
+  // the non-stream route guard (V3.9B.1). Must be computed after the rescue attempt
+  // (rawMerged.length reflects the real count after eBay/Walmart/Etsy/BestBuy rescue).
+  const _rescueSrcGuard = shouldSkipOracleSourceUnavailable({
+    serpCooling: isSourceCoolingDown("serpapi"),
+    ebayAvail:   hasEbayApi(),
+    itemCount:   rawMerged.length,
+  });
   const _rescueOracle = rescueOracleDecision({
     itemCount: rawMerged.length,
     skipOracle,
     incompleteAircraft: _rescueIncompleteAircraft.incomplete,
+    sourceUnavailableNoData: _rescueSrcGuard.skip,
   });
   if (_rescueOracle.blocked) {
     console.log("ORACLE_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_HARD", {
       query: normalizedQuery,
       requiredAirline: _rescueIncompleteAircraft.requiredAirline || null,
       reason: "airline_present_family_missing_rescue_oracle",
+    });
+  } else if (_rescueOracle.reason === "source_unavailable_no_market_data") {
+    console.log("MERGE_ORACLE_SKIPPED_SOURCE_UNAVAILABLE_NO_MARKET_DATA", {
+      query: normalizedQuery,
+      reason: _rescueSrcGuard.reason,
+      serpCooling: isSourceCoolingDown("serpapi"),
+      ebayAvailable: hasEbayApi(),
     });
   } else if (_rescueOracle.run) {
     console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
