@@ -20573,6 +20573,69 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         // stored in _graceRescuedFastResult and raceWinner is set to "fast" so Block 2
         // picks it up correctly (Block 0 for "query_fast" has already been evaluated).
         console.log("VISION_QUERY_FAST_GRACE_WATCHED", { rid: req.rid, graceMs: _noSeedGraceMs });
+
+        // Phase V3.10A — late similarity seed rescue.
+        // For item/prop mode the embed runs in background (not awaited pre-consensus).
+        // By the time the hard deadline fires (~3300ms), the embed is typically done
+        // (~300-450ms) and _similarityVec is already captured by the .then() at the
+        // end of the pre-consensus block. Check it HERE before starting the grace race:
+        // if we have a high-confidence safe similarity hit, return it immediately just
+        // as the provisional seed would have — no need to wait the full grace window.
+        // Safety: same evaluateProvisionalSeed policy + threshold + conf cap as provisional seed.
+        // Only fires when VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED is true (set by npm run dev).
+        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && !skipCaches && _similarityVec) {
+          try {
+            const _lateHit      = similarityFindSimilar(_similarityVec, VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD);
+            const _lateSeedQuery = _lateHit?.payload?.query || null;
+            const _lateSeedCat   = _lateHit?.payload?.identity?.category || _lateHit?.payload?.visionIdentity?.category || null;
+            const _lateSeedConf  = clamp01(Number(_lateHit?.payload?.confidence ?? 0));
+            const _lateEval      = _lateHit?.payload
+              ? evaluateProvisionalSeed({ mode, query: _lateSeedQuery, category: _lateSeedCat, similarity: _lateHit.similarity, threshold: VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD })
+              : { eligible: false, reason: "no_similarity_hit" };
+            console.log("VISION_SIMILARITY_LATE_SEED_READY", {
+              rid: req.rid, mode,
+              hit: !!_lateHit?.payload,
+              similarity: _lateHit ? Number(_lateHit.similarity.toFixed(4)) : null,
+              query: _lateSeedQuery, eligible: _lateEval.eligible, reason: _lateEval.reason,
+            });
+            if (_lateEval.eligible) {
+              const _lateCappedConf = Math.min(_lateSeedConf, VISION_SIMILARITY_PROVISIONAL_SEED_CONF_CAP);
+              console.log("VISION_SIMILARITY_LATE_SEED_ACCEPTED", {
+                rid: req.rid, query: _lateSeedQuery, category: _lateSeedCat,
+                similarity: Number(_lateHit.similarity.toFixed(4)),
+                confidence: _lateCappedConf,
+                graceElapsedMs: Date.now() - _graceT0,
+              });
+              _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery: _lateSeedQuery, seedImageHash: _lateHit.imageHash, similarity: _lateHit.similarity });
+              console.log("VISION_NO_SEED_GRACE_RESULT", {
+                rid: req.rid, source: "similarity_late_seed", query: _lateSeedQuery,
+                confidence: _lateCappedConf, graceMs: _noSeedGraceMs,
+                elapsedMs: Date.now() - _graceT0,
+              });
+              return res.status(200).json({
+                ...(_lateHit.payload),
+                imageHash,
+                query:           _lateSeedQuery,
+                confidence:      _lateCappedConf,
+                category:        _lateSeedCat,
+                source:          "similarity_late_seed",
+                cacheSource:     "similarity_late_seed",
+                cached:          true,
+                provisional:     true,
+                similarityScore: _lateHit.similarity,
+                cacheHit:        true,
+              });
+            } else {
+              console.log("VISION_SIMILARITY_LATE_SEED_REJECTED", {
+                rid: req.rid, reason: _lateEval.reason,
+                query: _lateSeedQuery, similarity: _lateHit ? Number(_lateHit.similarity.toFixed(4)) : null,
+              });
+            }
+          } catch (_lateErr) {
+            console.warn("VISION_SIMILARITY_LATE_SEED_ERROR", { rid: req.rid, err: _lateErr?.message });
+          }
+        }
+
         const _graceTimeoutP = new Promise((res) => {
           const t = setTimeout(res, _noSeedGraceMs);
           if (typeof t.unref === "function") t.unref();
