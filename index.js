@@ -1317,7 +1317,7 @@ import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordV
 import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
-import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk, entries as similarityEntries } from "./src/scanSimilarity.js";
+import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
@@ -22073,75 +22073,62 @@ app.get("/api/vision/background-result", async (req, res) => {
   });
   if (!_entry) return res.status(200).json({ ready: false });
 
-  // Phase V3.10B: attempt aircraft family recovery via similarity index before
-  // blocking market. When master returned airline-only (needsFamilyRecovery), check
-  // if a prior scan of the SAME image had a complete identity (airline + family).
-  if (_entry.needsFamilyRecovery && _imageHash) {
+  // Phase V3.10B / V3.10B.1: attempt aircraft family recovery using ONLY
+  // same-image/same-scan linkage. The incomplete entry (needsFamilyRecovery) was
+  // stored by master under imageHash. A prior pass of the SAME image may have stored
+  // a complete query under a different key (scanId). Only that hard linkage is safe —
+  // broad similarity-index or cross-image searches could graft a wrong family.
+  if (_entry.needsFamilyRecovery && (_imageHash || _scanId)) {
     console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_STARTED", {
-      rid: req.rid, query: _entry.query, imageHash: _imageHash,
+      rid: req.rid, query: _entry.query, imageHash: _imageHash, scanId: _scanId,
     });
     try {
       const _bgIncomplete = detectIncompleteAircraftIdentityQuery(_entry.query);
       const _bgAirline = _bgIncomplete.requiredAirline || null;
       if (_bgAirline) {
-        let _recoveryCandidate = null;
-        for (const [_k, _v] of BACKGROUND_VISION_RESULTS) {
-          if (_k === _imageHash || _k === _scanId) continue;
-          if (_v.needsFamilyRecovery) continue;
+        // Only check the OTHER key for the same scan/image. If imageHash found
+        // the incomplete entry, check scanId; if scanId found it, check imageHash.
+        // Both must point to the same physical scan.
+        let _sameImageCandidate = null;
+        const _altKeys = [_imageHash, _scanId].filter(Boolean);
+        for (const _altKey of _altKeys) {
+          const _alt = BACKGROUND_VISION_RESULTS.get(_altKey);
+          if (!_alt || _alt === _entry) continue;
+          if (_alt.needsFamilyRecovery) continue;
           const _eval = evaluateFamilyRecoveryHint({
             incompleteQuery: _entry.query,
             requiredAirline: _bgAirline,
-            candidateQuery: _v.query,
-            candidateCategory: _v.category,
-            candidateConfidence: _v.confidence || 0,
-            similarity: 0.95, // same-session entries are high trust
+            candidateQuery: _alt.query,
+            candidateCategory: _alt.category,
+            candidateConfidence: _alt.confidence || 0,
+            similarity: 1.0, // same image — proven linkage
             threshold: FAMILY_RECOVERY_SIMILARITY_THRESHOLD,
           });
           if (_eval.accepted) {
-            _recoveryCandidate = { query: _eval.recoveredQuery, source: "background_vision_cache", entry: _v };
+            _sameImageCandidate = { query: _eval.recoveredQuery, source: "same_image_prior_pass", key: _altKey };
             break;
           }
         }
-        // Also check similarity index for prior-session matches
-        if (!_recoveryCandidate) {
-          for (const _simEntry of similarityEntries()) {
-            if (!_simEntry?.payload?.query) continue;
-            const _eval = evaluateFamilyRecoveryHint({
-              incompleteQuery: _entry.query,
-              requiredAirline: _bgAirline,
-              candidateQuery: _simEntry.payload.query,
-              candidateCategory: _simEntry.payload.identity?.category || _simEntry.payload.visionIdentity?.category || null,
-              candidateConfidence: _simEntry.payload.confidence || 0,
-              similarity: 0.90,
-              threshold: FAMILY_RECOVERY_SIMILARITY_THRESHOLD,
-            });
-            if (_eval.accepted) {
-              _recoveryCandidate = { query: _eval.recoveredQuery, source: "similarity_index" };
-              break;
-            }
-          }
-        }
-        if (_recoveryCandidate) {
+        if (_sameImageCandidate) {
           _entry = {
             ..._entry,
-            query: _recoveryCandidate.query,
+            query: _sameImageCandidate.query,
             needsFamilyRecovery: false,
-            _familyRecoveredFrom: _recoveryCandidate.source,
+            _familyRecoveredFrom: _sameImageCandidate.source,
           };
-          // Update the cache so subsequent polls see the recovered query
           if (_imageHash) BACKGROUND_VISION_RESULTS.set(_imageHash, _entry);
           if (_scanId)    BACKGROUND_VISION_RESULTS.set(_scanId, _entry);
           console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_ACCEPTED", {
             rid: req.rid,
-            original: _entry.query !== _recoveryCandidate.query ? _entry.query : undefined,
-            recovered: _recoveryCandidate.query,
-            source: _recoveryCandidate.source,
+            recovered: _sameImageCandidate.query,
+            source: _sameImageCandidate.source,
+            linkedKey: _sameImageCandidate.key,
           });
         } else {
           console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_REJECTED", {
             rid: req.rid, query: _entry.query,
             requiredAirline: _bgAirline,
-            reason: "no_matching_complete_identity_found",
+            reason: "no_same_image_complete_identity",
           });
         }
       }
@@ -29897,6 +29884,9 @@ if (!Array.isArray(items) || items.length < 4) {
 // Phase V3.10B: legacy snapshot fallback for non-stream route.
 // When oracle was skipped (source unavailable) and items is still empty,
 // try serving an old-version snapshot as pricing-only data.
+// V3.10B.1: _legacyFallbackUsed gates all downstream cache writes so legacy
+// pricing-only data never poisons SERP_CACHE, ENRICHED_SCAN_CACHE, or v7 snapshots.
+let _legacyFallbackUsed = false;
 if ((!Array.isArray(items) || items.length === 0) && _nonStreamSourceGuard.skip) {
   const _legacyDecision = shouldAttemptLegacySnapshot({
     serpCooling: isSourceCoolingDown("serpapi"),
@@ -29917,6 +29907,7 @@ if ((!Array.isArray(items) || items.length === 0) && _nonStreamSourceGuard.skip)
         const _legacyItems = _legacyPolicy.action !== "bypass_stale_cache" ? _legacyPolicy.items : [];
         if (_legacyItems.length >= LEGACY_SNAPSHOT_MIN_CLEAN) {
           items = _legacyItems;
+          _legacyFallbackUsed = true;
           console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", {
             route: "/market/search", query,
             version: _legacySnap._snapshotVersion,
@@ -29929,8 +29920,8 @@ if ((!Array.isArray(items) || items.length === 0) && _nonStreamSourceGuard.skip)
   }
 }
 
-if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
-  // Only cache to SERP if we have real marketplace data (not oracle-only)
+if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult && !_legacyFallbackUsed) {
+  // Only cache to SERP if we have real marketplace data (not oracle-only, not legacy fallback)
   SERP_CACHE.set(cacheKey, items);
 }
 
@@ -29960,8 +29951,8 @@ if (!_oracleOnlyResult && Array.isArray(items)) {
     }
     if (Array.isArray(_raResult.refinedItems) && _raResult.refinedItems.length > items.length) {
       items = _raResult.refinedItems;
-      // Re-cache with expanded result set
-      if (!_oracleOnlyResult) SERP_CACHE.set(cacheKey, items);
+      // Re-cache with expanded result set (never for legacy fallback)
+      if (!_oracleOnlyResult && !_legacyFallbackUsed) SERP_CACHE.set(cacheKey, items);
     }
     _resultConsensus    = _raResult.resultConsensus;
     _refinedSearchUsed  = _raResult.refinedSearchUsed;
@@ -30013,11 +30004,16 @@ const [responsePayload, ebaySoldComps, localComps] = await Promise.all([
     conditionFlags:    _condFlags,
     categoryPrior:    _categoryPrior,
     retrievalMeta: {
-      source: _oracleOnlyResult ? "gpt_oracle" : (Array.isArray(items) && items.length > 0 ? "live_market" : "empty"),
-      kind:   _oracleOnlyResult ? "oracle"     : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
+      source: _legacyFallbackUsed ? "legacy_snapshot_source_unavailable"
+            : _oracleOnlyResult   ? "gpt_oracle"
+            : (Array.isArray(items) && items.length > 0 ? "live_market" : "empty"),
+      kind:   _legacyFallbackUsed ? "legacy_snapshot_source_unavailable"
+            : _oracleOnlyResult   ? "oracle"
+            : (Array.isArray(items) && items.length > 0 ? "live_refresh" : "empty"),
       scanId: _budgetScanIdEarly,
     },
-    persistSnapshot: !_oracleOnlyResult, // don't pollute snapshot with oracle-only data
+    // Never persist legacy fallback or oracle-only as a current-version snapshot
+    persistSnapshot: !_oracleOnlyResult && !_legacyFallbackUsed,
     identitySummaryFromRetrieval: _nonStreamRetrievalSummary,
     reviewContext: _reviewCtx,
   }),
@@ -30773,7 +30769,7 @@ app.post("/market/search/stream", async (req, res) => {
     ]);
 
     // ── Helper: assemble trusted profit intel + response payload ─────────
-    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, cv2 = visionConfidence, deferEnrichments = false, identitySummaryFromRoute = null, identitySummaryFromRetrieval = null } = {}) => {
+    const _buildPayload = async (items, { source = "live_market", kind = "live_refresh", isOracleOnly = false, isLegacyFallback = false, cv2 = visionConfidence, deferEnrichments = false, identitySummaryFromRoute = null, identitySummaryFromRetrieval = null } = {}) => {
       // ── Phase 3 instrumentation: timestamp every major stage so the
       // 10s gap between phase1_done and scan_response becomes visible.
       // Format: BUILD_STAGE { scanId, kind, stage, ms } — grep-friendly.
@@ -30805,7 +30801,7 @@ app.post("/market/search/stream", async (req, res) => {
         authenticityFlags: _authFlags, conditionFlags: _condFlags,
         categoryPrior:    _categoryPrior,
         retrievalMeta: { source, kind, scanId },
-        persistSnapshot: !isOracleOnly,
+        persistSnapshot: !isOracleOnly && !isLegacyFallback,
         lite:             _isLite || deferEnrichments,
         identitySummaryFromRoute,
         identitySummaryFromRetrieval,
@@ -31793,7 +31789,9 @@ app.post("/market/search/stream", async (req, res) => {
     enrichedItems = applyPrePayloadAircraftFilter(query, enrichedItems, scannedPrice, "live_refresh", null, null, null, _aircraftIdentitySummary);
     _aircraftIdentitySummary.keptCount = enrichedItems.length;
 
-    // Phase V3.10B: legacy snapshot fallback for stream path.
+    // Phase V3.10B / V3.10B.1: legacy snapshot fallback for stream path.
+    // _streamLegacyFallbackUsed gates all downstream cache writes.
+    let _streamLegacyFallbackUsed = false;
     if (!enrichedItems.length && _sourceUnavailableNoData) {
       console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_CONSIDERED", {
         rid: req.rid, scanId, query,
@@ -31807,6 +31805,7 @@ app.post("/market/search/stream", async (req, res) => {
           const _legacyItems = _legacyPolicy.action !== "bypass_stale_cache" ? _legacyPolicy.items : [];
           if (_legacyItems.length >= LEGACY_SNAPSHOT_MIN_CLEAN) {
             enrichedItems = _legacyItems;
+            _streamLegacyFallbackUsed = true;
             console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", {
               rid: req.rid, scanId, query,
               version: _legacySnap._snapshotVersion,
@@ -31833,8 +31832,8 @@ app.post("/market/search/stream", async (req, res) => {
     const _phase2Ms = Date.now() - _t2;
     _recordStreamMetric("phase2TotalMs", _phase2Ms);
 
-    // Write enriched cache only for clean (non-oracle, non-degraded) results
-    if (!_oracleOnlyResult && !_degraded && enrichedItems.length > 0) {
+    // Write enriched cache only for clean results — never for legacy fallback
+    if (!_oracleOnlyResult && !_degraded && !_streamLegacyFallbackUsed && enrichedItems.length > 0) {
       SERP_CACHE.set(cacheKey, enrichedItems);
       ENRICHED_SCAN_CACHE.set(cacheKey, {
         items:        enrichedItems,
@@ -31844,7 +31843,8 @@ app.post("/market/search/stream", async (req, res) => {
     }
 
     // ── In-band SERP fanout: bounded parallel expansion pre-payload ─────────
-    if (!_degraded && !clientClosed && !_oracleOnlyResult) {
+    // Never fanout on legacy fallback — sources are unavailable by definition.
+    if (!_degraded && !clientClosed && !_oracleOnlyResult && !_streamLegacyFallbackUsed) {
       const _preClean     = computeCleanRetrievalPool(query, enrichedItems, scannedPrice, "pre_fanout_check");
       const _preVerified  = enrichedItems.filter(x => x?.clickable !== false && x?.directUrl).length;
       const _prePricingOnly = enrichedItems.filter(x => x?.clickable === false).length;
@@ -31949,8 +31949,8 @@ app.post("/market/search/stream", async (req, res) => {
           topTitles:               enrichedItems.slice(0, 5).map(i => (i?.title || "").slice(0, 50)),
         });
 
-        // Refresh caches with expanded pool
-        if (enrichedItems.length > 0) {
+        // Refresh caches with expanded pool — never for legacy fallback
+        if (enrichedItems.length > 0 && !_streamLegacyFallbackUsed) {
           SERP_CACHE.set(cacheKey, enrichedItems);
           ENRICHED_SCAN_CACHE.set(cacheKey, {
             items:         enrichedItems,
@@ -31964,9 +31964,12 @@ app.post("/market/search/stream", async (req, res) => {
 
     const _tFinalBuild = Date.now();
     const finalPayload = await _buildPayload(enrichedItems, {
-      source:                      _oracleOnlyResult ? "gpt_oracle" : "live_market",
-      kind:                        _oracleOnlyResult ? "oracle"      : "live_refresh",
+      source:                      _streamLegacyFallbackUsed ? "legacy_snapshot_source_unavailable"
+                                   : _oracleOnlyResult       ? "gpt_oracle" : "live_market",
+      kind:                        _streamLegacyFallbackUsed ? "legacy_snapshot_source_unavailable"
+                                   : _oracleOnlyResult       ? "oracle"      : "live_refresh",
       isOracleOnly:                _oracleOnlyResult,
+      isLegacyFallback:            _streamLegacyFallbackUsed,
       deferEnrichments:            true,
       identitySummaryFromRoute:    _aircraftIdentitySummary,
       identitySummaryFromRetrieval: _retrievalIdentitySummary,
