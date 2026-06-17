@@ -1327,6 +1327,8 @@ import { approximateMarketDecision, rescueOracleDecision } from "./src/incomplet
 import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } from "./src/urlEvidenceAudit.js";
 // Phase V3.9B — extracted compactMarketSnapshotItem with recovery metadata preserved.
 import { compactMarketSnapshotItem } from "./src/marketSnapshotCompact.js";
+// Phase V3.9B.1 — pure oracle-skip guard for source-unavailable condition.
+import { shouldSkipOracleSourceUnavailable } from "./src/marketOracleGuard.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -29622,6 +29624,14 @@ if (_nonStreamGenericPremiumAircraft) {
     reason: "generic_aircraft_no_identity_premium_price",
   });
 }
+// Phase V3.9B.1: check source unavailability before the oracle decision.
+// Mirrors the same guard in the stream path (~31351). Must be computed here
+// (after all source fallbacks have run) so it reflects the live cooldown state.
+const _nonStreamSourceGuard = shouldSkipOracleSourceUnavailable({
+  serpCooling: isSourceCoolingDown("serpapi"),
+  ebayAvail:   hasEbayApi(),
+  itemCount:   Array.isArray(items) ? items.length : 0,
+});
 let _oracleOnlyResult = false;
 if (!Array.isArray(items) || items.length < 4) {
   if (_nonStreamIncompleteAircraft.incomplete) {
@@ -29634,6 +29644,13 @@ if (!Array.isArray(items) || items.length < 4) {
     console.log("ORACLE_SKIPPED_GENERIC_PREMIUM_AIRCRAFT_QUERY", {
       route: "/market/search", query, scannedPrice,
       reason: "generic_aircraft_no_identity_premium_price",
+    });
+  } else if (_nonStreamSourceGuard.skip) {
+    console.log("ROUTE_ORACLE_SKIPPED_SOURCE_UNAVAILABLE_NO_MARKET_DATA", {
+      route: "/market/search", query,
+      reason: _nonStreamSourceGuard.reason,
+      serpCooling: isSourceCoolingDown("serpapi"),
+      ebayAvailable: hasEbayApi(),
     });
   } else {
   console.log("🧠 Route-level oracle fallback for:", query);
