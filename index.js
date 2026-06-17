@@ -20583,7 +20583,9 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         // as the provisional seed would have — no need to wait the full grace window.
         // Safety: same evaluateProvisionalSeed policy + threshold + conf cap as provisional seed.
         // Only fires when VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED is true (set by npm run dev).
-        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && !skipCaches && _similarityVec) {
+        // skipCaches is declared in the outer handler scope AFTER runVisionConsensus returns,
+        // so it is not in scope here. isBenchBypass(req) is the same check (req IS in scope).
+        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && !isBenchBypass(req) && _similarityVec) {
           try {
             const _lateHit      = similarityFindSimilar(_similarityVec, VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD);
             const _lateSeedQuery = _lateHit?.payload?.query || null;
