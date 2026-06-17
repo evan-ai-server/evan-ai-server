@@ -188,3 +188,14 @@ export function clear() {
   _index.clear();
   _stats = { hits: 0, misses: 0, registrations: 0, removals: 0 };
 }
+
+// Phase V3.10B: iterate all valid (non-expired, version-matched) entries.
+// Yields { imageHash, payload } for each. Used by aircraft family recovery
+// to find prior complete identities without needing a vector.
+export function* entries() {
+  for (const [hash, entry] of _index) {
+    if (_isExpired(entry)) continue;
+    if (entry?.payload?._payloadVersion !== PAYLOAD_VERSION) continue;
+    yield { imageHash: hash, payload: entry.payload };
+  }
+}

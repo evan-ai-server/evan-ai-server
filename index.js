@@ -1317,7 +1317,7 @@ import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordV
 import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
-import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
+import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk, entries as similarityEntries } from "./src/scanSimilarity.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
@@ -1329,6 +1329,9 @@ import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } fro
 import { compactMarketSnapshotItem } from "./src/marketSnapshotCompact.js";
 // Phase V3.9B.1/V3.9C — pure oracle-skip guard for source-unavailable condition.
 import { shouldSkipOracleSourceUnavailable } from "./src/marketOracleGuard.js";
+// Phase V3.10B — legacy snapshot fallback + aircraft family recovery.
+import { shouldAttemptLegacySnapshot, sanitizeLegacySnapshotItems, LEGACY_SNAPSHOT_MIN_CLEAN } from "./src/legacySnapshotFallback.js";
+import { evaluateFamilyRecoveryHint, FAMILY_RECOVERY_SIMILARITY_THRESHOLD } from "./src/aircraftFamilyRecovery.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -15509,6 +15512,45 @@ async function readInternalMarketSnapshot(query = "") {
   return null;
 }
 
+// Phase V3.10B: read ANY-version snapshot from disk/redis as a pricing-only
+// fallback. Does NOT check _snapshotVersion — that's the whole point. Items
+// are sanitized to pricing-only (no verified/clickable/directUrl). Only
+// called when the normal version-matched read returned null AND primary
+// sources are unavailable.
+async function readLegacySnapshotFallback(query = "") {
+  const q = normalizeQuery(query);
+  if (!q) return null;
+
+  let raw = null;
+  try {
+    raw = await cacheGet(internalMarketSnapshotRedisKey(q));
+  } catch {}
+  if (!raw?.items?.length) {
+    raw = await readJson(internalMarketSnapshotDiskKey(q));
+  }
+  if (!raw?.items?.length) return null;
+
+  const items = sanitizeLegacySnapshotItems(raw.items);
+  if (items.length < LEGACY_SNAPSHOT_MIN_CLEAN) {
+    console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_REJECTED", {
+      query: q, version: raw._snapshotVersion || null,
+      rawCount: raw.items.length, cleanCount: items.length,
+      minRequired: LEGACY_SNAPSHOT_MIN_CLEAN,
+      reason: "insufficient_clean_items",
+    });
+    return null;
+  }
+
+  return {
+    items,
+    _snapshotVersion: raw._snapshotVersion || null,
+    _legacy: true,
+    source: "legacy_snapshot_source_unavailable",
+    query: q,
+    createdAt: raw.createdAt || null,
+  };
+}
+
 function marketSnapshotItemsFromPrecompute(snapshot = null) {
   if (!snapshot || typeof snapshot !== "object") return [];
 
@@ -21110,6 +21152,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                   tier: "hard_fail_no_seed",
                 },
                 error: "INSUFFICIENT_IDENTITY",
+                userMessage: "Couldn't identify this item — try scanning again",
+                retryable: true,
               };
             }
           }
@@ -22028,6 +22072,84 @@ app.get("/api/vision/background-result", async (req, res) => {
     userId: getResolvedUserId(req) || null,
   });
   if (!_entry) return res.status(200).json({ ready: false });
+
+  // Phase V3.10B: attempt aircraft family recovery via similarity index before
+  // blocking market. When master returned airline-only (needsFamilyRecovery), check
+  // if a prior scan of the SAME image had a complete identity (airline + family).
+  if (_entry.needsFamilyRecovery && _imageHash) {
+    console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_STARTED", {
+      rid: req.rid, query: _entry.query, imageHash: _imageHash,
+    });
+    try {
+      const _bgIncomplete = detectIncompleteAircraftIdentityQuery(_entry.query);
+      const _bgAirline = _bgIncomplete.requiredAirline || null;
+      if (_bgAirline) {
+        let _recoveryCandidate = null;
+        for (const [_k, _v] of BACKGROUND_VISION_RESULTS) {
+          if (_k === _imageHash || _k === _scanId) continue;
+          if (_v.needsFamilyRecovery) continue;
+          const _eval = evaluateFamilyRecoveryHint({
+            incompleteQuery: _entry.query,
+            requiredAirline: _bgAirline,
+            candidateQuery: _v.query,
+            candidateCategory: _v.category,
+            candidateConfidence: _v.confidence || 0,
+            similarity: 0.95, // same-session entries are high trust
+            threshold: FAMILY_RECOVERY_SIMILARITY_THRESHOLD,
+          });
+          if (_eval.accepted) {
+            _recoveryCandidate = { query: _eval.recoveredQuery, source: "background_vision_cache", entry: _v };
+            break;
+          }
+        }
+        // Also check similarity index for prior-session matches
+        if (!_recoveryCandidate) {
+          for (const _simEntry of similarityEntries()) {
+            if (!_simEntry?.payload?.query) continue;
+            const _eval = evaluateFamilyRecoveryHint({
+              incompleteQuery: _entry.query,
+              requiredAirline: _bgAirline,
+              candidateQuery: _simEntry.payload.query,
+              candidateCategory: _simEntry.payload.identity?.category || _simEntry.payload.visionIdentity?.category || null,
+              candidateConfidence: _simEntry.payload.confidence || 0,
+              similarity: 0.90,
+              threshold: FAMILY_RECOVERY_SIMILARITY_THRESHOLD,
+            });
+            if (_eval.accepted) {
+              _recoveryCandidate = { query: _eval.recoveredQuery, source: "similarity_index" };
+              break;
+            }
+          }
+        }
+        if (_recoveryCandidate) {
+          _entry = {
+            ..._entry,
+            query: _recoveryCandidate.query,
+            needsFamilyRecovery: false,
+            _familyRecoveredFrom: _recoveryCandidate.source,
+          };
+          // Update the cache so subsequent polls see the recovered query
+          if (_imageHash) BACKGROUND_VISION_RESULTS.set(_imageHash, _entry);
+          if (_scanId)    BACKGROUND_VISION_RESULTS.set(_scanId, _entry);
+          console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_ACCEPTED", {
+            rid: req.rid,
+            original: _entry.query !== _recoveryCandidate.query ? _entry.query : undefined,
+            recovered: _recoveryCandidate.query,
+            source: _recoveryCandidate.source,
+          });
+        } else {
+          console.log("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_REJECTED", {
+            rid: req.rid, query: _entry.query,
+            requiredAirline: _bgAirline,
+            reason: "no_matching_complete_identity_found",
+          });
+        }
+      }
+    } catch (err) {
+      console.warn("AIRCRAFT_FAMILY_BACKGROUND_RECOVERY_ERROR", { rid: req.rid, err: err?.message });
+    }
+  }
+
   const _bgIncompleteAircraft = detectIncompleteAircraftIdentityQuery(_entry.query);
   const _bgMarketReady = !(_entry.needsFamilyRecovery || _bgIncompleteAircraft.incomplete);
   // Phase 4L: if not market-ready, check if this is a safe collectible that allows
@@ -22071,7 +22193,18 @@ app.get("/api/vision/background-result", async (req, res) => {
       });
     }
   }
-  return res.status(200).json({ ..._entry, ready: true, marketReady: _bgMarketReady, approximateAllowed: _bgApproxAllowed });
+  // Phase V3.10B: add explicit incomplete identity metadata so the frontend
+  // can show a user-facing message instead of silently returning to Ready.
+  const _incompletePayload = (!_bgMarketReady && !_bgApproxAllowed) ? {
+    incompleteIdentity: true,
+    incompleteReason: "incomplete_aircraft_identity_missing_family",
+    userMessage: "Couldn't confirm the exact aircraft model — try scanning again",
+  } : {};
+
+  return res.status(200).json({
+    ..._entry, ready: true, marketReady: _bgMarketReady,
+    approximateAllowed: _bgApproxAllowed, ..._incompletePayload,
+  });
 });
 
 app.post(
@@ -22676,6 +22809,10 @@ if (!openai) {
             masterMs:        result?.visionTimings?.masterMs ?? null,
             raceWinner:      result?.visionTimings?.raceWinner ?? null,
           },
+          // Phase V3.10B: propagate user-facing fields from hard_fail
+          ...(result?.error       ? { error:       result.error }       : {}),
+          ...(result?.userMessage ? { userMessage: result.userMessage } : {}),
+          ...(result?.retryable   ? { retryable:   result.retryable }  : {}),
         };
 
         // ── Serial parser (non-LLM, from visibleText) ──────────────────────────
@@ -29757,6 +29894,41 @@ if (!Array.isArray(items) || items.length < 4) {
   } // end else
 }
 
+// Phase V3.10B: legacy snapshot fallback for non-stream route.
+// When oracle was skipped (source unavailable) and items is still empty,
+// try serving an old-version snapshot as pricing-only data.
+if ((!Array.isArray(items) || items.length === 0) && _nonStreamSourceGuard.skip) {
+  const _legacyDecision = shouldAttemptLegacySnapshot({
+    serpCooling: isSourceCoolingDown("serpapi"),
+    ebayAvail: hasEbayApi(),
+    currentVersionHit: false,
+    hasOldSnapshot: true,
+  });
+  if (_legacyDecision.attempt) {
+    console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_CONSIDERED", {
+      route: "/market/search", query,
+      serpCooling: isSourceCoolingDown("serpapi"),
+      ebayAvailable: hasEbayApi(),
+    });
+    try {
+      const _legacySnap = await readLegacySnapshotFallback(query);
+      if (_legacySnap?.items?.length) {
+        const _legacyPolicy = resolveAircraftCachePolicy(query, _legacySnap.items, scannedPrice, "legacy_snapshot");
+        const _legacyItems = _legacyPolicy.action !== "bypass_stale_cache" ? _legacyPolicy.items : [];
+        if (_legacyItems.length >= LEGACY_SNAPSHOT_MIN_CLEAN) {
+          items = _legacyItems;
+          console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", {
+            route: "/market/search", query,
+            version: _legacySnap._snapshotVersion,
+            itemCount: items.length,
+            source: "legacy_snapshot_source_unavailable",
+          });
+        }
+      }
+    } catch {}
+  }
+}
+
 if (Array.isArray(items) && items.length > 0 && !_oracleOnlyResult) {
   // Only cache to SERP if we have real marketplace data (not oracle-only)
   SERP_CACHE.set(cacheKey, items);
@@ -31620,6 +31792,31 @@ app.post("/market/search/stream", async (req, res) => {
     _aircraftIdentitySummary.rawCount = enrichedItems.length;
     enrichedItems = applyPrePayloadAircraftFilter(query, enrichedItems, scannedPrice, "live_refresh", null, null, null, _aircraftIdentitySummary);
     _aircraftIdentitySummary.keptCount = enrichedItems.length;
+
+    // Phase V3.10B: legacy snapshot fallback for stream path.
+    if (!enrichedItems.length && _sourceUnavailableNoData) {
+      console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_CONSIDERED", {
+        rid: req.rid, scanId, query,
+        serpCooling: isSourceCoolingDown("serpapi"),
+        ebayAvailable: hasEbayApi(),
+      });
+      try {
+        const _legacySnap = await readLegacySnapshotFallback(query);
+        if (_legacySnap?.items?.length) {
+          const _legacyPolicy = resolveAircraftCachePolicy(query, _legacySnap.items, scannedPrice, "legacy_snapshot");
+          const _legacyItems = _legacyPolicy.action !== "bypass_stale_cache" ? _legacyPolicy.items : [];
+          if (_legacyItems.length >= LEGACY_SNAPSHOT_MIN_CLEAN) {
+            enrichedItems = _legacyItems;
+            console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", {
+              rid: req.rid, scanId, query,
+              version: _legacySnap._snapshotVersion,
+              itemCount: enrichedItems.length,
+              source: "legacy_snapshot_source_unavailable",
+            });
+          }
+        }
+      } catch {}
+    }
 
     if (!enrichedItems.length) {
       _degraded       = true;
