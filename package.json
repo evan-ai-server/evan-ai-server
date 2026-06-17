@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js",
+    "dev": "VISION_QUERY_FAST_IMAGE_DETAIL=low VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED=true VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS=250 node index.js",
     "test": "node --test shared/",
     "bench": "node bench/run.js",
     "bench:save": "node bench/run.js --save",
