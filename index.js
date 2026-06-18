@@ -31282,6 +31282,21 @@ app.post("/market/search/stream", async (req, res) => {
                   normalizeVerdict(_slaLegacyPayload?.buyOrPass?.verdict) ||
                   normalizeVerdict(_slaLegacyPayload?.profitIntel?.verdict) ||
                   "HOLD";
+                // Phase V3.10B.7: populate the cross-route payload cache (same-scan,
+                // in-memory, 5-min TTL) exactly as the other stream complete paths do.
+                // Without this the non-stream /market/search saw PAYLOAD_CACHE_MISS,
+                // re-ran market, SerpAPI aborted (no 429 → serpCooling stayed false →
+                // oracle guard missed it), and the GPT oracle fabricated comps —
+                // poisoning a scan that already had a safe legacy answer. Reusing the
+                // payload keeps it pricing-only; it does NOT write any durable cache.
+                try {
+                  const _ctxCache = getCurrentSerpBudgetCtx();
+                  if (_ctxCache) {
+                    _ctxCache.cacheHit = true;
+                    _ctxCache._finalItemCount = Array.isArray(_slaLegacyPayload?.items) ? _slaLegacyPayload.items.length : null;
+                    setMarketScanResult(_ctxCache, { payload: _slaLegacyPayload, route: "/market/search/stream", layer: "legacy_snapshot_source_unavailable" });
+                  }
+                } catch {}
                 send("complete", {
                   ..._slaLegacyPayload,
                   verdict: _slaLegacyVerdict,

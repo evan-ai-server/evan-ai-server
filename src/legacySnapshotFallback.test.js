@@ -204,3 +204,37 @@ test("V3.10B.4 — static: readLegacySnapshotFallback rejects incomplete aircraf
   assert.ok(fnStart !== -1);
   assert.ok(rejLog > fnStart, "rejection must be inside readLegacySnapshotFallback");
 });
+
+// ── V3.10B.7: stream legacy payload must populate cross-route cache ───────────
+// Without setMarketScanResult here, the non-stream /market/search saw
+// PAYLOAD_CACHE_MISS, re-ran market, and the GPT oracle fabricated comps after
+// the stream already had a safe legacy answer. node --check can't catch a
+// missing cache-populate; this static guard can.
+test("V3.10B.7 — static: stream SLA legacy path populates cross-route payload cache", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  // Find the stream SLA-exhausted legacy USED log (the one tagged
+  // path: "sla_exhausted_stream") and assert its block populates the cross-route
+  // cache via setMarketScanResult BEFORE the complete event is sent.
+  let found = false;
+  let searchFrom = 0;
+  while (true) {
+    const usedIdx = src.indexOf("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", searchFrom);
+    if (usedIdx === -1) break;
+    const block = src.slice(usedIdx, usedIdx + 2600);
+    if (block.includes("sla_exhausted_stream")) {
+      const setIdx = block.indexOf("setMarketScanResult(");
+      const sendIdx = block.indexOf('send("complete"');
+      assert.ok(setIdx !== -1, "stream SLA legacy path must call setMarketScanResult");
+      assert.ok(sendIdx !== -1 && setIdx < sendIdx,
+        "cache populate must happen before the complete event is sent");
+      found = true;
+      break;
+    }
+    searchFrom = usedIdx + 1;
+  }
+  assert.ok(found, "stream SLA legacy USED block (sla_exhausted_stream) must exist");
+});
