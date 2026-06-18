@@ -1332,6 +1332,7 @@ import { shouldSkipOracleSourceUnavailable } from "./src/marketOracleGuard.js";
 // Phase V3.10B — legacy snapshot fallback + aircraft family recovery.
 import { shouldAttemptLegacySnapshot, sanitizeLegacySnapshotItems, LEGACY_SNAPSHOT_MIN_CLEAN } from "./src/legacySnapshotFallback.js";
 import { evaluateFamilyRecoveryHint, FAMILY_RECOVERY_SIMILARITY_THRESHOLD } from "./src/aircraftFamilyRecovery.js";
+import { recoverFamilyFromMasterFields } from "./src/aircraftFamilyFieldRecovery.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -20219,25 +20220,37 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
             console.log("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE", {
               rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.requiredAirline || null,
             });
-            // Try to recover family from variants
-            let _recoveredQuery = null;
-            for (const v of _bgVariants) {
-              const vNorm = normalizeTitleKey(v);
-              const vHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => vNorm.includes(tok)));
-              if (vHasFamily) {
-                _recoveredQuery = v;
-                break;
-              }
-            }
-            if (_recoveredQuery) {
-              _storedQuery = _recoveredQuery;
+            // Phase V3.10B.6: recover the family from the master result's OWN output —
+            // variants AND structured identity fields (model/family/modelNumber/brand/
+            // itemType/manufacturer/category/visibleText/searchQueries). Uses only data
+            // master already returned: no fresh model call, no similarity/legacy guessing.
+            const _bgIdent = m?.parsed?.identity || {};
+            const _bgRecovery = recoverFamilyFromMasterFields({
+              incompleteQuery: _bgQuery,
+              requiredAirline: _bgAirlineLock.requiredAirline,
+              candidateStrings: [
+                _bgQuery,
+                ..._bgVariants,
+                _bgIdent.exactQuery,
+                ...(Array.isArray(_bgIdent.searchQueries) ? _bgIdent.searchQueries : []),
+              ],
+              fieldValues: [
+                _bgIdent.brand, _bgIdent.model, _bgIdent.itemType, _bgIdent.manufacturer,
+                _bgIdent.family, _bgIdent.modelNumber, _bgIdent.category,
+                ...(Array.isArray(_bgIdent.visibleText) ? _bgIdent.visibleText : []),
+              ],
+            });
+            if (_bgRecovery.recovered) {
+              _storedQuery = _bgRecovery.query;
               console.log("AIRCRAFT_BACKGROUND_QUERY_FAMILY_RECOVERED", {
                 rid: req.rid, original: _bgQuery, recovered: _storedQuery,
+                family: _bgRecovery.family, matchedToken: _bgRecovery.matchedToken,
+                source: _bgRecovery.source,
               });
             } else {
               _needsFamily = true;
               console.log("AIRCRAFT_BACKGROUND_QUERY_NEEDS_FAMILY_RECOVERY", {
-                rid: req.rid, query: _bgQuery,
+                rid: req.rid, query: _bgQuery, reason: _bgRecovery.reason || "no_family_in_master_output",
               });
             }
           }
@@ -23259,6 +23272,50 @@ if (!openai) {
             masterLaunched:        _vt.masterLaunched ?? false,
             masterBlockedResponse: _vt.raceWinner === "consensus",
             categoryPolicy:        _cat ? getVisionCategoryPolicy(_cat) : null,
+          });
+        } catch { /* non-fatal */ }
+        // Phase V3.10B.6 (C): compact grep-able summary of WHY the first useful
+        // identity did/didn't land under ~2s. Derived from data already on hand —
+        // per-pass downscale/drift detail stays in VISION_DOWNSCALE_POLICY /
+        // VISION_DEADLINE_TIMER_DRIFT. Instrumentation only; changes no behavior.
+        try {
+          const _bvt          = shaped?.visionTimings || {};
+          const _bSimMs       = _ppSteps?.embed ?? null;
+          const _bTotalMs     = _epT4PreResponse - _epT0;
+          const _bWallMs      = _bvt.visionWallMs ?? null;
+          const _bSelectedQ   = shaped?.query ?? null;
+          const _bRaceWinner  = _bvt.raceWinner ?? null;
+          const _bQueryFastMs = _bvt.queryFastMs ?? null;
+          const _bQueryFastTimedOut = _bRaceWinner === "hard_deadline" && _bQueryFastMs == null;
+          const _bWallOverDeadlineMs = (typeof _bWallMs === "number")
+            ? _bWallMs - VISION_BAD_SCAN_HARD_FAIL_MS : null;
+          const _bReasons = [];
+          if (!_bSelectedQ)                                    _bReasons.push("no_first_identity");
+          if (_bRaceWinner === "hard_deadline")                _bReasons.push("hard_deadline_no_seed");
+          if (_bQueryFastMs == null)                           _bReasons.push("query_fast_no_result");
+          if (typeof _bSimMs === "number" && _bSimMs > 500)    _bReasons.push("slow_embed_event_loop_contention");
+          if (_embedTimedOut)                                  _bReasons.push("embed_timed_out");
+          if (typeof _bWallOverDeadlineMs === "number" && _bWallOverDeadlineMs > 300) _bReasons.push("deadline_drift");
+          if (shaped?.visionTier === "hard_fail_no_seed")      _bReasons.push("hard_fail_no_seed");
+          if (shaped?.visionTier && String(shaped.visionTier).startsWith("similarity")) _bReasons.push("similarity_seed_used");
+          console.log("VISION_UNDER_2S_BLOCKER_SUMMARY", {
+            rid:                req.rid,
+            totalMs:            _bTotalMs,
+            visionWallMs:       _bWallMs,
+            selectedPass:       shaped?.visionTier ?? null,
+            raceWinner:         _bRaceWinner,
+            queryFastMs:        _bQueryFastMs,
+            queryFastTimedOut:  _bQueryFastTimedOut,
+            fastMs:             _bvt.fastMs ?? null,
+            visualMs:           _bvt.visualMs ?? null,
+            masterMs:           _bvt.masterMs ?? null,
+            similarityMs:       _bSimMs,
+            embedTimedOut:      _embedTimedOut,
+            hardDeadlineMs:     VISION_BAD_SCAN_HARD_FAIL_MS,
+            wallOverDeadlineMs: _bWallOverDeadlineMs,
+            masterLaunched:     _bvt.masterLaunched ?? false,
+            under2s:            typeof _bTotalMs === "number" ? _bTotalMs <= 2000 : null,
+            blockerReasons:     _bReasons,
           });
         } catch { /* non-fatal */ }
         return res.status(200).json(shaped);

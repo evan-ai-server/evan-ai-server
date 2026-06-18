@@ -359,6 +359,50 @@ test("V3.10B.5 — static: background-recovery helper is defined and used by har
   );
 });
 
+// ── V3.10B.6 (B): background family recovery scans master identity fields ──────
+test("V3.10B.6 — static: background recovery scans master identity fields, not only variants", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const marker = src.indexOf("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE");
+  assert.ok(marker !== -1, "incomplete-aircraft background block must exist");
+  const block = src.slice(marker, marker + 1600);
+
+  assert.ok(block.includes("recoverFamilyFromMasterFields("),
+    "must use the pure recoverFamilyFromMasterFields helper");
+  // Proves it reads structured identity fields, not just variants.
+  for (const field of ["_bgIdent.model", "_bgIdent.family", "_bgIdent.modelNumber", "_bgIdent.brand"]) {
+    assert.ok(block.includes(field), `recovery must consider ${field}`);
+  }
+  // Must NOT graft from legacy snapshot or similarity in this path.
+  assert.ok(!block.includes("readLegacySnapshotFallback"), "must not use legacy snapshot to infer family");
+  assert.ok(!block.includes("similarityFindSimilar"), "must not use broad similarity to infer family");
+});
+
+test("V3.10B.6 — static: no fresh model/vision call added to background family recovery (no A)", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+  const marker = src.indexOf("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE");
+  const block = src.slice(marker, marker + 1600);
+  // The recovery must not invoke a new vision pass or oracle (B not A).
+  assert.ok(!block.includes("runVisionPass"), "background family recovery must not run a fresh vision pass");
+  assert.ok(!block.includes("gptMarketOracle"), "background family recovery must not call the oracle");
+  assert.ok(!block.includes("openai."), "background family recovery must not make a fresh model call");
+});
+
+// ── V3.10B.6 (C): VISION_UNDER_2S_BLOCKER_SUMMARY instrumentation ──────────────
+test("V3.10B.6 — static: VISION_UNDER_2S_BLOCKER_SUMMARY exists with key blocker fields", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const marker = src.indexOf("VISION_UNDER_2S_BLOCKER_SUMMARY");
+  assert.ok(marker !== -1, "blocker summary log must exist");
+  const block = src.slice(marker, marker + 1400);
+  for (const field of ["queryFastMs", "queryFastTimedOut", "fastMs", "visualMs", "similarityMs", "hardDeadlineMs", "masterLaunched", "blockerReasons"]) {
+    assert.ok(block.includes(field), `blocker summary must include ${field}`);
+  }
+});
+
 test("V3.10B.4 — static: market stream blocks incomplete aircraft pre-source", () => {
   const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
   const src = readFileSync(indexPath, "utf8");
