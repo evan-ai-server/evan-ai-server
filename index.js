@@ -25452,17 +25452,15 @@ async function buildMarketSearchResponsePayload({
       });
       return hasRequired || !hasCompetitor;
     });
-    if (_uiFiltered.length >= 2) {
-      const _uiRejected = _uiBeforeCount - _uiFiltered.length;
-      if (_uiRejected > 0) {
-        console.log("FINAL_UI_IDENTITY_LOCK_APPLIED", {
-          query: activeQuery,
-          requiredAirline: _uiAirlineLock.requiredAirline,
-          beforeCount: _uiBeforeCount,
-          afterCount: _uiFiltered.length,
-          rejectedCompetitorCount: _uiRejected,
-        });
-      }
+    const _uiRejected = _uiBeforeCount - _uiFiltered.length;
+    if (_uiRejected > 0) {
+      console.log("FINAL_UI_IDENTITY_LOCK_APPLIED", {
+        query: activeQuery,
+        requiredAirline: _uiAirlineLock.requiredAirline,
+        beforeCount: _uiBeforeCount,
+        afterCount: _uiFiltered.length,
+        rejectedCompetitorCount: _uiRejected,
+      });
       uiItems = _uiFiltered;
     }
   }
@@ -31089,16 +31087,18 @@ app.post("/market/search/stream", async (req, res) => {
         return;
       }
 
-      // 3) Phase V3.10B.2: try legacy snapshot before returning empty.
-      //    Primary sources are unavailable (SLA exhausted) and current-version
-      //    snapshot missed. A version-mismatched (legacy) snapshot may still
-      //    have usable pricing data. Never write caches from this path.
+      // 3) Phase V3.10B.3: try legacy snapshot before returning empty.
+      //    SLA is exhausted — there was no time to call primary sources at all
+      //    (remainingMs can be < 100ms). serpCooling may be false because the
+      //    429 hasn't happened yet in THIS route. slaExhausted bypasses the
+      //    cooling requirement: no time = no source, regardless of cooldown state.
       {
         const _slaLegacyGuard = shouldAttemptLegacySnapshot({
           serpCooling: isSourceCoolingDown("serpapi"),
           ebayAvail:   hasEbayApi(),
           currentVersionHit: false,
           hasOldSnapshot: true,
+          slaExhausted: true,
         });
         if (_slaLegacyGuard.attempt) {
           console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_CONSIDERED", {
@@ -31123,6 +31123,7 @@ app.post("/market/search/stream", async (req, res) => {
                 const _slaLegacyPayload = await _buildPayload(_slaLegacyItems, {
                   source: "legacy_snapshot_source_unavailable",
                   kind:   "legacy_snapshot_source_unavailable",
+                  isLegacyFallback: true,
                 });
                 const _slaLegacyVerdict =
                   normalizeVerdict(_slaLegacyPayload?.buyOrPass?.verdict) ||

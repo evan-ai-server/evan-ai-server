@@ -26,11 +26,13 @@ export function shouldAttemptLegacySnapshot({
   ebayAvail = false,
   currentVersionHit = false,
   hasOldSnapshot = false,
+  slaExhausted = false,
 } = {}) {
   if (currentVersionHit) return { attempt: false, reason: "current_version_available" };
+  if (!hasOldSnapshot) return { attempt: false, reason: "no_old_snapshot" };
+  if (slaExhausted) return { attempt: true, reason: "sla_exhausted_legacy_fallback" };
   const primaryUnavail = serpCooling && !ebayAvail;
   if (!primaryUnavail) return { attempt: false, reason: "primary_source_available" };
-  if (!hasOldSnapshot) return { attempt: false, reason: "no_old_snapshot" };
   return { attempt: true, reason: "source_unavailable_legacy_fallback" };
 }
 

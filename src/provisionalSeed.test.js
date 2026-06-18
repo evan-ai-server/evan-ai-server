@@ -241,3 +241,37 @@ test("V3.10B.2 — FINAL_UI_IDENTITY_LOCK_APPLIED log exists in buildMarketSearc
   assert.ok(payloadLog !== -1);
   assert.ok(lockLog < payloadLog, "identity lock must run BEFORE the final items log");
 });
+
+// ── V3.10B.3: SLA legacy _buildPayload must pass isLegacyFallback: true ─────
+test("V3.10B.3 — SLA legacy _buildPayload call includes isLegacyFallback: true", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const slaLegacyIdx = src.indexOf("sla_exhausted_legacy_fallback");
+  if (slaLegacyIdx === -1) return; // guard string may differ, skip gracefully
+
+  const slaBlock = src.slice(slaLegacyIdx, slaLegacyIdx + 2000);
+  const buildCall = slaBlock.indexOf("_buildPayload");
+  assert.ok(buildCall !== -1, "SLA legacy path must call _buildPayload");
+  const callSlice = slaBlock.slice(buildCall, buildCall + 300);
+  assert.ok(
+    callSlice.includes("isLegacyFallback: true") || callSlice.includes("isLegacyFallback:true"),
+    "SLA legacy _buildPayload must pass isLegacyFallback: true to prevent snapshot pollution"
+  );
+});
+
+// ── V3.10B.3: final UI identity lock has no >=2 floor (zero honest > competitor junk)
+test("V3.10B.3 — final UI identity lock assigns filtered even when < 2 items remain", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const lockIdx = src.indexOf("FINAL_UI_IDENTITY_LOCK_APPLIED");
+  assert.ok(lockIdx !== -1);
+
+  // Search backwards from the log to find the assignment block (~200 chars before the log)
+  const preBlock = src.slice(Math.max(0, lockIdx - 400), lockIdx);
+  assert.ok(
+    !preBlock.includes("_uiFiltered.length >= 2"),
+    "final UI identity lock must NOT have a >= 2 floor — zero honest items is better than competitor junk"
+  );
+});

@@ -131,6 +131,36 @@ test("V3.10B.2 — SLA-exhausted legacy decision: serpapi cooling + no ebay + no
   assert.equal(r.reason, "source_unavailable_legacy_fallback");
 });
 
+test("V3.10B.3 — SLA-exhausted legacy attempts even when serpCooling=false (no time for source)", () => {
+  const r = shouldAttemptLegacySnapshot({
+    serpCooling: false, ebayAvail: false,
+    currentVersionHit: false, hasOldSnapshot: true,
+    slaExhausted: true,
+  });
+  assert.equal(r.attempt, true);
+  assert.equal(r.reason, "sla_exhausted_legacy_fallback");
+});
+
+test("V3.10B.3 — SLA-exhausted still blocked by currentVersionHit", () => {
+  const r = shouldAttemptLegacySnapshot({
+    serpCooling: false, ebayAvail: false,
+    currentVersionHit: true, hasOldSnapshot: true,
+    slaExhausted: true,
+  });
+  assert.equal(r.attempt, false);
+  assert.equal(r.reason, "current_version_available");
+});
+
+test("V3.10B.3 — SLA-exhausted still blocked by no old snapshot", () => {
+  const r = shouldAttemptLegacySnapshot({
+    serpCooling: false, ebayAvail: false,
+    currentVersionHit: false, hasOldSnapshot: false,
+    slaExhausted: true,
+  });
+  assert.equal(r.attempt, false);
+  assert.equal(r.reason, "no_old_snapshot");
+});
+
 test("V3.10B.2 — SLA-exhausted legacy sanitize: output is pricing-only, no cache pollution fields", () => {
   const items = sanitizeLegacySnapshotItems([
     { title: "Hawaiian Airlines Boeing 787 1:400 Diecast", totalPrice: 55, source: "SerpAPI",
