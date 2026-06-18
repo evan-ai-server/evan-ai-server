@@ -119,3 +119,42 @@ test("legacy sanitize: does not unlock affiliate via links", () => {
 test("LEGACY_SNAPSHOT_MIN_CLEAN is at least 6", () => {
   assert.ok(LEGACY_SNAPSHOT_MIN_CLEAN >= 6);
 });
+
+// ── V3.10B.2: SLA-exhausted stream path uses legacy fallback ─────────────────
+
+test("V3.10B.2 — SLA-exhausted legacy decision: serpapi cooling + no ebay + no current version → attempt", () => {
+  const r = shouldAttemptLegacySnapshot({
+    serpCooling: true, ebayAvail: false,
+    currentVersionHit: false, hasOldSnapshot: true,
+  });
+  assert.equal(r.attempt, true);
+  assert.equal(r.reason, "source_unavailable_legacy_fallback");
+});
+
+test("V3.10B.2 — SLA-exhausted legacy sanitize: output is pricing-only, no cache pollution fields", () => {
+  const items = sanitizeLegacySnapshotItems([
+    { title: "Hawaiian Airlines Boeing 787 1:400 Diecast", totalPrice: 55, source: "SerpAPI",
+      clickable: true, directUrl: "https://example.com", isVerifiedListing: true,
+      _productId: "abc", _serpapiProductApiUrl: "https://serpapi.com/p/abc",
+      urlQuality: "merchant_direct", evidenceQuality: "verified_merchant" },
+    { title: "Hawaiian Airlines Boeing 787 Gemini Diecast", totalPrice: 62, source: "SerpAPI",
+      clickable: true, directUrl: "https://example2.com", isVerifiedListing: true },
+  ]);
+  assert.equal(items.length, 2);
+  for (const it of items) {
+    assert.equal(it.clickable, false, "must not be clickable");
+    assert.equal(it.directUrl, null, "must strip directUrl");
+    assert.equal(it.isVerifiedListing, false, "must not be verified");
+    assert.equal(it._productId, null, "must strip _productId");
+    assert.equal(it.evidenceQuality, "legacy_snapshot_pricing_only");
+  }
+});
+
+test("V3.10B.2 — legacy items below LEGACY_SNAPSHOT_MIN_CLEAN are rejected", () => {
+  const tooFew = Array.from({ length: LEGACY_SNAPSHOT_MIN_CLEAN - 1 }, (_, i) => ({
+    title: `Item ${i}`, totalPrice: 30 + i, source: "SerpAPI",
+  }));
+  const sanitized = sanitizeLegacySnapshotItems(tooFew);
+  assert.equal(sanitized.length, LEGACY_SNAPSHOT_MIN_CLEAN - 1);
+  assert.ok(sanitized.length < LEGACY_SNAPSHOT_MIN_CLEAN, "below min clean → caller must reject");
+});

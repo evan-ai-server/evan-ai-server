@@ -127,6 +127,31 @@ describe("competitor leak prevention — no oracle when no real market data and 
   });
 });
 
+// ── V3.10B.2: fresh recomputation proves guard transitions from allow→skip ──────
+
+describe("V3.10B.2 — guard can transition from false→true after SerpAPI 429", () => {
+  it("guard false before source attempt can become true after SerpAPI 429", () => {
+    // Before source attempt: serpapi not cooling
+    const before = shouldSkipOracleSourceUnavailable({ serpCooling: false, ebayAvail: false, itemCount: 0 });
+    assert.equal(before.skip, false, "before 429: serpapi is live → don't skip");
+
+    // After SerpAPI 429 triggers cooldown: serpapi now cooling
+    const after = shouldSkipOracleSourceUnavailable({ serpCooling: true, ebayAvail: false, itemCount: 0 });
+    assert.equal(after.skip, true, "after 429: serpapi cooling + eBay off + 0 items → skip");
+  });
+
+  it("oracle is skipped after fresh recompute with serpCooling=true", () => {
+    const fresh = shouldSkipOracleSourceUnavailable({ serpCooling: true, ebayAvail: false, itemCount: 0 });
+    assert.equal(fresh.skip, true);
+    assert.equal(fresh.reason, "primary_source_rate_limited_no_market_evidence");
+  });
+
+  it("no GPT oracle activation when serpCooling=true, ebayAvail=false, itemCount=0", () => {
+    const guard = shouldSkipOracleSourceUnavailable({ serpCooling: true, ebayAvail: false, itemCount: 0 });
+    assert.equal(guard.skip, true, "guard must prevent oracle from activating");
+  });
+});
+
 // ── V3.9C: all three guards are consistent (stream / route / merge) ────────────
 
 describe("V3.9C consistency — stream, route, and merge guards all use the same rule", () => {

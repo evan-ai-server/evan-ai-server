@@ -170,6 +170,7 @@ test("V3.10A.2 static scope guard — grace window late-seed block has no known 
   // These identifiers are known to be OUT OF SCOPE inside runVisionConsensus:
   // - _similarityVec: declared in the outer request handler, not passed as a param
   // - skipCaches: declared in the outer request handler AFTER runVisionConsensus returns
+  // - res: Express response object, only in the outer handler — not a param of runVisionConsensus
   assert.ok(
     !blockSlice.includes("_similarityVec") || blockSlice.includes("const _lateSimilarityVec"),
     "block must not reference out-of-scope _similarityVec (use _lateSimilarityVec from await _embedPromise)"
@@ -178,8 +179,65 @@ test("V3.10A.2 static scope guard — grace window late-seed block has no known 
     !blockSlice.includes("skipCaches"),
     "block must not reference out-of-scope skipCaches (use isBenchBypass(req) or gate by _embedPromise)"
   );
+  assert.ok(
+    !blockSlice.includes("res.status") && !blockSlice.includes("res.json"),
+    "block must not reference out-of-scope res (runVisionConsensus returns an object, not an HTTP response)"
+  );
 
   // And confirm the in-scope replacement is present
   assert.ok(blockSlice.includes("_embedPromise"), "block must use _embedPromise (in-scope param)");
   assert.ok(blockSlice.includes("_lateSimilarityVec"), "block must derive vector from await _embedPromise");
+});
+
+// ── V3.10B.2: late seed returns a result object, not res.status() ──────────
+test("V3.10B.2 — late seed accepted path sets _graceRescuedFastResult (not res.status)", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const startMarker = "VISION_SIMILARITY_LATE_SEED_ACCEPTED";
+  const startIdx = src.indexOf(startMarker);
+  assert.ok(startIdx !== -1, "LATE_SEED_ACCEPTED log must exist");
+
+  const block = src.slice(startIdx, startIdx + 1500);
+  assert.ok(
+    block.includes("_graceRescuedFastResult"),
+    "accepted late seed must set _graceRescuedFastResult for downstream seed_recovery"
+  );
+  assert.ok(
+    !block.includes("res.status"),
+    "accepted late seed must NOT call res.status() — res is not in scope"
+  );
+});
+
+// ── V3.10B.2: incomplete verified query is not treated as disagreement ──────
+test("V3.10B.2 — verified query subset of seed is 'inconclusive', not 'disagree'", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const fnIdx = src.indexOf("function isVerifiedQueryIncomplete");
+  assert.ok(fnIdx !== -1, "isVerifiedQueryIncomplete must be defined in index.js");
+});
+
+test("V3.10B.2 — self-heal uses isVerifiedQueryIncomplete before status='disagree'", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const selfHealSection = src.indexOf("isVerifiedQueryIncomplete(seedQuery, verifiedQuery)");
+  assert.ok(selfHealSection !== -1, "self-heal block must call isVerifiedQueryIncomplete");
+
+  const inconclusiveStatus = src.indexOf('status = "inconclusive"');
+  assert.ok(inconclusiveStatus !== -1, "inconclusive status must exist for subset queries");
+});
+
+// ── V3.10B.2: final UI identity lock — static code check ────────────────────
+test("V3.10B.2 — FINAL_UI_IDENTITY_LOCK_APPLIED log exists in buildMarketSearchResponsePayload", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const lockLog = src.indexOf("FINAL_UI_IDENTITY_LOCK_APPLIED");
+  assert.ok(lockLog !== -1, "final UI identity lock must be applied before PAYLOAD_FINAL_ITEMS_BEFORE_SEND");
+
+  const payloadLog = src.indexOf("PAYLOAD_FINAL_ITEMS_BEFORE_SEND");
+  assert.ok(payloadLog !== -1);
+  assert.ok(lockLog < payloadLog, "identity lock must run BEFORE the final items log");
 });

@@ -19616,6 +19616,32 @@ function extractOpenAiUsage(usage) {
   return { inputTokens, cachedInputTokens, outputTokens, totalTokens };
 }
 
+// Phase V3.10B.2: detect when the verified query is an incomplete subset of the
+// seed rather than a genuine contradiction. "Hawaiian Airlines diecast model airplane"
+// is a subset of "Hawaiian Airlines Boeing 787 diecast model airplane" — it's
+// missing information (the family), not providing contradictory information.
+// Only consider it a true disagreement if the verified query contains tokens
+// that actively CONFLICT with the seed (different airline, different family).
+function isVerifiedQueryIncomplete(seedQuery, verifiedQuery) {
+  if (!seedQuery || !verifiedQuery) return false;
+  const seedNorm     = normalizeTitleKey(seedQuery);
+  const verifiedNorm = normalizeTitleKey(verifiedQuery);
+  if (seedNorm === verifiedNorm) return false;
+  const seedTokens     = new Set(seedNorm.split(/\s+/).filter(Boolean));
+  const verifiedTokens = verifiedNorm.split(/\s+/).filter(Boolean);
+  if (verifiedTokens.length >= seedTokens.size) return false;
+  const allVerifiedInSeed = verifiedTokens.every((t) => seedTokens.has(t));
+  if (!allVerifiedInSeed) return false;
+  const _seedAirline     = detectAirlineLockInQuery(seedNorm);
+  const _verifiedAirline = detectAirlineLockInQuery(verifiedNorm);
+  if (_seedAirline && _verifiedAirline &&
+      _seedAirline.requiredAirline !== _verifiedAirline.requiredAirline) return false;
+  const _seedFamily    = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((t) => seedNorm.includes(t)));
+  const _verifiedFamily = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((t) => verifiedNorm.includes(t)));
+  if (_seedFamily && _verifiedFamily && _seedFamily.family !== _verifiedFamily.family) return false;
+  return true;
+}
+
 // Phase V3: fire-and-forget background verification for a provisional similarity
 // seed. Runs the real query_fast pass on the downscaled image and logs whether
 // OpenAI agrees with the cached identity. NEVER blocks the response.
@@ -19649,6 +19675,9 @@ function _launchProvisionalSeedVerification({ req, file, mode, propContext, seed
       } else if (normalizeTitleKey(verifiedQuery) === normalizeTitleKey(seedQuery)) {
         status = "confirmed"; agree = true;
         note   = "openai_confirms_seed";
+      } else if (isVerifiedQueryIncomplete(seedQuery, verifiedQuery)) {
+        status = "inconclusive"; agree = null;
+        note   = "verified_query_is_subset_of_seed_not_contradiction";
       } else {
         status = "disagree"; agree = false;
         note   = "openai_disagrees";
@@ -20662,19 +20691,19 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                 confidence: _lateCappedConf, graceMs: _noSeedGraceMs,
                 elapsedMs: Date.now() - _graceT0,
               });
-              return res.status(200).json({
-                ...(_lateHit.payload),
-                imageHash,
-                query:           _lateSeedQuery,
-                confidence:      _lateCappedConf,
-                category:        _lateSeedCat,
+              raceWinner = "fast";
+              _graceRescuedFastResult = {
+                parsed: {
+                  query:      _lateSeedQuery,
+                  confidence: _lateCappedConf,
+                  identity:   { category: _lateSeedCat, ...(_lateHit.payload?.visionIdentity || _lateHit.payload?.identity || {}) },
+                  variants:   Array.isArray(_lateHit.payload?.variants) ? _lateHit.payload.variants : [],
+                  attributeCertainty: _lateHit.payload?.attributeCertainty || {},
+                },
                 source:          "similarity_late_seed",
                 cacheSource:     "similarity_late_seed",
-                cached:          true,
-                provisional:     true,
-                similarityScore: _lateHit.similarity,
-                cacheHit:        true,
-              });
+                rescuedByGrace:  true,
+              };
             } else {
               console.log("VISION_SIMILARITY_LATE_SEED_REJECTED", {
                 rid: req.rid, reason: _lateEval.reason,
@@ -25397,7 +25426,7 @@ async function buildMarketSearchResponsePayload({
   }
 
   const _t_finalUi = Date.now();
-  const { uiItems, intelligence } = await buildFinalUiItemsWithIntelligence(
+  let { uiItems, intelligence } = await buildFinalUiItemsWithIntelligence(
     activeQuery,
     sourceItems,
     {
@@ -25406,6 +25435,37 @@ async function buildMarketSearchResponsePayload({
     }
   );
   _bmLog("buildFinalUiItemsWithIntelligence", _t_finalUi);
+
+  // Phase V3.10B.2: apply aircraft identity lock to final UI items.
+  // rankVisualComps + rerankWithIntelligence can reorder items and the oracle
+  // path may inject competitors that weren't filtered at the retrieval stage.
+  const _uiAirlineLock = detectAirlineLockInQuery(normalizeTitleKey(activeQuery));
+  if (_uiAirlineLock && uiItems.length > 0) {
+    const _uiBeforeCount = uiItems.length;
+    const _uiFiltered = uiItems.filter((it) => {
+      const t = normalizeTitleKey(it?.title || "");
+      const hasRequired = titleHasToken(t, _uiAirlineLock.requiredAirline);
+      const hasCompetitor = _uiAirlineLock.competitors.some((c) => {
+        if (titleHasToken(t, c)) return true;
+        const aliases = COMPETITOR_AIRCRAFT_ALIASES[c] || [];
+        return aliases.some((alias) => titleHasToken(t, alias));
+      });
+      return hasRequired || !hasCompetitor;
+    });
+    if (_uiFiltered.length >= 2) {
+      const _uiRejected = _uiBeforeCount - _uiFiltered.length;
+      if (_uiRejected > 0) {
+        console.log("FINAL_UI_IDENTITY_LOCK_APPLIED", {
+          query: activeQuery,
+          requiredAirline: _uiAirlineLock.requiredAirline,
+          beforeCount: _uiBeforeCount,
+          afterCount: _uiFiltered.length,
+          rejectedCompetitorCount: _uiRejected,
+        });
+      }
+      uiItems = _uiFiltered;
+    }
+  }
 
   try {
     const _pfTop5src = (sourceItems || []).slice(0, 5).map((i) => ({ title: i?.title, price: i?.price, source: i?.source }));
@@ -29836,16 +29896,17 @@ if (_nonStreamGenericPremiumAircraft) {
     reason: "generic_aircraft_no_identity_premium_price",
   });
 }
-// Phase V3.9B.1: check source unavailability before the oracle decision.
-// Mirrors the same guard in the stream path (~31351). Must be computed here
-// (after all source fallbacks have run) so it reflects the live cooldown state.
-const _nonStreamSourceGuard = shouldSkipOracleSourceUnavailable({
-  serpCooling: isSourceCoolingDown("serpapi"),
-  ebayAvail:   hasEbayApi(),
-  itemCount:   Array.isArray(items) ? items.length : 0,
-});
+// Phase V3.10B.2: recompute source-unavailable guard IMMEDIATELY before oracle.
+// The old _nonStreamSourceGuard was computed once and reused, but SerpAPI can
+// transition to cooling DURING the source attempt phase (429 increments failures).
+// Fresh recomputation here captures the live cooldown state at decision time.
 let _oracleOnlyResult = false;
 if (!Array.isArray(items) || items.length < 4) {
+  const _freshOracleGuard = shouldSkipOracleSourceUnavailable({
+    serpCooling: isSourceCoolingDown("serpapi"),
+    ebayAvail:   hasEbayApi(),
+    itemCount:   Array.isArray(items) ? items.length : 0,
+  });
   if (_nonStreamIncompleteAircraft.incomplete) {
     console.log("ORACLE_SKIPPED_INCOMPLETE_AIRCRAFT_IDENTITY", {
       route: "/market/search", query,
@@ -29857,10 +29918,10 @@ if (!Array.isArray(items) || items.length < 4) {
       route: "/market/search", query, scannedPrice,
       reason: "generic_aircraft_no_identity_premium_price",
     });
-  } else if (_nonStreamSourceGuard.skip) {
+  } else if (_freshOracleGuard.skip) {
     console.log("ROUTE_ORACLE_SKIPPED_SOURCE_UNAVAILABLE_NO_MARKET_DATA", {
       route: "/market/search", query,
-      reason: _nonStreamSourceGuard.reason,
+      reason: _freshOracleGuard.reason,
       serpCooling: isSourceCoolingDown("serpapi"),
       ebayAvailable: hasEbayApi(),
     });
@@ -29887,6 +29948,11 @@ if (!Array.isArray(items) || items.length < 4) {
 // V3.10B.1: _legacyFallbackUsed gates all downstream cache writes so legacy
 // pricing-only data never poisons SERP_CACHE, ENRICHED_SCAN_CACHE, or v7 snapshots.
 let _legacyFallbackUsed = false;
+const _nonStreamSourceGuard = shouldSkipOracleSourceUnavailable({
+  serpCooling: isSourceCoolingDown("serpapi"),
+  ebayAvail:   hasEbayApi(),
+  itemCount:   Array.isArray(items) ? items.length : 0,
+});
 if ((!Array.isArray(items) || items.length === 0) && _nonStreamSourceGuard.skip) {
   const _legacyDecision = shouldAttemptLegacySnapshot({
     serpCooling: isSourceCoolingDown("serpapi"),
@@ -31023,7 +31089,61 @@ app.post("/market/search/stream", async (req, res) => {
         return;
       }
 
-      // 3) all zero-cost sources missed → honest empty (no paid call spent).
+      // 3) Phase V3.10B.2: try legacy snapshot before returning empty.
+      //    Primary sources are unavailable (SLA exhausted) and current-version
+      //    snapshot missed. A version-mismatched (legacy) snapshot may still
+      //    have usable pricing data. Never write caches from this path.
+      {
+        const _slaLegacyGuard = shouldAttemptLegacySnapshot({
+          serpCooling: isSourceCoolingDown("serpapi"),
+          ebayAvail:   hasEbayApi(),
+          currentVersionHit: false,
+          hasOldSnapshot: true,
+        });
+        if (_slaLegacyGuard.attempt) {
+          console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_CONSIDERED", {
+            rid: req.rid, scanId, query,
+            serpCooling: isSourceCoolingDown("serpapi"),
+            ebayAvailable: hasEbayApi(),
+            path: "sla_exhausted_stream",
+          });
+          try {
+            const _slaLegacySnap = await readLegacySnapshotFallback(query);
+            if (_slaLegacySnap?.items?.length) {
+              const _slaLegacyPolicy = resolveAircraftCachePolicy(query, _slaLegacySnap.items, scannedPrice, "legacy_snapshot");
+              const _slaLegacyItems = _slaLegacyPolicy.action !== "bypass_stale_cache" ? _slaLegacyPolicy.items : [];
+              if (_slaLegacyItems.length >= LEGACY_SNAPSHOT_MIN_CLEAN) {
+                console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_USED", {
+                  rid: req.rid, scanId, query,
+                  version: _slaLegacySnap._snapshotVersion,
+                  itemCount: _slaLegacyItems.length,
+                  source: "legacy_snapshot_source_unavailable",
+                  path: "sla_exhausted_stream",
+                });
+                const _slaLegacyPayload = await _buildPayload(_slaLegacyItems, {
+                  source: "legacy_snapshot_source_unavailable",
+                  kind:   "legacy_snapshot_source_unavailable",
+                });
+                const _slaLegacyVerdict =
+                  normalizeVerdict(_slaLegacyPayload?.buyOrPass?.verdict) ||
+                  normalizeVerdict(_slaLegacyPayload?.profitIntel?.verdict) ||
+                  "HOLD";
+                send("complete", {
+                  ..._slaLegacyPayload,
+                  verdict: _slaLegacyVerdict,
+                  cacheFallback: true, slaExhausted: true,
+                  status: "complete",
+                  source: "legacy_snapshot_source_unavailable",
+                });
+                endStream();
+                return;
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // 4) all zero-cost sources missed → honest empty (no paid call spent).
       console.log(_slaDecision.log, {
         rid: req.rid, scanId, query,
         snapshotItems: _slaSnapItems.length, cleanCount: _slaCleanCount,
