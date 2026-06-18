@@ -20151,6 +20151,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     // runVisionPass call. Resolves with null immediately if master is aborted
     // before launch (via the abort event listener below).
     let masterLaunched = false;
+    let _masterBgRegistered = false;   // V3.10B.5: prevent double-registration of bg recovery
     let _masterResolve;
     const masterPromise = new Promise((res) => { _masterResolve = res; });
     masterAbortCtrl.signal.addEventListener("abort", () => {
@@ -20183,6 +20184,89 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     const masterLaunchTimer = setTimeout(launchMasterNow, VISUAL_SHAPE_TIMEOUT_MS + 500);
     if (typeof masterLaunchTimer.unref === "function") masterLaunchTimer.unref();
     masterPromise.catch(() => null);
+
+    // Phase V3.10B.5: keep the master pass alive in the background and store its
+    // result for frontend salvage long-poll (/api/vision/background-result).
+    // Shared by the hard_deadline no-seed path AND the incomplete-aircraft
+    // query_fast rejection — both return early without a usable seed, but master
+    // (gpt-4.1) typically recovers the exact identity a few seconds later. This is
+    // the mechanism that recovers e.g. "Hawaiian Airlines Boeing 787 Dreamliner"
+    // after a fast-pass miss. Idempotent; safe to call from either path.
+    const _registerMasterBackgroundRecovery = () => {
+      if (_masterBgRegistered) return;
+      if (!(VISION_MASTER_BACKGROUND_ENABLED && masterLaunched && !masterAbortCtrl.signal.aborted)) return;
+      _masterBgRegistered = true;
+      console.log("VISION_MASTER_BACKGROUND_STARTED", { rid: req.rid, elapsedMs: Date.now() - passT0 });
+      masterPromise.then((m) => {
+        const _bgQuery      = m?.parsed?.query || null;
+        const _bgElapsedMs  = Date.now() - passT0;
+        console.log("VISION_MASTER_BACKGROUND_COMPLETED", {
+          rid: req.rid, query: _bgQuery, confidence: m?.parsed?.confidence ?? null, elapsedMs: _bgElapsedMs,
+        });
+        // Phase 4H.5/4H.6: store usable background identity for frontend salvage polling.
+        // Aircraft queries: if airline is present but no family, try to recover family
+        // from variants before storing. If unrecoverable, mark needsFamilyRecovery.
+        if (isUsableVisionSeed(_bgQuery) && imageHash) {
+          const _bgVariants  = Array.isArray(m?.parsed?.variants) ? m.parsed.variants : [];
+          const _bgCategory  = String(m?.parsed?.identity?.category || "") || null;
+          let _storedQuery   = _bgQuery;
+          let _needsFamily   = false;
+
+          const _bgQNorm = normalizeTitleKey(_bgQuery || "");
+          const _bgHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => _bgQNorm.includes(tok)));
+          const _bgAirlineLock = detectAirlineLockInQuery(_bgQNorm);
+          if (_bgAirlineLock && !_bgHasFamily) {
+            console.log("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE", {
+              rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.requiredAirline || null,
+            });
+            // Try to recover family from variants
+            let _recoveredQuery = null;
+            for (const v of _bgVariants) {
+              const vNorm = normalizeTitleKey(v);
+              const vHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => vNorm.includes(tok)));
+              if (vHasFamily) {
+                _recoveredQuery = v;
+                break;
+              }
+            }
+            if (_recoveredQuery) {
+              _storedQuery = _recoveredQuery;
+              console.log("AIRCRAFT_BACKGROUND_QUERY_FAMILY_RECOVERED", {
+                rid: req.rid, original: _bgQuery, recovered: _storedQuery,
+              });
+            } else {
+              _needsFamily = true;
+              console.log("AIRCRAFT_BACKGROUND_QUERY_NEEDS_FAMILY_RECOVERY", {
+                rid: req.rid, query: _bgQuery,
+              });
+            }
+          }
+
+          const _bgEntry = {
+            query:              _storedQuery,
+            variants:           _bgVariants,
+            confidence:         Number(m?.parsed?.confidence || 0.7),
+            visionIdentity:     m?.parsed?.identity || null,
+            category:           _bgCategory,
+            completedAt:        Date.now(),
+            elapsedMs:          _bgElapsedMs,
+            needsFamilyRecovery: _needsFamily || undefined,
+          };
+          // Phase 4K.3: master uses the same quality-aware setter so it cannot
+          // blindly assassinate a stronger late result stored by fast/visual/query_fast.
+          const _masterStored = setBackgroundVisionResultIfBetter(imageHash, _bgEntry, { pass: "master", keyKind: "imageHash" });
+          if (_masterStored) {
+            console.log("VISION_BACKGROUND_RESULT_STORED", {
+              rid: req.rid, imageHash, query: _storedQuery,
+              originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
+              elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
+            });
+          }
+        } else if (_bgQuery) {
+          console.log("VISION_BACKGROUND_RESULT_REJECTED_GENERIC", { rid: req.rid, imageHash, query: _bgQuery });
+        }
+      }).catch(() => {});
+    };
 
     // Hard consensus-layer deadline for visual_shape. The `timeoutMs` above
     // caps the OpenAI call inside runVisionPass at VISUAL_SHAPE_TIMEOUT_MS,
@@ -20474,19 +20558,28 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       }
 
       // Phase V3.10B.4: if aircraft family was needed but NOT recovered, reject
-      // query_fast entirely. Do not proceed to market with a generic airline-only
-      // query. Return an explicit incomplete identity payload so the client shows
-      // a retry message instead of burning SerpAPI on a garbage search.
+      // query_fast as a market seed. Do not proceed to market with a generic
+      // airline-only query. Return an explicit incomplete identity payload.
+      //
+      // Phase V3.10B.5: do NOT abort master. The fast/visual losers are cancelled,
+      // but master (gpt-4.1) typically recovers the exact aircraft family a few
+      // seconds later — keep it alive in the background and store its result so the
+      // frontend salvage long-poll (/api/vision/background-result) can upgrade the
+      // generic seed to the exact identity, exactly as the hard_deadline path does.
+      // The generic query still never reaches market; only the exact recovered
+      // identity (with family) can, via the client re-issuing market with it.
       if (qfAcceptance.needsAircraftFamilyRefinement && !_refinementApplied) {
         try { queryFastAbortCtrl.abort(); } catch {}
         try { fastAbortCtrl.abort(); } catch {}
         try { visualAbortCtrl.abort(); } catch {}
-        try { masterAbortCtrl.abort(); } catch {}
+        launchMasterNow();                       // idempotent — ensure master is running
+        _registerMasterBackgroundRecovery();     // store master result for salvage long-poll
         const _incWallMs = Date.now() - passT0;
         console.log("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT", {
           rid: req.rid, query: qfQuery, category: qfCategory,
           reason: "airline_present_family_missing_refinement_failed",
           refinementMs: _refinementMs, wallMs: _incWallMs,
+          masterBackgroundContinued: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
         });
         return {
           ok:                 false,
@@ -20502,7 +20595,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           visionTimings: {
             queryFastMs: queryFastMs, fastMs: null, visualMs: null, masterMs: null,
             visionWallMs: _incWallMs, raceWinner: "query_fast",
-            masterLaunched: false, tier: "incomplete_aircraft_identity",
+            masterLaunched: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
+            tier: "incomplete_aircraft_identity",
           },
         };
       }
@@ -20928,78 +21022,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         fastCancelled: !!fastResult?.cancelled, visualCancelled: !!visualResult?.cancelled,
         masterBackgroundEnabled: VISION_MASTER_BACKGROUND_ENABLED, masterLaunched,
       });
-      if (VISION_MASTER_BACKGROUND_ENABLED && masterLaunched && !masterAbortCtrl.signal.aborted) {
-        console.log("VISION_MASTER_BACKGROUND_STARTED", { rid: req.rid, elapsedMs: Date.now() - passT0 });
-        masterPromise.then((m) => {
-          const _bgQuery      = m?.parsed?.query || null;
-          const _bgElapsedMs  = Date.now() - passT0;
-          console.log("VISION_MASTER_BACKGROUND_COMPLETED", {
-            rid: req.rid, query: _bgQuery, confidence: m?.parsed?.confidence ?? null, elapsedMs: _bgElapsedMs,
-          });
-          // Phase 4H.5/4H.6: store usable background identity for frontend salvage polling.
-          // Aircraft queries: if airline is present but no family, try to recover family
-          // from variants before storing. If unrecoverable, mark needsFamilyRecovery.
-          if (isUsableVisionSeed(_bgQuery) && imageHash) {
-            const _bgVariants  = Array.isArray(m?.parsed?.variants) ? m.parsed.variants : [];
-            const _bgCategory  = String(m?.parsed?.identity?.category || "") || null;
-            let _storedQuery   = _bgQuery;
-            let _needsFamily   = false;
-
-            const _bgQNorm = normalizeTitleKey(_bgQuery || "");
-            const _bgHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => _bgQNorm.includes(tok)));
-            const _bgAirlineLock = detectAirlineLockInQuery(_bgQNorm);
-            if (_bgAirlineLock && !_bgHasFamily) {
-              console.log("AIRCRAFT_BACKGROUND_QUERY_INCOMPLETE", {
-                rid: req.rid, query: _bgQuery, airlineLock: _bgAirlineLock?.requiredAirline || null,
-              });
-              // Try to recover family from variants
-              let _recoveredQuery = null;
-              for (const v of _bgVariants) {
-                const vNorm = normalizeTitleKey(v);
-                const vHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => vNorm.includes(tok)));
-                if (vHasFamily) {
-                  _recoveredQuery = v;
-                  break;
-                }
-              }
-              if (_recoveredQuery) {
-                _storedQuery = _recoveredQuery;
-                console.log("AIRCRAFT_BACKGROUND_QUERY_FAMILY_RECOVERED", {
-                  rid: req.rid, original: _bgQuery, recovered: _storedQuery,
-                });
-              } else {
-                _needsFamily = true;
-                console.log("AIRCRAFT_BACKGROUND_QUERY_NEEDS_FAMILY_RECOVERY", {
-                  rid: req.rid, query: _bgQuery,
-                });
-              }
-            }
-
-            const _bgEntry = {
-              query:              _storedQuery,
-              variants:           _bgVariants,
-              confidence:         Number(m?.parsed?.confidence || 0.7),
-              visionIdentity:     m?.parsed?.identity || null,
-              category:           _bgCategory,
-              completedAt:        Date.now(),
-              elapsedMs:          _bgElapsedMs,
-              needsFamilyRecovery: _needsFamily || undefined,
-            };
-            // Phase 4K.3: master uses the same quality-aware setter so it cannot
-            // blindly assassinate a stronger late result stored by fast/visual/query_fast.
-            const _masterStored = setBackgroundVisionResultIfBetter(imageHash, _bgEntry, { pass: "master", keyKind: "imageHash" });
-            if (_masterStored) {
-              console.log("VISION_BACKGROUND_RESULT_STORED", {
-                rid: req.rid, imageHash, query: _storedQuery,
-                originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
-                elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
-              });
-            }
-          } else if (_bgQuery) {
-            console.log("VISION_BACKGROUND_RESULT_REJECTED_GENERIC", { rid: req.rid, imageHash, query: _bgQuery });
-          }
-        }).catch(() => {});
-      }
+      _registerMasterBackgroundRecovery();
     }
 
     // Capture hoisted vars so visionTimings return + logs outside this block can read them.

@@ -299,11 +299,64 @@ test("V3.10B.4 — static: incomplete aircraft returns incompleteIdentity payloa
 
   const marker = src.indexOf("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT");
   assert.ok(marker !== -1);
-  const returnBlock = src.slice(marker, marker + 800);
+  const returnBlock = src.slice(marker, marker + 900);
   assert.ok(returnBlock.includes("incompleteIdentity: true"), "must return incompleteIdentity");
   assert.ok(returnBlock.includes('"INCOMPLETE_AIRCRAFT_IDENTITY"'), "must set error code");
-  assert.ok(returnBlock.includes("masterSkipped") === false || returnBlock.includes("masterLaunched: false"),
-    "must not claim master was launched");
+});
+
+// ── V3.10B.5: incomplete-aircraft rejection must NOT abort master ──────────────
+// node --check cannot catch this: aborting master here silently kills the
+// background long-poll recovery that produces the exact aircraft identity.
+test("V3.10B.5 — static: incomplete aircraft rejection keeps master alive for background recovery", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const marker = src.indexOf("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(marker !== -1, "rejection log must exist");
+  // Slice from just BEFORE the rejection block (the aborts precede the log) to the return.
+  const block = src.slice(marker - 400, marker + 900);
+
+  assert.ok(
+    !block.includes("masterAbortCtrl.abort()"),
+    "rejection branch must NOT abort master — it kills background identity recovery"
+  );
+  assert.ok(
+    block.includes("_registerMasterBackgroundRecovery()"),
+    "rejection branch must register master background recovery for salvage long-poll"
+  );
+  assert.ok(
+    block.includes("launchMasterNow()"),
+    "rejection branch must ensure master is launched"
+  );
+  // The returned payload must not hardcode masterLaunched:false (the old regression).
+  assert.ok(
+    !block.includes("masterLaunched: false"),
+    "rejection branch must not hardcode masterLaunched:false"
+  );
+});
+
+// ── V3.10B.5: shared background-recovery helper used by BOTH no-seed paths ──────
+test("V3.10B.5 — static: background-recovery helper is defined and used by hard_deadline + incomplete paths", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const def = src.indexOf("const _registerMasterBackgroundRecovery =");
+  assert.ok(def !== -1, "helper must be defined once");
+
+  // Used at exactly two call sites (hard_deadline + incomplete-aircraft rejection),
+  // plus the definition = 3 textual occurrences total.
+  const occurrences = src.split("_registerMasterBackgroundRecovery").length - 1;
+  assert.ok(occurrences >= 3, `helper must be defined and called from both no-seed paths (found ${occurrences} refs)`);
+
+  // The hard_deadline path must still trigger background recovery (extraction must
+  // not have dropped it).
+  const hardTimeout = src.indexOf("VISION_FIRST_QUERY_HARD_TIMEOUT");
+  assert.ok(hardTimeout !== -1);
+  const hardBlock = src.slice(hardTimeout, hardTimeout + 600);
+  assert.ok(
+    hardBlock.includes("_registerMasterBackgroundRecovery()"),
+    "hard_deadline path must still register master background recovery"
+  );
 });
 
 test("V3.10B.4 — static: market stream blocks incomplete aircraft pre-source", () => {
