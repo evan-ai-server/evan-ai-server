@@ -188,3 +188,19 @@ test("V3.10B.2 — legacy items below LEGACY_SNAPSHOT_MIN_CLEAN are rejected", (
   assert.equal(sanitized.length, LEGACY_SNAPSHOT_MIN_CLEAN - 1);
   assert.ok(sanitized.length < LEGACY_SNAPSHOT_MIN_CLEAN, "below min clean → caller must reject");
 });
+
+// ── V3.10B.4: legacy fallback rejects incomplete aircraft ────────────────────
+
+test("V3.10B.4 — static: readLegacySnapshotFallback rejects incomplete aircraft", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const rejLog = src.indexOf("incomplete_aircraft_identity_missing_family");
+  assert.ok(rejLog !== -1, "legacy fallback must reject incomplete aircraft with reason");
+
+  const fnStart = src.indexOf("async function readLegacySnapshotFallback");
+  assert.ok(fnStart !== -1);
+  assert.ok(rejLog > fnStart, "rejection must be inside readLegacySnapshotFallback");
+});

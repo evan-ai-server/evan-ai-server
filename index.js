@@ -15521,6 +15521,19 @@ async function readLegacySnapshotFallback(query = "") {
   const q = normalizeQuery(query);
   if (!q) return null;
 
+  // Phase V3.10B.4: reject incomplete aircraft queries. A generic airline-only
+  // query (e.g. "hawaiian airlines model airplane") must not use a legacy snapshot
+  // keyed to the exact family query ("hawaiian airlines boeing 787...") — no
+  // unsafe family grafting.
+  const _legacyAircraftCheck = detectIncompleteAircraftIdentityQuery(q);
+  if (_legacyAircraftCheck.incomplete) {
+    console.log("LEGACY_SNAPSHOT_SOURCE_UNAVAILABLE_REJECTED", {
+      query: q, reason: "incomplete_aircraft_identity_missing_family",
+      requiredAirline: _legacyAircraftCheck.requiredAirline,
+    });
+    return null;
+  }
+
   let raw = null;
   try {
     raw = await cacheGet(internalMarketSnapshotRedisKey(q));
@@ -20349,7 +20362,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
 
       // Identity completeness check — aircraft diecast requires airline + family.
       // Use detectAirlineLockInQuery for hasAirline so it matches VISION_QUERY_FAST_BRAND_POLICY.
-      const _completenessLock = detectAirlineLockInQuery(qfQuery || "");
+      // Must normalize first: titleHasToken is case-sensitive, and qfQuery is raw mixed-case.
+      const _completenessLock = detectAirlineLockInQuery(normalizeTitleKey(qfQuery || ""));
       console.log("AIRCRAFT_IDENTITY_COMPLETENESS_CHECK", {
         rid: req.rid, query: qfQuery, category: qfCategory,
         hasAirline: !!_completenessLock?.requiredAirline,
@@ -20457,6 +20471,40 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           refinementApplied: _refinementApplied, refinementSource: _refinementSource,
           refinementMs: _refinementMs,
         });
+      }
+
+      // Phase V3.10B.4: if aircraft family was needed but NOT recovered, reject
+      // query_fast entirely. Do not proceed to market with a generic airline-only
+      // query. Return an explicit incomplete identity payload so the client shows
+      // a retry message instead of burning SerpAPI on a garbage search.
+      if (qfAcceptance.needsAircraftFamilyRefinement && !_refinementApplied) {
+        try { queryFastAbortCtrl.abort(); } catch {}
+        try { fastAbortCtrl.abort(); } catch {}
+        try { visualAbortCtrl.abort(); } catch {}
+        try { masterAbortCtrl.abort(); } catch {}
+        const _incWallMs = Date.now() - passT0;
+        console.log("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT", {
+          rid: req.rid, query: qfQuery, category: qfCategory,
+          reason: "airline_present_family_missing_refinement_failed",
+          refinementMs: _refinementMs, wallMs: _incWallMs,
+        });
+        return {
+          ok:                 false,
+          query:              null,
+          confidence:         0,
+          imageHash:          imageHash || null,
+          visionTier:         "incomplete_aircraft_identity",
+          incompleteIdentity: true,
+          incompleteReason:   "airline_present_family_missing",
+          error:              "INCOMPLETE_AIRCRAFT_IDENTITY",
+          userMessage:        "Couldn't confirm the exact aircraft model — try scanning again",
+          retryable:          true,
+          visionTimings: {
+            queryFastMs: queryFastMs, fastMs: null, visualMs: null, masterMs: null,
+            visionWallMs: _incWallMs, raceWinner: "query_fast",
+            masterLaunched: false, tier: "incomplete_aircraft_identity",
+          },
+        };
       }
 
       // Now cancel everything still in flight.
@@ -22751,6 +22799,20 @@ if (!openai) {
           imageHash: originalHash || result.imageHash || null,
           visionTier: result.visionTier || "model_circuit_open",
           reason: result.reason || "model_circuit_open_all_passes",
+          totalMs: Date.now() - _epT0,
+        });
+        return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
+      }
+
+      // Phase V3.10B.4: incomplete aircraft identity — airline detected but no
+      // family/manufacturer recovered within the refinement window. Return the
+      // payload verbatim so the client shows a retry UI instead of searching
+      // market with a generic airline-only query.
+      if (result?.incompleteIdentity === true) {
+        console.log("VISION_INCOMPLETE_AIRCRAFT_IDENTITY_RESPONSE", {
+          rid: req.rid,
+          imageHash: originalHash || result.imageHash || null,
+          incompleteReason: result.incompleteReason || "unknown",
           totalMs: Date.now() - _epT0,
         });
         return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
@@ -29796,10 +29858,21 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   return res.status(200).json(responsePayload);
 }
 
+// Phase V3.10B.4: block market for incomplete aircraft before any SerpAPI call.
+const _preMarketAircraftCheck = detectIncompleteAircraftIdentityQuery(query);
+if (_preMarketAircraftCheck.incomplete) {
+  console.log("MARKET_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_PRE_SOURCE", {
+    route: "/market/search", query,
+    requiredAirline: _preMarketAircraftCheck.requiredAirline,
+    reason: "airline_present_family_missing_no_source_call",
+  });
+  items = [];
+}
+
 const _nonStreamRetrievalSummary = createEmptyIdentitySummary();
 // withInflight returns a packed { items, identitySummary } object so the identity
 // summary survives route cache hits, singleflight coalescing, and instant-scan cache hits.
-const _packedMarketResult = await withInflight(cacheKey, async () => {
+const _packedMarketResult = _preMarketAircraftCheck.incomplete ? packMarketItemsWithIdentity([], _nonStreamRetrievalSummary) : await withInflight(cacheKey, async () => {
   const routeCacheKey = `market_route_result:${cacheKey}`;
   const cachedResult = await cacheGet(routeCacheKey);
 
@@ -31660,6 +31733,26 @@ app.post("/market/search/stream", async (req, res) => {
       clearTimeout(_syntheticTimer);
       return _onEarlyItems(earlyRaw);
     };
+
+    // Phase V3.10B.4: block market before SerpAPI for incomplete aircraft identity.
+    const _streamPreMarketAircraftCheck = detectIncompleteAircraftIdentityQuery(query);
+    if (_streamPreMarketAircraftCheck.incomplete) {
+      console.log("MARKET_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_PRE_SOURCE", {
+        rid: req.rid, scanId, query,
+        requiredAirline: _streamPreMarketAircraftCheck.requiredAirline,
+        reason: "airline_present_family_missing_no_source_call",
+        route: "/market/search/stream",
+      });
+      clearTimeout(_syntheticTimer);
+      send("complete", {
+        items: [], reason: "incomplete_aircraft_identity", displayMode: "rescan_needed",
+        trust: "none", incompleteIdentity: true,
+        incompleteReason: "airline_present_family_missing",
+        userMessage: "Couldn't confirm the exact aircraft model — try scanning again",
+      });
+      endStream();
+      return;
+    }
 
     // In-flight dedup: share the Phase 1 promise across concurrent identical scans.
     // earlyItemsCb is only wired for the FIRST request — inflight hits get phase1Items directly.

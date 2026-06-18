@@ -275,3 +275,58 @@ test("V3.10B.3 — final UI identity lock assigns filtered even when < 2 items r
     "final UI identity lock must NOT have a >= 2 floor — zero honest items is better than competitor junk"
   );
 });
+
+// ── V3.10B.4: query_fast rejected for incomplete aircraft → no VISION_QUERY_FAST_ACCEPTED
+test("V3.10B.4 — static: AIRCRAFT_IDENTITY_INCOMPLETE_QUERY_FAST_REJECTED block does not also accept", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const rejIdx = src.indexOf("AIRCRAFT_IDENTITY_INCOMPLETE_QUERY_FAST_REJECTED");
+  assert.ok(rejIdx !== -1, "rejection log must exist");
+
+  // The rejection block sits inside the refinement failure path. After it,
+  // the code must return before reaching VISION_QUERY_FAST_ACCEPTED.
+  // Check that VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT exists
+  // (the new hard rejection that returns before acceptance).
+  const hardReject = src.indexOf("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(hardReject !== -1, "hard rejection log must exist after failed refinement");
+  assert.ok(hardReject > rejIdx, "hard rejection must follow the refinement failure log");
+});
+
+test("V3.10B.4 — static: incomplete aircraft returns incompleteIdentity payload (not query_fast accepted)", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const marker = src.indexOf("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(marker !== -1);
+  const returnBlock = src.slice(marker, marker + 800);
+  assert.ok(returnBlock.includes("incompleteIdentity: true"), "must return incompleteIdentity");
+  assert.ok(returnBlock.includes('"INCOMPLETE_AIRCRAFT_IDENTITY"'), "must set error code");
+  assert.ok(returnBlock.includes("masterSkipped") === false || returnBlock.includes("masterLaunched: false"),
+    "must not claim master was launched");
+});
+
+test("V3.10B.4 — static: market stream blocks incomplete aircraft pre-source", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const streamGuard = src.indexOf("MARKET_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_PRE_SOURCE");
+  assert.ok(streamGuard !== -1, "stream pre-source block must exist");
+  const guardBlock = src.slice(streamGuard, streamGuard + 500);
+  assert.ok(
+    guardBlock.includes("/market/search/stream") || guardBlock.includes("/market/search"),
+    "pre-source block must reference a market route"
+  );
+});
+
+test("V3.10B.4 — static: market non-stream blocks incomplete aircraft pre-source", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const routeGuard = src.indexOf('route: "/market/search", query');
+  const preSource = src.indexOf("MARKET_BLOCKED_INCOMPLETE_AIRCRAFT_IDENTITY_PRE_SOURCE");
+  assert.ok(preSource !== -1);
+  // The non-stream pre-source guard must exist
+  const nonStreamGuard = src.indexOf('route: "/market/search"', preSource);
+  assert.ok(nonStreamGuard !== -1, "non-stream pre-source block must exist");
+});

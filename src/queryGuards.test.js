@@ -319,3 +319,31 @@ test('oracle guard — source unavailable but has items still allows oracle', ()
   const needsOracle = _sourceUnavailableNoData ? false : oracleDecisionInvoke;
   assert.equal(needsOracle, true, "source unavailable but items present → oracle still allowed");
 });
+
+// ── V3.10B.4: Hawaiian Airlines model airplane is airline-present/family-missing ──
+
+test('V3.10B.4 — "Hawaiian Airlines model airplane" is incomplete aircraft', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Hawaiian Airlines model airplane");
+  assert.equal(r.incomplete, true);
+  assert.ok(r.requiredAirline, "must detect airline");
+});
+
+test('V3.10B.4 — exact "Hawaiian Airlines Boeing 787 diecast model airplane" is NOT incomplete', () => {
+  const r = detectIncompleteAircraftIdentityQuery("Hawaiian Airlines Boeing 787 diecast model airplane");
+  assert.equal(r.incomplete, false);
+});
+
+test('V3.10B.4 — incomplete aircraft blocks market stream and non-stream pre-source', () => {
+  const query = "Hawaiian Airlines model airplane";
+  const r = detectIncompleteAircraftIdentityQuery(query);
+  assert.equal(r.incomplete, true, "pre-source guard must detect incomplete aircraft");
+  assert.equal(r.reason, "airline_present_family_missing");
+});
+
+test('V3.10B.4 — no GPT Oracle for incomplete aircraft (direct check)', () => {
+  const query = "Hawaiian Airlines diecast airplane model";
+  const r = detectIncompleteAircraftIdentityQuery(query);
+  assert.equal(r.incomplete, true, "must be incomplete");
+  const oracleAllowed = !r.incomplete;
+  assert.equal(oracleAllowed, false, "oracle must not activate for incomplete aircraft");
+});
