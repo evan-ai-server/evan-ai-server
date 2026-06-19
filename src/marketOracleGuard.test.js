@@ -5,7 +5,54 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { shouldSkipOracleSourceUnavailable } from "./marketOracleGuard.js";
+
+// ── Phase V3.10B.9: central live-oracle kill switch (static guards) ───────────
+// node --check can't catch "oracle still reachable in live scan"; these read
+// index.js and assert the central guard is in place and the cosmetic
+// activation logs are gated.
+describe("V3.10B.9 — live GPT oracle disabled by default", () => {
+  const src = readFileSync(resolve(new URL(import.meta.url).pathname, "../../index.js"), "utf8");
+
+  it("LIVE_ORACLE_ENABLED defaults to false (opt-in via env only)", () => {
+    const m = src.match(/const LIVE_ORACLE_ENABLED\s*=\s*String\([^)]*\)\.toLowerCase\(\)\s*===\s*"true"/);
+    assert.ok(m, "LIVE_ORACLE_ENABLED must be an env opt-in defaulting to false");
+  });
+
+  it("gptMarketOracle returns [] before any work when oracle is disabled", () => {
+    const fn = src.indexOf("async function gptMarketOracle");
+    assert.ok(fn !== -1);
+    const head = src.slice(fn, fn + 420);
+    // The disabled guard must be the FIRST thing — before the openai/cache logic.
+    assert.ok(head.includes("if (!LIVE_ORACLE_ENABLED)"), "must gate on LIVE_ORACLE_ENABLED first");
+    assert.ok(head.includes("ORACLE_DISABLED_LIVE_SCAN"), "must log the disabled reason");
+    const guardIdx = head.indexOf("if (!LIVE_ORACLE_ENABLED)");
+    const openaiIdx = head.indexOf("if (!openai");
+    assert.ok(openaiIdx === -1 || guardIdx < openaiIdx, "disabled guard must precede the openai check");
+  });
+
+  it("every 'GPT Market Oracle activating' / 'Route-level oracle fallback' log is gated on LIVE_ORACLE_ENABLED", () => {
+    // No oracle-activation log line may be reachable without the flag.
+    for (const phrase of ["GPT Market Oracle activating", "Route-level oracle fallback"]) {
+      let from = 0;
+      while (true) {
+        const i = src.indexOf(phrase, from);
+        if (i === -1) break;
+        // the start of that source line
+        const lineStart = src.lastIndexOf("\n", i) + 1;
+        const line = src.slice(lineStart, i);
+        assert.ok(
+          line.includes("if (LIVE_ORACLE_ENABLED)"),
+          `"${phrase}" log must be gated on LIVE_ORACLE_ENABLED`
+        );
+        from = i + phrase.length;
+      }
+    }
+  });
+});
+
 
 // ── shouldSkipOracleSourceUnavailable ────────────────────────────────────────
 

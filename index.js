@@ -1333,6 +1333,7 @@ import { shouldSkipOracleSourceUnavailable } from "./src/marketOracleGuard.js";
 import { shouldAttemptLegacySnapshot, sanitizeLegacySnapshotItems, LEGACY_SNAPSHOT_MIN_CLEAN } from "./src/legacySnapshotFallback.js";
 import { evaluateFamilyRecoveryHint, FAMILY_RECOVERY_SIMILARITY_THRESHOLD } from "./src/aircraftFamilyRecovery.js";
 import { recoverFamilyFromMasterFields } from "./src/aircraftFamilyFieldRecovery.js";
+import { filterFinalUiByAircraftIdentity } from "./src/finalUiIdentityLock.js";
 import { runReleaseGate }                  from "./src/releaseGate.js";
 import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
@@ -13385,7 +13386,23 @@ function buildOracleSearchUrl(platform, query) {
 const GPT_ORACLE_CACHE = new Map(); // key → { items, ts }
 const GPT_ORACLE_TTL_MS = 4 * 60 * 60 * 1000;
 
+// Phase V3.10B.9: the GPT oracle fabricates listings. It must NEVER run in live
+// user-visible scan flow — even filtered/unused it wastes latency, can leak into
+// the UI, and pollutes prediction snapshots. Disabled by default; an explicit
+// dev-only flag re-enables it for offline/lab work. This is the single central
+// kill-switch every invocation path (in-merge rescue, route-level, stream) funnels
+// through. Note: this is identity-fabrication only — real marketplace rescue
+// (SerpAPI/eBay/Etsy re-query) is unaffected.
+const LIVE_ORACLE_ENABLED = String(process.env.LIVE_ORACLE_ENABLED || "").toLowerCase() === "true";
+
 async function gptMarketOracle(query, identity = null) {
+  if (!LIVE_ORACLE_ENABLED) {
+    console.log("ORACLE_DISABLED_LIVE_SCAN", {
+      query: typeof query === "string" ? normalizeQuery(query) : null,
+      reason: "live_oracle_injection_disabled_set_LIVE_ORACLE_ENABLED=true_for_dev_lab",
+    });
+    return [];
+  }
   if (!openai || !query) return [];
 
   const cacheKey = `oracle:${normalizeQuery(query)}:${identity?.brand || ""}:${identity?.model || ""}:${identity?.category || ""}`;
@@ -14296,7 +14313,7 @@ if (Array.isArray(rawMerged) && rawMerged.length > 0) {
       ebayAvailable: hasEbayApi(),
     });
   } else if (_rescueOracle.run) {
-    console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
+    if (LIVE_ORACLE_ENABLED) console.log("🧠 GPT Market Oracle activating for:", normalizedQuery);
     const oracleItems = await gptMarketOracle(normalizedQuery, identity).catch(() => []);
     if (oracleItems.length) {
       rawMerged = [...rawMerged, ...oracleItems];
@@ -25578,32 +25595,36 @@ async function buildMarketSearchResponsePayload({
   );
   _bmLog("buildFinalUiItemsWithIntelligence", _t_finalUi);
 
-  // Phase V3.10B.2: apply aircraft identity lock to final UI items.
-  // rankVisualComps + rerankWithIntelligence can reorder items and the oracle
-  // path may inject competitors that weren't filtered at the retrieval stage.
+  // Phase V3.10B.2 / V3.10B.9: apply aircraft identity lock to final UI items.
+  // rankVisualComps + rerankWithIntelligence reorder items and the wider UI source
+  // pool can still carry missing-airline / wrong-family comps. V3.10B.9 ENFORCES
+  // required-airline AND required-family presence (not just competitor rejection)
+  // so e.g. "Gulf Air 787-9" or a generic "787-9 Dreamliner" can never reach
+  // top5ui for a Hawaiian 787 query. Never refills with off-identity comps.
   const _uiAirlineLock = detectAirlineLockInQuery(normalizeTitleKey(activeQuery));
   if (_uiAirlineLock && uiItems.length > 0) {
     const _uiBeforeCount = uiItems.length;
-    const _uiFiltered = uiItems.filter((it) => {
-      const t = normalizeTitleKey(it?.title || "");
-      const hasRequired = titleHasToken(t, _uiAirlineLock.requiredAirline);
-      const hasCompetitor = _uiAirlineLock.competitors.some((c) => {
-        if (titleHasToken(t, c)) return true;
-        const aliases = COMPETITOR_AIRCRAFT_ALIASES[c] || [];
-        return aliases.some((alias) => titleHasToken(t, alias));
-      });
-      return hasRequired || !hasCompetitor;
+    const _uiReqFamily = _uiAirlineLock.requiredFamily || null;
+    const _uiLockResult = filterFinalUiByAircraftIdentity(uiItems, {
+      requiredAirline:   _uiAirlineLock.requiredAirline,
+      competitors:       _uiAirlineLock.competitors,
+      requiredFamily:    _uiReqFamily,
+      familyTokens:      _uiReqFamily ? (AIRCRAFT_FAMILY_MAP[_uiReqFamily] || []) : [],
+      competitorAliases: COMPETITOR_AIRCRAFT_ALIASES,
     });
-    const _uiRejected = _uiBeforeCount - _uiFiltered.length;
+    const _uiRejected = _uiBeforeCount - _uiLockResult.kept.length;
     if (_uiRejected > 0) {
       console.log("FINAL_UI_IDENTITY_LOCK_APPLIED", {
         query: activeQuery,
         requiredAirline: _uiAirlineLock.requiredAirline,
+        requiredFamily: _uiReqFamily,
         beforeCount: _uiBeforeCount,
-        afterCount: _uiFiltered.length,
-        rejectedCompetitorCount: _uiRejected,
+        afterCount: _uiLockResult.kept.length,
+        rejectedCompetitorCount: _uiLockResult.rejectedCompetitor,
+        rejectedMissingAirlineCount: _uiLockResult.rejectedMissingAirline,
+        rejectedFamilyCount: _uiLockResult.rejectedFamily,
       });
-      uiItems = _uiFiltered;
+      uiItems = _uiLockResult.kept;
     }
   }
 
@@ -30077,7 +30098,7 @@ if (!Array.isArray(items) || items.length < 4) {
       ebayAvailable: hasEbayApi(),
     });
   } else {
-  console.log("🧠 Route-level oracle fallback for:", query);
+  if (LIVE_ORACLE_ENABLED) console.log("🧠 Route-level oracle fallback for:", query);
   const _oracleVi = visionIdentity ? { ...visionIdentity } : {};
   const oracleItems = await gptMarketOracle(query, _oracleVi).catch(() => []);
   if (oracleItems.length) {
