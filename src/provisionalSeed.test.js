@@ -427,3 +427,72 @@ test("V3.10B.4 — static: market non-stream blocks incomplete aircraft pre-sour
   const nonStreamGuard = src.indexOf('route: "/market/search"', preSource);
   assert.ok(nonStreamGuard !== -1, "non-stream pre-source block must exist");
 });
+
+// ── V3.10B.10: grace-path aircraft family-completeness gate ─────────────────
+// The seed recovery loop (where grace-rescued query_fast results are accepted)
+// must enforce the same aircraft family check the normal query_fast path has.
+
+test("V3.10B.10 — seed recovery loop contains aircraft family-completeness gate", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  // The seed recovery loop starts with _seedCandidates and iterates with "if (acceptable)"
+  const seedLoop = src.indexOf("_seedCandidates");
+  assert.ok(seedLoop !== -1, "seed recovery loop must exist");
+
+  // Find the "if (acceptable)" block within the seed recovery section
+  const acceptableCheck = src.indexOf("if (acceptable)", seedLoop);
+  assert.ok(acceptableCheck !== -1, "acceptable check must exist in seed recovery");
+
+  // The aircraft family gate must be INSIDE the acceptable block, BEFORE _seedResult assignment
+  const gateLog = src.indexOf("VISION_SEED_RECOVERY_REJECTED_INCOMPLETE_AIRCRAFT", acceptableCheck);
+  assert.ok(gateLog !== -1, "grace-path aircraft family rejection log must exist in seed recovery");
+
+  const seedAssignment = src.indexOf("_seedResult = {", acceptableCheck);
+  assert.ok(seedAssignment !== -1, "seed result assignment must exist");
+  assert.ok(gateLog < seedAssignment, "aircraft family gate must precede seed result assignment");
+});
+
+test("V3.10B.10 — grace aircraft gate checks AIRCRAFT_FAMILY_MATCH (not queryGuards pattern)", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const gateLog = src.indexOf("VISION_SEED_RECOVERY_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(gateLog !== -1);
+
+  // The gate must use AIRCRAFT_FAMILY_MATCH (index.js's authoritative family source),
+  // NOT _FAMILY_PATTERN from queryGuards.js (which diverges on 767/757/727/717).
+  const gateBlock = src.slice(gateLog - 600, gateLog);
+  assert.ok(gateBlock.includes("AIRCRAFT_FAMILY_MATCH"), "must check family via AIRCRAFT_FAMILY_MATCH");
+  assert.ok(gateBlock.includes("AIRLINE_COMPETITOR_MAP"), "must check airline via AIRLINE_COMPETITOR_MAP");
+});
+
+test("V3.10B.10 — grace aircraft gate returns incomplete_aircraft_identity and registers master recovery", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const gateLog = src.indexOf("VISION_SEED_RECOVERY_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(gateLog !== -1);
+
+  // After the rejection log, the code must launch master and register background recovery
+  const afterGate = src.slice(gateLog, gateLog + 1800);
+  assert.ok(afterGate.includes("launchMasterNow()"), "must call launchMasterNow");
+  assert.ok(afterGate.includes("_registerMasterBackgroundRecovery()"), "must register master background recovery");
+  assert.ok(afterGate.includes('"incomplete_aircraft_identity"'), "must return incomplete_aircraft_identity tier");
+  assert.ok(afterGate.includes("INCOMPLETE_AIRCRAFT_IDENTITY"), "must set INCOMPLETE_AIRCRAFT_IDENTITY error");
+});
+
+test("V3.10B.10 — grace aircraft gate also emits VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  // The existing log name used by the normal path must also fire from the grace path
+  // so grep/audit tooling catches both paths with the same search.
+  const gateLog = src.indexOf("VISION_SEED_RECOVERY_REJECTED_INCOMPLETE_AIRCRAFT");
+  assert.ok(gateLog !== -1);
+  const afterGate = src.slice(gateLog, gateLog + 1200);
+  assert.ok(
+    afterGate.includes("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT"),
+    "grace gate must emit the same rejection log as the normal path for unified audit"
+  );
+});

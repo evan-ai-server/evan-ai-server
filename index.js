@@ -21198,6 +21198,55 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
             brand <= 0.2 &&
             cat && !isTrueHighStakesVisionCategory(cat);
           if (acceptable) {
+            // Phase V3.10B.10: aircraft family-completeness gate on grace-rescued seeds.
+            // The normal query_fast path (Block 0) rejects airline-present/family-missing
+            // aircraft seeds via needsAircraftFamilyRefinement. The grace path bypassed
+            // that gate entirely — a 767 misread committed to market before master could
+            // correct to 787. Apply the SAME family check here: if the seed is aircraft-
+            // category with airline but no family per AIRCRAFT_FAMILY_MATCH, reject it
+            // and let master background recovery supply the accurate identity.
+            const _seedQNorm = normalizeTitleKey(q || "");
+            const _seedIsAircraft =
+              cat.includes("airplane") || cat.includes("aircraft") ||
+              cat.includes("diecast") || cat.includes("model plane") ||
+              cat.includes("aviation");
+            const _seedHasAirline = _seedIsAircraft && Object.keys(AIRLINE_COMPETITOR_MAP).some((a) => titleHasToken(_seedQNorm, a));
+            const _seedHasFamily  = !_seedIsAircraft || AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => _seedQNorm.includes(tok)));
+            if (_seedIsAircraft && _seedHasAirline && !_seedHasFamily) {
+              console.log("VISION_SEED_RECOVERY_REJECTED_INCOMPLETE_AIRCRAFT", {
+                rid: req.rid, sourcePass, query: q, category: cat, confidence: conf,
+                reason: "grace_rescued_airline_present_family_missing",
+                hasAirline: true, hasFamily: false,
+              });
+              launchMasterNow();
+              _registerMasterBackgroundRecovery();
+              const _incWallMs = Date.now() - passT0;
+              console.log("VISION_QUERY_FAST_REJECTED_INCOMPLETE_AIRCRAFT", {
+                rid: req.rid, query: q, category: cat,
+                reason: "grace_seed_airline_present_family_missing",
+                wallMs: _incWallMs,
+                masterBackgroundContinued: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
+              });
+              return {
+                ok:                 false,
+                query:              null,
+                confidence:         0,
+                imageHash:          imageHash || null,
+                visionTier:         "incomplete_aircraft_identity",
+                incompleteIdentity: true,
+                incompleteReason:   "airline_present_family_missing",
+                error:              "INCOMPLETE_AIRCRAFT_IDENTITY",
+                userMessage:        "Couldn't confirm the exact aircraft model — try scanning again",
+                retryable:          true,
+                visionTimings: {
+                  queryFastMs: null, fastMs: null, visualMs: null, masterMs: null,
+                  visionWallMs: _incWallMs, raceWinner: sourcePass,
+                  masterLaunched: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
+                  tier: "incomplete_aircraft_identity",
+                },
+              };
+            }
+
             _seedResult = { r, sourcePass, q, conf, cat };
             console.log("VISION_SEED_RECOVERY_USED", {
               rid: req.rid, sourcePass, query: q, confidence: conf, category: cat,
