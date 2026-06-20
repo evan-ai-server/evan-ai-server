@@ -76,7 +76,7 @@ test("CACHE_REFRESH_METADATA_BACKFILL_PAYLOAD_CACHE_INVALIDATED log exists", () 
 
 test("payload cache invalidation uses _makeAllBudgetKeys", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
   assert.ok(block.includes("_makeAllBudgetKeys"), "must use _makeAllBudgetKeys for surgical key derivation");
@@ -84,7 +84,7 @@ test("payload cache invalidation uses _makeAllBudgetKeys", () => {
 
 test("payload cache invalidation deletes from MARKET_SCAN_RESULT_CACHE", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
   assert.ok(block.includes("MARKET_SCAN_RESULT_CACHE.delete(k)"), "must delete from MARKET_SCAN_RESULT_CACHE");
@@ -92,7 +92,7 @@ test("payload cache invalidation deletes from MARKET_SCAN_RESULT_CACHE", () => {
 
 test("payload cache invalidation deletes from INSTANT_SCAN_CACHE", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
   assert.ok(block.includes("INSTANT_SCAN_CACHE.delete(cacheKey)"), "must delete from INSTANT_SCAN_CACHE");
@@ -100,7 +100,7 @@ test("payload cache invalidation deletes from INSTANT_SCAN_CACHE", () => {
 
 test("payload cache invalidation deletes from ENRICHED_SCAN_CACHE", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
   assert.ok(block.includes("ENRICHED_SCAN_CACHE.delete(cacheKey)"), "must delete from ENRICHED_SCAN_CACHE");
@@ -108,18 +108,38 @@ test("payload cache invalidation deletes from ENRICHED_SCAN_CACHE", () => {
 
 test("invalidation only runs when _metadataBackfillCount > 0", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
-  assert.ok(block.includes("_metadataBackfillCount > 0") || INDEX_SRC.indexOf("Phase 5A.2C:") > INDEX_SRC.indexOf("if (_metadataBackfillCount > 0)"), "invalidation must be inside metadataBackfillCount > 0 guard");
+  assert.ok(block.includes("_metadataBackfillCount > 0") || INDEX_SRC.indexOf("Phase 5A.2C") > INDEX_SRC.indexOf("if (_metadataBackfillCount > 0)"), "invalidation must be inside metadataBackfillCount > 0 guard");
 });
 
 test("invalidation does not set clickable, directUrl, or isVerifiedListing", () => {
   const block = INDEX_SRC.slice(
-    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Phase 5A.2C"),
     INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
   );
   assert.ok(!block.includes("clickable = true"), "must not set clickable");
   assert.ok(!block.includes("directUrl ="), "must not set directUrl");
   assert.ok(!block.includes("isVerifiedListing"), "must not set isVerifiedListing");
+});
+
+// ── Static guards: Phase 5A.2D — try/catch + TTLCache API ───────────────────
+
+test("invalidation block is wrapped in try/catch", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("try {"), "invalidation must be wrapped in try");
+  assert.ok(block.includes("CACHE_REFRESH_METADATA_BACKFILL_PAYLOAD_CACHE_INVALIDATION_FAILED"), "catch must log failure");
+});
+
+test("TTLCache has delete and has methods", () => {
+  const ttlBlock = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("class TTLCache"),
+    INDEX_SRC.indexOf("class TTLCache") + 1500
+  );
+  assert.ok(ttlBlock.includes("delete(key)"), "TTLCache must have delete method");
+  assert.ok(ttlBlock.includes("has(key)"), "TTLCache must have has method");
 });
