@@ -543,6 +543,9 @@ import {
   selectBestVerifiedSeller,
 } from "./src/offerIdentityGuard.js";
 import {
+  applyUrlRecoveryCacheRecord,
+} from "./src/urlRecoveryInjectionPolicy.js";
+import {
   createEmptyIdentitySummary,
   mergeIdentitySummaries,
   normalizeIdentitySummary,
@@ -25524,6 +25527,7 @@ async function buildMarketSearchResponsePayload({
   // URL_RECOVERY_CACHE injection: if a prior async recovery run stored a direct
   // merchant URL for this item's _productId, inject it BEFORE the outbound
   // sanitizer so the sanitizer classifies it as merchant_direct → isVerifiedListing.
+  let _urlRecoveryInjectedCount = 0;
   const _rawSourceItems = (Array.isArray(items) ? items.filter(Boolean) : [])
     .map(it => {
       const _pid = it._productId || null;
@@ -25539,38 +25543,44 @@ async function buildMarketSearchResponsePayload({
           hasDirectUrl: !!_cachedRec.directUrl,
         });
       }
-      let _itToSanitize = it;
-      if (_cachedRec && !it.isVerifiedListing) {
-        if (!_cachedRec.directUrl) {
+      // Phase 5A.3C: injection-time identity re-check via applyUrlRecoveryCacheRecord
+      const _injResult = _cachedRec
+        ? applyUrlRecoveryCacheRecord(it, _cachedRec, { scanId: retrievalMeta?.scanId || null, query: baseQuery, isValidMerchantUrl: _isValidMerchantUrl })
+        : { inject: false, item: it, reason: "no_cached_record" };
+      if (_cachedRec && !_injResult.inject) {
+        const _rejReason = _injResult.reason;
+        if (_rejReason === "missing_direct_url") {
           console.log("URL_RECOVERY_REJECTED_MISSING_DIRECT_URL", {
-            scanId: retrievalMeta?.scanId || null,
-            query: baseQuery,
-            productId: _pid,
-            reason: "cached_recovery_has_no_direct_url",
+            scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, reason: "cached_recovery_has_no_direct_url",
           });
-        } else if (!_isValidMerchantUrl(_cachedRec.directUrl)) {
-          let _rejHost = null;
-          try { _rejHost = new URL(_cachedRec.directUrl).hostname.toLowerCase(); } catch {}
-          const _isGoogleHost = _rejHost && (/(^|\.)google\./i.test(_rejHost) || /(^|\.)googleadservices\./i.test(_rejHost));
-          console.log(_isGoogleHost ? "URL_RECOVERY_REJECTED_GOOGLE_SHELL" : "URL_RECOVERY_CACHE_REJECTED_INVALID_MERCHANT_URL", {
-            scanId: retrievalMeta?.scanId || null,
-            query: baseQuery,
-            productId: _pid,
-            host: _rejHost,
-            reason: _isGoogleHost ? "google_shell_url" : "invalid_merchant_url",
+        } else if (_rejReason === "google_shell_url") {
+          console.log("URL_RECOVERY_REJECTED_GOOGLE_SHELL", {
+            scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null, reason: "google_shell_url",
           });
-        } else {
-          _itToSanitize = { ...it, directUrl: _cachedRec.directUrl, link: _cachedRec.directUrl, url: _cachedRec.directUrl, buyLink: _cachedRec.directUrl, clickable: true, urlQuality: "merchant_direct", urlHost: _cachedRec.urlHost };
-          console.log("URL_RECOVERY_CACHE_INJECTED", {
-            scanId: retrievalMeta?.scanId || null,
-            query: baseQuery,
-            productId: _pid,
-            host: _cachedRec.urlHost || null,
-            urlQuality: "merchant_direct",
+        } else if (_rejReason === "invalid_merchant_url") {
+          console.log("URL_RECOVERY_CACHE_REJECTED_INVALID_MERCHANT_URL", {
+            scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null, reason: "invalid_merchant_url",
+          });
+        } else if (_rejReason === "identity_contradiction_host" || _rejReason === "identity_contradiction_query") {
+          console.log("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_REJECTED", {
+            scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null, reason: _rejReason,
+          });
+        } else if (_rejReason !== "already_verified" && _rejReason !== "no_cached_record") {
+          console.log("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_REJECTED", {
+            scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, reason: _rejReason,
           });
         }
       }
-      return sanitizeOutboundListingForClient(_itToSanitize, { scanId: retrievalMeta?.scanId || null });
+      if (_injResult.inject) {
+        _urlRecoveryInjectedCount++;
+        console.log("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_PASSED", {
+          scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null,
+        });
+        console.log("URL_RECOVERY_CACHE_INJECTED", {
+          scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null, urlQuality: "merchant_direct",
+        });
+      }
+      return sanitizeOutboundListingForClient(_injResult.item, { scanId: retrievalMeta?.scanId || null });
     });
 
   // Phase V3.9A — audit: URL/recovery-field presence on the INBOUND items (before
@@ -26373,7 +26383,21 @@ async function buildMarketSearchResponsePayload({
       urlRecoveryAsyncEnabled: URL_RECOVERY_ASYNC_ENABLED,
       urlVerificationEnabled:  URL_VERIFICATION_ENABLED,
       googleProductAvailable:  _googleProductApiAvailable,
+      urlRecoveryInjectedCount: _urlRecoveryInjectedCount,
     });
+    // Phase 5A.3C: log when recovery injection produced verified upgrades
+    if (_urlRecoveryInjectedCount > 0) {
+      const _verifiedFromRecovery = uiItemsForCalibration.filter(x =>
+        x?.isVerifiedListing === true && x?.urlQuality === "merchant_direct"
+      ).length;
+      console.log("VERIFIED_LISTING_EVIDENCE_UPGRADED", {
+        scanId: retrievalMeta?.scanId || null,
+        query: baseQuery,
+        urlRecoveryInjectedCount: _urlRecoveryInjectedCount,
+        verifiedFromRecovery: _verifiedFromRecovery,
+        totalVerifiedListings: _cleanUrlSummary.verifiedListings,
+      });
+    }
 
     // ── Phase 4 (Prompt 3): direct_clickable_listing evidence class ───────────
     // A native clickable merchant URL (eBay/Etsy/etc.) is STRONGER than an
@@ -26414,6 +26438,7 @@ async function buildMarketSearchResponsePayload({
       directClickableCount: _directClickableCount,
       hosts: _directClickableHosts,
       verifiedListingCount: _cleanUrlSummary.verifiedListings,  // unchanged by this class
+      urlRecoveryInjectedCount: _urlRecoveryInjectedCount,
       note: "observation_only_not_counted_as_verified",
     });
     // Optional UI metadata — additive, ignored by calibration/affiliate/verdict.

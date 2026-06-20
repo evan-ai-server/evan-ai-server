@@ -4,7 +4,6 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   evaluateRecoveredOfferIdentity,
-  selectBestVerifiedSeller,
   hasIdentityContradiction,
 } from "./offerIdentityGuard.js";
 import {
@@ -207,22 +206,22 @@ test("URL_RECOVERY_REJECTED_IDENTITY_MISMATCH log exists in index.js", () => {
   assert.ok(INDEX_SRC.includes("URL_RECOVERY_REJECTED_IDENTITY_MISMATCH"), "identity mismatch log missing");
 });
 
-// ── Static guards: injection acceptance logic unchanged ────────────────────────
+// ── Static guards: injection acceptance logic (5A.3C) ─────────────────────────
 
-test("injection point still checks _isValidMerchantUrl before injecting", () => {
+test("injection point uses applyUrlRecoveryCacheRecord", () => {
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("URL_RECOVERY_CACHE injection:"),
     INDEX_SRC.indexOf("URL_RECOVERY_CACHE injection:") + 2000
   );
-  assert.ok(block.includes("_isValidMerchantUrl(_cachedRec.directUrl)"), "must validate merchant URL before inject");
+  assert.ok(block.includes("applyUrlRecoveryCacheRecord"), "must use applyUrlRecoveryCacheRecord helper");
 });
 
-test("injection point checks !it.isVerifiedListing before injecting", () => {
+test("injection point passes _isValidMerchantUrl to helper", () => {
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("URL_RECOVERY_CACHE injection:"),
     INDEX_SRC.indexOf("URL_RECOVERY_CACHE injection:") + 2000
   );
-  assert.ok(block.includes("!it.isVerifiedListing"), "must not re-inject into already verified items");
+  assert.ok(block.includes("isValidMerchantUrl: _isValidMerchantUrl"), "must pass merchant URL validator to helper");
 });
 
 test("injection does not set isVerifiedListing directly", () => {
@@ -232,4 +231,33 @@ test("injection does not set isVerifiedListing directly", () => {
   );
   assert.ok(!block.includes("isVerifiedListing: true"), "injection must not set isVerifiedListing directly — sanitizer derives it");
   assert.ok(!block.includes("isVerifiedListing:true"), "injection must not set isVerifiedListing directly");
+});
+
+// ── Static guards: Phase 5A.3C identity re-check logs ─────────────────────────
+
+test("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_PASSED log exists in index.js", () => {
+  assert.ok(INDEX_SRC.includes("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_PASSED"), "identity recheck pass log missing");
+});
+
+test("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_REJECTED log exists in index.js", () => {
+  assert.ok(INDEX_SRC.includes("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_REJECTED"), "identity recheck reject log missing");
+});
+
+test("VERIFIED_LISTING_EVIDENCE_UPGRADED log exists in index.js", () => {
+  assert.ok(INDEX_SRC.includes("VERIFIED_LISTING_EVIDENCE_UPGRADED"), "verified evidence upgraded log missing");
+});
+
+test("VERIFIED_LISTING_EVIDENCE_SUMMARY includes urlRecoveryInjectedCount", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("VERIFIED_LISTING_EVIDENCE_SUMMARY"),
+    INDEX_SRC.indexOf("VERIFIED_LISTING_EVIDENCE_SUMMARY") + 700
+  );
+  assert.ok(block.includes("urlRecoveryInjectedCount"), "must include recovery injection count in summary");
+});
+
+test("URL_RECOVERY_CACHE_INJECTED appears after identity recheck pass, not before", () => {
+  const recheckPassPos = INDEX_SRC.indexOf("URL_RECOVERY_INJECTION_IDENTITY_RECHECK_PASSED");
+  const injectedPos = INDEX_SRC.indexOf("URL_RECOVERY_CACHE_INJECTED", recheckPassPos);
+  assert.ok(recheckPassPos > 0, "recheck pass log must exist");
+  assert.ok(injectedPos > recheckPassPos, "CACHE_INJECTED must appear after identity recheck pass");
 });
