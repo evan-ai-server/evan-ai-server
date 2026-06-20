@@ -1324,7 +1324,7 @@ import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVision
 import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
 import { approximateMarketDecision, rescueOracleDecision } from "./src/incompleteAircraftMarketPolicy.js";
 // Phase V3.9A — URL evidence audit (logging-only; pure field-presence summaries).
-import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary } from "./src/urlEvidenceAudit.js";
+import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary, extractProductIdFromGoogleUrl } from "./src/urlEvidenceAudit.js";
 // Phase V3.9B — extracted compactMarketSnapshotItem with recovery metadata preserved.
 import { compactMarketSnapshotItem } from "./src/marketSnapshotCompact.js";
 // Phase V3.9B.1/V3.9C — pure oracle-skip guard for source-unavailable condition.
@@ -31654,6 +31654,69 @@ app.post("/market/search/stream", async (req, res) => {
             console.log("CACHE_BACKGROUND_REFRESH_REJECTED_DUPES", {
               rid: req.rid, scanId, query, rejectedCount: _rejectedDupes,
             });
+          }
+
+          // Phase 5A.2B: backfill recovery metadata from duplicate refresh items
+          // into matching cached items that are missing _productId/googleUrl/urlQuality.
+          let _metadataBackfillCount = 0;
+          let _productIdsAdded = 0;
+          let _serpApiUrlsAdded = 0;
+          let _googleUrlsAdded = 0;
+          let _urlQualitiesUpgraded = 0;
+          if (_rejectedDupes > 0) {
+            const _cacheFpToIdx = new Map();
+            for (let i = 0; i < _internalItems.length; i++) {
+              const it = _internalItems[i];
+              const t = String(it?.title || "").toLowerCase().slice(0, 60);
+              const p = Math.round(Number(it?.totalPrice ?? it?.price ?? 0) * 10) / 10;
+              const s = String(it?.source || "").toLowerCase().slice(0, 30);
+              _cacheFpToIdx.set(`${t}|${p}|${s}`, i);
+            }
+            for (const liveItem of (_refreshRaw || [])) {
+              if (!liveItem?.title) continue;
+              const t = String(liveItem.title).toLowerCase().slice(0, 60);
+              const p = Math.round(Number(liveItem?.totalPrice ?? liveItem?.price ?? 0) * 10) / 10;
+              const s = String(liveItem?.source || "").toLowerCase().slice(0, 30);
+              const fp = `${t}|${p}|${s}`;
+              const idx = _cacheFpToIdx.get(fp);
+              if (idx === undefined) continue;
+              const cached = _internalItems[idx];
+              let backfilled = false;
+              const liveProductId = liveItem._productId || extractProductIdFromGoogleUrl(liveItem.googleUrl);
+              if (liveProductId && !cached._productId) {
+                cached._productId = liveProductId;
+                _productIdsAdded++;
+                backfilled = true;
+              }
+              if (liveItem._serpapiProductApiUrl && !cached._serpapiProductApiUrl) {
+                cached._serpapiProductApiUrl = liveItem._serpapiProductApiUrl;
+                _serpApiUrlsAdded++;
+                backfilled = true;
+              }
+              if (liveItem.googleUrl && !cached.googleUrl) {
+                cached.googleUrl = liveItem.googleUrl;
+                _googleUrlsAdded++;
+                backfilled = true;
+              }
+              if (liveItem.urlQuality && liveItem.urlQuality !== "unknown_legacy_no_url" &&
+                  (!cached.urlQuality || cached.urlQuality === "unknown_legacy_no_url")) {
+                cached.urlQuality = liveItem.urlQuality;
+                _urlQualitiesUpgraded++;
+                backfilled = true;
+              }
+              if (backfilled) _metadataBackfillCount++;
+            }
+            if (_metadataBackfillCount > 0) {
+              console.log("CACHE_REFRESH_DUPLICATE_METADATA_BACKFILLED", {
+                scanId, query,
+                metadataBackfilledCount: _metadataBackfillCount,
+                productIdsAdded: _productIdsAdded,
+                serpApiUrlsAdded: _serpApiUrlsAdded,
+                googleUrlsAdded: _googleUrlsAdded,
+                urlQualitiesUpgraded: _urlQualitiesUpgraded,
+              });
+              try { await saveInternalMarketSnapshot(query, { items: _internalItems, source: "metadata_backfill" }); } catch {}
+            }
           }
 
           // Run identity/aircraft filter on net-new candidates.

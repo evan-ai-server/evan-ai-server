@@ -94,6 +94,12 @@ export function classifyRecoveryCandidate(it = {}) {
   return { candidate: false, reason: "missing_product_id" };
 }
 
+export function extractProductIdFromGoogleUrl(googleUrl) {
+  if (typeof googleUrl !== "string" || !googleUrl) return null;
+  const m = googleUrl.match(/[?&,=]productid[=:](\d{5,})/i);
+  return m ? m[1] : null;
+}
+
 export function recoveryEligibilitySummary(items = []) {
   const arr = Array.isArray(items) ? items.filter(Boolean) : [];
   let eligible = 0;
