@@ -1339,6 +1339,7 @@ import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
 import { refreshThresholdCache, getAllAdaptiveOverrides } from "./src/adaptiveThresholds.js";
 import { isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategoryPolicy } from "./src/visionCategoryPolicy.js";
+import { sanitizeAircraftVariants } from "./src/aircraftCacheSafeGuard.js";
 import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
 import {
   storeSignalSnapshot,
@@ -13749,11 +13750,16 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
     normalizedQuery = learnedQuery;
   }
 
-  const incomingVariants = normalizeVariantList(
+  let incomingVariants = normalizeVariantList(
     extraVariants,
     normalizedQuery,
     "item"
   );
+  const _variantSanitized = sanitizeAircraftVariants(normalizedQuery, incomingVariants);
+  if (_variantSanitized.removed.length > 0) {
+    incomingVariants = _variantSanitized.variants;
+    console.log("MARKET_VARIANTS_SANITIZED_BY_CATEGORY", { query: normalizedQuery, context: "aircraft", beforeVariants: [..._variantSanitized.variants, ..._variantSanitized.removed], afterVariants: _variantSanitized.variants, removedVariants: _variantSanitized.removed, reason: "aircraft_query_removed_non_aircraft_variants" });
+  }
 
   const instantKey = scanFingerprint(normalizedQuery, incomingVariants);
   const instantHit = INSTANT_SCAN_CACHE.get(instantKey);
@@ -30929,6 +30935,7 @@ app.post("/market/search/stream", async (req, res) => {
     const _airlineLockForBudget = detectAirlineLockInQuery(_queryNormForBudget);
     const _isExactAircraftIdentity = !!_airlineLockForBudget?.requiredAirline && !!_airlineLockForBudget?.requiredFamily;
     const _isHighConfExactIdentity = (_isExactAircraftIdentity || _visionConf >= 0.85) && !_isBackgroundRecovery;
+    const _notHighStakesForCache = !isTrueHighStakesVisionCategory(req.body?.category);
     const _marketDeadlineMs = _isHighConfExactIdentity
       ? Math.max(_marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
       : _marketDeadlineBase;
@@ -31405,8 +31412,12 @@ app.post("/market/search/stream", async (req, res) => {
         const _enrichedItems = _enrichedPolicy.items;
         const _enrichedClean  = computeCleanRetrievalPool(query, _enrichedItems, scannedPrice, "enriched_cache_check");
         const _enrichedSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
-        const _enrichedReturn = _enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_enrichedSerpOk;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "enriched", kind: "cache_hit", beforeCount: _enrichedItems.length, cleanCount: _enrichedClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _enrichedSerpOk, action: _enrichedReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _enrichedReturn ? (_enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        const _exactAircraftOkEnriched = _isExactAircraftIdentity && _notHighStakesForCache && _enrichedClean.cleanCount >= 4;
+        const _enrichedReturn = _enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_enrichedSerpOk || _exactAircraftOkEnriched;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "enriched", kind: "cache_hit", beforeCount: _enrichedItems.length, cleanCount: _enrichedClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _enrichedSerpOk, action: _enrichedReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: !_enrichedReturn ? "below_min_target" : _enrichedClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : !_enrichedSerpOk ? "serp_unavailable" : "exact_aircraft_safe_cache" });
+        if (_exactAircraftOkEnriched && _enrichedClean.cleanCount < MIN_CLEAN_RESULTS_TARGET) {
+          console.log("EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED_BELOW_MIN_TARGET", { scanId, query, cleanCount: _enrichedClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, requiredAirline: _airlineLockForBudget?.requiredAirline || null, requiredFamily: _airlineLockForBudget?.requiredFamily || null, cacheLayer: "enriched", kind: "cache_hit", evidenceTier: "pricing_signal_only", verifiedListingCount: 0, pricingSignalCount: _enrichedClean.cleanCount, reason: "exact_aircraft_clean_cache_safe_below_min_target" });
+        }
         if (_enrichedReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "enriched", query });
@@ -31453,8 +31464,12 @@ app.post("/market/search/stream", async (req, res) => {
         const _internalItems = _internalPolicy.items;
         const _internalClean  = computeCleanRetrievalPool(query, _internalItems, scannedPrice, "internal_cache_check");
         const _internalSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
-        const _internalReturn = _internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_internalSerpOk;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "internal", kind: internalHit.kind, beforeCount: _internalItems.length, cleanCount: _internalClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _internalSerpOk, action: _internalReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _internalReturn ? (_internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        const _exactAircraftOkInternal = _isExactAircraftIdentity && _notHighStakesForCache && _internalClean.cleanCount >= 4;
+        const _internalReturn = _internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_internalSerpOk || _exactAircraftOkInternal;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "internal", kind: internalHit.kind, beforeCount: _internalItems.length, cleanCount: _internalClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _internalSerpOk, action: _internalReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: !_internalReturn ? "below_min_target" : _internalClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : !_internalSerpOk ? "serp_unavailable" : "exact_aircraft_safe_cache" });
+        if (_exactAircraftOkInternal && _internalClean.cleanCount < MIN_CLEAN_RESULTS_TARGET) {
+          console.log("EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED_BELOW_MIN_TARGET", { scanId, query, cleanCount: _internalClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, requiredAirline: _airlineLockForBudget?.requiredAirline || null, requiredFamily: _airlineLockForBudget?.requiredFamily || null, cacheLayer: "internal", kind: internalHit.kind, evidenceTier: "pricing_signal_only", verifiedListingCount: 0, pricingSignalCount: _internalClean.cleanCount, reason: "exact_aircraft_clean_cache_safe_below_min_target" });
+        }
         if (_internalReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "internal", query, kind: internalHit.kind });
@@ -31755,8 +31770,12 @@ app.post("/market/search/stream", async (req, res) => {
         const _serpItems = _serpPolicy.items;
         const _serpClean  = computeCleanRetrievalPool(query, _serpItems, scannedPrice, "serp_cache_check");
         const _serpSerpOk = !!SERPAPI_KEY && process.env.DISABLE_SERP !== "true" && process.env.DISABLE_SERP_FANOUT !== "true" && !isSourceCoolingDown("serpapi");
-        const _serpReturn = _serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_serpSerpOk;
-        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "serp", kind: "route_cache_hit", beforeCount: _serpItems.length, cleanCount: _serpClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _serpSerpOk, action: _serpReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: _serpReturn ? (_serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : "serp_unavailable") : "below_min_target" });
+        const _exactAircraftOkSerp = _isExactAircraftIdentity && _notHighStakesForCache && _serpClean.cleanCount >= 4;
+        const _serpReturn = _serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET || !_serpSerpOk || _exactAircraftOkSerp;
+        console.log("CACHE_MIN_CLEAN_POOL_POLICY", { cacheLayer: "serp", kind: "route_cache_hit", beforeCount: _serpItems.length, cleanCount: _serpClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, serpAvail: _serpSerpOk, action: _serpReturn ? "return_cache" : "bypass_for_fresh_fanout", reason: !_serpReturn ? "below_min_target" : _serpClean.cleanCount >= MIN_CLEAN_RESULTS_TARGET ? "sufficient_clean_pool" : !_serpSerpOk ? "serp_unavailable" : "exact_aircraft_safe_cache" });
+        if (_exactAircraftOkSerp && _serpClean.cleanCount < MIN_CLEAN_RESULTS_TARGET) {
+          console.log("EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED_BELOW_MIN_TARGET", { scanId, query, cleanCount: _serpClean.cleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET, requiredAirline: _airlineLockForBudget?.requiredAirline || null, requiredFamily: _airlineLockForBudget?.requiredFamily || null, cacheLayer: "serp", kind: "route_cache_hit", evidenceTier: "pricing_signal_only", verifiedListingCount: 0, pricingSignalCount: _serpClean.cleanCount, reason: "exact_aircraft_clean_cache_safe_below_min_target" });
+        }
         if (_serpReturn) {
           _recordStreamMetric("cacheHits", 1);
           scanLog("cache_hit", scanId, { layer: "serp", query });
