@@ -261,3 +261,26 @@ test("URL_RECOVERY_CACHE_INJECTED appears after identity recheck pass, not befor
   assert.ok(recheckPassPos > 0, "recheck pass log must exist");
   assert.ok(injectedPos > recheckPassPos, "CACHE_INJECTED must appear after identity recheck pass");
 });
+
+// ── Static guards: Phase 5A.3C.2 persisted guard metadata ─────────────────────
+
+test("_verifyOneItem return persists write-time guard metadata", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("async function _verifyOneItem"),
+    INDEX_SRC.indexOf("async function _verifyOneItem") + 5500
+  );
+  assert.ok(block.includes("recoveryGuardVersion"), "must persist recoveryGuardVersion");
+  assert.ok(block.includes("origTitle:"), "must persist origTitle");
+  assert.ok(block.includes("origPrice:"), "must persist origPrice");
+  assert.ok(block.includes("recoveredPrice:"), "must persist recoveredPrice");
+  assert.ok(block.includes("guardScore:"), "must persist guardScore");
+});
+
+test("applyUrlRecoveryCacheRecord helper rejects old-shape records (behavioral)", async () => {
+  const { applyUrlRecoveryCacheRecord } = await import("./urlRecoveryInjectionPolicy.js");
+  const item = { title: "Hawaiian Airlines Boeing 787", price: 50, totalPrice: 50, _productId: "1", clickable: false };
+  const oldShape = { _productId: "1", directUrl: "https://www.ebay.com/itm/1", urlQuality: "merchant_direct", urlHost: "www.ebay.com" };
+  const result = applyUrlRecoveryCacheRecord(item, oldShape, { query: "hawaiian 787", isValidMerchantUrl: () => true });
+  assert.equal(result.inject, false);
+  assert.equal(result.reason, "insufficient_recovery_identity_evidence");
+});

@@ -24034,6 +24034,16 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
       directUrl: bestLink,
       urlQuality: "merchant_direct",
       urlHost: recoveredHost,
+      // Phase 5A.3C.2: persist write-time guard metadata so injection-time can
+      // positively re-prove identity (generic hosts like ebay.com carry no
+      // contradiction tokens). Records without these fields fail closed.
+      recoveryGuardVersion: 1,
+      origTitle:      title,
+      origSource:     source,
+      origPrice:      gr.details.originalPrice,
+      recoveredPrice: gr.details.recoveredPrice,
+      guardScore:     gr.score,
+      recoveredAtMs:  Date.now(),
     };
   } catch (err) {
     clearTimeout(t);
