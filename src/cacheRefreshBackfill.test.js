@@ -67,3 +67,59 @@ test("backfill only upgrades urlQuality from unknown_legacy_no_url", () => {
   );
   assert.ok(backfillBlock.includes('cached.urlQuality === "unknown_legacy_no_url"'), "urlQuality upgrade guard missing");
 });
+
+// ── Static guards: Phase 5A.2C payload cache invalidation ───────────────────
+
+test("CACHE_REFRESH_METADATA_BACKFILL_PAYLOAD_CACHE_INVALIDATED log exists", () => {
+  assert.ok(INDEX_SRC.includes("CACHE_REFRESH_METADATA_BACKFILL_PAYLOAD_CACHE_INVALIDATED"), "invalidation log missing");
+});
+
+test("payload cache invalidation uses _makeAllBudgetKeys", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("_makeAllBudgetKeys"), "must use _makeAllBudgetKeys for surgical key derivation");
+});
+
+test("payload cache invalidation deletes from MARKET_SCAN_RESULT_CACHE", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("MARKET_SCAN_RESULT_CACHE.delete(k)"), "must delete from MARKET_SCAN_RESULT_CACHE");
+});
+
+test("payload cache invalidation deletes from INSTANT_SCAN_CACHE", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("INSTANT_SCAN_CACHE.delete(cacheKey)"), "must delete from INSTANT_SCAN_CACHE");
+});
+
+test("payload cache invalidation deletes from ENRICHED_SCAN_CACHE", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("ENRICHED_SCAN_CACHE.delete(cacheKey)"), "must delete from ENRICHED_SCAN_CACHE");
+});
+
+test("invalidation only runs when _metadataBackfillCount > 0", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(block.includes("_metadataBackfillCount > 0") || INDEX_SRC.indexOf("Phase 5A.2C:") > INDEX_SRC.indexOf("if (_metadataBackfillCount > 0)"), "invalidation must be inside metadataBackfillCount > 0 guard");
+});
+
+test("invalidation does not set clickable, directUrl, or isVerifiedListing", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2C:"),
+    INDEX_SRC.indexOf("Run identity/aircraft filter on net-new candidates")
+  );
+  assert.ok(!block.includes("clickable = true"), "must not set clickable");
+  assert.ok(!block.includes("directUrl ="), "must not set directUrl");
+  assert.ok(!block.includes("isVerifiedListing"), "must not set isVerifiedListing");
+});

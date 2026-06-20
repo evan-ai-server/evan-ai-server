@@ -31716,6 +31716,30 @@ app.post("/market/search/stream", async (req, res) => {
                 urlQualitiesUpgraded: _urlQualitiesUpgraded,
               });
               try { await saveInternalMarketSnapshot(query, { items: _internalItems, source: "metadata_backfill" }); } catch {}
+              // Phase 5A.2C: invalidate stale full payload cache so next request
+              // rebuilds from the repaired snapshot instead of returning the old
+              // starved payload. Surgical: only keys derived from this scan's identity.
+              const _invalidatedKeys = [];
+              const _keysToInvalidate = _makeAllBudgetKeys({ scanId, imageHash, query, userId: _budgetUserIdStream });
+              for (const k of _keysToInvalidate) {
+                if (MARKET_SCAN_RESULT_CACHE.has(k)) {
+                  MARKET_SCAN_RESULT_CACHE.delete(k);
+                  _invalidatedKeys.push(k);
+                }
+              }
+              if (INSTANT_SCAN_CACHE.has(cacheKey)) {
+                INSTANT_SCAN_CACHE.delete(cacheKey);
+                _invalidatedKeys.push(`instant:${cacheKey}`);
+              }
+              if (ENRICHED_SCAN_CACHE.has(cacheKey)) {
+                ENRICHED_SCAN_CACHE.delete(cacheKey);
+                _invalidatedKeys.push(`enriched:${cacheKey}`);
+              }
+              console.log("CACHE_REFRESH_METADATA_BACKFILL_PAYLOAD_CACHE_INVALIDATED", {
+                scanId, query,
+                invalidatedKeys: _invalidatedKeys,
+                reason: "metadata_backfill_repaired_snapshot",
+              });
             }
           }
 
