@@ -546,3 +546,56 @@ test("V3.10B.11 — stream snapshot fallback only fires when phase1 items < 2", 
     "snapshot fallback must only fire when phase1 items < 2"
   );
 });
+
+// ── V3.10B.12: stream Phase 1 success + clientClosed → cross-route cache write ──
+
+test("V3.10B.12 — stream writes cross-route cache when Phase 1 succeeds but client closed", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const cacheLog = src.indexOf("STREAM_PHASE1_CLIENT_CLOSED_CACHE_WRITE");
+  assert.ok(cacheLog !== -1, "stream must have Phase 1 client-closed cache write path");
+
+  // The cache write must happen before STREAM_CLIENT_CLOSED_STAGE
+  const closedStage = src.indexOf("STREAM_CLIENT_CLOSED_STAGE", cacheLog);
+  assert.ok(closedStage > cacheLog, "cache write must happen before STREAM_CLIENT_CLOSED_STAGE log");
+});
+
+test("V3.10B.12 — client-closed cache write calls setMarketScanResult", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const cacheLog = src.indexOf("STREAM_PHASE1_CLIENT_CLOSED_CACHE_WRITE");
+  assert.ok(cacheLog !== -1);
+
+  const cacheBlock = src.slice(cacheLog - 1200, cacheLog);
+  assert.ok(cacheBlock.includes("setMarketScanResult"), "must call setMarketScanResult");
+  assert.ok(cacheBlock.includes('"client_closed_phase1"'), "layer must be client_closed_phase1");
+});
+
+test("V3.10B.12 — client-closed cache write only fires when phase1Items >= 2 and no provisional sent", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const cacheLog = src.indexOf("STREAM_PHASE1_CLIENT_CLOSED_CACHE_WRITE");
+  assert.ok(cacheLog !== -1);
+
+  const cacheBlock = src.slice(cacheLog - 1500, cacheLog);
+  assert.ok(cacheBlock.includes("phase1Items.length >= 2"), "must guard on phase1Items >= 2");
+  assert.ok(cacheBlock.includes("!_earlyProvSent"), "must guard on no provisional sent");
+});
+
+test("V3.10B.12 — enriched query secondary /market/search has scanId cross-route cache lookup", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  // The non-stream route must look up by scanId before running market
+  const cacheLookup = src.indexOf("getMarketScanResult({");
+  assert.ok(cacheLookup !== -1, "non-stream route must call getMarketScanResult");
+
+  const lookupBlock = src.slice(cacheLookup, cacheLookup + 200);
+  assert.ok(lookupBlock.includes("scanId"), "lookup must include scanId");
+
+  // ENRICHED_QUERY_MARKET_CALL_BLOCKED must exist
+  assert.ok(src.includes("ENRICHED_QUERY_MARKET_CALL_BLOCKED"), "enriched query block log must exist");
+});

@@ -32153,6 +32153,31 @@ app.post("/market/search/stream", async (req, res) => {
     }
 
     if (clientClosed) {
+      // Phase V3.10B.12: when Phase 1 succeeded with items but the client closed
+      // before we could send a provisional, build a payload from the Phase 1 items
+      // and write it to the cross-route cache. This prevents non-stream /market/search
+      // from hitting PAYLOAD_CACHE_MISS and re-running a 6s empty rescue loop.
+      if (phase1Items.length >= 2 && !_earlyProvSent) {
+        try {
+          const _ccItems = applyPrePayloadAircraftFilter(query, phase1Items, scannedPrice, "client_closed_cache");
+          const _ccPayload = await _buildPayload(_ccItems, {
+            source: "live_market", kind: "client_closed_cache",
+          });
+          if (_ccPayload) {
+            const _ctxCache = getCurrentSerpBudgetCtx();
+            if (_ctxCache) {
+              _ctxCache.cacheHit = true;
+              _ctxCache._finalItemCount = Array.isArray(_ccPayload?.items) ? _ccPayload.items.length : null;
+              setMarketScanResult(_ctxCache, { payload: _ccPayload, route: "/market/search/stream", layer: "client_closed_phase1" });
+            }
+            console.log("STREAM_PHASE1_CLIENT_CLOSED_CACHE_WRITE", {
+              scanId, query, phase1Count: phase1Items.length,
+              finalItemCount: (_ccPayload?.items || []).length, route: "/market/search/stream",
+            });
+            _tryRecordSnapshot("stream_client_closed_phase1", { req, scanId, query, category, scannedPrice, finalPayload: _ccPayload, enrichedItems: _ccItems, visionConfidence, visionIdentity }).catch(() => {});
+          }
+        } catch {}
+      }
       console.log("STREAM_CLIENT_CLOSED_STAGE", { scanId, stage: "after_provisional", phase1Count: phase1Items.length, provisionalSent: _earlyProvSent });
       endStream(); return;
     }
