@@ -15408,6 +15408,16 @@ function hydrateMarketSnapshotItem(it = {}) {
     linkVerified: it?.linkVerified !== false,
     sold: it?.sold === true,
     status: it?.status || null,
+
+    // Phase 5A.2: preserve recovery/trust metadata from compact snapshot.
+    // Trust contract: _productId alone never implies clickable or verified.
+    _productId:            it?._productId            || null,
+    _serpapiProductApiUrl: it?._serpapiProductApiUrl || null,
+    urlQuality:            it?.urlQuality            || null,
+    evidenceQuality:       it?.evidenceQuality       || null,
+    clickable:             it?.clickable === true,
+    directUrl:             it?.clickable === true ? (it?.directUrl || null) : null,
+    isVerifiedListing:     it?.isVerifiedListing === true,
   };
 }
 
@@ -25520,7 +25530,7 @@ async function buildMarketSearchResponsePayload({
         kind: _evKind,
         query: baseQuery,
         evidence: summarizeUrlEvidence(_inboundItems),
-        note: "snapshot-sourced pool — recovery fields absent here were dropped at snapshot write (see URL_EVIDENCE_CACHE_WRITE_SUMMARY)",
+        note: "snapshot-sourced pool — if recovery fields are absent, they were stripped by hydrateMarketSnapshotItem (fixed in Phase 5A.2)",
       });
     }
   } catch {}
