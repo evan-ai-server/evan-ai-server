@@ -23946,6 +23946,10 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
         host: "serpapi.com",
         urlQualityBefore: qualBefore,
       });
+      // Phase 5A.3B: alias for structured recovery audit
+      console.log("URL_RECOVERY_REJECTED_MISSING_DIRECT_URL", {
+        scanId: scanId || null, productId, reason: "no_sellers_returned",
+      });
       return null;
     }
 
@@ -23981,6 +23985,11 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
         host: "serpapi.com",
         urlQualityBefore: qualBefore,
       });
+      // Phase 5A.3B: alias for structured recovery audit
+      console.log("URL_RECOVERY_REJECTED_IDENTITY_MISMATCH", {
+        scanId: scanId || null, productId, reason: "no_guard_passing_seller",
+        sellersEvaluated: rawSellers.length,
+      });
       return null;
     }
 
@@ -24011,6 +24020,11 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
       originalSource: source,
       originalPrice: gr.details.originalPrice,
       recoveredPrice: gr.details.recoveredPrice,
+    });
+    // Phase 5A.3B: alias for structured recovery audit
+    console.log("URL_RECOVERY_DIRECT_URL_ACCEPTED", {
+      scanId: scanId || null, productId, host: recoveredHost,
+      urlQuality: "merchant_direct", guardScore: gr.score,
     });
     return {
       _productId: productId,
@@ -25514,9 +25528,48 @@ async function buildMarketSearchResponsePayload({
     .map(it => {
       const _pid = it._productId || null;
       const _cachedRec = _pid ? URL_RECOVERY_CACHE.get(`pid:${_pid}`) : null;
-      const _itToSanitize = (_cachedRec?.directUrl && _isValidMerchantUrl(_cachedRec.directUrl) && !it.isVerifiedListing)
-        ? { ...it, directUrl: _cachedRec.directUrl, link: _cachedRec.directUrl, url: _cachedRec.directUrl, buyLink: _cachedRec.directUrl, clickable: true, urlQuality: "merchant_direct", urlHost: _cachedRec.urlHost }
-        : it;
+      // Phase 5A.3B: observability logs for URL_RECOVERY_CACHE injection path
+      if (_cachedRec) {
+        const _recHost = _cachedRec.urlHost || null;
+        console.log("URL_RECOVERY_CACHE_HIT", {
+          scanId: retrievalMeta?.scanId || null,
+          query: baseQuery,
+          productId: _pid,
+          host: _recHost,
+          hasDirectUrl: !!_cachedRec.directUrl,
+        });
+      }
+      let _itToSanitize = it;
+      if (_cachedRec && !it.isVerifiedListing) {
+        if (!_cachedRec.directUrl) {
+          console.log("URL_RECOVERY_REJECTED_MISSING_DIRECT_URL", {
+            scanId: retrievalMeta?.scanId || null,
+            query: baseQuery,
+            productId: _pid,
+            reason: "cached_recovery_has_no_direct_url",
+          });
+        } else if (!_isValidMerchantUrl(_cachedRec.directUrl)) {
+          let _rejHost = null;
+          try { _rejHost = new URL(_cachedRec.directUrl).hostname.toLowerCase(); } catch {}
+          const _isGoogleHost = _rejHost && (/(^|\.)google\./i.test(_rejHost) || /(^|\.)googleadservices\./i.test(_rejHost));
+          console.log(_isGoogleHost ? "URL_RECOVERY_REJECTED_GOOGLE_SHELL" : "URL_RECOVERY_CACHE_REJECTED_INVALID_MERCHANT_URL", {
+            scanId: retrievalMeta?.scanId || null,
+            query: baseQuery,
+            productId: _pid,
+            host: _rejHost,
+            reason: _isGoogleHost ? "google_shell_url" : "invalid_merchant_url",
+          });
+        } else {
+          _itToSanitize = { ...it, directUrl: _cachedRec.directUrl, link: _cachedRec.directUrl, url: _cachedRec.directUrl, buyLink: _cachedRec.directUrl, clickable: true, urlQuality: "merchant_direct", urlHost: _cachedRec.urlHost };
+          console.log("URL_RECOVERY_CACHE_INJECTED", {
+            scanId: retrievalMeta?.scanId || null,
+            query: baseQuery,
+            productId: _pid,
+            host: _cachedRec.urlHost || null,
+            urlQuality: "merchant_direct",
+          });
+        }
+      }
       return sanitizeOutboundListingForClient(_itToSanitize, { scanId: retrievalMeta?.scanId || null });
     });
 
