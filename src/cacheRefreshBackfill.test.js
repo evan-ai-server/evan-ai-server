@@ -143,3 +143,27 @@ test("TTLCache has delete and has methods", () => {
   assert.ok(ttlBlock.includes("delete(key)"), "TTLCache must have delete method");
   assert.ok(ttlBlock.includes("has(key)"), "TTLCache must have has method");
 });
+
+// ── Static guards: Phase 5A.2E — SLA-exhausted exact-aircraft exception ─────
+
+test("SLA_EXHAUSTED_EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED log exists", () => {
+  assert.ok(INDEX_SRC.includes("SLA_EXHAUSTED_EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED"), "SLA aircraft exception log missing");
+});
+
+test("SLA-exhausted path uses _isExactAircraftIdentity for aircraft exception", () => {
+  assert.ok(INDEX_SRC.includes("_slaExactAircraftOk = _isExactAircraftIdentity && _notHighStakesForCache && _slaCleanCount >= 4"), "SLA aircraft exception guard missing");
+});
+
+test("SLA-exhausted aircraft exception promotes cleanCount to minTarget", () => {
+  assert.ok(INDEX_SRC.includes("_slaExactAircraftOk ? MIN_CLEAN_RESULTS_TARGET : _slaCleanCount"), "SLA aircraft exception promotion missing");
+});
+
+test("SLA-exhausted aircraft exception does not set clickable or verified", () => {
+  const block = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("Phase 5A.2E:"),
+    INDEX_SRC.indexOf("Phase 5A.2E:") + 800
+  );
+  assert.ok(!block.includes("clickable = true"), "must not set clickable");
+  assert.ok(!block.includes("isVerifiedListing = true"), "must not set verified");
+  assert.ok(!block.includes("directUrl ="), "must not set directUrl");
+});

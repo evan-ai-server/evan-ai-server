@@ -31305,11 +31305,26 @@ app.post("/market/search/stream", async (req, res) => {
         }
       }
 
+      // Phase 5A.2E: apply exact-aircraft safe cache exception (same as V3.10B.13)
+      // so the SLA-exhausted path uses the evidence-rich versioned snapshot instead
+      // of falling through to the product-starved legacy fallback.
+      const _slaExactAircraftOk = _isExactAircraftIdentity && _notHighStakesForCache && _slaCleanCount >= 4;
+      const _slaEffectiveClean = _slaExactAircraftOk ? MIN_CLEAN_RESULTS_TARGET : _slaCleanCount;
+
       const _slaDecision = selectSlaFallbackSource({
         inMemoryHit: false,
-        snapshotCleanCount: _slaCleanCount,
+        snapshotCleanCount: _slaEffectiveClean,
         minCleanTarget: MIN_CLEAN_RESULTS_TARGET,
       });
+
+      if (_slaExactAircraftOk && _slaDecision.source === "internal_snapshot") {
+        console.log("SLA_EXHAUSTED_EXACT_AIRCRAFT_SAFE_CACHE_ACCEPTED", {
+          scanId, query, cleanCount: _slaCleanCount, minTarget: MIN_CLEAN_RESULTS_TARGET,
+          requiredAirline: _airlineLockForBudget?.requiredAirline,
+          requiredFamily: _airlineLockForBudget?.requiredFamily,
+          reason: "exact_aircraft_evidence_rich_snapshot_preferred_over_legacy",
+        });
+      }
 
       if (_slaDecision.source === "internal_snapshot") {
         const _slaPayload = await _buildPayload(_slaPolicyItems, { source: "market_snapshot", kind: "stale_snapshot" });
