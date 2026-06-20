@@ -496,3 +496,53 @@ test("V3.10B.10 — grace aircraft gate also emits VISION_QUERY_FAST_REJECTED_IN
     "grace gate must emit the same rejection log as the normal path for unified audit"
   );
 });
+
+// ── V3.10B.11: stream Phase 1 empty → snapshot fallback + cross-route cache ──
+
+test("V3.10B.11 — stream has Phase 1 empty snapshot fallback with cross-route cache write", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const fallbackLog = src.indexOf("STREAM_PHASE1_EMPTY_SNAPSHOT_FALLBACK");
+  assert.ok(fallbackLog !== -1, "stream must have Phase 1 empty snapshot fallback path");
+
+  // The fallback must call readInternalMarketSnapshot
+  const fallbackBlock = src.slice(fallbackLog - 2000, fallbackLog);
+  assert.ok(fallbackBlock.includes("readInternalMarketSnapshot"), "fallback must read internal snapshot");
+  assert.ok(fallbackBlock.includes("resolveAircraftCachePolicy"), "fallback must apply aircraft cache policy");
+  assert.ok(fallbackBlock.includes("computeCleanRetrievalPool"), "fallback must compute clean pool");
+});
+
+test("V3.10B.11 — stream snapshot fallback writes to cross-route payload cache", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const fallbackLog = src.indexOf("STREAM_PHASE1_EMPTY_SNAPSHOT_FALLBACK");
+  assert.ok(fallbackLog !== -1);
+
+  // The setMarketScanResult call must be BEFORE the fallback log (it writes, then logs)
+  const beforeLog = src.slice(fallbackLog - 1200, fallbackLog);
+  assert.ok(
+    beforeLog.includes("setMarketScanResult"),
+    "snapshot fallback must write to cross-route cache before logging"
+  );
+  assert.ok(
+    beforeLog.includes('layer: "phase1_empty_snapshot"'),
+    "cache layer must be identified as phase1_empty_snapshot"
+  );
+});
+
+test("V3.10B.11 — stream snapshot fallback only fires when phase1 items < 2", () => {
+  const indexPath = resolve(new URL(import.meta.url).pathname, "../../index.js");
+  const src = readFileSync(indexPath, "utf8");
+
+  const fallbackLog = src.indexOf("STREAM_PHASE1_EMPTY_SNAPSHOT_FALLBACK");
+  assert.ok(fallbackLog !== -1);
+
+  // The fallback must be guarded by phase1Items.length < 2
+  const beforeFallback = src.slice(fallbackLog - 2500, fallbackLog);
+  assert.ok(
+    beforeFallback.includes("phase1Items.length < 2"),
+    "snapshot fallback must only fire when phase1 items < 2"
+  );
+});

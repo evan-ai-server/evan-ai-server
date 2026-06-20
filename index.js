@@ -32075,14 +32075,81 @@ app.post("/market/search/stream", async (req, res) => {
         .then(() => console.log("STREAM_SNAPSHOT_RECORDED", { scanId, source: "stream_provisional", verdict: _provVerdictKey }))
         .catch(() => {});
     } else if (!_earlyProvSent) {
-      // Neither early provisional nor phase1 provisional fired — log why no snapshot was captured
-      console.log("PREDICTION_SNAPSHOT_SKIPPED", {
-        source: "stream_provisional",
-        scanId, query,
-        reason: phase1Items.length < 2 ? "insufficient_phase1_items" : "client_closed_before_provisional",
-        phase1Count: phase1Items.length,
-        clientClosed,
-      });
+      // Phase V3.10B.11: Phase 1 returned 0 live items and no early provisional
+      // was sent. Before giving up, check the persistent internal snapshot —
+      // the same source the SLA-exhausted path uses. If it has clean items for
+      // this exact query, build a provisional payload and write it to the
+      // cross-route cache so non-stream /market/search can reuse it immediately
+      // (PAYLOAD_CACHE_HIT) instead of re-running a SerpAPI call that will be
+      // budget-blocked and falling through 6s of empty rescue.
+      let _snapshotProvisionalSent = false;
+      if (phase1Items.length < 2) {
+        try {
+          const _snapFallback = await readInternalMarketSnapshot(query);
+          const _snapItems = Array.isArray(_snapFallback?.items)
+            ? _snapFallback.items.map(hydrateMarketSnapshotItem).filter((x) => x?.title)
+            : [];
+          if (_snapItems.length >= 4) {
+            const _snapPolicy = resolveAircraftCachePolicy(query, _snapItems, scannedPrice, "stream_phase1_empty_snapshot");
+            if (_snapPolicy.action !== "bypass_stale_cache") {
+              const _snapClean = computeCleanRetrievalPool(query, _snapPolicy.items, scannedPrice, "stream_phase1_empty_snapshot");
+              if (_snapClean.cleanCount >= 4) {
+                const _snapPayload = await _buildPayload(_snapPolicy.items, {
+                  source: "market_snapshot", kind: "stream_phase1_empty_snapshot",
+                });
+                if (_snapPayload) {
+                  const _snapVerdict =
+                    normalizeVerdict(_snapPayload?.buyOrPass?.verdict) ||
+                    normalizeVerdict(_snapPayload?.profitIntel?.verdict) ||
+                    "HOLD";
+                  // Write to cross-route cache — this is the critical fix.
+                  // Non-stream sees PAYLOAD_CACHE_HIT instead of CACHE_MISS.
+                  try {
+                    const _ctxCache = getCurrentSerpBudgetCtx();
+                    if (_ctxCache) {
+                      _ctxCache.cacheHit = true;
+                      _ctxCache._finalItemCount = Array.isArray(_snapPayload?.items) ? _snapPayload.items.length : null;
+                      setMarketScanResult(_ctxCache, { payload: _snapPayload, route: "/market/search/stream", layer: "phase1_empty_snapshot" });
+                    }
+                  } catch {}
+                  console.log("STREAM_PHASE1_EMPTY_SNAPSHOT_FALLBACK", {
+                    scanId, query, snapshotItemCount: _snapItems.length,
+                    cleanCount: _snapClean.cleanCount, uiItemCount: (_snapPayload?.items || []).length,
+                    verdict: _snapVerdict, clientClosed,
+                  });
+                  if (!clientClosed) {
+                    _earlyProvSent = true;
+                    _snapshotProvisionalSent = true;
+                    firstPayloadSent = true;
+                    clearTimeout(marketDeadlineTimer);
+                    _recordStreamMetric("provisionalSent", 1);
+                    _provVerdictKey = _snapVerdict;
+                    send("provisional", {
+                      ..._snapPayload,
+                      verdict: _snapVerdict,
+                      status: "provisional", enriching: false,
+                      needsOracle: false,
+                      dataDepth: (_snapPayload?.items || []).length < 3 ? "thin" : "normal",
+                      cacheFallback: true,
+                      _timing: { phase1Ms: _phase1Ms },
+                    });
+                  }
+                  _tryRecordSnapshot("stream_phase1_empty_snapshot", { req, scanId, query, category, scannedPrice, finalPayload: _snapPayload, enrichedItems: _snapPolicy.items, visionConfidence, visionIdentity }).catch(() => {});
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+      if (!_snapshotProvisionalSent) {
+        console.log("PREDICTION_SNAPSHOT_SKIPPED", {
+          source: "stream_provisional",
+          scanId, query,
+          reason: phase1Items.length < 2 ? "insufficient_phase1_items" : "client_closed_before_provisional",
+          phase1Count: phase1Items.length,
+          clientClosed,
+        });
+      }
     }
 
     if (clientClosed) {
