@@ -20675,6 +20675,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
             visionWallMs: _incWallMs, raceWinner: "query_fast",
             masterLaunched: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
             tier: "incomplete_aircraft_identity",
+            downscaleMs: _vpMs, queryFastUsage: extractOpenAiUsage(qfResult?.usage),
           },
         };
       }
@@ -20824,6 +20825,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           raceWinner:    "query_fast",
           masterLaunched: false,
           tier:          "query_fast",
+          downscaleMs: _vpMs, queryFastUsage: extractOpenAiUsage(qfResult?.usage),
         },
         debug: { passQueries: [_finalQuery, qfQuery].filter(Boolean), passLabels: ["query_fast"] },
       };
@@ -21291,6 +21293,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                   visionWallMs: _incWallMs, raceWinner: sourcePass,
                   masterLaunched: VISION_MASTER_BACKGROUND_ENABLED && masterLaunched,
                   tier: "incomplete_aircraft_identity",
+                  downscaleMs: _vpMs, queryFastUsage: null,
                 },
               };
             }
@@ -21377,6 +21380,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                   raceWinner: "hard_deadline",
                   masterLaunched: true,
                   tier: "hard_fail_no_seed",
+                  downscaleMs: _vpMs, queryFastUsage: _queryFastSettled?.usage ? extractOpenAiUsage(_queryFastSettled.usage) : null,
                 },
                 error: "INSUFFICIENT_IDENTITY",
                 userMessage: "Couldn't identify this item — try scanning again",
@@ -21983,6 +21987,7 @@ if (
         raceWinner:     _visionRaceWinner,
         masterLaunched: _visionMasterLaunched,
         tier:           visionTier,
+        downscaleMs: _vpMs, queryFastUsage: _queryFastSettled?.usage ? extractOpenAiUsage(_queryFastSettled.usage) : null,
       },
       debug: {
         passQueries: rawQueries,
@@ -22502,11 +22507,12 @@ if (!file && uploadedObjectKey) {
         mimetype: file.mimetype,
       });
       _epT1FileAccepted = Date.now();
+      // multer upload parsing happens before _epT0; this measures handler entry → file accepted
       console.log("VISION_UPLOAD_PARSED", {
         rid: req.rid,
         scanId: req.body?.scanId || null,
         bytes: file.size || 0,
-        uploadParseMs: _epT1FileAccepted - _epT0,
+        handlerToAcceptedMs: _epT1FileAccepted - _epT0,
         mime: file.mimetype || null,
         hasFile: true,
       });
@@ -23450,16 +23456,18 @@ if (!openai) {
           const _54cat      = shaped?.identity?.category || shaped?.visionIdentity?.category || null;
           const _54isHS     = _54cat ? HIGH_STAKES_CATEGORIES.has(_54cat) : false;
 
+          const _54pathEligible = ["exact_cache", "similarity_seed", "query_fast", "low_quality"].includes(_54path);
           console.log("VISION_UNDER_1200_ELIGIBLE", {
-            rid:       req.rid,
-            totalMs:   _54totalMs,
-            path:      _54path,
-            eligible:  _54under === true,
-            reason:    _54under ? "under_budget" : _54path === "exact_cache" ? "exact_cache" : _54path === "similarity_seed" ? "similarity_seed" : "over_budget",
+            rid:               req.rid,
+            totalMs:           _54totalMs,
+            path:              _54path,
+            achievedUnder1200: _54under === true,
+            pathEligible:      _54pathEligible,
+            reason:            _54under ? "under_budget" : _54pathEligible ? "path_eligible_but_over_budget" : "path_not_under1200_candidate",
           });
 
           if (_54totalMs > 1200) {
-            const _54qfUsage  = shaped?.visionTimings?.queryFastUsage || null;
+            const _54qfUsage  = _54vt.queryFastUsage || null;
             const _54missReason = classifyMissReason({
               totalMs:           _54totalMs,
               uploadMs:          _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
@@ -23486,6 +23494,7 @@ if (!openai) {
             });
           }
 
+          const _54v2qfUsage = _54vt.queryFastUsage || null;
           console.log("VISION_CRITICAL_PATH_TIMING_V2", buildCriticalPathTimingV2({
             rid:                req.rid,
             totalMs:            _54totalMs,
@@ -23496,15 +23505,15 @@ if (!openai) {
             exactCacheMs:       null,
             embedMs:            _ppSteps?.embed ?? null,
             embedTimedOut:      _embedTimedOut,
-            downscaleMs:        _54vt.downscaleMs ?? (_ppSteps?.preprocess ?? null),
+            downscaleMs:        _54vt.downscaleMs ?? null,
             sourceBudgetMs:     _ppSteps?.sourceBudget ?? null,
             queryFastMs:        _54vt.queryFastMs ?? null,
             visualShapeMs:      _54vt.visualMs ?? null,
             masterStarted:      _54vt.masterLaunched ?? false,
             masterCriticalPath: _54vt.raceWinner === "consensus",
             firstResponder:     _54vt.raceWinner ?? shaped?.visionTier ?? null,
-            promptCached:       null,
-            cachedInputTokens:  null,
+            promptCached:       _54v2qfUsage ? _54v2qfUsage.cachedInputTokens > 0 : null,
+            cachedInputTokens:  _54v2qfUsage?.cachedInputTokens ?? null,
             under1200:          _54under,
             preSteps:           _ppSteps,
           }));
@@ -43280,7 +43289,12 @@ function _firePromptCacheWarmup() {
         ],
       }).catch(() => {});
     }
-    console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape/fast/query_fast passes");
+    console.log("VISION_PROMPT_CACHE_WARMUP_FIRED", {
+      passes: 5,
+      passLabels: ["master", "brand_model", "visual_shape", "fast", "query_fast"],
+      models: [VISION_MODEL, VISUAL_SHAPE_MODEL, FAST_VISION_MODEL, QUERY_FAST_MODEL],
+      fireAndForget: true,
+    });
   } catch (e) {
     // non-critical
   }
@@ -43290,7 +43304,7 @@ function _firePromptCacheWarmup() {
 // immediately after server_started. Does not block startup.
 setTimeout(() => {
   runBootWarmup({ warmPromptCache: _firePromptCacheWarmup }).catch((e) => {
-    console.log("VISION_BOOT_WARMUP_FAILED", { error: e?.message || String(e), totalWarmMs: null, sharpWarmMs: null, embedderWarmMs: null, promptCacheWarmMs: null, errors: [e?.message || String(e)] });
+    console.log("VISION_BOOT_WARMUP_FAILED", { error: e?.message || String(e), totalWarmMs: null, sharpWarmMs: null, embedderWarmMs: null, promptCacheFireMs: null, errors: [e?.message || String(e)] });
   });
 }, 500);
 

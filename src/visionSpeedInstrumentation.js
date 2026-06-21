@@ -63,7 +63,7 @@ export function buildCriticalPathTimingV2({
     exactCacheMs:       exactCacheMs ?? null,
     embedMs:            embedMs ?? (preSteps?.embed ?? null),
     embedTimedOut:      embedTimedOut ?? false,
-    preprocessMs:       downscaleMs ?? (preSteps?.preprocess ?? null),
+    downscaleMs:        downscaleMs ?? null,
     sourceBudgetMs:     sourceBudgetMs ?? (preSteps?.sourceBudget ?? null),
     queryFastMs:        queryFastMs ?? null,
     visualShapeMs:      visualShapeMs ?? null,

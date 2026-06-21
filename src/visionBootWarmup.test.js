@@ -11,7 +11,17 @@ describe("runBootWarmup", () => {
     assert.equal(called, true);
     assert.equal(typeof result.totalWarmMs, "number");
     assert.ok(result.totalWarmMs >= 0);
-    assert.equal(typeof result.promptCacheWarmMs, "number");
+    assert.equal(typeof result.promptCacheFireMs, "number");
+  });
+
+  it("reports promptCacheFired in DONE log", async () => {
+    let fired = false;
+    const result = await runBootWarmup({
+      warmPromptCache: () => { fired = true; },
+    });
+    assert.equal(fired, true);
+    assert.equal(typeof result.promptCacheFireMs, "number");
+    assert.ok(!result.errors.some((e) => e.startsWith("promptCache:")));
   });
 
   it("captures warmPromptCache error without throwing", async () => {

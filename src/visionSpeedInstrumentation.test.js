@@ -97,12 +97,16 @@ describe("buildCriticalPathTimingV2", () => {
     assert.equal(result.masterCriticalPath, false);
     assert.equal(result.under1200, null);
     assert.equal(result.embedTimedOut, false);
+    assert.equal(result.downscaleMs, null);
+    assert.equal(result.promptCached, null);
+    assert.equal(result.cachedInputTokens, null);
   });
-  it("passes through provided values", () => {
+  it("passes through provided values including real usage", () => {
     const result = buildCriticalPathTimingV2({
       rid: "r2", totalMs: 900, uploadMs: 50, preConsensusMs: 100,
       consensusMs: 700, postConsensusMs: 50, embedMs: 30,
       queryFastMs: 600, masterStarted: true, under1200: true,
+      downscaleMs: 12, promptCached: true, cachedInputTokens: 500,
     });
     assert.equal(result.uploadMs, 50);
     assert.equal(result.preConsensusMs, 100);
@@ -110,6 +114,9 @@ describe("buildCriticalPathTimingV2", () => {
     assert.equal(result.queryFastMs, 600);
     assert.equal(result.masterStarted, true);
     assert.equal(result.under1200, true);
+    assert.equal(result.downscaleMs, 12);
+    assert.equal(result.promptCached, true);
+    assert.equal(result.cachedInputTokens, 500);
   });
   it("reads embedMs from preSteps fallback", () => {
     const result = buildCriticalPathTimingV2({
