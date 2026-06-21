@@ -1431,6 +1431,12 @@ import {
   checkSimilarItemAlert,
   checkEscalationAlert,
 } from "./src/watchlistIntelligence.js";
+import {
+  classifyVisionPath,
+  classifyMissReason,
+  buildCriticalPathTimingV2,
+} from "./src/visionSpeedInstrumentation.js";
+import { runBootWarmup } from "./src/visionBootWarmup.js";
 
   dotenv.config();
 
@@ -19907,6 +19913,20 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
       parsedConfidence:  parsed.confidence,
     });
 
+    console.log("VISION_FAST_MODEL_CACHE", {
+      rid, model, elapsedMs,
+      inputTokens: _qfUsage.inputTokens,
+      cachedInputTokens: _qfUsage.cachedInputTokens,
+      outputTokens: _qfUsage.outputTokens,
+      promptChars: _qfPrompt.length,
+      promptCacheHit: typeof _qfUsage.cachedInputTokens === "number" && typeof _qfUsage.inputTokens === "number" && _qfUsage.inputTokens > 0
+        ? _qfUsage.cachedInputTokens > 0
+        : null,
+      cacheHitRatio: typeof _qfUsage.cachedInputTokens === "number" && typeof _qfUsage.inputTokens === "number" && _qfUsage.inputTokens > 0
+        ? Number((_qfUsage.cachedInputTokens / _qfUsage.inputTokens).toFixed(4))
+        : null,
+    });
+
     return { rawText, parsed, source: "openai", model, usage: response?.usage || null };
 
   } catch (err) {
@@ -22482,6 +22502,14 @@ if (!file && uploadedObjectKey) {
         mimetype: file.mimetype,
       });
       _epT1FileAccepted = Date.now();
+      console.log("VISION_UPLOAD_PARSED", {
+        rid: req.rid,
+        scanId: req.body?.scanId || null,
+        bytes: file.size || 0,
+        uploadParseMs: _epT1FileAccepted - _epT0,
+        mime: file.mimetype || null,
+        hasFile: true,
+      });
       // Per-step preConsensus instrumentation. Each step records ms into _ppSteps
       // so the final VISION_ENDPOINT_TIMINGS log can break down where the
       // pre-consensus wall went (sha256 / cache / embed / preprocess / budget).
@@ -23412,6 +23440,76 @@ if (!openai) {
             blockerReasons:     _bReasons,
           });
         } catch { /* non-fatal */ }
+
+        // Phase 5A.4A: 1200ms eligibility + miss-reason + critical path V2
+        try {
+          const _54vt       = shaped?.visionTimings || {};
+          const _54totalMs  = _epT4PreResponse - _epT0;
+          const _54path     = classifyVisionPath(shaped, _54vt);
+          const _54under    = typeof _54totalMs === "number" ? _54totalMs <= 1200 : null;
+          const _54cat      = shaped?.identity?.category || shaped?.visionIdentity?.category || null;
+          const _54isHS     = _54cat ? HIGH_STAKES_CATEGORIES.has(_54cat) : false;
+
+          console.log("VISION_UNDER_1200_ELIGIBLE", {
+            rid:       req.rid,
+            totalMs:   _54totalMs,
+            path:      _54path,
+            eligible:  _54under === true,
+            reason:    _54under ? "under_budget" : _54path === "exact_cache" ? "exact_cache" : _54path === "similarity_seed" ? "similarity_seed" : "over_budget",
+          });
+
+          if (_54totalMs > 1200) {
+            const _54qfUsage  = shaped?.visionTimings?.queryFastUsage || null;
+            const _54missReason = classifyMissReason({
+              totalMs:           _54totalMs,
+              uploadMs:          _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
+              embedMs:           _ppSteps?.embed ?? null,
+              downscaleMs:       _54vt.downscaleMs ?? null,
+              queryFastMs:       _54vt.queryFastMs ?? null,
+              cachedInputTokens: _54qfUsage?.cachedInputTokens ?? null,
+              inputTokens:       _54qfUsage?.inputTokens ?? null,
+              visionTier:        shaped?.visionTier,
+              raceWinner:        _54vt.raceWinner,
+              isHighStakes:      _54isHS,
+            });
+            console.log("VISION_UNDER_1200_MISS_REASON", {
+              rid:              req.rid,
+              totalMs:          _54totalMs,
+              missReason:       _54missReason,
+              uploadMs:         _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
+              preConsensusMs:   _epT2PreConsensus && _epT1FileAccepted ? _epT2PreConsensus - _epT1FileAccepted : null,
+              embedMs:          _ppSteps?.embed ?? null,
+              downscaleMs:      _54vt.downscaleMs ?? null,
+              queryFastMs:      _54vt.queryFastMs ?? null,
+              consensusMs:      _epT3PostConsensus && _epT2PreConsensus ? _epT3PostConsensus - _epT2PreConsensus : null,
+              cachedInputTokens: _54qfUsage?.cachedInputTokens ?? null,
+            });
+          }
+
+          console.log("VISION_CRITICAL_PATH_TIMING_V2", buildCriticalPathTimingV2({
+            rid:                req.rid,
+            totalMs:            _54totalMs,
+            uploadMs:           _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
+            preConsensusMs:     _epT2PreConsensus && _epT1FileAccepted ? _epT2PreConsensus - _epT1FileAccepted : null,
+            consensusMs:        _epT3PostConsensus && _epT2PreConsensus ? _epT3PostConsensus - _epT2PreConsensus : null,
+            postConsensusMs:    _epT3PostConsensus ? _epT4PreResponse - _epT3PostConsensus : null,
+            exactCacheMs:       null,
+            embedMs:            _ppSteps?.embed ?? null,
+            embedTimedOut:      _embedTimedOut,
+            downscaleMs:        _54vt.downscaleMs ?? (_ppSteps?.preprocess ?? null),
+            sourceBudgetMs:     _ppSteps?.sourceBudget ?? null,
+            queryFastMs:        _54vt.queryFastMs ?? null,
+            visualShapeMs:      _54vt.visualMs ?? null,
+            masterStarted:      _54vt.masterLaunched ?? false,
+            masterCriticalPath: _54vt.raceWinner === "consensus",
+            firstResponder:     _54vt.raceWinner ?? shaped?.visionTier ?? null,
+            promptCached:       null,
+            cachedInputTokens:  null,
+            under1200:          _54under,
+            preSteps:           _ppSteps,
+          }));
+        } catch { /* non-fatal */ }
+
         return res.status(200).json(shaped);
     } catch (err) {
       if (err?.status === 429 || String(err?.message || "").includes("429")) {
@@ -43151,50 +43249,50 @@ app.post("/api/profile/flip", async (req, res) => {
 
 leaderElection.start();
 
-// Warm prompt cache on boot so first real user scan benefits from cached system prompt
-if (OPENAI_API_KEY && openai) {
-  setTimeout(async () => {
-    try {
-      // Minimal 1x1 white JPEG — just enough to warm the prompt cache for all 3 pass labels
-      const warmPixel = Buffer.from(
-        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
-        "base64"
-      );
-      const warmDataUrl = `data:image/jpeg;base64,${warmPixel.toString("base64")}`;
-      // Each (pass × model) combo needs its own warmup — prompt_cache is scoped
-      // per model, so a gpt-4.1 warmup doesn't help a gpt-4.1-mini call even
-      // with the same cache key. visual_shape now uses VISUAL_SHAPE_MODEL
-      // (mini by default) and fast uses FAST_VISION_MODEL — warm both.
-      // Phase A2.7: query_fast uses ultra-lean schema + dedicated cache key.
-      // Phase A2.6: fast/visual_shape use lean schema (v6 cache key).
-      // master/brand_model keep full schema (v5 cache key).
-      const warmupPasses = [
-        { passLabel: "master",       model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-master-v5",       schemaName: "evan_ai_vision_master",          promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
-        { passLabel: "brand_model",  model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-brand_model-v5",   schemaName: "evan_ai_vision_brand_model",     promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
-        { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL, schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-visual_shape-v6",  schemaName: "evan_ai_vision_visual_shape_lean", promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
-        { passLabel: "fast",         model: FAST_VISION_MODEL,  schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-fast-v6",          schemaName: "evan_ai_vision_fast_lean",       promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
-        { passLabel: "query_fast",   model: QUERY_FAST_MODEL,   schema: buildUltraLeanVisionSchema(), cacheKey: "evan-ai-vision-query-fast-v1",    schemaName: "evan_ai_vision_query_fast_v1",  promptFn: () => buildUltraLeanVisionPrompt("item", "") },
-      ];
-      for (const { passLabel, model, schema, cacheKey, schemaName, promptFn } of warmupPasses) {
-        openai.responses.create({
-          model,
-          temperature: 0.1,
-          max_output_tokens: 10,
-          prompt_cache_key: cacheKey,
-          prompt_cache_retention: "24h",
-          text: { format: { type: "json_schema", name: schemaName, strict: true, schema } },
-          input: [
-            { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
-            { role: "user", content: [{ type: "input_text", text: promptFn(passLabel) }, { type: "input_image", image_url: warmDataUrl }] },
-          ],
-        }).catch(() => {});
-      }
-      console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape/fast passes");
-    } catch (e) {
-      // non-critical
+// Phase 5A.4B: fire prompt cache warmup synchronously (non-blocking) instead of
+// waiting 60s. Sharp + embedder warmup run in parallel in background via runBootWarmup.
+function _firePromptCacheWarmup() {
+  if (!OPENAI_API_KEY || !openai) return;
+  try {
+    const warmPixel = Buffer.from(
+      "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
+      "base64"
+    );
+    const warmDataUrl = `data:image/jpeg;base64,${warmPixel.toString("base64")}`;
+    const warmupPasses = [
+      { passLabel: "master",       model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-master-v5",       schemaName: "evan_ai_vision_master",            promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+      { passLabel: "brand_model",  model: VISION_MODEL,       schema: buildVisionConsensusSchema(), cacheKey: "evan-ai-vision-brand_model-v5",   schemaName: "evan_ai_vision_brand_model",       promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+      { passLabel: "visual_shape", model: VISUAL_SHAPE_MODEL, schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-visual_shape-v6",  schemaName: "evan_ai_vision_visual_shape_lean", promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+      { passLabel: "fast",         model: FAST_VISION_MODEL,  schema: buildFastVisionSchema(),      cacheKey: "evan-ai-vision-fast-v6",          schemaName: "evan_ai_vision_fast_lean",         promptFn: (pl) => buildVisionPassPrompt(pl, "item", "") },
+      { passLabel: "query_fast",   model: QUERY_FAST_MODEL,   schema: buildUltraLeanVisionSchema(), cacheKey: "evan-ai-vision-query-fast-v1",    schemaName: "evan_ai_vision_query_fast_v1",     promptFn: () => buildUltraLeanVisionPrompt("item", "") },
+    ];
+    for (const { passLabel, model, schema, cacheKey, schemaName, promptFn } of warmupPasses) {
+      openai.responses.create({
+        model,
+        temperature: 0.1,
+        max_output_tokens: 10,
+        prompt_cache_key: cacheKey,
+        prompt_cache_retention: "24h",
+        text: { format: { type: "json_schema", name: schemaName, strict: true, schema } },
+        input: [
+          { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
+          { role: "user", content: [{ type: "input_text", text: promptFn(passLabel) }, { type: "input_image", image_url: warmDataUrl }] },
+        ],
+      }).catch(() => {});
     }
-  }, 60_000);
+    console.log("🔥 Prompt cache warm-up fired for master/brand_model/visual_shape/fast/query_fast passes");
+  } catch (e) {
+    // non-critical
+  }
 }
+
+// Phase 5A.4B: boot warmup — sharp + embedder + prompt cache, all in background
+// immediately after server_started. Does not block startup.
+setTimeout(() => {
+  runBootWarmup({ warmPromptCache: _firePromptCacheWarmup }).catch((e) => {
+    console.log("VISION_BOOT_WARMUP_FAILED", { error: e?.message || String(e), totalWarmMs: null, sharpWarmMs: null, embedderWarmMs: null, promptCacheWarmMs: null, errors: [e?.message || String(e)] });
+  });
+}, 500);
 
 let leaderLoopsStarted = false;
 
