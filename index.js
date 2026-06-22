@@ -1321,6 +1321,8 @@ import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, 
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
+import { computeDHash, hammingDistance } from "./src/perceptualHash.js";
+import { registerPHash, findNearPHash, removePHash, getPHashStats } from "./src/perceptualHashIndex.js";
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
@@ -22539,7 +22541,9 @@ if (!openai) {
       const _t_sha = Date.now();
       const imgHash = sha256(file.buffer);
       _stepLog("sha256", _t_sha);
-      const cacheKey = `vision|consensus|${mode}|${propContext}|${imgHash}`;
+      // Phase 5A.4F.1: remove propContext from exact-cache key so identical image
+      // bytes hit the same identity regardless of user-supplied price/hint/size.
+      const cacheKey = `vision|consensus|${mode}|${imgHash}`;
 
       // Bench bypass also bypasses both cache layers — so the smoke test can
       // exercise the FULL pipeline every run without being short-circuited by
@@ -22547,14 +22551,25 @@ if (!openai) {
       // by embedding even when bytes differ).
       const skipCaches = isBenchBypass(req);
 
+      // Phase 5A.4F.1: check in-memory first (no Redis hop), fall back to Redis.
       const _t_cache = Date.now();
-      let cached = skipCaches ? null : await cacheGet(cacheKey);
-      if (!cached && !skipCaches) cached = visionCache.get(cacheKey);
+      let cached = skipCaches ? null : visionCache.get(cacheKey);
+      let _exactCacheSource = cached ? "memory" : null;
+      if (!cached && !skipCaches) {
+        cached = await cacheGet(cacheKey);
+        if (cached) _exactCacheSource = "redis";
+      }
       _stepLog("cacheGet", _t_cache);
 
       if (cached) {
         visionTierStats.exactCacheHit++;
-        return res.status(200).json({ ...cached, cached: true, cacheSource: "exact" });
+        console.log("VISION_EXACT_CACHE_LOOKUP", {
+          rid: req.rid, mode, imageHashPrefix: imgHash.slice(0, 12),
+          memoryHit: _exactCacheSource === "memory",
+          redisHit: _exactCacheSource === "redis",
+          elapsedMs: Date.now() - _t_cache,
+        });
+        return res.status(200).json({ ...cached, cached: true, cacheSource: "exact", exactCacheSource: _exactCacheSource });
       }
 
       const originalHash = imgHash;
@@ -22808,6 +22823,92 @@ if (!openai) {
         costUnits: visionCostUnits,
       });
       _stepLog("sourceBudget", _t_budget);
+
+      // Phase 5A.4F.1: pHash near-duplicate prefilter. Compute a dHash from the
+      // original buffer (fast, ~1-5ms, no ONNX). If a near-dup is in the index and
+      // passes safety gates, return it immediately without an OpenAI call.
+      const _t_phash = Date.now();
+      let _pHash = null;
+      let _pHashMs = 0;
+      let _nearDupHit = false;
+      let _nearDupHamming = null;
+      let _nearDupReturned = false;
+      if (!skipCaches && ["item", "prop"].includes(mode)) {
+        try {
+          _pHash = await computeDHash(file.buffer);
+          _pHashMs = Date.now() - _t_phash;
+          if (_pHash) {
+            console.log("VISION_PHASH_COMPUTED", {
+              rid: req.rid, pHash: _pHash, elapsedMs: _pHashMs,
+              imageHashPrefix: imgHash.slice(0, 12),
+            });
+            const nearDup = findNearPHash(_pHash);
+            if (nearDup) {
+              _nearDupHit = true;
+              _nearDupHamming = nearDup.hamming;
+              const ndPayload = nearDup.payload;
+              const ndQuery = String(ndPayload?.query ?? "").trim().toLowerCase();
+              const ndCategory = String(ndPayload?.identity?.category || ndPayload?.visionIdentity?.category || "").trim().toLowerCase();
+              const isHighStakes = ndCategory && isTrueHighStakesVisionCategory(ndCategory);
+
+              // Safety gate: block high-stakes categories from pHash early-return
+              let gateReason = null;
+              if (isHighStakes) {
+                gateReason = "high_stakes_category";
+              } else if (!ndQuery) {
+                gateReason = "empty_query";
+              }
+
+              // Aircraft identity completeness gate
+              if (!gateReason && ndCategory && /aircraft|diecast|model.*air/i.test(ndCategory)) {
+                const _ndAirlineLock = detectAirlineLockInQuery(ndQuery);
+                const _ndHasFamily = AIRCRAFT_FAMILY_MATCH.some(({ tokens }) => tokens.some((tok) => ndQuery.includes(tok)));
+                if (_ndAirlineLock && !_ndHasFamily) {
+                  gateReason = "aircraft_missing_family";
+                }
+              }
+
+              if (!gateReason) {
+                _nearDupReturned = true;
+                const cappedConf = Math.min(Number(ndPayload?.confidence || 0), 0.75);
+                console.log("VISION_NEARDUP_HIT", {
+                  rid: req.rid, hamming: nearDup.hamming, priorImageHash: nearDup.imageHash,
+                  query: ndPayload?.query, category: ndCategory,
+                  cappedConfidence: cappedConf,
+                  pHashMs: _pHashMs,
+                });
+                _stepLog("pHash", _t_phash);
+                _epT2PreConsensus = Date.now();
+                _epT3PostConsensus = Date.now();
+                const nearDupResult = {
+                  ...ndPayload,
+                  confidence: cappedConf,
+                  cached: true,
+                  cacheSource: "near_duplicate",
+                  nearDupHamming: nearDup.hamming,
+                  imageHash: imgHash,
+                  visionTier: "near_duplicate",
+                };
+                visionCache.set(cacheKey, nearDupResult);
+                return res.status(200).json(nearDupResult);
+              } else {
+                console.log("VISION_NEARDUP_MISS", {
+                  rid: req.rid, hamming: nearDup.hamming,
+                  reason: gateReason, query: ndPayload?.query, category: ndCategory,
+                });
+              }
+            } else {
+              console.log("VISION_NEARDUP_MISS", {
+                rid: req.rid, reason: "no_match_in_index",
+                indexSize: getPHashStats().size,
+              });
+            }
+          }
+        } catch (e) {
+          console.warn("VISION_PHASH_ERROR", { rid: req.rid, err: e?.message || String(e) });
+        }
+      }
+      _stepLog("pHash", _t_phash);
 
       const allowFreshEmbedding =
         requestPlan === "pro" || requestPlan === "internal";
@@ -23284,6 +23385,21 @@ if (!openai) {
             // Text mode: embed resolved during the pre-consensus race / drain.
             similarityRegister(originalHash, _similarityVec, shaped);
           }
+
+          // Phase 5A.4F.1: register pHash for future near-dup hits.
+          if (_pHash) {
+            const _pReg = registerPHash({ imageHash: originalHash, pHash: _pHash, payload: shaped });
+            if (_pReg.registered) {
+              console.log("VISION_NEARDUP_REGISTERED", {
+                rid: req.rid, imageHashPrefix: originalHash.slice(0, 12),
+                pHash: _pHash, query: shaped?.query,
+              });
+            } else {
+              console.log("VISION_NEARDUP_REGISTER_SKIPPED", {
+                rid: req.rid, reason: _pReg.reason, query: shaped?.query,
+              });
+            }
+          }
         }
 
         harnessRecordScan(req, shaped).catch(() => {});
@@ -23404,7 +23520,7 @@ if (!openai) {
           const _54cat      = shaped?.identity?.category || shaped?.visionIdentity?.category || null;
           const _54isHS     = _54cat ? HIGH_STAKES_CATEGORIES.has(_54cat) : false;
 
-          const _54pathEligible = ["exact_cache", "similarity_seed", "query_fast", "low_quality"].includes(_54path);
+          const _54pathEligible = ["exact_cache", "near_duplicate", "similarity_seed", "query_fast", "low_quality"].includes(_54path);
           console.log("VISION_UNDER_1200_ELIGIBLE", {
             rid:               req.rid,
             totalMs:           _54totalMs,
@@ -23464,6 +23580,10 @@ if (!openai) {
             promptCached:       _54v2qfUsage ? _54v2qfUsage.cachedInputTokens > 0 : null,
             cachedInputTokens:  _54v2qfUsage?.cachedInputTokens ?? null,
             under1200:          _54under,
+            pHashMs:            _pHashMs || null,
+            nearDupHit:         _nearDupHit,
+            nearDupHamming:     _nearDupHamming,
+            nearDupReturned:    _nearDupReturned,
             preSteps:           _ppSteps,
           }));
         } catch { /* non-fatal */ }
@@ -43212,8 +43332,10 @@ leaderElection.start();
 function _firePromptCacheWarmup() {
   if (!OPENAI_API_KEY || !openai) return;
   try {
+    // Phase 5A.4F.1: use 16×16 grey JPEG instead of 1×1 pixel — larger image
+    // produces enough tokens for OpenAI prompt cache to populate on warmup.
     const warmPixel = Buffer.from(
-      "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k=",
+      "/9j/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2P/wAARCAAQABADASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAAAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AAA//2Q==",
       "base64"
     );
     const warmDataUrl = `data:image/jpeg;base64,${warmPixel.toString("base64")}`;

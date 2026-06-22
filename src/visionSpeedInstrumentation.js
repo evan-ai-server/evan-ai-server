@@ -4,6 +4,7 @@ export function classifyVisionPath(shaped, visionTimings) {
   if (!shaped) return "unknown";
   const tier = shaped.visionTier || shaped.cacheSource;
   if (tier === "exact" || shaped.cacheSource === "exact") return "exact_cache";
+  if (tier === "near_duplicate" || shaped.cacheSource === "near_duplicate") return "near_duplicate";
   if (tier === "similarity_cache" || shaped.cacheSource === "similarity" || shaped.cacheSource === "similarity_cache") return "similarity_seed";
   if (tier === "query_fast") return "query_fast";
   if (tier === "low_quality") return "low_quality";
@@ -51,6 +52,7 @@ export function buildCriticalPathTimingV2({
   exactCacheMs, embedMs, embedTimedOut, embedDeferred, downscaleMs, sourceBudgetMs,
   queryFastMs, visualShapeMs, masterStarted, masterCriticalPath,
   firstResponder, promptCached, cachedInputTokens, under1200,
+  pHashMs, nearDupHit, nearDupHamming, nearDupReturned,
   preSteps,
 }) {
   return {
@@ -74,5 +76,9 @@ export function buildCriticalPathTimingV2({
     promptCached:       promptCached ?? null,
     cachedInputTokens:  cachedInputTokens ?? null,
     under1200:          under1200 ?? null,
+    pHashMs:            pHashMs ?? null,
+    nearDupHit:         nearDupHit ?? false,
+    nearDupHamming:     nearDupHamming ?? null,
+    nearDupReturned:    nearDupReturned ?? false,
   };
 }

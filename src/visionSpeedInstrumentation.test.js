@@ -37,6 +37,10 @@ describe("classifyVisionPath", () => {
   it("returns unknown for unrecognized tier", () => {
     assert.equal(classifyVisionPath({ visionTier: "something_else" }, {}), "unknown");
   });
+  it("returns near_duplicate for pHash near-dup hit", () => {
+    assert.equal(classifyVisionPath({ visionTier: "near_duplicate" }, {}), "near_duplicate");
+    assert.equal(classifyVisionPath({ cacheSource: "near_duplicate" }, {}), "near_duplicate");
+  });
 });
 
 describe("classifyMissReason", () => {
@@ -135,5 +139,22 @@ describe("buildCriticalPathTimingV2", () => {
     });
     assert.equal(result.embedDeferred, true);
     assert.equal(result.embedMs, 0);
+  });
+  it("defaults pHash fields", () => {
+    const result = buildCriticalPathTimingV2({ rid: "r6", totalMs: 2000 });
+    assert.equal(result.pHashMs, null);
+    assert.equal(result.nearDupHit, false);
+    assert.equal(result.nearDupHamming, null);
+    assert.equal(result.nearDupReturned, false);
+  });
+  it("passes through pHash fields when provided", () => {
+    const result = buildCriticalPathTimingV2({
+      rid: "r7", totalMs: 200,
+      pHashMs: 3, nearDupHit: true, nearDupHamming: 2, nearDupReturned: true,
+    });
+    assert.equal(result.pHashMs, 3);
+    assert.equal(result.nearDupHit, true);
+    assert.equal(result.nearDupHamming, 2);
+    assert.equal(result.nearDupReturned, true);
   });
 });
