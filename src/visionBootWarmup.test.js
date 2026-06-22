@@ -50,10 +50,13 @@ describe("runBootWarmup", () => {
   });
 
   it("runs embedder warmup when explicitly enabled", async () => {
+    let called = false;
     const result = await runBootWarmup({
       warmPromptCache: () => {},
       warmEmbedder: true,
+      embedderFn: async () => { called = true; return { ok: true, ms: 1 }; },
     });
+    assert.equal(called, true);
     assert.equal(result.embedderSkipped, false);
     assert.equal(typeof result.embedderWarmMs, "number");
   });

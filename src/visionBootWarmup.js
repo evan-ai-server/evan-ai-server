@@ -37,7 +37,7 @@ export async function warmEmbedder(timeout = 15000) {
   }
 }
 
-export async function runBootWarmup({ warmPromptCache, warmEmbedder: doWarmEmbedder = false }) {
+export async function runBootWarmup({ warmPromptCache, warmEmbedder: doWarmEmbedder = false, embedderFn = warmEmbedder }) {
   const t0 = Date.now();
   console.log("VISION_BOOT_WARMUP_STARTED", { startedAt: t0 });
 
@@ -51,7 +51,7 @@ export async function runBootWarmup({ warmPromptCache, warmEmbedder: doWarmEmbed
   }
 
   const warmTasks = [warmSharp()];
-  if (doWarmEmbedder) warmTasks.push(warmEmbedder());
+  if (doWarmEmbedder) warmTasks.push(embedderFn());
 
   const settled = await Promise.allSettled(warmTasks);
   const sharpResult = settled[0];
