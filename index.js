@@ -22890,19 +22890,11 @@ if (!openai) {
       }
 
       // Phase 5A.4D: start deferred embed now that consensus is done and the
-      // event loop is free. The .then() populates _similarityVec for the
-      // similarityRegister call at the end of this handler.
+      // event loop is free. The embed resolves after res.json; similarity
+      // registration happens in its .then() at the end of this handler (5A.4D.1),
+      // once `shaped` is built — registering here would race a still-null vector.
       if (_embedDeferred) {
-        const _deferredEmbedT0 = Date.now();
         _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
-        _embedPromise.then((v) => {
-          if (Array.isArray(v) && v.length) _similarityVec = v;
-          console.log("VISION_EMBED_BACKGROUND_READY", {
-            rid: req.rid,
-            elapsedMs: Date.now() - _deferredEmbedT0,
-            usedForSimilarityRegister: Array.isArray(v) && v.length > 0,
-          });
-        }).catch(() => {});
       }
 
       // Embedding is background-only; scanEmbedding/visualMatches stay null for immediate response
@@ -23270,8 +23262,28 @@ if (!openai) {
         // similar upload can early-return without paying the vision cost.
         // Skip if vision identity is empty — caching a no-op identity would
         // satisfy future similarity hits with garbage.
-        if (_similarityVec && (shaped?.identity || shaped?.visionIdentity)) {
-          similarityRegister(originalHash, _similarityVec, shaped);
+        if (shaped?.identity || shaped?.visionIdentity) {
+          if (_embedDeferred && _embedPromise) {
+            // Phase 5A.4D.1: deferred embed resolves after the response. Register
+            // in its .then() when the vector is actually ready (never blocks
+            // res.json). `shaped` is fully built here, so the closure is safe.
+            const _regT0 = Date.now();
+            _embedPromise.then((v) => {
+              const used = Array.isArray(v) && v.length > 0;
+              if (used) {
+                _similarityVec = v;
+                similarityRegister(originalHash, v, shaped);
+              }
+              console.log("VISION_EMBED_BACKGROUND_READY", {
+                rid: req.rid,
+                elapsedMs: Date.now() - _regT0,
+                usedForSimilarityRegister: used,
+              });
+            }).catch(() => {});
+          } else if (_similarityVec) {
+            // Text mode: embed resolved during the pre-consensus race / drain.
+            similarityRegister(originalHash, _similarityVec, shaped);
+          }
         }
 
         harnessRecordScan(req, shaped).catch(() => {});
