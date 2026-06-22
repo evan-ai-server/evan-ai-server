@@ -23057,6 +23057,16 @@ if (!openai) {
           ...(result?.retryable   ? { retryable:   result.retryable }  : {}),
         };
 
+        // Phase 5A.4A+B.2: queryFastUsage/downscaleMs in visionTimings are log-only
+        // telemetry — the VISION_UNDER_1200_MISS_REASON / VISION_CRITICAL_PATH_TIMING_V2
+        // logs below read them from result.visionTimings. Serve a trimmed copy so the
+        // response (and the cache/similarity payloads built from `shaped`) stay lean;
+        // all other visionTimings fields are preserved.
+        if (result?.visionTimings && typeof result.visionTimings === "object") {
+          const { queryFastUsage, downscaleMs, ..._visionTimingsLean } = result.visionTimings;
+          shaped.visionTimings = _visionTimingsLean;
+        }
+
         // ── Serial parser (non-LLM, from visibleText) ──────────────────────────
         const visibleTextArray = Array.isArray(shaped.identity?.visibleText)
           ? shaped.identity.visibleText
@@ -23449,7 +23459,9 @@ if (!openai) {
 
         // Phase 5A.4A: 1200ms eligibility + miss-reason + critical path V2
         try {
-          const _54vt       = shaped?.visionTimings || {};
+          // Read raw result.visionTimings (full) — shaped.visionTimings is the
+          // trimmed response copy (queryFastUsage/downscaleMs stripped above).
+          const _54vt       = result?.visionTimings || {};
           const _54totalMs  = _epT4PreResponse - _epT0;
           const _54path     = classifyVisionPath(shaped, _54vt);
           const _54under    = typeof _54totalMs === "number" ? _54totalMs <= 1200 : null;
