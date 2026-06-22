@@ -1437,6 +1437,7 @@ import {
   buildCriticalPathTimingV2,
 } from "./src/visionSpeedInstrumentation.js";
 import { runBootWarmup } from "./src/visionBootWarmup.js";
+import { buildItemDynamicContext, assembleUltraLeanVisionPrompt } from "./src/visionPromptPrefix.js";
 
   dotenv.config();
 
@@ -17820,50 +17821,10 @@ function buildUltraLeanVisionSchema() {
 // Phase A2.7: Focused prompt for the query_fast pass. Asks for only what's
 // needed to produce a good resale search query — no SKU, no condition, no auth.
 function buildUltraLeanVisionPrompt(mode, propContext) {
-  const header = modeHeader(mode, propContext);
-  return `${header}
-
-You are identifying a resale item from an image.
-Return ONLY the best marketplace search query.
-
-Rules:
-1. Identify the physical item type first (sunglasses, sneaker, handbag, watch, model airplane, etc.).
-2. Include visible color, material, and style descriptors.
-3. Include brand ONLY if it is clearly readable from text or logo on the item. Never guess brand from shape alone.
-4. Do not include condition, price, authenticity, or explanation.
-5. Query must be something a buyer would type on eBay or Google Shopping.
-6. Prefer concise but specific queries over generic ones.
-
-Special case — model airplane / aircraft collectible:
-If the item is a model airplane, diecast aircraft, or airplane toy:
-- Include the airline livery if text or markings are visible (Hawaiian Airlines, United, Delta, ANA, Emirates, etc.).
-- Include the aircraft family/type if visible or recognizable from body markings or text: 787, 787-9, 777, 747, 737, A321, A320, A350, A330, A380.
-- If the fuselage or tail text includes "787", "Dreamliner", "777", etc., include it in the query.
-- Include the word "Dreamliner" if clearly marked or visually recognizable.
-- Include scale if visible: 1:400, 1:200, 1:300.
-- Include maker/brand if text is visible on packaging or base: GeminiJets, NG Models, Herpa, Daron, Skymarks.
-- If BOTH airline and aircraft type are visible, you MUST include both in the query.
-- If airline livery is visible but aircraft type is ambiguous, include airline only and set confidence lower.
-
-Examples:
-- "black oval plastic sunglasses orange lens"
-- "white leather Nike low top sneakers"
-- "tan leather crossbody bag gold hardware"
-- "blue denim Levi's trucker jacket"
-- "black digital watch plastic strap"
-- "Hawaiian Airlines Boeing 787-9 Dreamliner diecast model airplane"
-- "Hawaiian Airlines 787-9 model airplane 1:400 GeminiJets"
-- "Daron Hawaiian Airlines single plane toy pullback"
-- "United Airlines Boeing 777 diecast model airplane"
-
-Output:
-- query: best resale search query (or null if item unclear)
-- variants: 3-5 alternate queries ordered specific → broad
-- confidence: 0.0-1.0 confidence in item type and visual descriptors
-- category: simple noun like "sunglasses", "shoes", "jacket", "bag", "watch", "model airplane", "diecast model"
-- brandCertainty: 0.0-1.0 certainty that brand is clearly readable (0 if not visible)
-
-Keep response short.`;
+  const isItemMode = !["mark", "part", "label", "prop", "box_tag"].includes(mode);
+  const staticHeader = isItemMode ? modeHeader(mode, "") : modeHeader(mode, propContext);
+  const dynamicSuffix = isItemMode ? buildItemDynamicContext(propContext) : "";
+  return assembleUltraLeanVisionPrompt(staticHeader, dynamicSuffix);
 }
 
 function buildVisionPassPrompt(passLabel, mode, propContext) {
