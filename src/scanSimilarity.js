@@ -17,6 +17,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { cosineSimilarity } from "../intelligence/vision/embeddingSearch.js";
+import { isGarbageQuery, isGenericGarbageQuery } from "./queryGuards.js";
 
 const MAX_ENTRIES          = Number(process.env.SCAN_SIMILARITY_MAX_ENTRIES || 500);
 const SIMILARITY_THRESHOLD = Number(process.env.SCAN_SIMILARITY_THRESHOLD || 0.92);
@@ -30,7 +31,18 @@ const PAYLOAD_VERSION      = String(process.env.SCAN_SIMILARITY_PAYLOAD_VERSION 
 
 const _index = new Map(); // imageHash → { vector, payload, ts }
 
-let _stats = { hits: 0, misses: 0, registrations: 0, removals: 0, loaded: 0 };
+let _stats = { hits: 0, misses: 0, registrations: 0, removals: 0, loaded: 0, registerSkipped: 0 };
+
+const JUNK_TIERS = new Set(["hard_fail_no_seed", "rejected_generic", "low_quality"]);
+
+export function getSimilarityPayloadJunkReason(payload) {
+  const query = String(payload?.query ?? "").trim();
+  if (!query) return "missing_query";
+  if (isGarbageQuery(query) || isGenericGarbageQuery(query)) return "garbage_query";
+  const tier = String(payload?.visionTier || payload?.cacheSource || payload?.source || "").toLowerCase();
+  if (JUNK_TIERS.has(tier)) return "low_quality_tier";
+  return null;
+}
 
 let _dirReady = null;
 async function _ensureDir() {
@@ -71,6 +83,17 @@ function _isExpired(entry) {
  */
 export function register(imageHash, vector, payload) {
   if (!imageHash || !Array.isArray(vector) || !vector.length || !payload) return;
+  const junkReason = getSimilarityPayloadJunkReason(payload);
+  if (junkReason) {
+    _stats.registerSkipped++;
+    console.log("VISION_SIMILARITY_REGISTER_SKIPPED", {
+      imageHashPrefix: String(imageHash).slice(0, 8),
+      reason: junkReason,
+      query: payload?.query ?? null,
+      visionTier: payload?.visionTier || payload?.cacheSource || payload?.source || null,
+    });
+    return;
+  }
   const ts = Date.now();
   const stampedPayload = { ...payload, _payloadVersion: PAYLOAD_VERSION };
   _index.set(imageHash, { vector, payload: stampedPayload, ts, version: PAYLOAD_VERSION });
@@ -90,18 +113,28 @@ export async function loadFromDisk(maxEntries = MAX_ENTRIES) {
     const files = await fs.readdir(STORAGE_DIR).catch(() => []);
     const candidates = [];
     const now = Date.now();
+    let ttlExpired = 0;
+    let junkPruned = 0;
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
       try {
         const raw = await fs.readFile(path.join(STORAGE_DIR, file), "utf8");
         const data = JSON.parse(raw);
         if (!data?.imageHash || !Array.isArray(data?.vector) || !data?.payload) continue;
-        if ((data.ts || 0) + ENTRY_TTL_MS < now) continue;
+        if ((data.ts || 0) + ENTRY_TTL_MS < now) {
+          ttlExpired++;
+          fs.unlink(path.join(STORAGE_DIR, file)).catch(() => {});
+          continue;
+        }
+        const junkReason = getSimilarityPayloadJunkReason(data.payload);
+        if (junkReason) {
+          junkPruned++;
+          fs.unlink(path.join(STORAGE_DIR, file)).catch(() => {});
+          continue;
+        }
         candidates.push(data);
       } catch { /* skip corrupt entries */ }
     }
-    // Skip entries whose payload version doesn't match — they may carry
-    // stale vision queries (e.g. fabricated tokens) from a prior shape.
     const versionMatches = candidates.filter((c) => c?.payload?._payloadVersion === PAYLOAD_VERSION);
     const versionSkipped = candidates.length - versionMatches.length;
     versionMatches.sort((a, b) => (b.ts || 0) - (a.ts || 0));
@@ -115,11 +148,20 @@ export async function loadFromDisk(maxEntries = MAX_ENTRIES) {
       });
     }
     _stats.loaded = slice.length;
+    const pruned = ttlExpired + junkPruned;
+    if (pruned > 0) {
+      console.log("VISION_SIMILARITY_DISK_PRUNED", {
+        ttlExpired, junkPruned, pruned, scanned: files.length,
+      });
+    }
     return {
       loaded: slice.length,
       scanned: files.length,
-      expired: candidates.length - slice.length - versionSkipped,
+      ttlExpired,
+      junkPruned,
+      pruned,
       versionSkipped,
+      capDropped: versionMatches.length - slice.length,
     };
   } catch (e) {
     return { loaded: 0, scanned: 0, error: e?.message || String(e) };
@@ -186,7 +228,7 @@ export function getStats() {
 
 export function clear() {
   _index.clear();
-  _stats = { hits: 0, misses: 0, registrations: 0, removals: 0 };
+  _stats = { hits: 0, misses: 0, registrations: 0, removals: 0, registerSkipped: 0 };
 }
 
 // Phase V3.10B: iterate all valid (non-expired, version-matched) entries.
