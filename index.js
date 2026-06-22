@@ -22598,106 +22598,44 @@ if (!openai) {
       const _t_embed = Date.now();
       let _similarityVec = null;
       let _embedTimedOut = false;
-      const _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
+      let _embedDeferred = false;
+      let _embedPromise = null;
 
       if (_useFastPreConsensus) {
-        let _provisionalSeedReturned = false;
+        _embedDeferred = true;
+      } else {
+        _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
+      }
 
-        // Phase V3 (default OFF): bounded embed race → similarity lookup → if a
-        // SAFE high-similarity near-duplicate exists, return its identity now and
-        // verify with OpenAI in the background. When the flag is off this whole
-        // block is skipped and behavior is byte-for-byte the prior background path.
-        if (VISION_SIMILARITY_PROVISIONAL_SEED_ENABLED && !skipCaches) {
-          const _seedRace = await Promise.race([
-            _embedPromise.then((v) => ({ kind: "ready", vec: v })),
-            new Promise((r) => setTimeout(() => r({ kind: "timeout" }), VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS)),
-          ]);
-          if (_seedRace?.kind === "ready" && Array.isArray(_seedRace.vec) && _seedRace.vec.length) {
-            _similarityVec = _seedRace.vec;
-            try {
-              const hit = similarityFindSimilar(_similarityVec, VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD);
-              const seedQuery    = hit?.payload?.query || null;
-              const seedCategory = hit?.payload?.identity?.category || hit?.payload?.visionIdentity?.category || null;
-              const seedConfidence = clamp01(Number(hit?.payload?.confidence ?? 0));
-              const _eval = hit?.payload
-                ? evaluateProvisionalSeed({ mode, query: seedQuery, category: seedCategory, similarity: hit.similarity, threshold: VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD })
-                : { eligible: false, reason: "no_similarity_hit" };
-              console.log("VISION_SIMILARITY_PROVISIONAL_SEED_CHECK", {
-                rid: req.rid, mode,
-                hit: !!hit?.payload,
-                similarity: hit ? Number(hit.similarity.toFixed(4)) : null,
-                threshold: VISION_SIMILARITY_PROVISIONAL_SEED_THRESHOLD,
-                seedQuery, seedCategory,
-                eligible: _eval.eligible, reason: _eval.reason,
-              });
-              if (_eval.eligible) {
-                visionTierStats.similarityCacheHit++;
-                const _seedConf = Math.min(seedConfidence, VISION_SIMILARITY_PROVISIONAL_SEED_CONF_CAP);
-                console.log("VISION_SIMILARITY_PROVISIONAL_SEED_ACCEPTED", {
-                  rid: req.rid, query: seedQuery, category: seedCategory,
-                  similarityScore: Number(hit.similarity.toFixed(4)),
-                  confidence: _seedConf, provisional: true,
-                });
-                // Verify in the background — never blocks this response. Pass the
-                // hit's imageHash so a disagreement can self-heal that exact entry.
-                _launchProvisionalSeedVerification({ req, file, mode, propContext, seedQuery, seedImageHash: hit.imageHash, similarity: hit.similarity });
-                _provisionalSeedReturned = true;
-                return res.status(200).json({
-                  ...hit.payload,
-                  imageHash:       imgHash,
-                  query:           seedQuery,
-                  confidence:      _seedConf,
-                  category:        seedCategory,
-                  source:          "similarity_cache",
-                  cacheSource:     "similarity_cache",
-                  cached:          true,
-                  provisional:     true,
-                  similarityScore: hit.similarity,
-                  cacheHit:        true,
-                });
-              }
-              console.log("VISION_SIMILARITY_PROVISIONAL_SEED_REJECTED", {
-                rid: req.rid, mode, reason: _eval.reason,
-                seedQuery, seedCategory,
-                similarity: hit ? Number(hit.similarity.toFixed(4)) : null,
-              });
-            } catch (e) {
-              console.warn("provisional_seed_lookup_error", e?.message || e);
-            }
-          } else {
-            // V3.1: embed not ready within the seed budget — no provisional seed
-            // this scan. Falls through to the normal background path below.
-            console.log("VISION_SIMILARITY_PROVISIONAL_SEED_TIMEOUT", {
-              rid: req.rid, mode,
-              budgetMs: VISION_SIMILARITY_PROVISIONAL_SEED_BUDGET_MS,
-              reason: "embed_not_ready_within_seed_budget",
-            });
-          }
-        }
-
-        if (!_provisionalSeedReturned) {
-          // item/prop: skip the await, run embed fully in background.
-          // The embed result is captured for similarityRegister (end of handler).
-          _embedPromise.then((v) => {
-            if (Array.isArray(v) && v.length) _similarityVec = v;
-          }).catch(() => {});
-          _stepLog("embed", _t_embed); // records ~0ms (no await)
-          console.log("VISION_SIMILARITY_BUDGET_ENFORCED", {
-            rid:      req.rid,
-            budgetMs: 0,
-            elapsedMs: 0,
-            mode,
-            timedOut: false,
-            blocking: false,
-            reason:   "item_prop_preconsensus_background",
-          });
-          console.log("VISION_SIMILARITY_POLICY", {
-            rid: req.rid, mode,
-            blocking: false, timeoutMs: 0,
-            reason: "item_prop_preconsensus_background",
-            hit: false, timedOut: false, elapsedMs: 0,
-          });
-        }
+      if (_useFastPreConsensus) {
+        // Phase 5A.4D: embed deferred off critical path. ONNX model load blocks the
+        // event loop — even fire-and-forget delays vision API response callbacks.
+        // Embed starts after consensus; similarity registration still works via the
+        // post-consensus background drain. Provisional seed is skipped (no embed to
+        // race against); the late-seed path inside runVisionConsensus also skips
+        // because _embedPromise is null.
+        _stepLog("embed", _t_embed);
+        console.log("VISION_EMBED_CRITICAL_PATH_DEFERRED", {
+          rid: req.rid,
+          reason: "fresh_exact_cache_miss",
+          embedStarted: false,
+          criticalPathWaitMs: 0,
+        });
+        console.log("VISION_SIMILARITY_BUDGET_ENFORCED", {
+          rid:      req.rid,
+          budgetMs: 0,
+          elapsedMs: 0,
+          mode,
+          timedOut: false,
+          blocking: false,
+          reason:   "embed_deferred_off_critical_path",
+        });
+        console.log("VISION_SIMILARITY_POLICY", {
+          rid: req.rid, mode,
+          blocking: false, timeoutMs: 0,
+          reason: "embed_deferred_off_critical_path",
+          hit: false, timedOut: false, elapsedMs: 0,
+        });
       } else {
         // text mode: await the 300ms race (event loop is not busy with parallel Sharp)
         const _embedRace = await Promise.race([
@@ -22896,6 +22834,7 @@ if (!openai) {
         sourceBudgetMs: _ppSteps.sourceBudget || 0,
         totalPreConsensusMs: _epT2PreConsensus - _epT1FileAccepted,
         preprocessDeferred: _preprocessDeferred ?? false,
+        embedDeferred: _embedDeferred,
       });
       const result = await withInflight(cacheKey, async () =>
         distributedSingleflight.run(
@@ -22948,6 +22887,22 @@ if (!openai) {
           totalMs: Date.now() - _epT0,
         });
         return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
+      }
+
+      // Phase 5A.4D: start deferred embed now that consensus is done and the
+      // event loop is free. The .then() populates _similarityVec for the
+      // similarityRegister call at the end of this handler.
+      if (_embedDeferred) {
+        const _deferredEmbedT0 = Date.now();
+        _embedPromise = computeImageEmbedding(file.buffer).catch(() => null);
+        _embedPromise.then((v) => {
+          if (Array.isArray(v) && v.length) _similarityVec = v;
+          console.log("VISION_EMBED_BACKGROUND_READY", {
+            rid: req.rid,
+            elapsedMs: Date.now() - _deferredEmbedT0,
+            usedForSimilarityRegister: Array.isArray(v) && v.length > 0,
+          });
+        }).catch(() => {});
       }
 
       // Embedding is background-only; scanEmbedding/visualMatches stay null for immediate response
@@ -23336,6 +23291,7 @@ if (!openai) {
           preConsensusMs:   _epT2PreConsensus && _epT1FileAccepted   ? _epT2PreConsensus - _epT1FileAccepted   : null,
           preSteps:         _ppSteps,
           embedTimedOut:    _embedTimedOut,
+          embedDeferred:    _embedDeferred,
           consensusMs:      _epT3PostConsensus && _epT2PreConsensus  ? _epT3PostConsensus - _epT2PreConsensus  : null,
           postConsensusMs:  _epT3PostConsensus  ? _epT4PreResponse - _epT3PostConsensus  : null,
           totalMs:          _epT4PreResponse - _epT0,
@@ -23485,6 +23441,7 @@ if (!openai) {
             exactCacheMs:       null,
             embedMs:            _ppSteps?.embed ?? null,
             embedTimedOut:      _embedTimedOut,
+            embedDeferred:      _embedDeferred,
             downscaleMs:        _54vt.downscaleMs ?? null,
             sourceBudgetMs:     _ppSteps?.sourceBudget ?? null,
             queryFastMs:        _54vt.queryFastMs ?? null,

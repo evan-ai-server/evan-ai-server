@@ -48,7 +48,7 @@ export function classifyMissReason({
 
 export function buildCriticalPathTimingV2({
   rid, totalMs, uploadMs, preConsensusMs, consensusMs, postConsensusMs,
-  exactCacheMs, embedMs, embedTimedOut, downscaleMs, sourceBudgetMs,
+  exactCacheMs, embedMs, embedTimedOut, embedDeferred, downscaleMs, sourceBudgetMs,
   queryFastMs, visualShapeMs, masterStarted, masterCriticalPath,
   firstResponder, promptCached, cachedInputTokens, under1200,
   preSteps,
@@ -63,6 +63,7 @@ export function buildCriticalPathTimingV2({
     exactCacheMs:       exactCacheMs ?? null,
     embedMs:            embedMs ?? (preSteps?.embed ?? null),
     embedTimedOut:      embedTimedOut ?? false,
+    embedDeferred:      embedDeferred ?? false,
     downscaleMs:        downscaleMs ?? null,
     sourceBudgetMs:     sourceBudgetMs ?? (preSteps?.sourceBudget ?? null),
     queryFastMs:        queryFastMs ?? null,

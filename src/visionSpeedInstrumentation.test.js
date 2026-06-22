@@ -125,4 +125,15 @@ describe("buildCriticalPathTimingV2", () => {
     assert.equal(result.embedMs, 42);
     assert.equal(result.sourceBudgetMs, 5);
   });
+  it("defaults embedDeferred to false", () => {
+    const result = buildCriticalPathTimingV2({ rid: "r4", totalMs: 2000 });
+    assert.equal(result.embedDeferred, false);
+  });
+  it("passes through embedDeferred when true", () => {
+    const result = buildCriticalPathTimingV2({
+      rid: "r5", totalMs: 900, embedDeferred: true, embedMs: 0,
+    });
+    assert.equal(result.embedDeferred, true);
+    assert.equal(result.embedMs, 0);
+  });
 });
