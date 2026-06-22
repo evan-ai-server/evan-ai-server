@@ -17,7 +17,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { cosineSimilarity } from "../intelligence/vision/embeddingSearch.js";
-import { isGarbageQuery, isGenericGarbageQuery } from "./queryGuards.js";
+import { isGarbageQuery } from "./queryGuards.js";
 
 const MAX_ENTRIES          = Number(process.env.SCAN_SIMILARITY_MAX_ENTRIES || 500);
 const SIMILARITY_THRESHOLD = Number(process.env.SCAN_SIMILARITY_THRESHOLD || 0.92);
@@ -38,7 +38,7 @@ const JUNK_TIERS = new Set(["hard_fail_no_seed", "rejected_generic", "low_qualit
 export function getSimilarityPayloadJunkReason(payload) {
   const query = String(payload?.query ?? "").trim();
   if (!query) return "missing_query";
-  if (isGarbageQuery(query) || isGenericGarbageQuery(query)) return "garbage_query";
+  if (isGarbageQuery(query)) return "garbage_query";
   const tier = String(payload?.visionTier || payload?.cacheSource || payload?.source || "").toLowerCase();
   if (JUNK_TIERS.has(tier)) return "low_quality_tier";
   return null;

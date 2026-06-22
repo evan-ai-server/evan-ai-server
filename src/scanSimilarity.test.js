@@ -75,8 +75,22 @@ test("getSimilarityPayloadJunkReason rejects whitespace-only query", () => {
   assert.equal(getSimilarityPayloadJunkReason({ query: "   " }), "missing_query");
 });
 
-test("getSimilarityPayloadJunkReason rejects garbage query", () => {
-  assert.equal(getSimilarityPayloadJunkReason({ query: "item for sale" }), "garbage_query");
+test("getSimilarityPayloadJunkReason rejects exact-token garbage query", () => {
+  assert.equal(getSimilarityPayloadJunkReason({ query: "item" }), "garbage_query");
+  assert.equal(getSimilarityPayloadJunkReason({ query: "product" }), "garbage_query");
+  assert.equal(getSimilarityPayloadJunkReason({ query: "unknown" }), "garbage_query");
+});
+
+test("getSimilarityPayloadJunkReason rejects generic phrase via rejected_generic tier", () => {
+  assert.equal(getSimilarityPayloadJunkReason({ query: "item for sale", visionTier: "rejected_generic" }), "low_quality_tier");
+});
+
+test("getSimilarityPayloadJunkReason preserves short real identities", () => {
+  assert.equal(getSimilarityPayloadJunkReason({ query: "AirPods Max" }), null);
+  assert.equal(getSimilarityPayloadJunkReason({ query: "Rolex Submariner" }), null);
+  assert.equal(getSimilarityPayloadJunkReason({ query: "ANA A380" }), null);
+  assert.equal(getSimilarityPayloadJunkReason({ query: "iPhone 14" }), null);
+  assert.equal(getSimilarityPayloadJunkReason({ query: "Leica M6" }), null);
 });
 
 test("getSimilarityPayloadJunkReason rejects hard_fail_no_seed tier", () => {
@@ -110,8 +124,16 @@ test("register rejects whitespace query payload", () => {
 });
 
 test("register rejects garbage query payload", () => {
-  register("junk3", VEC_A, { query: "item for sale", identity: { category: "diecast model" } });
+  register("junk3", VEC_A, { query: "item", identity: { category: "diecast model" } });
   assert.equal(findSimilar(VEC_A, 0.5), null);
+});
+
+test("register preserves short real identities", () => {
+  register("short1", VEC_A, { query: "ANA A380", identity: { category: "diecast model" } });
+  const hit = findSimilar(VEC_A, 0.5);
+  assert.ok(hit);
+  assert.equal(hit.imageHash, "short1");
+  assert.equal(hit.payload.query, "ANA A380");
 });
 
 test("register rejects hard_fail_no_seed tier", () => {
