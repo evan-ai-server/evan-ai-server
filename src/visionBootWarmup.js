@@ -37,16 +37,25 @@ export async function warmEmbedder(timeout = 15000) {
   }
 }
 
-export async function runBootWarmup({ warmPromptCache }) {
+export async function runBootWarmup({ warmPromptCache, warmEmbedder: doWarmEmbedder = false }) {
   const t0 = Date.now();
   console.log("VISION_BOOT_WARMUP_STARTED", { startedAt: t0 });
 
-  const results = { sharpWarmMs: null, embedderWarmMs: null, promptCacheFireMs: null, errors: [] };
+  const results = { sharpWarmMs: null, embedderWarmMs: null, embedderSkipped: !doWarmEmbedder, promptCacheFireMs: null, errors: [] };
 
-  const [sharpResult, embedderResult] = await Promise.allSettled([
-    warmSharp(),
-    warmEmbedder(),
-  ]);
+  if (!doWarmEmbedder) {
+    console.log("VISION_BOOT_WARMUP_EMBEDDER_SKIPPED", {
+      reason: "disabled_by_default",
+      envFlag: "VISION_BOOT_WARM_EMBEDDER_ENABLED",
+    });
+  }
+
+  const warmTasks = [warmSharp()];
+  if (doWarmEmbedder) warmTasks.push(warmEmbedder());
+
+  const settled = await Promise.allSettled(warmTasks);
+  const sharpResult = settled[0];
+  const embedderResult = doWarmEmbedder ? settled[1] : null;
 
   if (sharpResult.status === "fulfilled") {
     results.sharpWarmMs = sharpResult.value.ms;
@@ -55,11 +64,13 @@ export async function runBootWarmup({ warmPromptCache }) {
     results.errors.push(`sharp: ${sharpResult.reason?.message || "unknown"}`);
   }
 
-  if (embedderResult.status === "fulfilled") {
-    results.embedderWarmMs = embedderResult.value.ms;
-    if (!embedderResult.value.ok) results.errors.push(`embedder: ${embedderResult.value.error}`);
-  } else {
-    results.errors.push(`embedder: ${embedderResult.reason?.message || "unknown"}`);
+  if (embedderResult) {
+    if (embedderResult.status === "fulfilled") {
+      results.embedderWarmMs = embedderResult.value.ms;
+      if (!embedderResult.value.ok) results.errors.push(`embedder: ${embedderResult.value.error}`);
+    } else {
+      results.errors.push(`embedder: ${embedderResult.reason?.message || "unknown"}`);
+    }
   }
 
   const pcT0 = Date.now();
@@ -87,6 +98,7 @@ export async function runBootWarmup({ warmPromptCache }) {
     totalWarmMs,
     sharpWarmMs: results.sharpWarmMs,
     embedderWarmMs: results.embedderWarmMs,
+    embedderSkipped: results.embedderSkipped,
     promptCacheFireMs: results.promptCacheFireMs,
     promptCacheFired: results.promptCacheFireMs != null && !results.errors.some((e) => e.startsWith("promptCache:")),
     errorCount: results.errors.length,

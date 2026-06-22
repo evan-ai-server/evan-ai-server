@@ -43283,7 +43283,7 @@ function _firePromptCacheWarmup() {
 // Phase 5A.4B: boot warmup — sharp + embedder + prompt cache, all in background
 // immediately after server_started. Does not block startup.
 setTimeout(() => {
-  runBootWarmup({ warmPromptCache: _firePromptCacheWarmup }).catch((e) => {
+  runBootWarmup({ warmPromptCache: _firePromptCacheWarmup, warmEmbedder: process.env.VISION_BOOT_WARM_EMBEDDER_ENABLED === "true" }).catch((e) => {
     console.log("VISION_BOOT_WARMUP_FAILED", { error: e?.message || String(e), totalWarmMs: null, sharpWarmMs: null, embedderWarmMs: null, promptCacheFireMs: null, errors: [e?.message || String(e)] });
   });
 }, 500);

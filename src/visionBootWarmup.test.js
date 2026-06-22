@@ -39,4 +39,32 @@ describe("runBootWarmup", () => {
     assert.equal(typeof result.sharpWarmMs, "number");
     assert.ok(result.sharpWarmMs >= 0);
   });
+
+  it("skips embedder warmup by default", async () => {
+    const result = await runBootWarmup({
+      warmPromptCache: () => {},
+    });
+    assert.equal(result.embedderSkipped, true);
+    assert.equal(result.embedderWarmMs, null);
+    assert.ok(!result.errors.some((e) => e.startsWith("embedder:")));
+  });
+
+  it("runs embedder warmup when explicitly enabled", async () => {
+    const result = await runBootWarmup({
+      warmPromptCache: () => {},
+      warmEmbedder: true,
+    });
+    assert.equal(result.embedderSkipped, false);
+    assert.equal(typeof result.embedderWarmMs, "number");
+  });
+
+  it("default is production-safe: no ONNX load without opt-in", async () => {
+    const result = await runBootWarmup({
+      warmPromptCache: () => {},
+    });
+    assert.equal(result.embedderSkipped, true);
+    assert.equal(result.embedderWarmMs, null);
+    assert.equal(typeof result.sharpWarmMs, "number");
+    assert.equal(typeof result.promptCacheFireMs, "number");
+  });
 });
