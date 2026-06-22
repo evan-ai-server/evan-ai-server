@@ -16660,7 +16660,14 @@ Extract with maximum precision:
 Put ALL text you can read into visibleText[]. Even partial text fragments.
 If box/tag is not present or unreadable => query=null.`;
   }
-  // Parse price bracket and item hint from propContext
+  // Parse price bracket and item hint from propContext.
+  // DRIFT CONTRACT (Phase 5A.4C.1): the price/hint/size signal wording below is
+  // mirrored in src/visionPromptPrefix.js -> buildItemDynamicContext, which the
+  // query_fast pass uses to append the SAME signals AFTER the static body (for
+  // prompt-cache prefix stability). The master/brand_model/visual_shape/fast passes
+  // keep using this front-placed version via buildVisionPassPrompt. If you change any
+  // signal text here, update buildItemDynamicContext AND its golden reference in
+  // src/visionPromptPrefix.test.js ("drift guard") so both paths stay identical.
   const priceBracketMatch = (propContext || "").match(/price:(luxury|premium|mid|entry)/);
   const listedMatch = (propContext || "").match(/listed:([\d.]+)/);
   const altMatch = (propContext || "").match(/alt:([\d.]+)/);

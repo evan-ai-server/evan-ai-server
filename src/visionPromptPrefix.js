@@ -1,3 +1,9 @@
+// DRIFT CONTRACT (Phase 5A.4C.1): the price/hint/size signal wording below mirrors
+// index.js -> modeHeader (item path), which the master/brand_model/visual_shape/fast
+// passes still use with signals at the FRONT. Here the same signals are emitted as a
+// suffix (with a leading blank-line separator) so the query_fast static prefix stays
+// byte-stable across scans for prompt caching. Keep wording in sync with modeHeader;
+// the "drift guard" test in visionPromptPrefix.test.js pins this output.
 export function buildItemDynamicContext(propContext) {
   const priceBracketMatch = (propContext || "").match(/price:(luxury|premium|mid|entry)/);
   const listedMatch = (propContext || "").match(/listed:([\d.]+)/);

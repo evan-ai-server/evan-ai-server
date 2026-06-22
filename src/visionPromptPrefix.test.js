@@ -129,3 +129,78 @@ describe("assembleUltraLeanVisionPrompt", () => {
     assert.ok(noContext.length > dynamicLen * 3, `static prefix (${noContext.length}) should be much larger than dynamic suffix (${dynamicLen})`);
   });
 });
+
+// Phase 5A.4C.1 drift guard. modeHeader() lives in index.js, which boots the server
+// on import, so it cannot be imported here. Instead we keep a GOLDEN reference of its
+// item-path signal output (a verbatim mirror of index.js modeHeader lines ~16663-16689)
+// and assert buildItemDynamicContext stays semantically identical to it. Per the DRIFT
+// CONTRACT comments in both files: if modeHeader's signal wording changes, update this
+// golden reference AND buildItemDynamicContext together — this test will fail until the
+// suffix helper matches, catching accidental divergence between the two prompt paths.
+function goldenModeHeaderItemSignals(propContext) {
+  const priceBracketMatch = (propContext || "").match(/price:(luxury|premium|mid|entry)/);
+  const listedMatch = (propContext || "").match(/listed:([\d.]+)/);
+  const altMatch = (propContext || "").match(/alt:([\d.]+)/);
+  const hintMatch  = (propContext || "").match(/hint:([^|]+)/);
+  const sizeMatch  = (propContext || "").match(/size:([^|]+)/);
+  const priceBracketLabel = priceBracketMatch?.[1] || null;
+  const listedPrice = listedMatch?.[1] ? `$${listedMatch[1]}` : null;
+  const altPrice = altMatch?.[1] ? `$${altMatch[1]}` : null;
+
+  let priceSignal = "";
+  if (priceBracketLabel === "luxury") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "high value"}, cheapest alternative ${altPrice || "comparable"}. HIGH-VALUE ITEM — prioritize luxury brand extraction (LV, Gucci, Chanel, Hermès, Rolex, AP, Patek, Prada, Balenciaga, etc). These brands have authentication tells — look harder.`;
+  } else if (priceBracketLabel === "premium") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "mid-high"}, cheapest alternative ${altPrice || "comparable"}. PREMIUM BRACKET — check for Nike/Jordan/Adidas/New Balance limited releases, designer streetwear, mid-tier watches, electronics with storage variants.`;
+  } else if (priceBracketLabel === "mid") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "mid-range"}, cheapest alternative ${altPrice || "comparable"}. MID BRACKET — branded sportswear, contemporary fashion, used electronics. Condition matters for this price.`;
+  } else if (priceBracketLabel === "entry") {
+    priceSignal = `\nPRICE SIGNAL: Listed at ${listedPrice || "low"}, cheapest alternative ${altPrice || "comparable"}. ENTRY BRACKET — common brands, mass market, or significantly worn. Be honest about condition.`;
+  }
+
+  const itemHintSignal = hintMatch?.[1]
+    ? `\nUSER HINT: The user says this is "${hintMatch[1].trim()}". Use this as a strong search-query anchor — confirm visually if consistent, then build the query around it.`
+    : "";
+  const sizeHintSignal = sizeMatch?.[1]
+    ? `\nSIZE HINT: The user specified size/variant "${sizeMatch[1].trim()}". Include this in the search query when relevant (e.g. "Nike Air Force 1 Size 10", "Medium Blue").`
+    : "";
+  return `${priceSignal}${itemHintSignal}${sizeHintSignal}`;
+}
+
+describe("drift guard: buildItemDynamicContext mirrors modeHeader item path", () => {
+  const matrix = [
+    "",
+    "price:luxury|listed:500|alt:300",
+    "price:premium|listed:200|alt:150",
+    "price:mid|listed:80|alt:60",
+    "price:entry|listed:15|alt:10",
+    "price:luxury",
+    "price:premium",
+    "price:mid",
+    "price:entry",
+    "hint:Nike Air Force 1",
+    "size:10",
+    "price:luxury|listed:500|alt:300|hint:Rolex Submariner|size:41mm",
+    "hint:Hawaiian 787|size:1:400",
+    "listed:500|alt:300",
+    "garbage:value",
+    "price:unknownbracket",
+  ];
+
+  for (const ctx of matrix) {
+    it(`content equals modeHeader signals for: ${JSON.stringify(ctx)}`, () => {
+      // buildItemDynamicContext appends a leading blank-line separator before the
+      // (newline-prefixed) signals; modeHeader appends the raw signals at the front.
+      // Same content, different placement — so strip the one extra separator newline.
+      const golden = goldenModeHeaderItemSignals(ctx);
+      const expected = golden === "" ? "" : "\n" + golden;
+      assert.equal(buildItemDynamicContext(ctx), expected);
+    });
+  }
+
+  it("emits nothing when no recognized signals are present", () => {
+    assert.equal(buildItemDynamicContext("garbage:value"), "");
+    assert.equal(buildItemDynamicContext("listed:500|alt:300"), "");
+    assert.equal(buildItemDynamicContext(""), "");
+  });
+});
