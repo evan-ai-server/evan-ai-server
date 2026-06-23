@@ -95,4 +95,44 @@ describe("perceptualHash", () => {
       assert.equal(hammingDistance(h1, h2), 0);
     });
   });
+
+  describe("budget race pattern (5A.4F.4)", () => {
+    it("computeDHash resolves normally within a generous budget", async () => {
+      _injectSharp(makeStubSharp(0));
+      const buf = Buffer.alloc(1000, 42);
+      let budgetExceeded = false;
+      const timeout = new Promise((r) => {
+        const t = setTimeout(() => { budgetExceeded = true; r(null); }, 5000);
+        if (typeof t.unref === "function") t.unref();
+      });
+      const result = await Promise.race([computeDHash(buf), timeout]);
+      assert.ok(result, "should resolve with a hash");
+      assert.equal(result.length, 16);
+      assert.equal(budgetExceeded, false, "budget should not fire for fast compute");
+    });
+
+    it("budget timeout produces null without throwing when compute is slow", async () => {
+      _injectSharp(async () => (buf, _opts) => ({
+        rotate() { return this; },
+        greyscale() { return this; },
+        resize() { return this; },
+        raw() { return this; },
+        async toBuffer() {
+          await new Promise((r) => setTimeout(r, 200));
+          const raw = Buffer.alloc(72);
+          for (let i = 0; i < 72; i++) raw[i] = (buf[0] + i) % 256;
+          return raw;
+        },
+      }));
+      const buf = Buffer.alloc(1000, 42);
+      let budgetExceeded = false;
+      const timeout = new Promise((r) => {
+        const t = setTimeout(() => { budgetExceeded = true; r(null); }, 10);
+        if (typeof t.unref === "function") t.unref();
+      });
+      const result = await Promise.race([computeDHash(buf), timeout]);
+      assert.equal(result, null, "budget timeout should produce null");
+      assert.equal(budgetExceeded, true, "budget flag should be set");
+    });
+  });
 });

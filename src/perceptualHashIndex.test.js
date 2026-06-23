@@ -125,5 +125,13 @@ describe("perceptualHashIndex", () => {
       assert.equal(stats.misses, 1);
       assert.equal(stats.registrations, 1);
     });
+
+    it("reports size 0 on cleared/fresh index (5A.4F.4 empty-index guard)", () => {
+      assert.equal(getPHashStats().size, 0, "fresh index must be empty");
+      registerPHash({ imageHash: "x1", pHash: "0000000000000000", payload: GOOD_PAYLOAD });
+      assert.equal(getPHashStats().size, 1, "after register, size must be 1");
+      clearPHashIndex();
+      assert.equal(getPHashStats().size, 0, "after clear, size must be 0 again");
+    });
   });
 });

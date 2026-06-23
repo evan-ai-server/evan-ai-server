@@ -1614,7 +1614,7 @@ const VISION_MASTER_BACKGROUND_ENABLED  = process.env.VISION_MASTER_BACKGROUND_E
 // we use it immediately — skipping master entirely for common items.
 const QUERY_FAST_ENABLED = String(process.env.QUERY_FAST_ENABLED || "true").toLowerCase() !== "false";
 const QUERY_FAST_MODEL   = process.env.QUERY_FAST_MODEL || FAST_VISION_MODEL || "gpt-4.1-mini";
-const QUERY_FAST_TIMEOUT_MS         = Number(process.env.QUERY_FAST_TIMEOUT_MS         || 4500);
+const QUERY_FAST_TIMEOUT_MS         = Number(process.env.QUERY_FAST_TIMEOUT_MS         || 4200);
 const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_TOKENS  || 160);
 const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
 const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
@@ -22827,150 +22827,162 @@ if (!openai) {
       });
       _stepLog("sourceBudget", _t_budget);
 
-      // Phase 5A.4F.1: pHash near-duplicate prefilter. Compute a dHash from the
-      // original buffer (fast, ~1-5ms, no ONNX). If a near-dup is in the index and
-      // passes safety gates, return it immediately without an OpenAI call.
+      // Phase 5A.4F.1/4: pHash near-duplicate prefilter. Compute a dHash from the
+      // buffer (no ONNX). If a near-dup is in the index and passes safety gates,
+      // return it immediately without an OpenAI call.
+      // 5A.4F.4: skip lookup when index empty (avoids cold-sharp decode on first scan).
+      // Start compute in background unconditionally for registration after consensus.
+      // Budget-gate the lookup so pHash never delays model launch.
       const _t_phash = Date.now();
       let _pHash = null;
+      let _pHashPromise = null;
       let _pHashMs = 0;
       let _nearDupHit = false;
       let _nearDupHamming = null;
       let _nearDupReturned = false;
+      const _pHashBudgetMs = Number(process.env.VISION_PHASH_BUDGET_MS || 50);
       if (!skipCaches && ["item", "prop"].includes(mode)) {
-        try {
-          _pHash = await computeDHash(file.buffer);
-          _pHashMs = Date.now() - _t_phash;
-          if (_pHash) {
-            console.log("VISION_PHASH_COMPUTED", {
-              rid: req.rid, pHash: _pHash, elapsedMs: _pHashMs,
-              imageHashPrefix: imgHash.slice(0, 12),
+        _pHashPromise = computeDHash(file.buffer).catch(() => null);
+        const _pHashIndexSize = getPHashStats().size;
+        if (_pHashIndexSize === 0) {
+          console.log("VISION_PHASH_SKIPPED", {
+            rid: req.rid, reason: "empty_index", indexSize: 0,
+          });
+        } else {
+          try {
+            let _pHashBudgetExceeded = false;
+            const _pHashTimeout = new Promise((resolve) => {
+              const t = setTimeout(() => { _pHashBudgetExceeded = true; resolve(null); }, _pHashBudgetMs);
+              if (typeof t.unref === "function") t.unref();
             });
-            const nearDup = findNearPHash(_pHash);
-            if (nearDup) {
-              _nearDupHit = true;
-              _nearDupHamming = nearDup.hamming;
-              const ndPayload = nearDup.payload;
-              const ndQuery = String(ndPayload?.query ?? "").trim();
-              const ndQueryNorm = ndQuery.toLowerCase();
-              const ndCategory = String(ndPayload?.identity?.category || ndPayload?.visionIdentity?.category || "").trim().toLowerCase();
-
-              // Phase 5A.4F.2: identity-aware serve gate (pure helper). The shared
-              // isTrueHighStakesVisionCategory exact-set is passed in; the helper
-              // adds a stricter substring high-stakes block + aircraft airline+family
-              // completeness — without mutating the shared category policy.
-              const _ndAirline = detectAirlineLockInQuery(ndQueryNorm)?.requiredAirline || null;
-              const _ndFamilyEntry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => ndQueryNorm.includes(tok)));
-              const _ndFamily = _ndFamilyEntry?.family || null;
-              const _ndGate = evaluateNearDupServeGate({
-                query: ndQuery,
-                category: ndCategory,
-                airline: _ndAirline,
-                hasFamily: !!_ndFamilyEntry,
-                isHighStakesExact: !!ndCategory && isTrueHighStakesVisionCategory(ndCategory),
+            _pHash = await Promise.race([_pHashPromise, _pHashTimeout]);
+            _pHashMs = Date.now() - _t_phash;
+            if (_pHashBudgetExceeded) {
+              console.log("VISION_PHASH_BUDGET_EXCEEDED", {
+                rid: req.rid, budgetMs: _pHashBudgetMs, elapsedMs: _pHashMs,
+                imageHashPrefix: imgHash.slice(0, 12), indexSize: _pHashIndexSize,
               });
+            } else if (_pHash) {
+              console.log("VISION_PHASH_COMPUTED", {
+                rid: req.rid, pHash: _pHash, elapsedMs: _pHashMs,
+                imageHashPrefix: imgHash.slice(0, 12),
+              });
+              const nearDup = findNearPHash(_pHash);
+              if (nearDup) {
+                _nearDupHit = true;
+                _nearDupHamming = nearDup.hamming;
+                const ndPayload = nearDup.payload;
+                const ndQuery = String(ndPayload?.query ?? "").trim();
+                const ndQueryNorm = ndQuery.toLowerCase();
+                const ndCategory = String(ndPayload?.identity?.category || ndPayload?.visionIdentity?.category || "").trim().toLowerCase();
 
-              if (_ndGate.serve) {
-                _nearDupReturned = true;
-                const cappedConf = Math.min(Number(ndPayload?.confidence || 0), 0.75);
-                console.log("VISION_NEARDUP_HIT", {
-                  rid: req.rid, hamming: nearDup.hamming, priorImageHash: nearDup.imageHash,
-                  query: ndPayload?.query, category: ndCategory,
-                  cappedConfidence: cappedConf, pHashMs: _pHashMs,
+                const _ndAirline = detectAirlineLockInQuery(ndQueryNorm)?.requiredAirline || null;
+                const _ndFamilyEntry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => ndQueryNorm.includes(tok)));
+                const _ndFamily = _ndFamilyEntry?.family || null;
+                const _ndGate = evaluateNearDupServeGate({
+                  query: ndQuery,
+                  category: ndCategory,
+                  airline: _ndAirline,
+                  hasFamily: !!_ndFamilyEntry,
+                  isHighStakesExact: !!ndCategory && isTrueHighStakesVisionCategory(ndCategory),
                 });
-                _stepLog("pHash", _t_phash);
-                _epT2PreConsensus = Date.now();
-                _epT3PostConsensus = Date.now();
-                // Phase 5A.4F.2: do NOT write near-dup into the exact cache — it must
-                // never be re-served as cacheSource:"exact" without re-gating. The next
-                // exact repeat re-runs the cheap pHash path and re-gates.
-                const nearDupResult = {
-                  ...ndPayload,
-                  confidence: cappedConf,
-                  cached: true,
-                  cacheSource: "near_duplicate",
-                  nearDupHamming: nearDup.hamming,
-                  imageHash: imgHash,
-                  visionTier: "near_duplicate",
-                };
 
-                // Phase 5A.4F.2: fast-path timing logs (parity with the consensus path).
-                const _ndTotalMs = Date.now() - _epT0;
-                console.log("VISION_FIRST_RESPONSE_TIMING", {
-                  rid: req.rid, totalMs: _ndTotalMs, visionWallMs: null,
-                  raceWinner: "near_duplicate", masterBlocked: false,
-                  hardDeadlineFired: false, selectedPass: "near_duplicate",
-                });
-                console.log("VISION_CRITICAL_PATH_TIMING_V2", buildCriticalPathTimingV2({
-                  rid: req.rid, totalMs: _ndTotalMs,
-                  uploadMs: _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
-                  preConsensusMs: _epT2PreConsensus && _epT1FileAccepted ? _epT2PreConsensus - _epT1FileAccepted : null,
-                  consensusMs: 0, postConsensusMs: 0,
-                  embedDeferred: true,
-                  firstResponder: "near_duplicate",
-                  pHashMs: _pHashMs, nearDupHit: true,
-                  nearDupHamming: nearDup.hamming, nearDupReturned: true,
-                  preSteps: _ppSteps,
-                }));
+                if (_ndGate.serve) {
+                  _nearDupReturned = true;
+                  const cappedConf = Math.min(Number(ndPayload?.confidence || 0), 0.75);
+                  console.log("VISION_NEARDUP_HIT", {
+                    rid: req.rid, hamming: nearDup.hamming, priorImageHash: nearDup.imageHash,
+                    query: ndPayload?.query, category: ndCategory,
+                    cappedConfidence: cappedConf, pHashMs: _pHashMs,
+                  });
+                  _stepLog("pHash", _t_phash);
+                  _epT2PreConsensus = Date.now();
+                  _epT3PostConsensus = Date.now();
+                  const nearDupResult = {
+                    ...ndPayload,
+                    confidence: cappedConf,
+                    cached: true,
+                    cacheSource: "near_duplicate",
+                    nearDupHamming: nearDup.hamming,
+                    imageHash: imgHash,
+                    visionTier: "near_duplicate",
+                  };
 
-                // Phase 5A.4F.2: background verify + self-heal (fire-and-forget — never
-                // blocks the response). A confident contradiction drops the offending
-                // pHash entry so it stops serving a wrong near-dup seed.
-                if (process.env.VISION_NEARDUP_VERIFY_ENABLED !== "false") {
-                  const _verifyPriorHash = nearDup.imageHash;
-                  (async () => {
-                    try {
-                      console.log("VISION_NEARDUP_VERIFY_STARTED", {
-                        rid: req.rid, priorImageHash: _verifyPriorHash, servedQuery: ndQuery,
-                      });
-                      const { buffer: _vBuf } = await prepareVisionBufferWithBudget(
-                        file.buffer, req.rid, VISION_ITEM_MAX_EDGE, VISION_DOWNSCALE_TIMEOUT_ITEM_MS
-                      );
-                      const _vDataUrl = `data:image/jpeg;base64,${_vBuf.toString("base64")}`;
-                      const _vRes = await runUltraLeanVisionPass({ dataUrl: _vDataUrl, mode, propContext, rid: req.rid });
-                      const _vQuery = _vRes?.parsed?.query || "";
-                      const _vConf = Number(_vRes?.parsed?.confidence || 0);
-                      const _vNorm = String(_vQuery).toLowerCase();
-                      const _vAirline = detectAirlineLockInQuery(_vNorm)?.requiredAirline || null;
-                      const _vFamEntry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => _vNorm.includes(tok)));
-                      const _contra = detectNearDupContradiction({
-                        servedQuery: ndQuery, verifyQuery: _vQuery,
-                        servedAirline: _ndAirline, verifyAirline: _vAirline,
-                        servedFamily: _ndFamily, verifyFamily: _vFamEntry?.family || null,
-                        verifyConfidence: _vConf,
-                      });
-                      if (_contra.contradicts) {
-                        removePHash(_verifyPriorHash);
-                        console.log("VISION_NEARDUP_SELF_HEALED", {
-                          rid: req.rid, priorImageHash: _verifyPriorHash,
-                          reason: _contra.reason, servedQuery: ndQuery, verifyQuery: _vQuery,
+                  const _ndTotalMs = Date.now() - _epT0;
+                  console.log("VISION_FIRST_RESPONSE_TIMING", {
+                    rid: req.rid, totalMs: _ndTotalMs, visionWallMs: null,
+                    raceWinner: "near_duplicate", masterBlocked: false,
+                    hardDeadlineFired: false, selectedPass: "near_duplicate",
+                  });
+                  console.log("VISION_CRITICAL_PATH_TIMING_V2", buildCriticalPathTimingV2({
+                    rid: req.rid, totalMs: _ndTotalMs,
+                    uploadMs: _epT1FileAccepted ? _epT1FileAccepted - _epT0 : null,
+                    preConsensusMs: _epT2PreConsensus && _epT1FileAccepted ? _epT2PreConsensus - _epT1FileAccepted : null,
+                    consensusMs: 0, postConsensusMs: 0,
+                    embedDeferred: true,
+                    firstResponder: "near_duplicate",
+                    pHashMs: _pHashMs, nearDupHit: true,
+                    nearDupHamming: nearDup.hamming, nearDupReturned: true,
+                    preSteps: _ppSteps,
+                  }));
+
+                  if (process.env.VISION_NEARDUP_VERIFY_ENABLED !== "false") {
+                    const _verifyPriorHash = nearDup.imageHash;
+                    (async () => {
+                      try {
+                        console.log("VISION_NEARDUP_VERIFY_STARTED", {
+                          rid: req.rid, priorImageHash: _verifyPriorHash, servedQuery: ndQuery,
                         });
-                      } else {
-                        console.log("VISION_NEARDUP_VERIFY_CONSISTENT", {
-                          rid: req.rid, reason: _contra.reason, verifyQuery: _vQuery,
+                        const { buffer: _vBuf } = await prepareVisionBufferWithBudget(
+                          file.buffer, req.rid, VISION_ITEM_MAX_EDGE, VISION_DOWNSCALE_TIMEOUT_ITEM_MS
+                        );
+                        const _vDataUrl = `data:image/jpeg;base64,${_vBuf.toString("base64")}`;
+                        const _vRes = await runUltraLeanVisionPass({ dataUrl: _vDataUrl, mode, propContext, rid: req.rid });
+                        const _vQuery = _vRes?.parsed?.query || "";
+                        const _vConf = Number(_vRes?.parsed?.confidence || 0);
+                        const _vNorm = String(_vQuery).toLowerCase();
+                        const _vAirline = detectAirlineLockInQuery(_vNorm)?.requiredAirline || null;
+                        const _vFamEntry = AIRCRAFT_FAMILY_MATCH.find(({ tokens }) => tokens.some((tok) => _vNorm.includes(tok)));
+                        const _contra = detectNearDupContradiction({
+                          servedQuery: ndQuery, verifyQuery: _vQuery,
+                          servedAirline: _ndAirline, verifyAirline: _vAirline,
+                          servedFamily: _ndFamily, verifyFamily: _vFamEntry?.family || null,
+                          verifyConfidence: _vConf,
                         });
+                        if (_contra.contradicts) {
+                          removePHash(_verifyPriorHash);
+                          console.log("VISION_NEARDUP_SELF_HEALED", {
+                            rid: req.rid, priorImageHash: _verifyPriorHash,
+                            reason: _contra.reason, servedQuery: ndQuery, verifyQuery: _vQuery,
+                          });
+                        } else {
+                          console.log("VISION_NEARDUP_VERIFY_CONSISTENT", {
+                            rid: req.rid, reason: _contra.reason, verifyQuery: _vQuery,
+                          });
+                        }
+                      } catch (_vErr) {
+                        console.warn("VISION_NEARDUP_VERIFY_ERROR", { rid: req.rid, err: _vErr?.message || String(_vErr) });
                       }
-                    } catch (_vErr) {
-                      console.warn("VISION_NEARDUP_VERIFY_ERROR", { rid: req.rid, err: _vErr?.message || String(_vErr) });
-                    }
-                  })();
-                }
+                    })();
+                  }
 
-                return res.status(200).json(nearDupResult);
+                  return res.status(200).json(nearDupResult);
+                } else {
+                  console.log("VISION_NEARDUP_MISS", {
+                    rid: req.rid, hamming: nearDup.hamming,
+                    reason: _ndGate.reason, query: ndPayload?.query, category: ndCategory,
+                  });
+                }
               } else {
                 console.log("VISION_NEARDUP_MISS", {
-                  rid: req.rid, hamming: nearDup.hamming,
-                  reason: _ndGate.reason, query: ndPayload?.query, category: ndCategory,
+                  rid: req.rid, reason: "no_match_in_index",
+                  indexSize: _pHashIndexSize,
                 });
               }
-            } else {
-              console.log("VISION_NEARDUP_MISS", {
-                rid: req.rid, reason: "no_match_in_index",
-                indexSize: getPHashStats().size,
-              });
             }
+          } catch (e) {
+            console.warn("VISION_PHASH_ERROR", { rid: req.rid, err: e?.message || String(e) });
           }
-        } catch (e) {
-          console.warn("VISION_PHASH_ERROR", { rid: req.rid, err: e?.message || String(e) });
         }
       }
       _stepLog("pHash", _t_phash);
@@ -23451,13 +23463,16 @@ if (!openai) {
             similarityRegister(originalHash, _similarityVec, shaped);
           }
 
-          // Phase 5A.4F.1: register pHash for future near-dup hits.
-          if (_pHash) {
-            const _pReg = registerPHash({ imageHash: originalHash, pHash: _pHash, payload: shaped });
+          // Phase 5A.4F.1/4: register pHash for future near-dup hits.
+          // If critical-path was skipped (empty index / budget exceeded), resolve
+          // the background promise now — it should be instant since consensus took seconds.
+          const _pHashForReg = _pHash || ((_pHashPromise) ? await _pHashPromise : null);
+          if (_pHashForReg) {
+            const _pReg = registerPHash({ imageHash: originalHash, pHash: _pHashForReg, payload: shaped });
             if (_pReg.registered) {
               console.log("VISION_NEARDUP_REGISTERED", {
                 rid: req.rid, imageHashPrefix: originalHash.slice(0, 12),
-                pHash: _pHash, query: shaped?.query,
+                pHash: _pHashForReg, query: shaped?.query,
               });
             } else {
               console.log("VISION_NEARDUP_REGISTER_SKIPPED", {
