@@ -23463,22 +23463,37 @@ if (!openai) {
             similarityRegister(originalHash, _similarityVec, shaped);
           }
 
-          // Phase 5A.4F.1/4: register pHash for future near-dup hits.
-          // If critical-path was skipped (empty index / budget exceeded), resolve
-          // the background promise now — it should be instant since consensus took seconds.
-          const _pHashForReg = _pHash || ((_pHashPromise) ? await _pHashPromise : null);
-          if (_pHashForReg) {
-            const _pReg = registerPHash({ imageHash: originalHash, pHash: _pHashForReg, payload: shaped });
+          // Phase 5A.4F.1/4/5: register pHash for future near-dup hits.
+          // Sync when _pHash already resolved (non-empty-index hit / budgeted).
+          // Fire-and-forget via .then() when _pHashPromise is pending (empty-index
+          // skip / budget exceeded) — same pattern as deferred-embed above.
+          if (_pHash) {
+            const _pReg = registerPHash({ imageHash: originalHash, pHash: _pHash, payload: shaped });
             if (_pReg.registered) {
               console.log("VISION_NEARDUP_REGISTERED", {
                 rid: req.rid, imageHashPrefix: originalHash.slice(0, 12),
-                pHash: _pHashForReg, query: shaped?.query,
+                pHash: _pHash, query: shaped?.query,
               });
             } else {
               console.log("VISION_NEARDUP_REGISTER_SKIPPED", {
                 rid: req.rid, reason: _pReg.reason, query: shaped?.query,
               });
             }
+          } else if (_pHashPromise) {
+            _pHashPromise.then((h) => {
+              if (!h) return;
+              const _pReg = registerPHash({ imageHash: originalHash, pHash: h, payload: shaped });
+              if (_pReg.registered) {
+                console.log("VISION_NEARDUP_REGISTERED", {
+                  rid: req.rid, imageHashPrefix: originalHash.slice(0, 12),
+                  pHash: h, query: shaped?.query,
+                });
+              } else {
+                console.log("VISION_NEARDUP_REGISTER_SKIPPED", {
+                  rid: req.rid, reason: _pReg.reason, query: shaped?.query,
+                });
+              }
+            }).catch(() => {});
           }
         }
 
