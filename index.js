@@ -21077,7 +21077,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     }
 
     // Capture hoisted vars so visionTimings return + logs outside this block can read them.
-    _visionRaceWinner    = raceWinner;
+    _visionRaceWinner    = (raceWinner === "fast" && fastResult?.rescuedByGrace) ? "query_fast_grace" : raceWinner;
     _visionMasterLaunched = masterLaunched;
 
     console.log("VISION_MASTER_POLICY", {
@@ -21108,9 +21108,10 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     console.log("VISION_FAST_PATH_DECISION", {
       rid:               req.rid,
       returnedEarly:     raceWinner === "fast" || raceWinner === "visual_early",
-      reason:            raceWinner,
+      reason:            _visionRaceWinner,
       elapsedMs:         Date.now() - passT0,
-      selectedPass:      raceWinner === "fast"          ? "fast"
+      selectedPass:      raceWinner === "fast"
+                           ? (fastResult?.rescuedByGrace ? "query_fast_grace" : "fast")
                        : raceWinner === "visual_early"  ? "visual_shape"
                        : raceWinner === "hard_deadline" ? "hard_deadline_fail"
                        : "consensus",
@@ -21500,7 +21501,8 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     console.log("⏱️ VISION PASS TIMINGS", {
       rid:              req.rid,
       tier:             visionTier,
-      raceWinner,
+      raceWinner:       _visionRaceWinner,
+      queryFastMs,
       fastMs,
       visualMs,
       masterMs,
@@ -21951,6 +21953,7 @@ if (
       visionSource,
       visionTier,
       visionTimings: {
+        queryFastMs,
         fastMs,
         visualMs,
         masterMs,

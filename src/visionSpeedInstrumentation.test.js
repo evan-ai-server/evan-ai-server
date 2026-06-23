@@ -89,6 +89,18 @@ describe("classifyMissReason", () => {
       cachedInputTokens: 500, inputTokens: 1000,
     }), "unknown");
   });
+  it("returns model_floor (not query_fast_rejected) for grace-rescued query_fast with real queryFastMs", () => {
+    const result = classifyMissReason({
+      totalMs: 3504,
+      queryFastMs: 3457,
+      cachedInputTokens: 4864,
+      inputTokens: 5000,
+      visionTier: "seed_recovery",
+      raceWinner: "query_fast_grace",
+    });
+    assert.notEqual(result, "query_fast_rejected");
+    assert.equal(result, "model_floor");
+  });
 });
 
 describe("buildCriticalPathTimingV2", () => {
