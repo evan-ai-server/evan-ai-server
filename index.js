@@ -4816,6 +4816,29 @@ function consumeSerpBudget(reason, callDescriptor = {}) {
 }
 
 /**
+ * Public helper — release one previously consumed SerpAPI unit. Fires at
+ * most once per scan (_refundedOnce). Returns true on success, false if
+ * already refunded, nothing consumed, or no context.
+ */
+function releaseSerpBudget(reason, callDescriptor = {}) {
+  try {
+    const c = getCurrentSerpBudgetCtx();
+    if (!c) return false;
+    const entry = _SERP_BUDGET_REGISTRY.get(c.key);
+    if (!entry || entry.consumed <= 0 || entry._refundedOnce) return false;
+    entry.consumed = Math.max(0, entry.consumed - 1);
+    entry._refundedOnce = true;
+    entry.ts = Date.now();
+    entry.history.push({ reason, ts: Date.now(), refund: true, ...callDescriptor });
+    console.log("SERP_BUDGET_REFUNDED", {
+      scanId: c.scanId, route: callDescriptor.route || c.route, reason,
+      consumed: entry.consumed, max: c.max || SERP_BUDGET_MAX,
+    });
+    return true;
+  } catch (_e) { return false; }
+}
+
+/**
  * Public helper — current budget status for the active scan (or a passed
  * ctx). Read-only.
  */
@@ -9593,6 +9616,56 @@ if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
 } catch (_e) {
   console.warn("CROSS_ROUTE_KEY_SELFTEST_ERROR", { error: String(_e) });
 } // end RUN_STARTUP_SELFTESTS cross-route
+
+// ── Phase 5A.4I.1 — releaseSerpBudget self-test ────────────────────────────
+if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
+  let _rfPass = 0;
+  let _rfTotal = 0;
+  const _rfKey = "scan:refund_selftest_1";
+  const _rfCtx = (scanId, key) => ({
+    scanId, query: "test", userId: "u", route: "/test", max: 1,
+    callsUsed: 0, blockedExtraCalls: 0, cacheHit: false, key,
+  });
+
+  _rfTotal++;
+  _SERP_BUDGET_REGISTRY.set(_rfKey, {
+    consumed: 1, ts: Date.now(), route: "/stream", query: "test",
+    scanId: "refund_selftest_1", history: [{ reason: "serpShopping", ts: Date.now() }],
+  });
+  const _rf1 = SERP_BUDGET_STORE.run(_rfCtx("refund_selftest_1", _rfKey), () =>
+    releaseSerpBudget("empty_stream_no_pool", { scanId: "refund_selftest_1", route: "/market/search" })
+  );
+  const _rfE1 = _SERP_BUDGET_REGISTRY.get(_rfKey);
+  if (_rf1 === true && _rfE1.consumed === 0 && _rfE1._refundedOnce === true) _rfPass++;
+  else console.warn("REFUND_SELFTEST_FAIL", { case: "basic_refund", r: _rf1, consumed: _rfE1?.consumed });
+
+  _rfTotal++;
+  _rfE1.consumed = 1;
+  const _rf2 = SERP_BUDGET_STORE.run(_rfCtx("refund_selftest_1", _rfKey), () =>
+    releaseSerpBudget("empty_stream_no_pool", { scanId: "refund_selftest_1", route: "/market/search" })
+  );
+  if (_rf2 === false && _rfE1.consumed === 1) _rfPass++;
+  else console.warn("REFUND_SELFTEST_FAIL", { case: "double_refund_blocked", r: _rf2, consumed: _rfE1?.consumed });
+
+  _rfTotal++;
+  const _rfKey2 = "scan:refund_selftest_2";
+  _SERP_BUDGET_REGISTRY.set(_rfKey2, {
+    consumed: 0, ts: Date.now(), route: "/test", query: "test2",
+    scanId: "refund_selftest_2", history: [],
+  });
+  const _rf3 = SERP_BUDGET_STORE.run(_rfCtx("refund_selftest_2", _rfKey2), () =>
+    consumeSerpBudget("serpShopping", { query: "test2" })
+  );
+  const _rfE3 = _SERP_BUDGET_REGISTRY.get(_rfKey2);
+  if (_rf3 === true && _rfE3.consumed === 1 && !_rfE3._refundedOnce) _rfPass++;
+  else console.warn("REFUND_SELFTEST_FAIL", { case: "normal_consume_unaffected", r: _rf3, consumed: _rfE3?.consumed });
+
+  console.log("REFUND_SELFTEST_PASS", { passed: _rfPass, total: _rfTotal });
+  _SERP_BUDGET_REGISTRY.delete(_rfKey);
+  _SERP_BUDGET_REGISTRY.delete(_rfKey2);
+} catch (_e) {
+  console.warn("REFUND_SELFTEST_ERROR", { error: String(_e) });
+}
 
 // ── Phase 2C.10 — Multi-key MARKET_SCAN_RESULT_CACHE self-test ───────────────
 // Asserts that a scan's result pool is found via ANY of its identities — the
@@ -29754,6 +29827,16 @@ console.log("PAYLOAD_CACHE_MISS", {
   query: rawQuery,
   reason: "no_cross_route_payload_for_scan",
 });
+
+{
+  const _bs = getSerpBudgetStatus();
+  const _scanBound = !!(_budgetScanIdEarly || _budgetImageHashEarly);
+  if (_scanBound && _bs.consumed >= _bs.max && !_bs.devBypass) {
+    releaseSerpBudget("empty_stream_no_pool", { scanId: _budgetScanIdEarly, route: "/market/search" });
+  } else if (!_scanBound && _bs.consumed >= _bs.max) {
+    console.log("SERP_BUDGET_REFUND_SKIPPED", { route: "/market/search", reason: "not_scan_bound_query_user_key" });
+  }
+}
 
 // Phase 2 (Prompt 3): populate the cross-route payload cache after a non-stream
 // build so a subsequent /market/search for the SAME scan returns the full payload
