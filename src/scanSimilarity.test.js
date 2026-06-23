@@ -17,7 +17,15 @@ const VEC_A = [1, 0, 0, 0];
 const VEC_B = [0, 1, 0, 0];
 const PAYLOAD_A = { query: "Hawaiian Airlines Boeing 787 diecast model airplane", identity: { category: "diecast model" }, confidence: 0.95 };
 
-afterEach(() => clear());
+afterEach(() => {
+  clear();
+  // Flush any fire-and-forget disk writes from register() so no stale files
+  // leak into subsequent loadFromDisk tests that re-import the module.
+  try {
+    const files = fs.readdirSync(TEST_STORAGE).filter((f) => f.endsWith(".json"));
+    for (const f of files) fs.unlinkSync(path.join(TEST_STORAGE, f));
+  } catch { /* dir may not exist yet */ }
+});
 
 test("remove() forgets a registered entry so findSimilar misses (the V3.2 self-heal)", () => {
   register("hashA", VEC_A, PAYLOAD_A);
@@ -190,6 +198,8 @@ test("loadFromDisk prunes TTL-expired files and returns honest counters", async 
 
   assert.equal(result.ttlExpired, 1);
   assert.equal(result.loaded, 1);
+  // loadFromDisk unlinks are fire-and-forget — allow them to settle under load
+  await new Promise((r) => setTimeout(r, 100));
   assert.equal(fs.existsSync(path.join(dir, "exp1.json")), false, "expired file should be unlinked");
   assert.equal(fs.existsSync(path.join(dir, "live1.json")), true, "live file should remain");
   fs.rmSync(dir, { recursive: true, force: true });
@@ -212,6 +222,8 @@ test("loadFromDisk prunes junk-query files and returns junkPruned", async () => 
   assert.equal(result.junkPruned, 1);
   assert.equal(result.loaded, 1);
   assert.equal(result.pruned, 1);
+  // loadFromDisk unlinks are fire-and-forget — allow them to settle under load
+  await new Promise((r) => setTimeout(r, 100));
   assert.equal(fs.existsSync(path.join(dir, "junk1.json")), false, "junk file should be unlinked");
   fs.rmSync(dir, { recursive: true, force: true });
 });
