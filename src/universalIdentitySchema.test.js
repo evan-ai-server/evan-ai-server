@@ -10,6 +10,13 @@ import {
   deriveBookAuthor,
   deriveIsbn,
   deriveGamePlatform,
+  isHeadphoneIdentity,
+  deriveAudioKind,
+  deriveHeadphoneFit,
+  deriveHeadphoneBackType,
+  deriveHeadphoneWireless,
+  deriveHeadphoneNoiseCancelling,
+  deriveHeadphoneFeatures,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -785,6 +792,350 @@ describe("enrichIdentityWithSchema — video games", () => {
   });
 });
 
+describe("isHeadphoneIdentity", () => {
+  it("detects over-ear headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "over-ear headphones", category: "electronics" }), true);
+  });
+  it("detects on-ear headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "on-ear headphones" }), true);
+  });
+  it("detects in-ear headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "in-ear headphones" }), true);
+  });
+  it("detects earbuds", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "earbuds", category: "electronics" }), true);
+  });
+  it("detects gaming headset", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "gaming headset" }), true);
+  });
+  it("detects headphones from styleWords", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "audio", styleWords: ["headphones", "wireless"] }), true);
+  });
+  it("detects circumaural headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ subtype: "circumaural" }), true);
+  });
+  it("detects supra-aural headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ subtype: "supra-aural" }), true);
+  });
+  it("detects IEM", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "iem" }), true);
+  });
+  // False-positive tests
+  it("headphone stand is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headphone stand", category: "accessories" }), false);
+  });
+  it("headphone case is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headphone case" }), false);
+  });
+  it("headphone cable is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headphone cable" }), false);
+  });
+  it("wireless charger is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "wireless charger", category: "electronics" }), false);
+  });
+  it("Bluetooth speaker is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "Bluetooth speaker", category: "electronics" }), false);
+  });
+  it("noise-cancelling microphone is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "microphone", styleWords: ["noise-cancelling"] }), false);
+  });
+  it("open-back chair is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "chair", styleWords: ["open-back"] }), false);
+  });
+  it("Beats shirt is not Beats headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "t-shirt", category: "apparel", brand: "Beats" }), false);
+  });
+  it("Sony camera is not Sony headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "camera", category: "electronics", brand: "Sony" }), false);
+  });
+  it("Apple phone is not AirPods Max", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "phone", category: "electronics", brand: "Apple" }), false);
+  });
+  it("VR headset is not audio headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headset", styleWords: ["vr"] }), false);
+  });
+  it("earring is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "earring", category: "jewelry" }), false);
+  });
+  it("ear muffs is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "ear muffs", category: "winter accessories" }), false);
+  });
+  it("earplug is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "earplug", category: "safety" }), false);
+  });
+  it("headphone ear pad replacement is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headphone ear pads replacement" }), false);
+  });
+  it("headphone amp is not headphones", () => {
+    assert.strictEqual(isHeadphoneIdentity({ itemType: "headphone amplifier" }), false);
+  });
+  it("returns false for null", () => {
+    assert.strictEqual(isHeadphoneIdentity(null), false);
+  });
+  it("returns false for empty object", () => {
+    assert.strictEqual(isHeadphoneIdentity({}), false);
+  });
+});
+
+describe("deriveAudioKind", () => {
+  it("returns headphones for over-ear headphones", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "over-ear headphones" }), "headphones");
+  });
+  it("returns headphones for gaming headset", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "gaming headset" }), "headphones");
+  });
+  it("returns earbuds for earbuds", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "earbuds" }), "earbuds");
+  });
+  it("returns earbuds for in-ear monitors", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "in-ear monitor" }), "earbuds");
+  });
+  it("returns earbuds for earphones", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "earphones" }), "earbuds");
+  });
+  it("returns null for non-headphone identity", () => {
+    assert.strictEqual(deriveAudioKind({ itemType: "camera", category: "electronics" }), null);
+  });
+});
+
+describe("deriveHeadphoneFit", () => {
+  it("derives over_ear", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "over-ear headphones" }), "over_ear");
+  });
+  it("derives over_ear from around-ear", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "around-ear headphones" }), "over_ear");
+  });
+  it("derives over_ear from circumaural", () => {
+    assert.strictEqual(deriveHeadphoneFit({ subtype: "circumaural", itemType: "headphones" }), "over_ear");
+  });
+  it("derives on_ear", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "on-ear headphones" }), "on_ear");
+  });
+  it("derives on_ear from supra-aural", () => {
+    assert.strictEqual(deriveHeadphoneFit({ subtype: "supra-aural", itemType: "headphones" }), "on_ear");
+  });
+  it("derives in_ear from earbuds", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "earbuds" }), "in_ear");
+  });
+  it("derives in_ear from in-ear", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "in-ear headphones" }), "in_ear");
+  });
+  it("derives in_ear from IEM", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "iem" }), "in_ear");
+  });
+  it("returns null for generic headphones without fit", () => {
+    assert.strictEqual(deriveHeadphoneFit({ itemType: "headphones" }), null);
+  });
+});
+
+describe("deriveHeadphoneBackType", () => {
+  it("derives open_back from type-defining fields", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "open-back headphones" }), "open_back");
+  });
+  it("derives open_back from visibleText", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "headphones", visibleText: ["Open Back Design"] }), "open_back");
+  });
+  it("derives closed_back from type-defining fields", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "closed-back headphones" }), "closed_back");
+  });
+  it("derives closed_back from visibleText", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "headphones", visibleText: ["Closed Back"] }), "closed_back");
+  });
+  it("returns null when no back type evidence", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "headphones" }), null);
+  });
+  it("does not infer back type from brand or model", () => {
+    assert.strictEqual(deriveHeadphoneBackType({ itemType: "headphones", brand: "Sennheiser", model: "HD 600" }), null);
+  });
+});
+
+describe("deriveHeadphoneWireless", () => {
+  it("derives true from visibleText Bluetooth", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "headphones", visibleText: ["Bluetooth 5.0"] }), true);
+  });
+  it("derives true from visibleText wireless", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "headphones", visibleText: ["Wireless"] }), true);
+  });
+  it("derives true from styleWords wireless", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "headphones", styleWords: ["wireless"] }), true);
+  });
+  it("derives true from TWS", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "earbuds", visibleText: ["TWS"] }), true);
+  });
+  it("returns null when no wireless evidence", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "headphones", visibleText: [] }), null);
+  });
+  it("does not infer wireless from brand or model", () => {
+    assert.strictEqual(deriveHeadphoneWireless({ itemType: "headphones", brand: "Sony", model: "WH-1000XM5" }), null);
+  });
+  it("does not return false", () => {
+    const result = deriveHeadphoneWireless({ itemType: "headphones" });
+    assert.ok(result === null || result === true, "must be null or true, never false");
+  });
+});
+
+describe("deriveHeadphoneNoiseCancelling", () => {
+  it("derives true from visibleText ANC", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", visibleText: ["ANC"] }), true);
+  });
+  it("derives true from visibleText noise cancelling", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", visibleText: ["noise cancelling"] }), true);
+  });
+  it("derives true from visibleText noise-cancelling", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", visibleText: ["Active Noise-Cancelling"] }), true);
+  });
+  it("derives true from styleWords", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", styleWords: ["noise cancelling"] }), true);
+  });
+  it("returns null when no ANC evidence", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", visibleText: [] }), null);
+  });
+  it("does not infer from premium brand", () => {
+    assert.strictEqual(deriveHeadphoneNoiseCancelling({ itemType: "headphones", brand: "Bose", model: "QuietComfort" }), null);
+  });
+  it("does not return false", () => {
+    const result = deriveHeadphoneNoiseCancelling({ itemType: "headphones" });
+    assert.ok(result === null || result === true, "must be null or true, never false");
+  });
+});
+
+describe("deriveHeadphoneFeatures", () => {
+  it("includes bluetooth when Bluetooth text present", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["Bluetooth 5.0"] });
+    assert.ok(result.includes("bluetooth"));
+  });
+  it("includes wireless when wireless text present (no bluetooth)", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["Wireless"] });
+    assert.ok(result.includes("wireless"));
+  });
+  it("does not include both bluetooth and wireless when bluetooth present", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["Bluetooth Wireless"] });
+    assert.ok(result.includes("bluetooth"));
+    assert.ok(!result.includes("wireless"));
+  });
+  it("includes noise_cancelling when ANC text present", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["ANC"] });
+    assert.ok(result.includes("noise_cancelling"));
+  });
+  it("includes microphone when mic text present", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["Built-in Mic"] });
+    assert.ok(result.includes("microphone"));
+  });
+  it("includes foldable when foldable text present", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", styleWords: ["foldable"] });
+    assert.ok(result.includes("foldable"));
+  });
+  it("returns empty array for non-headphone identity", () => {
+    assert.deepStrictEqual(deriveHeadphoneFeatures({ itemType: "camera" }), []);
+  });
+  it("supports wireless + noise-cancelling simultaneously", () => {
+    const result = deriveHeadphoneFeatures({ itemType: "headphones", visibleText: ["Bluetooth ANC"], styleWords: ["foldable"] });
+    assert.ok(result.includes("bluetooth"));
+    assert.ok(result.includes("noise_cancelling"));
+    assert.ok(result.includes("foldable"));
+  });
+});
+
+describe("enrichIdentityWithSchema — headphones", () => {
+  it("populates headphone fields for headphone identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics", visibleText: ["Bluetooth", "ANC"] },
+      { overallConfidence: 0.70, attributeCertainty: { category: 0.80 } }
+    );
+    assert.strictEqual(result.audioKind, "headphones");
+    assert.strictEqual(result.headphoneFit, "over_ear");
+    assert.strictEqual(result.headphoneWireless, true);
+    assert.strictEqual(result.headphoneNoiseCancelling, true);
+    assert.ok(result.headphoneFeatures.includes("bluetooth"));
+    assert.ok(result.headphoneFeatures.includes("noise_cancelling"));
+  });
+
+  it("headphone identity has mediaKind === null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics" },
+      { overallConfidence: 0.70, attributeCertainty: { category: 0.80 } }
+    );
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("headphoneEvidence includes fit", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones" },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.headphoneEvidence.includes("fit:over_ear"));
+  });
+
+  it("headphoneEvidence includes wireless:bluetooth", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "headphones", visibleText: ["Bluetooth"] },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.headphoneEvidence.includes("wireless:bluetooth"));
+  });
+
+  it("headphoneEvidence includes noise_cancelling:anc", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "headphones", visibleText: ["ANC mode"] },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.headphoneEvidence.includes("noise_cancelling:anc"));
+  });
+
+  it("headphoneEvidence includes back_type:open_back", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "open-back headphones" },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.headphoneEvidence.includes("back_type:open_back"));
+  });
+
+  it("non-headphone identity has null headphone fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Hanes" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.audioKind, null);
+    assert.strictEqual(result.headphoneFit, null);
+    assert.strictEqual(result.headphoneBackType, null);
+    assert.strictEqual(result.headphoneWireless, null);
+    assert.strictEqual(result.headphoneNoiseCancelling, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
+    assert.deepStrictEqual(result.headphoneEvidence, []);
+  });
+
+  it("empty identity has null headphone fields", () => {
+    const result = enrichIdentityWithSchema({}, {});
+    assert.strictEqual(result.audioKind, null);
+    assert.strictEqual(result.headphoneFit, null);
+    assert.strictEqual(result.headphoneBackType, null);
+    assert.strictEqual(result.headphoneWireless, null);
+    assert.strictEqual(result.headphoneNoiseCancelling, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
+    assert.deepStrictEqual(result.headphoneEvidence, []);
+  });
+
+  it("does not alter queryTermsAllowed or queryTermsBlocked for headphones", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics", brand: "Sony", visibleText: ["Sony", "Bluetooth"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    // headphone fields should NOT appear in query terms
+    assert.ok(!result.queryTermsAllowed.includes("over_ear"));
+    assert.ok(!result.queryTermsAllowed.includes("bluetooth"));
+    assert.ok(!result.queryTermsBlocked.includes("over_ear"));
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked disjoint for headphones", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "headphones", category: "electronics", brand: "Sony", visibleText: ["Sony", "Bluetooth"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.55 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+});
+
 describe("enrichIdentityWithSchema — regressions", () => {
   it("Rolex weak evidence still blocked (high-stakes regression)", () => {
     const result = enrichIdentityWithSchema(
@@ -823,6 +1174,24 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.mediaKind, null);
   });
 
+  it("ink cartridge remains not video game (regression)", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "ink cartridge", category: "printer supplies" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.audioKind, null);
+  });
+
+  it("Book Club Tee remains not book (regression)", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Gap", model: "Book Club Tee" },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.audioKind, null);
+  });
+
   it("apparel identity unchanged by media enrichment", () => {
     const result = enrichIdentityWithSchema(
       { itemType: "t-shirt", category: "apparel", brand: "Hanes", model: "ComfortSoft", visibleText: ["Hanes"] },
@@ -832,8 +1201,34 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.author, null);
     assert.strictEqual(result.isbn, null);
     assert.strictEqual(result.platform, null);
+    assert.strictEqual(result.audioKind, null);
+    assert.strictEqual(result.headphoneFit, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
+    assert.deepStrictEqual(result.headphoneEvidence, []);
     assert.ok(!result.missingEvidence.includes("book title not readable"));
     assert.ok(!result.missingEvidence.includes("video game title not readable"));
+  });
+
+  it("book existing behavior still passes with headphone fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune", "by Frank Herbert"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "book");
+    assert.strictEqual(result.author, "Frank Herbert");
+    assert.strictEqual(result.audioKind, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
+  });
+
+  it("video game existing behavior still passes with headphone fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "video_game");
+    assert.strictEqual(result.platform, "Nintendo Switch");
+    assert.strictEqual(result.audioKind, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
   });
 
   it("queryTermsAllowed and queryTermsBlocked never overlap across all media types", () => {
@@ -841,6 +1236,7 @@ describe("enrichIdentityWithSchema — regressions", () => {
       { itemType: "book", model: "Dune", visibleText: ["Dune"] },
       { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
       { itemType: "sneakers", category: "sneakers", brand: "Nike", visibleText: ["Nike"] },
+      { itemType: "over-ear headphones", category: "electronics", brand: "Sony", visibleText: ["Sony"] },
     ];
     for (const id of identities) {
       const result = enrichIdentityWithSchema(id, { overallConfidence: 0.70, attributeCertainty: { brand: 0.55, model: 0.55 } });

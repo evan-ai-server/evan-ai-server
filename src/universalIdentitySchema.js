@@ -1,8 +1,8 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2 — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
-// and book/video-game recognition enrichment.
+// book/video-game recognition, and headphone taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -166,6 +166,131 @@ export function deriveGamePlatform(visibleText) {
     }
   }
   return null;
+}
+
+// --- Headphone taxonomy (Phase 5B.3B) ---
+
+const HEADPHONE_DEVICE_RE = /\b(headphone|headphones|earbud|earbuds|earphone|earphones|in-ear|in ear|on-ear|on ear|over-ear|over ear|around-ear|around ear|circumaural|supra-aural|iem|in-ear monitor|headset|gaming headset|audio headset|wireless headset|bluetooth headset)\b/i;
+const HEADPHONE_ACCESSORY_RE = /\b(stand|case|cable|holder|hanger|hook|mount|bracket|adapter|splitter|jack|amp|amplifier|dac|receiver|ear pad|ear pads|earpad|earpads|cushion|cover|replacement|wall)\b/i;
+const VR_AR_RE = /\b(vr|virtual reality|ar|augmented)\b/i;
+const BARE_HEADSET_RE = /\bheadset\b/i;
+
+export function isHeadphoneIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  if (!HEADPHONE_DEVICE_RE.test(joined)) return false;
+  if (HEADPHONE_ACCESSORY_RE.test(joined)) return false;
+  // Bare "headset" without audio qualifier — check for VR/AR veto
+  const hasOnlyHeadset = BARE_HEADSET_RE.test(joined) &&
+    !(/\b(headphone|headphones|earbud|earbuds|earphone|earphones|in-ear|in ear|on-ear|on ear|over-ear|over ear|around-ear|around ear|circumaural|supra-aural|iem|in-ear monitor|gaming headset|audio headset|wireless headset|bluetooth headset)\b/i.test(joined));
+  if (hasOnlyHeadset && VR_AR_RE.test(joined)) return false;
+  return true;
+}
+
+const EARBUD_RE = /\b(earbud|earbuds|earphone|earphones|in-ear|in ear|iem|in-ear monitor)\b/i;
+const HEADPHONE_KIND_RE = /\b(headphone|headphones|headset|over-ear|over ear|on-ear|on ear|around-ear|around ear|circumaural|supra-aural)\b/i;
+
+export function deriveAudioKind(identity) {
+  if (!isHeadphoneIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (EARBUD_RE.test(joined)) return "earbuds";
+  if (HEADPHONE_KIND_RE.test(joined)) return "headphones";
+  return null;
+}
+
+const FIT_OVER_EAR_RE = /\b(over-ear|over ear|around-ear|around ear|circumaural)\b/i;
+const FIT_ON_EAR_RE = /\b(on-ear|on ear|supra-aural)\b/i;
+const FIT_IN_EAR_RE = /\b(in-ear|in ear|earbuds|earphones|iem|in-ear monitor)\b/i;
+
+export function deriveHeadphoneFit(identity) {
+  if (!isHeadphoneIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (FIT_OVER_EAR_RE.test(joined)) return "over_ear";
+  if (FIT_ON_EAR_RE.test(joined)) return "on_ear";
+  if (FIT_IN_EAR_RE.test(joined)) return "in_ear";
+  return null;
+}
+
+const BACK_OPEN_RE = /\b(open-back|open back)\b/i;
+const BACK_CLOSED_RE = /\b(closed-back|closed back)\b/i;
+
+export function deriveHeadphoneBackType(identity) {
+  if (!isHeadphoneIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  if (BACK_OPEN_RE.test(joined)) return "open_back";
+  if (BACK_CLOSED_RE.test(joined)) return "closed_back";
+  return null;
+}
+
+const WIRELESS_RE = /\b(wireless|bluetooth|true wireless|tws)\b/i;
+
+export function deriveHeadphoneWireless(identity) {
+  if (!isHeadphoneIdentity(identity)) return null;
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const sw = Array.isArray(identity.styleWords) ? identity.styleWords : [];
+  const joined = vt.filter((t) => t && typeof t === "string").join(" ") +
+    " " + sw.filter((s) => s && typeof s === "string").join(" ");
+  if (WIRELESS_RE.test(joined)) return true;
+  return null;
+}
+
+const NC_RE = /\b(noise cancelling|noise-cancelling|noise canceling|active noise cancelling|active noise cancellation|anc)\b/i;
+
+export function deriveHeadphoneNoiseCancelling(identity) {
+  if (!isHeadphoneIdentity(identity)) return null;
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const sw = Array.isArray(identity.styleWords) ? identity.styleWords : [];
+  const joined = vt.filter((t) => t && typeof t === "string").join(" ") +
+    " " + sw.filter((s) => s && typeof s === "string").join(" ");
+  if (NC_RE.test(joined)) return true;
+  return null;
+}
+
+const BLUETOOTH_RE = /\bbluetooth\b/i;
+const WIRELESS_FEAT_RE = /\bwireless\b/i;
+const MIC_RE = /\b(mic|microphone)\b/i;
+const FOLDABLE_RE = /\b(foldable|folding)\b/i;
+
+export function deriveHeadphoneFeatures(identity) {
+  if (!isHeadphoneIdentity(identity)) return [];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const sw = Array.isArray(identity.styleWords) ? identity.styleWords : [];
+  const joined = vt.filter((t) => t && typeof t === "string").join(" ") +
+    " " + sw.filter((s) => s && typeof s === "string").join(" ");
+  const features = [];
+  if (BLUETOOTH_RE.test(joined)) features.push("bluetooth");
+  if (WIRELESS_FEAT_RE.test(joined) && !BLUETOOTH_RE.test(joined)) features.push("wireless");
+  if (NC_RE.test(joined)) features.push("noise_cancelling");
+  if (MIC_RE.test(joined)) features.push("microphone");
+  if (FOLDABLE_RE.test(joined)) features.push("foldable");
+  return features;
 }
 
 function computeMissingEvidence(identity) {
@@ -351,6 +476,44 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     if (platform && !rawQueryTermsAllowed.includes(platform)) rawQueryTermsAllowed.push(platform);
   }
 
+  // --- Headphone taxonomy enrichment (Phase 5B.3B) ---
+  const headphoneDetected = isHeadphoneIdentity(id);
+  let audioKind = null;
+  let headphoneFit = null;
+  let headphoneBackType = null;
+  let headphoneWireless = null;
+  let headphoneNoiseCancelling = null;
+  let headphoneFeatures = [];
+  let headphoneEvidence = [];
+
+  if (headphoneDetected) {
+    audioKind = deriveAudioKind(id);
+    headphoneFit = deriveHeadphoneFit(id);
+    headphoneBackType = deriveHeadphoneBackType(id);
+    headphoneWireless = deriveHeadphoneWireless(id);
+    headphoneNoiseCancelling = deriveHeadphoneNoiseCancelling(id);
+    headphoneFeatures = deriveHeadphoneFeatures(id);
+
+    const evidence = [];
+    if (headphoneFit) evidence.push(`fit:${headphoneFit}`);
+    if (headphoneBackType) evidence.push(`back_type:${headphoneBackType}`);
+    if (headphoneWireless === true) {
+      const vt = Array.isArray(id.visibleText) ? id.visibleText : [];
+      const sw = Array.isArray(id.styleWords) ? id.styleWords : [];
+      const j = vt.filter((t) => t && typeof t === "string").join(" ") +
+        " " + sw.filter((s) => s && typeof s === "string").join(" ");
+      evidence.push(/\bbluetooth\b/i.test(j) ? "wireless:bluetooth" : "wireless:true");
+    }
+    if (headphoneNoiseCancelling === true) {
+      const vt = Array.isArray(id.visibleText) ? id.visibleText : [];
+      const sw = Array.isArray(id.styleWords) ? id.styleWords : [];
+      const j = vt.filter((t) => t && typeof t === "string").join(" ") +
+        " " + sw.filter((s) => s && typeof s === "string").join(" ");
+      evidence.push(/\banc\b/i.test(j) ? "noise_cancelling:anc" : "noise_cancelling:true");
+    }
+    headphoneEvidence = evidence;
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -382,5 +545,12 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     rating: null,
     publisher: null,
     developer: null,
+    audioKind,
+    headphoneFit,
+    headphoneBackType,
+    headphoneWireless,
+    headphoneNoiseCancelling,
+    headphoneFeatures,
+    headphoneEvidence,
   };
 }
