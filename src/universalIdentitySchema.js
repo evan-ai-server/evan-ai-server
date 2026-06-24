@@ -1,7 +1,8 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1 — Universal identity schema foundation.
+// Phase 5B.1+5B.2 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
-// high-stakes flags, evidence metadata, and query-safety metadata.
+// high-stakes flags, evidence metadata, query-safety metadata,
+// and book/video-game recognition enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -81,6 +82,90 @@ export function computeConfidenceLabel({
     return "unknown";
   }
   return "insufficient_evidence";
+}
+
+const BOOK_KEYWORDS = /\b(book|paperback|hardcover|hardback|novel|textbook|manga|comic|graphic novel)\b/i;
+const VIDEO_GAME_KEYWORDS = /\b(video game|game case|game cartridge|disc game|nintendo switch game|playstation game|xbox game)\b/i;
+
+export function isBookIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  return fields.some((f) => f && typeof f === "string" && BOOK_KEYWORDS.test(f));
+}
+
+export function isVideoGameIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  return fields.some((f) => f && typeof f === "string" && VIDEO_GAME_KEYWORDS.test(f));
+}
+
+const AUTHOR_BYLINE_RE = /\bby\s+([A-Z][A-Za-z'.]+(?:\s+[A-Z][A-Za-z'.]+){0,4})/;
+
+export function deriveBookAuthor(visibleText) {
+  if (!Array.isArray(visibleText)) return null;
+  for (const t of visibleText) {
+    if (!t || typeof t !== "string") continue;
+    const m = t.match(AUTHOR_BYLINE_RE);
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+const ISBN13_RE = /(?:^|\D)(97[89]\d{10})(?:\D|$)/;
+const ISBN10_RE = /(?:^|\D)(\d{9}[\dX])(?:\D|$)/;
+
+export function deriveIsbn(visibleText) {
+  if (!Array.isArray(visibleText)) return null;
+  for (const t of visibleText) {
+    if (!t || typeof t !== "string") continue;
+    const normalized = t.replace(/[-\s]/g, "");
+    const m13 = normalized.match(ISBN13_RE);
+    if (m13) return m13[1];
+    const m10 = normalized.match(ISBN10_RE);
+    if (m10) return m10[1];
+  }
+  return null;
+}
+
+const GAME_PLATFORMS = [
+  "Nintendo Switch 2",
+  "Nintendo Switch",
+  "Nintendo 3DS",
+  "Wii",
+  "PlayStation 5",
+  "PlayStation 4",
+  "PlayStation 3",
+  "Xbox Series X",
+  "Xbox Series S",
+  "Xbox One",
+  "Xbox 360",
+  "PS5",
+  "PS4",
+  "PS3",
+  "Steam",
+  "PC",
+];
+
+export function deriveGamePlatform(visibleText) {
+  if (!Array.isArray(visibleText)) return null;
+  for (const t of visibleText) {
+    if (!t || typeof t !== "string") continue;
+    const upper = t.toUpperCase();
+    for (const plat of GAME_PLATFORMS) {
+      if (upper.includes(plat.toUpperCase())) return plat;
+    }
+  }
+  return null;
 }
 
 function computeMissingEvidence(identity) {
@@ -222,6 +307,25 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     }
   }
 
+  const bookDetected = isBookIdentity(id);
+  const gameDetected = isVideoGameIdentity(id);
+  const mediaKind = bookDetected ? "book" : gameDetected ? "video_game" : null;
+
+  const vt = Array.isArray(id.visibleText) ? id.visibleText : [];
+  const author = bookDetected ? deriveBookAuthor(vt) : null;
+  const isbn = bookDetected ? deriveIsbn(vt) : null;
+  const platform = gameDetected ? deriveGamePlatform(vt) : null;
+
+  if (bookDetected) {
+    if (!id.model) missingEvidence.push("book title not readable");
+    if (!author) missingEvidence.push("author not identified");
+    if (!isbn) missingEvidence.push("ISBN not visible or not readable");
+  }
+  if (gameDetected) {
+    if (!id.model) missingEvidence.push("video game title not readable");
+    if (!platform) missingEvidence.push("game platform not identified");
+  }
+
   const rawQueryTermsAllowed = computeQueryTermsAllowed(
     id, confidenceLabel, authenticityClaimAllowed, highStakes
   );
@@ -231,6 +335,21 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
   const identityWarnings = computeIdentityWarnings(
     id, highStakes, confidenceLabel, authenticityClaimAllowed, evidenceSource
   );
+
+  if (bookDetected && !id.model) {
+    identityWarnings.push("Book title is not confirmed from readable cover text.");
+  }
+  if (gameDetected && !platform) {
+    identityWarnings.push("Platform not confirmed — do not infer from case color.");
+  }
+
+  if (bookDetected && (confidenceLabel === "confirmed" || confidenceLabel === "likely")) {
+    if (author && !rawQueryTermsAllowed.includes(author)) rawQueryTermsAllowed.push(author);
+    if (isbn && !rawQueryTermsAllowed.includes(isbn)) rawQueryTermsAllowed.push(isbn);
+  }
+  if (gameDetected && (confidenceLabel === "confirmed" || confidenceLabel === "likely")) {
+    if (platform && !rawQueryTermsAllowed.includes(platform)) rawQueryTermsAllowed.push(platform);
+  }
 
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
@@ -254,5 +373,14 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     broadQuery: id.broadQuery ?? null,
     categoryFallbackQuery: id.categoryFallbackQuery ?? null,
     visualDescriptorQuery: id.visualDescriptorQuery ?? null,
+    mediaKind,
+    author,
+    isbn,
+    platform,
+    edition: null,
+    region: null,
+    rating: null,
+    publisher: null,
+    developer: null,
   };
 }

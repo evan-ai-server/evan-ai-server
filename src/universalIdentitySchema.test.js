@@ -5,6 +5,11 @@ import {
   computeConfidenceLabel,
   enrichIdentityWithSchema,
   isHighStakesBrand,
+  isBookIdentity,
+  isVideoGameIdentity,
+  deriveBookAuthor,
+  deriveIsbn,
+  deriveGamePlatform,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -485,6 +490,362 @@ describe("enrichIdentityWithSchema", () => {
         key in result,
         `expected key "${key}" in enriched identity`
       );
+    }
+  });
+
+  it("non-book/game identity has null media fields", () => {
+    const result = enrichIdentityWithSchema(baseIdentity, {
+      attributeCertainty: { brand: 0.80 },
+      overallConfidence: 0.85,
+    });
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.author, null);
+    assert.strictEqual(result.isbn, null);
+    assert.strictEqual(result.platform, null);
+    assert.strictEqual(result.edition, null);
+    assert.strictEqual(result.region, null);
+    assert.strictEqual(result.rating, null);
+    assert.strictEqual(result.publisher, null);
+    assert.strictEqual(result.developer, null);
+  });
+
+  it("empty identity has null media fields", () => {
+    const result = enrichIdentityWithSchema({}, {});
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.author, null);
+    assert.strictEqual(result.isbn, null);
+    assert.strictEqual(result.platform, null);
+  });
+});
+
+describe("isBookIdentity", () => {
+  it("detects book from itemType", () => {
+    assert.strictEqual(isBookIdentity({ itemType: "paperback book" }), true);
+  });
+  it("detects book from category", () => {
+    assert.strictEqual(isBookIdentity({ category: "hardcover" }), true);
+  });
+  it("detects manga from styleWords", () => {
+    assert.strictEqual(isBookIdentity({ styleWords: ["manga", "shonen"] }), true);
+  });
+  it("does not detect sneakers as book", () => {
+    assert.strictEqual(isBookIdentity({ itemType: "sneakers", category: "sneakers" }), false);
+  });
+  it("does not detect shirt with book in model name", () => {
+    assert.strictEqual(isBookIdentity({ itemType: "shirt", model: "Book Club Tee" }), false);
+  });
+  it("does not detect t-shirt with comic in model name", () => {
+    assert.strictEqual(isBookIdentity({ itemType: "t-shirt", model: "Comic Hero" }), false);
+  });
+  it("returns false for null", () => {
+    assert.strictEqual(isBookIdentity(null), false);
+  });
+});
+
+describe("isVideoGameIdentity", () => {
+  it("detects video game from itemType", () => {
+    assert.strictEqual(isVideoGameIdentity({ itemType: "video game case" }), true);
+  });
+  it("detects cartridge from subtype", () => {
+    assert.strictEqual(isVideoGameIdentity({ subtype: "game cartridge" }), true);
+  });
+  it("does not detect game console as video game", () => {
+    assert.strictEqual(isVideoGameIdentity({ itemType: "game console", category: "electronics" }), false);
+  });
+  it("does not detect ink cartridge as video game", () => {
+    assert.strictEqual(isVideoGameIdentity({ itemType: "ink cartridge", category: "printer supplies" }), false);
+  });
+  it("does not detect toner cartridge as video game", () => {
+    assert.strictEqual(isVideoGameIdentity({ itemType: "toner cartridge" }), false);
+  });
+  it("does not detect razor cartridge as video game", () => {
+    assert.strictEqual(isVideoGameIdentity({ itemType: "razor cartridge" }), false);
+  });
+  it("returns false for null", () => {
+    assert.strictEqual(isVideoGameIdentity(null), false);
+  });
+});
+
+describe("deriveBookAuthor", () => {
+  it("derives author from byline", () => {
+    assert.strictEqual(deriveBookAuthor(["The Great Gatsby", "by F. Scott Fitzgerald"]), "F. Scott Fitzgerald");
+  });
+  it("derives author from mixed-case by", () => {
+    assert.strictEqual(deriveBookAuthor(["by J.K. Rowling"]), "J.K. Rowling");
+  });
+  it("returns null when no byline", () => {
+    assert.strictEqual(deriveBookAuthor(["Harry Potter", "Scholastic"]), null);
+  });
+  it("returns null for null input", () => {
+    assert.strictEqual(deriveBookAuthor(null), null);
+  });
+});
+
+describe("deriveIsbn", () => {
+  it("derives ISBN-13", () => {
+    assert.strictEqual(deriveIsbn(["ISBN 978-0-13-468599-1"]), "9780134685991");
+  });
+  it("derives ISBN-10", () => {
+    assert.strictEqual(deriveIsbn(["013468599X"]), "013468599X");
+  });
+  it("returns null when no ISBN present", () => {
+    assert.strictEqual(deriveIsbn(["First Edition", "Copyright 2020"]), null);
+  });
+  it("returns null for null input", () => {
+    assert.strictEqual(deriveIsbn(null), null);
+  });
+});
+
+describe("deriveGamePlatform", () => {
+  it("derives Nintendo Switch", () => {
+    assert.strictEqual(deriveGamePlatform(["Nintendo Switch"]), "Nintendo Switch");
+  });
+  it("derives PS5", () => {
+    assert.strictEqual(deriveGamePlatform(["PS5 exclusive"]), "PS5");
+  });
+  it("derives PlayStation 5 case-insensitive", () => {
+    assert.strictEqual(deriveGamePlatform(["playstation 5 edition"]), "PlayStation 5");
+  });
+  it("returns null when no platform text", () => {
+    assert.strictEqual(deriveGamePlatform(["Zelda", "Tears of the Kingdom"]), null);
+  });
+  it("returns null for null input", () => {
+    assert.strictEqual(deriveGamePlatform(null), null);
+  });
+  it("prefers Nintendo Switch 2 over Nintendo Switch", () => {
+    assert.strictEqual(deriveGamePlatform(["Nintendo Switch 2 game"]), "Nintendo Switch 2");
+  });
+});
+
+describe("enrichIdentityWithSchema — books", () => {
+  it("mediaKind is book for book identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "The Great Gatsby", visibleText: ["The Great Gatsby", "by F. Scott Fitzgerald"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "book");
+  });
+
+  it("book title stays in model", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.model, "Dune");
+  });
+
+  it("author derived from visibleText", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "hardcover", model: "Harry Potter", visibleText: ["Harry Potter", "by J.K. Rowling"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.author, "J.K. Rowling");
+  });
+
+  it("isbn derived from visibleText", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "book", model: "Clean Code", visibleText: ["ISBN 978-0-13-468599-1"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.isbn, "9780134685991");
+  });
+
+  it("book with no model does not fabricate title", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", visibleText: [] },
+      { overallConfidence: 0.40, attributeCertainty: {} }
+    );
+    assert.strictEqual(result.model, undefined);
+    assert.ok(result.missingEvidence.includes("book title not readable"));
+  });
+
+  it("book with no author adds missing evidence", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.ok(result.missingEvidence.includes("author not identified"));
+  });
+
+  it("book with no model adds title warning", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", visibleText: [] },
+      { overallConfidence: 0.40, attributeCertainty: {} }
+    );
+    assert.ok(result.identityWarnings.some((w) => /book title/i.test(w)));
+  });
+
+  it("book query terms include author when derived and confidence sufficient", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "book", model: "Harry Potter", visibleText: ["Harry Potter", "by J.K. Rowling"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.ok(result.queryTermsAllowed.includes("J.K. Rowling"));
+  });
+
+  it("book query terms do not include author when confidence low", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "book", model: "Harry Potter", visibleText: ["Harry Potter", "by J.K. Rowling"] },
+      { overallConfidence: 0.20, attributeCertainty: {} }
+    );
+    assert.ok(!result.queryTermsAllowed.includes("J.K. Rowling"));
+  });
+
+  it("book query terms allowed/blocked disjoint", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "book", category: "luxury", brand: "Assouline", model: "Chanel", visibleText: ["by someone"] },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+});
+
+describe("enrichIdentityWithSchema — video games", () => {
+  it("mediaKind is video_game for game identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda TOTK", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "video_game");
+  });
+
+  it("game title stays in model", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda TOTK", visibleText: [] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.model, "Zelda TOTK");
+  });
+
+  it("platform derived from visibleText containing Nintendo Switch", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda TOTK", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.platform, "Nintendo Switch");
+  });
+
+  it("platform derived from visibleText containing PS5", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "God of War", visibleText: ["PS5"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.platform, "PS5");
+  });
+
+  it("platform null when no platform text", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Mario", visibleText: ["Mario"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.platform, null);
+  });
+
+  it("no platform does not infer from case color", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Game", colors: ["blue"], visibleText: [] },
+      { overallConfidence: 0.50, attributeCertainty: {} }
+    );
+    assert.strictEqual(result.platform, null);
+    assert.ok(result.identityWarnings.some((w) => /platform.*case color/i.test(w)));
+  });
+
+  it("game with no model adds missing evidence", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", visibleText: [] },
+      { overallConfidence: 0.40, attributeCertainty: {} }
+    );
+    assert.ok(result.missingEvidence.includes("video game title not readable"));
+  });
+
+  it("game with no platform adds missing evidence", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Some Game", visibleText: ["Some Game"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.ok(result.missingEvidence.includes("game platform not identified"));
+  });
+
+  it("game query terms include platform when derived and confidence sufficient", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Zelda", "Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.ok(result.queryTermsAllowed.includes("Nintendo Switch"));
+  });
+
+  it("game query terms allowed/blocked disjoint", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", category: "luxury", brand: "Nintendo", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+});
+
+describe("enrichIdentityWithSchema — regressions", () => {
+  it("Rolex weak evidence still blocked (high-stakes regression)", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "watch", brand: "Rolex", model: "Submariner", visibleText: [] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.72, model: 0.60 } }
+    );
+    assert.ok(result.queryTermsBlocked.includes("Rolex"));
+    assert.ok(!result.queryTermsAllowed.includes("Rolex"));
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("Rolex confirmed still allowed (high-stakes regression)", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "watch", brand: "Rolex", model: "Submariner", visibleText: ["ROLEX"] },
+      { overallConfidence: 0.92, attributeCertainty: { brand: 0.90, model: 0.85 } }
+    );
+    assert.ok(result.queryTermsAllowed.includes("Rolex"));
+    assert.deepStrictEqual(result.queryTermsBlocked, []);
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("model aircraft remains non-high-stakes", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "model airplane", brand: "Gemini Jets" },
+      { overallConfidence: 0.50 }
+    );
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("ink cartridge enrichment has null mediaKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "ink cartridge", category: "printer supplies" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("apparel identity unchanged by media enrichment", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Hanes", model: "ComfortSoft", visibleText: ["Hanes"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.author, null);
+    assert.strictEqual(result.isbn, null);
+    assert.strictEqual(result.platform, null);
+    assert.ok(!result.missingEvidence.includes("book title not readable"));
+    assert.ok(!result.missingEvidence.includes("video game title not readable"));
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked never overlap across all media types", () => {
+    const identities = [
+      { itemType: "book", model: "Dune", visibleText: ["Dune"] },
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { itemType: "sneakers", category: "sneakers", brand: "Nike", visibleText: ["Nike"] },
+    ];
+    for (const id of identities) {
+      const result = enrichIdentityWithSchema(id, { overallConfidence: 0.70, attributeCertainty: { brand: 0.55, model: 0.55 } });
+      const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+      assert.deepStrictEqual(overlap, [], `overlap found for ${id.itemType}`);
     }
   });
 });
