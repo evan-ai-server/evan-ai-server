@@ -1618,6 +1618,18 @@ const QUERY_FAST_TIMEOUT_MS         = Number(process.env.QUERY_FAST_TIMEOUT_MS  
 const QUERY_FAST_MAX_OUTPUT_TOKENS  = Number(process.env.QUERY_FAST_MAX_OUTPUT_TOKENS  || 160);
 const QUERY_FAST_CONFIDENCE_THRESHOLD = Number(process.env.QUERY_FAST_CONFIDENCE_THRESHOLD || 0.60);
 const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERTAINTY_MAX  || 0.2);
+// Phase 5A.4J: cold-start hardening. The boot prompt-cache warmup is fire-and-forget,
+// so the first scan after restart can race it with a COLD prompt cache — query_fast then
+// runs ~4.8s (vs ~2.6-3.1s warm), overrunning both its abort timeout and the no-seed
+// grace ceiling → hard_fail_no_seed. While the cache is unconfirmed-warm we widen ONLY
+// query_fast's abort timeout + the no-seed grace window so the slower-but-correct cold
+// seed completes and rescues via the existing grace path. Cold grace ceiling
+// (VISION_FIRST_QUERY_DEADLINE_MS + VISION_NO_SEED_GRACE_COLD_MS) stays under
+// ITEM_VISION_HARD_RETURN_MS (5500). Flips warm when the boot warmup query_fast resolves
+// OR any query_fast response reports cached prompt tokens. Warm path is unchanged.
+const QUERY_FAST_COLD_TIMEOUT_MS    = Number(process.env.QUERY_FAST_COLD_TIMEOUT_MS    || 5300);
+const VISION_NO_SEED_GRACE_COLD_MS  = Number(process.env.VISION_NO_SEED_GRACE_COLD_MS  || 2000);
+let _visionPromptCacheWarm = false;
 // Slice V2: env-gated image detail for the query_fast pass ONLY. "low"/"high"
 // attach an explicit detail to the image input; "auto", unset, or any invalid
 // value preserve current behavior (no detail param → OpenAI default). No other
@@ -19836,7 +19848,10 @@ function _launchProvisionalSeedVerification({ req, file, mode, propContext, seed
 // accepted result first wins.
 async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externalSignal }) {
   const model = QUERY_FAST_MODEL;
-  const openaiCutoffMs = QUERY_FAST_TIMEOUT_MS;
+  // Phase 5A.4J: cold start (unconfirmed-warm prompt cache) gets a wider abort timeout
+  // so the slower cold query_fast call produces a real seed instead of being killed.
+  const _qfWarm = _visionPromptCacheWarm;
+  const openaiCutoffMs = _qfWarm ? QUERY_FAST_TIMEOUT_MS : QUERY_FAST_COLD_TIMEOUT_MS;
   const timeout = withTimeout(openaiCutoffMs);
   const combinedSignal = externalSignal
     ? AbortSignal.any([timeout.signal, externalSignal])
@@ -19854,6 +19869,7 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
     timeoutMs: openaiCutoffMs,
     maxOutputTokens: QUERY_FAST_MAX_OUTPUT_TOKENS,
     imageDetail: _qfImageDetail,
+    coldStart: !_qfWarm,
   });
 
   try {
@@ -19941,6 +19957,12 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
 
     // Slice V1: token-level usage diagnostic — no image data, no raw prompt text.
     const _qfUsage = extractOpenAiUsage(response?.usage);
+    // Phase 5A.4J: once we observe cached prompt tokens, the cache is warm — flip the
+    // flag so subsequent scans use the normal (tighter) query_fast timeout + grace.
+    if (!_visionPromptCacheWarm && typeof _qfUsage.cachedInputTokens === "number" && _qfUsage.cachedInputTokens > 0) {
+      _visionPromptCacheWarm = true;
+      try { console.log("VISION_PROMPT_CACHE_WARM_CONFIRMED", { rid, source: "query_fast_cached_tokens", cachedInputTokens: _qfUsage.cachedInputTokens }); } catch {}
+    }
     console.log("VISION_QUERY_FAST_USAGE", {
       rid, model, elapsedMs, timedOut: false,
       inputTokens:       _qfUsage.inputTokens,
@@ -20903,11 +20925,17 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // Phase 4K Part C / 4L: grace window — give late fast/query_fast/visual a chance
       // before committing to hard_fail_no_seed. Default 1000ms catches query_fast which
       // typically returns ~150-800ms after the hard deadline fires.
-      const _noSeedGraceMs = Number(process.env.VISION_NO_SEED_GRACE_MS || 1000);
+      // Phase 5A.4J: cold start (unconfirmed-warm prompt cache) gets a wider grace
+      // window so the slower cold query_fast (~4.8s) is caught by the grace rescue
+      // instead of committing to hard_fail_no_seed. Warm path unchanged.
+      const _noSeedGraceMs = _visionPromptCacheWarm
+        ? Number(process.env.VISION_NO_SEED_GRACE_MS || 1000)
+        : VISION_NO_SEED_GRACE_COLD_MS;
       if (_noSeedGraceMs > 0) {
         const _graceT0 = Date.now();
         console.log("VISION_NO_SEED_GRACE_STARTED", {
           rid: req.rid, graceMs: _noSeedGraceMs, elapsedMs: Date.now() - passT0,
+          coldStart: !_visionPromptCacheWarm,
         });
         // Phase 4L: query_fast is now watched by grace. When it rescues, its result is
         // stored in _graceRescuedFastResult and raceWinner is set to "fast" so Block 2
@@ -43528,7 +43556,7 @@ function _firePromptCacheWarmup() {
       { passLabel: "query_fast",   model: QUERY_FAST_MODEL,   schema: buildUltraLeanVisionSchema(), cacheKey: "evan-ai-vision-query-fast-v1",    schemaName: "evan_ai_vision_query_fast_v1",     promptFn: () => buildUltraLeanVisionPrompt("item", "") },
     ];
     for (const { passLabel, model, schema, cacheKey, schemaName, promptFn } of warmupPasses) {
-      openai.responses.create({
+      const _warmP = openai.responses.create({
         model,
         temperature: 0.1,
         max_output_tokens: 10,
@@ -43539,7 +43567,19 @@ function _firePromptCacheWarmup() {
           { role: "system", content: [{ type: "input_text", text: VISION_SYSTEM }] },
           { role: "user", content: [{ type: "input_text", text: promptFn(passLabel) }, { type: "input_image", image_url: warmDataUrl }] },
         ],
-      }).catch(() => {});
+      });
+      // Phase 5A.4J: when the query_fast warmup resolves, that pass's prompt cache is
+      // populated — mark warm so the first real scan uses normal (tighter) timeouts.
+      if (passLabel === "query_fast") {
+        _warmP.then(() => {
+          if (!_visionPromptCacheWarm) {
+            _visionPromptCacheWarm = true;
+            try { console.log("VISION_PROMPT_CACHE_WARM_CONFIRMED", { source: "boot_warmup_query_fast" }); } catch {}
+          }
+        }).catch(() => {});
+      } else {
+        _warmP.catch(() => {});
+      }
     }
     console.log("VISION_PROMPT_CACHE_WARMUP_FIRED", {
       passes: 5,
