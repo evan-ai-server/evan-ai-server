@@ -1630,6 +1630,11 @@ const QUERY_FAST_BRAND_CERTAINTY_MAX  = Number(process.env.QUERY_FAST_BRAND_CERT
 const QUERY_FAST_COLD_TIMEOUT_MS    = Number(process.env.QUERY_FAST_COLD_TIMEOUT_MS    || 5300);
 const VISION_NO_SEED_GRACE_COLD_MS  = Number(process.env.VISION_NO_SEED_GRACE_COLD_MS  || 2000);
 let _visionPromptCacheWarm = false;
+function _markVisionPromptCacheWarm(source, extra = {}) {
+  if (_visionPromptCacheWarm) return;
+  _visionPromptCacheWarm = true;
+  try { console.log("VISION_PROMPT_CACHE_WARM_CONFIRMED", { source, ...extra }); } catch {}
+}
 // Slice V2: env-gated image detail for the query_fast pass ONLY. "low"/"high"
 // attach an explicit detail to the image input; "auto", unset, or any invalid
 // value preserve current behavior (no detail param → OpenAI default). No other
@@ -19960,8 +19965,7 @@ async function runUltraLeanVisionPass({ dataUrl, mode, propContext, rid, externa
     // Phase 5A.4J: once we observe cached prompt tokens, the cache is warm — flip the
     // flag so subsequent scans use the normal (tighter) query_fast timeout + grace.
     if (!_visionPromptCacheWarm && typeof _qfUsage.cachedInputTokens === "number" && _qfUsage.cachedInputTokens > 0) {
-      _visionPromptCacheWarm = true;
-      try { console.log("VISION_PROMPT_CACHE_WARM_CONFIRMED", { rid, source: "query_fast_cached_tokens", cachedInputTokens: _qfUsage.cachedInputTokens }); } catch {}
+      _markVisionPromptCacheWarm("query_fast_cached_tokens", { rid, cachedInputTokens: _qfUsage.cachedInputTokens });
     }
     console.log("VISION_QUERY_FAST_USAGE", {
       rid, model, elapsedMs, timedOut: false,
@@ -43556,10 +43560,11 @@ function _firePromptCacheWarmup() {
       { passLabel: "query_fast",   model: QUERY_FAST_MODEL,   schema: buildUltraLeanVisionSchema(), cacheKey: "evan-ai-vision-query-fast-v1",    schemaName: "evan_ai_vision_query_fast_v1",     promptFn: () => buildUltraLeanVisionPrompt("item", "") },
     ];
     for (const { passLabel, model, schema, cacheKey, schemaName, promptFn } of warmupPasses) {
+      const _warmMaxTokens = passLabel === "query_fast" ? QUERY_FAST_MAX_OUTPUT_TOKENS : 10;
       const _warmP = openai.responses.create({
         model,
         temperature: 0.1,
-        max_output_tokens: 10,
+        max_output_tokens: _warmMaxTokens,
         prompt_cache_key: cacheKey,
         prompt_cache_retention: "24h",
         text: { format: { type: "json_schema", name: schemaName, strict: true, schema } },
@@ -43568,15 +43573,14 @@ function _firePromptCacheWarmup() {
           { role: "user", content: [{ type: "input_text", text: promptFn(passLabel) }, { type: "input_image", image_url: warmDataUrl }] },
         ],
       });
-      // Phase 5A.4J: when the query_fast warmup resolves, that pass's prompt cache is
-      // populated — mark warm so the first real scan uses normal (tighter) timeouts.
       if (passLabel === "query_fast") {
+        try { console.log("VISION_PROMPT_CACHE_WARMUP_QUERY_FAST_STARTED", { model, maxOutputTokens: _warmMaxTokens }); } catch {}
         _warmP.then(() => {
-          if (!_visionPromptCacheWarm) {
-            _visionPromptCacheWarm = true;
-            try { console.log("VISION_PROMPT_CACHE_WARM_CONFIRMED", { source: "boot_warmup_query_fast" }); } catch {}
-          }
-        }).catch(() => {});
+          try { console.log("VISION_PROMPT_CACHE_WARMUP_QUERY_FAST_DONE", { model }); } catch {}
+          _markVisionPromptCacheWarm("boot_warmup_query_fast");
+        }).catch((e) => {
+          try { console.log("VISION_PROMPT_CACHE_WARMUP_QUERY_FAST_FAILED", { errorName: e?.name, errorMessage: e?.message, errorCode: e?.code, status: e?.status }); } catch {}
+        });
       } else {
         _warmP.catch(() => {});
       }
