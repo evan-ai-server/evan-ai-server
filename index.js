@@ -1345,6 +1345,7 @@ import { runRepairJob, listRepairJobs }    from "./workers/repairWorker.js";
 import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, getRecentLearningScans } from "./src/learningStore.js";
 import { refreshThresholdCache, getAllAdaptiveOverrides } from "./src/adaptiveThresholds.js";
 import { isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategoryPolicy } from "./src/visionCategoryPolicy.js";
+import { enrichIdentityWithSchema } from "./src/universalIdentitySchema.js";
 import { sanitizeAircraftVariants } from "./src/aircraftCacheSafeGuard.js";
 import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
 import {
@@ -17029,6 +17030,10 @@ function normalizeVisionIdentityPayload(raw = null, fallbackQuery = "") {
     searchQueries,
     substituteCandidates,
     marketSegment,
+    conditionNotes:        safeStr(raw.conditionNotes || "", 500) || null,
+    broadQuery:            safeStr(raw.broadQuery || "", 220) || null,
+    categoryFallbackQuery: safeStr(raw.categoryFallbackQuery || "", 220) || null,
+    visualDescriptorQuery: safeStr(raw.visualDescriptorQuery || "", 220) || null,
   };
 }
 
@@ -22048,12 +22053,27 @@ if (
       };
     }
 
+    const enrichedIdentity = enrichIdentityWithSchema(mergedIdentity, {
+      attributeCertainty: mergedAttributeCertainty,
+      authenticityFlags: parsedList.flatMap((p) => Array.isArray(p?.authenticityFlags) ? p.authenticityFlags : []),
+      overallConfidence: confidence,
+    });
+    console.log("IDENTITY_SCHEMA_ENRICHMENT", {
+      rid: req.rid,
+      confidenceLabel: enrichedIdentity.confidenceLabel,
+      highStakes: enrichedIdentity.highStakes,
+      luxuryCandidate: enrichedIdentity.luxuryCandidate,
+      authenticityClaimAllowed: enrichedIdentity.authenticityClaimAllowed,
+      queryTermsBlockedCount: enrichedIdentity.queryTermsBlocked?.length || 0,
+      identityWarningsCount: enrichedIdentity.identityWarnings?.length || 0,
+    });
+
     return {
       ok: true,
       query,
       variants,
       confidence,
-      identity: mergedIdentity,
+      identity: enrichedIdentity,
       attributeCertainty: mergedAttributeCertainty,
       visionSource,
       visionTier,
