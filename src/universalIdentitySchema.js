@@ -1,8 +1,9 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2+5B.3B — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B+5B.4 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
-// book/video-game recognition, and headphone taxonomy enrichment.
+// book/video-game recognition, headphone taxonomy enrichment,
+// and watch taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -293,6 +294,138 @@ export function deriveHeadphoneFeatures(identity) {
   return features;
 }
 
+// --- Watch taxonomy (Phase 5B.4) ---
+
+const WATCH_ACCESSORY_RE = /\b(watch box|watch case|watch band|watch strap|watch charger|watch stand|watch winder|watch display|watch tool|watch repair|watch holder|watch hanger|watch mount|watch roll|watch cushion|watch pillow|watch cabinet|watch organizer|screen protector|replacement band|replacement strap)\b/i;
+const WATCH_NON_WATCH_RE = /\b(wall clock|desk clock|alarm clock|grandfather clock|cuckoo clock|clock tower|stopwatch|timer|compass|bangle|bracelet|jewelry box|poster|book|phone|laptop|tablet|scale|bike computer|clock)\b/i;
+const WATCH_DEVICE_RE = /\b(analog watch|digital watch|smartwatch|smart watch|sports watch|sport watch|chronograph watch|dive watch|diver watch|dress watch|field watch|pilot watch|aviator watch|fitness tracker|fitness band|activity tracker|pocket watch|kids watch|children watch|children's watch|couple watch|wristwatches|wristwatch|watches|watch|chronograph|timepiece)\b/i;
+
+export function isWatchIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  if (WATCH_ACCESSORY_RE.test(joined)) return false;
+  if (WATCH_NON_WATCH_RE.test(joined) && !WATCH_DEVICE_RE.test(joined)) return false;
+  if (WATCH_DEVICE_RE.test(joined)) return true;
+  return false;
+}
+
+const SMARTWATCH_TYPE_RE = /\b(smartwatch|smart watch)\b/i;
+const SMARTWATCH_VT_RE = /\b(apple watch|galaxy watch|wear os|watchos)\b/i;
+const FITNESS_BAND_RE = /\b(fitness band|fitness tracker|activity tracker)\b/i;
+const POCKET_WATCH_RE = /\bpocket watch\b/i;
+
+export function deriveWatchKind(identity) {
+  if (!isWatchIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (SMARTWATCH_TYPE_RE.test(joined)) return "smartwatch";
+  if (FITNESS_BAND_RE.test(joined)) return "fitness_band";
+  if (POCKET_WATCH_RE.test(joined)) return "pocket_watch";
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const vtJoined = vt.filter((t) => t && typeof t === "string").join(" ");
+  if (SMARTWATCH_VT_RE.test(vtJoined)) return "smartwatch";
+  return "watch";
+}
+
+const DISPLAY_ANALOG_RE = /\b(analog|analog watch)\b/i;
+const DISPLAY_DIGITAL_RE = /\b(digital|digital watch|lcd|led display)\b/i;
+const DISPLAY_HYBRID_RE = /\bhybrid\b/i;
+
+export function deriveWatchDisplayType(identity) {
+  if (!isWatchIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (DISPLAY_ANALOG_RE.test(joined)) return "analog";
+  if (DISPLAY_DIGITAL_RE.test(joined)) return "digital";
+  if (DISPLAY_HYBRID_RE.test(joined)) return "hybrid";
+  return null;
+}
+
+const STYLE_SPORTS_RE = /\b(sports watch|sport watch|dive watch|diver|field watch)\b/i;
+const STYLE_LUXURY_RE = /\b(dress watch|luxury watch)\b/i;
+const STYLE_KIDS_RE = /\b(kids watch|children watch|children's watch)\b/i;
+const STYLE_COUPLE_RE = /\b(couple watch|couple watches|his and hers)\b/i;
+
+export function deriveWatchStyle(identity) {
+  if (!isWatchIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (STYLE_SPORTS_RE.test(joined)) return "sports";
+  if (STYLE_LUXURY_RE.test(joined)) return "luxury_style";
+  if (STYLE_KIDS_RE.test(joined)) return "kids";
+  if (STYLE_COUPLE_RE.test(joined)) return "couple";
+  return null;
+}
+
+const STRAP_LEATHER_RE = /\b(leather strap|leather band)\b/i;
+const STRAP_METAL_RE = /\b(metal bracelet|metal strap|metal band|stainless steel bracelet|stainless steel)\b/i;
+const STRAP_RUBBER_RE = /\b(rubber strap|silicone strap|rubber band)\b/i;
+const STRAP_FABRIC_RE = /\b(nato strap|nylon strap|fabric strap|canvas strap)\b/i;
+
+export function deriveWatchStrapType(identity) {
+  if (!isWatchIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  if (STRAP_LEATHER_RE.test(joined) || matJoined.includes("leather")) return "leather";
+  if (STRAP_METAL_RE.test(joined) || matJoined.includes("stainless steel") || matJoined.includes("metal")) return "metal";
+  if (STRAP_RUBBER_RE.test(joined) || matJoined.includes("rubber") || matJoined.includes("silicone")) return "rubber";
+  if (STRAP_FABRIC_RE.test(joined) || matJoined.includes("nato") || matJoined.includes("nylon") || matJoined.includes("canvas") || matJoined.includes("fabric")) return "fabric";
+  return null;
+}
+
+const FEAT_CHRONO_RE = /\b(chronograph|subdials|pushers)\b/i;
+const FEAT_DATE_RE = /\b(date window|day-date|date display)\b/i;
+const FEAT_BEZEL_RE = /\b(rotating bezel|dive bezel)\b/i;
+const FEAT_WR_RE = /\b(water resistant|waterproof)\b/i;
+
+export function deriveWatchFeatures(identity) {
+  if (!isWatchIdentity(identity)) return [];
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  const features = [];
+  if (FEAT_CHRONO_RE.test(joined)) features.push("chronograph");
+  if (FEAT_DATE_RE.test(joined)) features.push("date_window");
+  if (FEAT_BEZEL_RE.test(joined)) features.push("rotating_bezel");
+  if (FEAT_WR_RE.test(joined)) features.push("water_resistant");
+  return features;
+}
+
 function computeMissingEvidence(identity) {
   const missing = [];
   if (!identity.brand) missing.push("brand not identified");
@@ -514,6 +647,36 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     headphoneEvidence = evidence;
   }
 
+  // --- Watch taxonomy enrichment (Phase 5B.4) ---
+  const watchDetected = isWatchIdentity(id);
+  let watchKind = null;
+  let watchDisplayType = null;
+  let watchStyle = null;
+  let watchStrapType = null;
+  let watchFeatures = [];
+  let watchEvidence = [];
+  let watchLuxurySignal = null;
+
+  if (watchDetected) {
+    watchKind = deriveWatchKind(id);
+    watchDisplayType = deriveWatchDisplayType(id);
+    watchStyle = deriveWatchStyle(id);
+    watchStrapType = deriveWatchStrapType(id);
+    watchFeatures = deriveWatchFeatures(id);
+
+    const evidence = [];
+    if (watchKind) evidence.push(`kind:${watchKind}`);
+    if (watchDisplayType) evidence.push(`display:${watchDisplayType}`);
+    if (watchStyle) evidence.push(`style:${watchStyle}`);
+    if (watchStrapType) evidence.push(`strap:${watchStrapType}`);
+    for (const f of watchFeatures) evidence.push(`feature:${f}`);
+    watchEvidence = evidence;
+
+    if (watchStyle === "luxury_style") {
+      watchLuxurySignal = "possible_luxury_style";
+    }
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -552,5 +715,12 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     headphoneNoiseCancelling,
     headphoneFeatures,
     headphoneEvidence,
+    watchKind,
+    watchDisplayType,
+    watchStyle,
+    watchStrapType,
+    watchFeatures,
+    watchEvidence,
+    watchLuxurySignal,
   };
 }

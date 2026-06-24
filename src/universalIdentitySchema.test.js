@@ -17,6 +17,12 @@ import {
   deriveHeadphoneWireless,
   deriveHeadphoneNoiseCancelling,
   deriveHeadphoneFeatures,
+  isWatchIdentity,
+  deriveWatchKind,
+  deriveWatchDisplayType,
+  deriveWatchStyle,
+  deriveWatchStrapType,
+  deriveWatchFeatures,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -1136,6 +1142,461 @@ describe("enrichIdentityWithSchema — headphones", () => {
   });
 });
 
+describe("isWatchIdentity", () => {
+  // Positive detection
+  it("detects analog watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "analog watch", category: "watch" }), true);
+  });
+  it("detects digital watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "digital watch" }), true);
+  });
+  it("detects smartwatch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "smartwatch" }), true);
+  });
+  it("detects smart watch (two words)", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "smart watch" }), true);
+  });
+  it("detects sports watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "sports watch" }), true);
+  });
+  it("detects chronograph watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "chronograph watch" }), true);
+  });
+  it("detects chronograph alone", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "chronograph", category: "accessories" }), true);
+  });
+  it("detects fitness band", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "fitness band" }), true);
+  });
+  it("detects fitness tracker", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "fitness tracker" }), true);
+  });
+  it("detects activity tracker", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "activity tracker" }), true);
+  });
+  it("detects pocket watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "pocket watch" }), true);
+  });
+  it("detects kids watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "kids watch" }), true);
+  });
+  it("detects couple watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "couple watch" }), true);
+  });
+  it("detects dress watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "dress watch" }), true);
+  });
+  it("detects dive watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "dive watch" }), true);
+  });
+  it("detects wristwatch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "wristwatch" }), true);
+  });
+  it("detects timepiece", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "timepiece" }), true);
+  });
+  it("detects watch from category", () => {
+    assert.strictEqual(isWatchIdentity({ category: "watch" }), true);
+  });
+  it("detects watches (plural) from category", () => {
+    assert.strictEqual(isWatchIdentity({ category: "watches" }), true);
+  });
+  it("detects from styleWords", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "accessory", styleWords: ["watch", "vintage"] }), true);
+  });
+  // False-positive tests
+  it("watch box is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch box", category: "accessories" }), false);
+  });
+  it("watch case is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch case" }), false);
+  });
+  it("watch strap is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch strap" }), false);
+  });
+  it("watch band is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch band" }), false);
+  });
+  it("watch charger is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch charger" }), false);
+  });
+  it("watch stand is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch stand" }), false);
+  });
+  it("watch winder is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "watch winder" }), false);
+  });
+  it("Apple phone is not Apple Watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "phone", category: "electronics", brand: "Apple" }), false);
+  });
+  it("Samsung phone is not smartwatch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "phone", category: "electronics", brand: "Samsung" }), false);
+  });
+  it("Garmin bike computer is not fitness watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "bike computer", category: "electronics", brand: "Garmin" }), false);
+  });
+  it("Fitbit scale is not fitness band", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "scale", category: "electronics", brand: "Fitbit" }), false);
+  });
+  it("Rolex poster is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "poster", brand: "Rolex" }), false);
+  });
+  it("Omega book is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "book", brand: "Omega" }), false);
+  });
+  it("Cartier bracelet is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "bracelet", category: "jewelry", brand: "Cartier" }), false);
+  });
+  it("jewelry box is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "jewelry box", category: "accessories" }), false);
+  });
+  it("wall clock is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "wall clock" }), false);
+  });
+  it("clock is not wristwatch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "clock" }), false);
+  });
+  it("stopwatch is not wristwatch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "stopwatch" }), false);
+  });
+  it("bracelet with charm is not watch", () => {
+    assert.strictEqual(isWatchIdentity({ itemType: "bracelet", styleWords: ["charm"] }), false);
+  });
+  it("returns false for null", () => {
+    assert.strictEqual(isWatchIdentity(null), false);
+  });
+  it("returns false for empty object", () => {
+    assert.strictEqual(isWatchIdentity({}), false);
+  });
+});
+
+describe("deriveWatchKind", () => {
+  it("returns smartwatch from type text", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "smartwatch" }), "smartwatch");
+  });
+  it("returns smartwatch from smart watch (two words)", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "smart watch" }), "smartwatch");
+  });
+  it("returns smartwatch from visibleText Apple Watch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "watch", visibleText: ["Apple Watch Series 9"] }), "smartwatch");
+  });
+  it("returns smartwatch from visibleText Galaxy Watch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "watch", visibleText: ["Galaxy Watch"] }), "smartwatch");
+  });
+  it("returns smartwatch from visibleText Wear OS", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "watch", visibleText: ["Wear OS"] }), "smartwatch");
+  });
+  it("returns fitness_band", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "fitness band" }), "fitness_band");
+  });
+  it("returns fitness_band for fitness tracker", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "fitness tracker" }), "fitness_band");
+  });
+  it("returns fitness_band for activity tracker", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "activity tracker" }), "fitness_band");
+  });
+  it("returns pocket_watch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "pocket watch" }), "pocket_watch");
+  });
+  it("returns watch for generic watch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "analog watch" }), "watch");
+  });
+  it("returns watch for wristwatch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "wristwatch" }), "watch");
+  });
+  it("returns null for non-watch", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "camera", category: "electronics" }), null);
+  });
+  it("does not infer smartwatch from brand alone", () => {
+    assert.strictEqual(deriveWatchKind({ itemType: "watch", brand: "Apple" }), "watch");
+  });
+});
+
+describe("deriveWatchDisplayType", () => {
+  it("derives analog", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "analog watch" }), "analog");
+  });
+  it("derives analog from styleWords", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "watch", styleWords: ["analog"] }), "analog");
+  });
+  it("derives digital", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "digital watch" }), "digital");
+  });
+  it("derives digital from LCD", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "watch", styleWords: ["lcd"] }), "digital");
+  });
+  it("derives hybrid", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "watch", styleWords: ["hybrid"] }), "hybrid");
+  });
+  it("returns null for generic watch", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "watch" }), null);
+  });
+  it("returns null for non-watch", () => {
+    assert.strictEqual(deriveWatchDisplayType({ itemType: "camera" }), null);
+  });
+});
+
+describe("deriveWatchStyle", () => {
+  it("derives sports from sports watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "sports watch" }), "sports");
+  });
+  it("derives sports from dive watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "dive watch" }), "sports");
+  });
+  it("derives sports from field watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "field watch" }), "sports");
+  });
+  it("derives luxury_style from dress watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "dress watch" }), "luxury_style");
+  });
+  it("derives luxury_style from luxury watch in styleWords", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "watch", styleWords: ["luxury watch"] }), "luxury_style");
+  });
+  it("derives kids", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "kids watch" }), "kids");
+  });
+  it("derives kids from children's watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "children's watch" }), "kids");
+  });
+  it("derives couple", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "couple watch" }), "couple");
+  });
+  it("derives couple from his and hers", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "watch", styleWords: ["his and hers"] }), "couple");
+  });
+  it("returns null for generic watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "watch" }), null);
+  });
+  it("returns null for non-watch", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "camera" }), null);
+  });
+  it("does not derive luxury from brand", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "watch", brand: "Rolex" }), null);
+  });
+  it("does not derive luxury from metal strap alone", () => {
+    assert.strictEqual(deriveWatchStyle({ itemType: "watch", materials: ["metal"] }), null);
+  });
+});
+
+describe("deriveWatchStrapType", () => {
+  it("derives leather from type text", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", styleWords: ["leather strap"] }), "leather");
+  });
+  it("derives leather from materials", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", materials: ["leather"] }), "leather");
+  });
+  it("derives metal from stainless steel bracelet", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", styleWords: ["stainless steel bracelet"] }), "metal");
+  });
+  it("derives metal from materials", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", materials: ["stainless steel"] }), "metal");
+  });
+  it("derives rubber from silicone strap", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", styleWords: ["silicone strap"] }), "rubber");
+  });
+  it("derives rubber from materials", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", materials: ["rubber"] }), "rubber");
+  });
+  it("derives fabric from nato strap", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", styleWords: ["nato strap"] }), "fabric");
+  });
+  it("derives fabric from materials nylon", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch", materials: ["nylon"] }), "fabric");
+  });
+  it("returns null for generic watch", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "watch" }), null);
+  });
+  it("returns null for non-watch", () => {
+    assert.strictEqual(deriveWatchStrapType({ itemType: "camera" }), null);
+  });
+});
+
+describe("deriveWatchFeatures", () => {
+  it("derives chronograph from type text", () => {
+    const result = deriveWatchFeatures({ itemType: "chronograph watch" });
+    assert.ok(result.includes("chronograph"));
+  });
+  it("derives chronograph from visibleText subdials", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", visibleText: ["subdials"] });
+    assert.ok(result.includes("chronograph"));
+  });
+  it("derives date_window from visibleText", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", visibleText: ["date window"] });
+    assert.ok(result.includes("date_window"));
+  });
+  it("derives date_window from day-date", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", styleWords: ["day-date"] });
+    assert.ok(result.includes("date_window"));
+  });
+  it("derives rotating_bezel", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", styleWords: ["rotating bezel"] });
+    assert.ok(result.includes("rotating_bezel"));
+  });
+  it("derives rotating_bezel from dive bezel", () => {
+    const result = deriveWatchFeatures({ itemType: "dive watch", visibleText: ["dive bezel"] });
+    assert.ok(result.includes("rotating_bezel"));
+  });
+  it("derives water_resistant", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", visibleText: ["water resistant"] });
+    assert.ok(result.includes("water_resistant"));
+  });
+  it("derives water_resistant from waterproof", () => {
+    const result = deriveWatchFeatures({ itemType: "watch", visibleText: ["waterproof"] });
+    assert.ok(result.includes("water_resistant"));
+  });
+  it("supports multiple features", () => {
+    const result = deriveWatchFeatures({ itemType: "chronograph watch", styleWords: ["rotating bezel"], visibleText: ["water resistant"] });
+    assert.ok(result.includes("chronograph"));
+    assert.ok(result.includes("rotating_bezel"));
+    assert.ok(result.includes("water_resistant"));
+  });
+  it("returns empty for generic watch with no features", () => {
+    assert.deepStrictEqual(deriveWatchFeatures({ itemType: "watch" }), []);
+  });
+  it("returns empty for non-watch", () => {
+    assert.deepStrictEqual(deriveWatchFeatures({ itemType: "camera" }), []);
+  });
+  it("does not infer chronograph from brand/model", () => {
+    assert.deepStrictEqual(deriveWatchFeatures({ itemType: "watch", brand: "Omega", model: "Speedmaster" }), []);
+  });
+});
+
+describe("enrichIdentityWithSchema — watches", () => {
+  it("populates watch fields for watch identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch", styleWords: ["leather strap", "chronograph"], visibleText: ["water resistant"] },
+      { overallConfidence: 0.70, attributeCertainty: { category: 0.80 } }
+    );
+    assert.strictEqual(result.watchKind, "watch");
+    assert.strictEqual(result.watchDisplayType, "analog");
+    assert.strictEqual(result.watchStrapType, "leather");
+    assert.ok(result.watchFeatures.includes("chronograph"));
+    assert.ok(result.watchFeatures.includes("water_resistant"));
+  });
+
+  it("watchEvidence includes expected entries", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch", styleWords: ["leather strap"] },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.watchEvidence.includes("kind:watch"));
+    assert.ok(result.watchEvidence.includes("display:analog"));
+    assert.ok(result.watchEvidence.includes("strap:leather"));
+  });
+
+  it("watchEvidence includes style for dress watch", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "dress watch", category: "watch" },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.watchEvidence.includes("style:luxury_style"));
+    assert.strictEqual(result.watchLuxurySignal, "possible_luxury_style");
+  });
+
+  it("watchLuxurySignal is null for non-luxury-style watches", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "sports watch", category: "watch" },
+      { overallConfidence: 0.50 }
+    );
+    assert.strictEqual(result.watchLuxurySignal, null);
+  });
+
+  it("watchLuxurySignal does not change luxuryCandidate computation", () => {
+    const withDress = enrichIdentityWithSchema(
+      { itemType: "dress watch", category: "watch", brand: "Seiko" },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.55 } }
+    );
+    const withoutDress = enrichIdentityWithSchema(
+      { itemType: "watch", category: "watch", brand: "Seiko" },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.55 } }
+    );
+    assert.strictEqual(withDress.watchLuxurySignal, "possible_luxury_style");
+    assert.strictEqual(withoutDress.watchLuxurySignal, null);
+    assert.strictEqual(withDress.luxuryCandidate, withoutDress.luxuryCandidate);
+    assert.strictEqual(withDress.authenticityClaimAllowed, withoutDress.authenticityClaimAllowed);
+    assert.strictEqual(withDress.highStakes, withoutDress.highStakes);
+  });
+
+  it("watch identity has mediaKind === null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("watch identity has null headphone fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.audioKind, null);
+    assert.strictEqual(result.headphoneFit, null);
+    assert.deepStrictEqual(result.headphoneFeatures, []);
+  });
+
+  it("smartwatch from visibleText", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "watch", category: "watch", visibleText: ["Apple Watch"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.watchKind, "smartwatch");
+    assert.ok(result.watchEvidence.includes("kind:smartwatch"));
+  });
+
+  it("fitness band enrichment", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "fitness tracker", category: "electronics" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.watchKind, "fitness_band");
+  });
+
+  it("non-watch identity has null watch fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Hanes" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.watchKind, null);
+    assert.strictEqual(result.watchDisplayType, null);
+    assert.strictEqual(result.watchStyle, null);
+    assert.strictEqual(result.watchStrapType, null);
+    assert.deepStrictEqual(result.watchFeatures, []);
+    assert.deepStrictEqual(result.watchEvidence, []);
+    assert.strictEqual(result.watchLuxurySignal, null);
+  });
+
+  it("empty identity has null watch fields", () => {
+    const result = enrichIdentityWithSchema({}, {});
+    assert.strictEqual(result.watchKind, null);
+    assert.strictEqual(result.watchDisplayType, null);
+    assert.strictEqual(result.watchStyle, null);
+    assert.strictEqual(result.watchStrapType, null);
+    assert.deepStrictEqual(result.watchFeatures, []);
+    assert.deepStrictEqual(result.watchEvidence, []);
+    assert.strictEqual(result.watchLuxurySignal, null);
+  });
+
+  it("does not alter queryTermsAllowed or queryTermsBlocked for watches", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch", brand: "Seiko", visibleText: ["Seiko"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.ok(!result.queryTermsAllowed.includes("analog"));
+    assert.ok(!result.queryTermsAllowed.includes("leather"));
+    assert.ok(!result.queryTermsBlocked.includes("analog"));
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked disjoint for watches", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "watch", category: "watch", brand: "Rolex", visibleText: ["ROLEX"] },
+      { overallConfidence: 0.92, attributeCertainty: { brand: 0.90, model: 0.85 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+});
+
 describe("enrichIdentityWithSchema — regressions", () => {
   it("Rolex weak evidence still blocked (high-stakes regression)", () => {
     const result = enrichIdentityWithSchema(
@@ -1145,6 +1606,7 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.ok(result.queryTermsBlocked.includes("Rolex"));
     assert.ok(!result.queryTermsAllowed.includes("Rolex"));
     assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.watchKind, "watch");
   });
 
   it("Rolex confirmed still allowed (high-stakes regression)", () => {
@@ -1155,6 +1617,7 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.ok(result.queryTermsAllowed.includes("Rolex"));
     assert.deepStrictEqual(result.queryTermsBlocked, []);
     assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.watchKind, "watch");
   });
 
   it("model aircraft remains non-high-stakes", () => {
@@ -1205,11 +1668,15 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.headphoneFit, null);
     assert.deepStrictEqual(result.headphoneFeatures, []);
     assert.deepStrictEqual(result.headphoneEvidence, []);
+    assert.strictEqual(result.watchKind, null);
+    assert.strictEqual(result.watchDisplayType, null);
+    assert.deepStrictEqual(result.watchFeatures, []);
+    assert.deepStrictEqual(result.watchEvidence, []);
     assert.ok(!result.missingEvidence.includes("book title not readable"));
     assert.ok(!result.missingEvidence.includes("video game title not readable"));
   });
 
-  it("book existing behavior still passes with headphone fields", () => {
+  it("book existing behavior still passes with headphone and watch fields", () => {
     const result = enrichIdentityWithSchema(
       { itemType: "paperback book", model: "Dune", visibleText: ["Dune", "by Frank Herbert"] },
       { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
@@ -1218,9 +1685,11 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.author, "Frank Herbert");
     assert.strictEqual(result.audioKind, null);
     assert.deepStrictEqual(result.headphoneFeatures, []);
+    assert.strictEqual(result.watchKind, null);
+    assert.deepStrictEqual(result.watchFeatures, []);
   });
 
-  it("video game existing behavior still passes with headphone fields", () => {
+  it("video game existing behavior still passes with headphone and watch fields", () => {
     const result = enrichIdentityWithSchema(
       { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
       { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
@@ -1229,6 +1698,8 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.platform, "Nintendo Switch");
     assert.strictEqual(result.audioKind, null);
     assert.deepStrictEqual(result.headphoneFeatures, []);
+    assert.strictEqual(result.watchKind, null);
+    assert.deepStrictEqual(result.watchFeatures, []);
   });
 
   it("queryTermsAllowed and queryTermsBlocked never overlap across all media types", () => {
@@ -1237,6 +1708,7 @@ describe("enrichIdentityWithSchema — regressions", () => {
       { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
       { itemType: "sneakers", category: "sneakers", brand: "Nike", visibleText: ["Nike"] },
       { itemType: "over-ear headphones", category: "electronics", brand: "Sony", visibleText: ["Sony"] },
+      { itemType: "analog watch", category: "watch", brand: "Seiko", visibleText: ["Seiko"] },
     ];
     for (const id of identities) {
       const result = enrichIdentityWithSchema(id, { overallConfidence: 0.70, attributeCertainty: { brand: 0.55, model: 0.55 } });
