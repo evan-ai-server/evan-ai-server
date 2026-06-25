@@ -1,9 +1,9 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2+5B.3B+5B.4 — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
 // book/video-game recognition, headphone taxonomy enrichment,
-// and watch taxonomy enrichment.
+// watch taxonomy enrichment, and jacket/coat/sweater/zip taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -426,6 +426,197 @@ export function deriveWatchFeatures(identity) {
   return features;
 }
 
+// --- Garment / outerwear taxonomy (Phase 5B.5) ---
+
+const GARMENT_ACCESSORY_RE = /\b(coat rack|coat hanger|coat hook|coat stand|clothes hanger|jacket hanger|garment bag|sweater shaver|sweater stone|lint roller|zipper pull|zipper pouch|zip pouch|zip tie|zip ties|zip code|zippo|parka hood)\b/i;
+const GARMENT_NON_RE = /\b(book jacket|dust jacket|record jacket|album jacket|jacket cover|life jacket|life vest|bomber plane|bomber jet|bomber aircraft|puffer fish|pufferfish|blowfish|trench shovel|trench art|trench warfare|trench foot|coat of arms|coat of paint|blanket|throw|pillowcase|fleece blanket)\b/i;
+const GARMENT_POSITIVE_RE = /\b(denim jacket|leather jacket|bomber jacket|flight jacket|puffer jacket|down jacket|down vest|down coat|trucker jacket|varsity jacket|letterman jacket|track jacket|fleece jacket|chore jacket|field jacket|utility jacket|harrington jacket|trench coat|wool coat|rain coat|quarter-zip|quarter zip|half-zip|half zip|full-zip|zip-up|mock neck sweater|mock-neck sweater|mock neck knit|hoodie|sweatshirt|sweater|cardigan|turtleneck|crewneck|pullover|blazer|parka|peacoat|overcoat|windbreaker|raincoat|anorak|gilet|jacket|coat|vest)\b/i;
+
+export function isGarmentOuterwearIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  if (GARMENT_ACCESSORY_RE.test(joined)) return false;
+  if (GARMENT_NON_RE.test(joined)) return false;
+  if (GARMENT_POSITIVE_RE.test(joined)) return true;
+  return false;
+}
+
+const GKIND_HOODIE_RE = /\b(hoodie|hooded sweatshirt)\b/i;
+const GKIND_SWEATSHIRT_RE = /\bsweatshirt\b/i;
+const GKIND_VEST_RE = /\b(sweater vest|down vest|vest|gilet)\b/i;
+const GKIND_COAT_RE = /\b(trench coat|overcoat|peacoat|parka|wool coat|raincoat|rain coat|coat)\b/i;
+const GKIND_JACKET_RE = /\b(jacket|blazer|windbreaker|anorak)\b/i;
+const GKIND_SWEATER_RE = /\b(sweater|cardigan|turtleneck|crewneck|pullover|cable-knit|cable knit|quarter-zip|quarter zip|half-zip|half zip|mock neck sweater|mock-neck sweater|mock neck knit)\b/i;
+
+export function deriveGarmentKind(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // Most-specific first: hoodie > sweatshirt > vest > coat > jacket > sweater
+  if (GKIND_HOODIE_RE.test(joined)) return "hoodie";
+  if (GKIND_SWEATSHIRT_RE.test(joined)) return "sweatshirt";
+  if (GKIND_VEST_RE.test(joined)) return "vest";
+  if (GKIND_COAT_RE.test(joined)) return "coat";
+  if (GKIND_JACKET_RE.test(joined)) return "jacket";
+  if (GKIND_SWEATER_RE.test(joined)) return "sweater";
+  return null;
+}
+
+export function deriveOuterwearType(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  const hasJacket = /\bjacket\b/i.test(joined);
+  const hasCoat = /\bcoat\b/i.test(joined);
+  if (/\btrucker jacket\b/i.test(joined)) return "trucker_jacket";
+  if (/\bdenim jacket\b/i.test(joined)) return "denim_jacket";
+  if (matJoined.includes("denim") && hasJacket) return "denim_jacket";
+  if (/\b(varsity jacket|letterman jacket)\b/i.test(joined)) return "varsity_jacket";
+  if (/\bleather jacket\b/i.test(joined)) return "leather_jacket";
+  if (matJoined.includes("leather") && hasJacket) return "leather_jacket";
+  if (/\b(bomber jacket|flight jacket)\b/i.test(joined)) return "bomber_jacket";
+  if (/\bpuffer jacket\b/i.test(joined)) return "puffer_jacket";
+  if (/\bdown jacket\b/i.test(joined)) return "down_jacket";
+  if (/\bwindbreaker\b/i.test(joined)) return "windbreaker";
+  if (/\brain jacket\b/i.test(joined)) return "rain_jacket";
+  if (/\btrack jacket\b/i.test(joined)) return "track_jacket";
+  if (/\bfleece jacket\b/i.test(joined)) return "fleece_jacket";
+  if (matJoined.includes("fleece") && hasJacket) return "fleece_jacket";
+  if (/\bchore jacket\b/i.test(joined)) return "chore_jacket";
+  if (/\bfield jacket\b/i.test(joined)) return "field_jacket";
+  if (/\butility jacket\b/i.test(joined)) return "utility_jacket";
+  if (/\bblazer\b/i.test(joined)) return "blazer";
+  if (/\btrench coat\b/i.test(joined)) return "trench_coat";
+  if (/\bovercoat\b/i.test(joined)) return "overcoat";
+  if (/\bpeacoat\b/i.test(joined)) return "peacoat";
+  if (/\bparka\b/i.test(joined)) return "parka";
+  if (/\bwool coat\b/i.test(joined)) return "wool_coat";
+  if (matJoined.includes("wool") && hasCoat) return "wool_coat";
+  if (/\b(raincoat|rain coat)\b/i.test(joined)) return "raincoat";
+  return null;
+}
+
+const SWEATER_CARDIGAN_RE = /\bcardigan\b/i;
+const SWEATER_CREWNECK_RE = /\b(crewneck|crew neck)\b/i;
+const SWEATER_VNECK_RE = /\b(v-neck|v neck)\b/i;
+const SWEATER_TURTLE_RE = /\b(turtleneck|mock neck sweater|mock-neck sweater|mock neck knit)\b/i;
+const SWEATER_QZ_RE = /\b(quarter-zip|quarter zip)\b/i;
+const SWEATER_HZ_RE = /\b(half-zip|half zip)\b/i;
+const SWEATER_CABLE_RE = /\b(cable-knit|cable knit)\b/i;
+const SWEATER_VEST_RE = /\bsweater vest\b/i;
+
+export function deriveSweaterType(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (SWEATER_VEST_RE.test(joined)) return "sweater_vest";
+  if (SWEATER_CARDIGAN_RE.test(joined)) return "cardigan";
+  if (SWEATER_CREWNECK_RE.test(joined)) return "crewneck";
+  if (SWEATER_VNECK_RE.test(joined)) return "v_neck";
+  if (SWEATER_TURTLE_RE.test(joined)) return "turtleneck";
+  if (SWEATER_QZ_RE.test(joined)) return "quarter_zip";
+  if (SWEATER_HZ_RE.test(joined)) return "half_zip";
+  if (SWEATER_CABLE_RE.test(joined)) return "cable_knit";
+  return null;
+}
+
+const CLOSURE_ZIP_RE = /\b(zip-up|zip up|full-zip|full zip|quarter-zip|quarter zip|half-zip|half zip)\b/i;
+const CLOSURE_BUTTON_RE = /\b(button front|button-front|buttons|button closure)\b/i;
+const CLOSURE_SNAP_RE = /\b(snap front|snap-front|snaps|snap closure)\b/i;
+const CLOSURE_PULL_RE = /\bpullover\b/i;
+
+export function deriveClosureType(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (CLOSURE_ZIP_RE.test(joined)) return "zip";
+  if (CLOSURE_BUTTON_RE.test(joined)) return "button";
+  if (CLOSURE_SNAP_RE.test(joined)) return "snap";
+  if (CLOSURE_PULL_RE.test(joined)) return "pullover";
+  return null;
+}
+
+export function deriveGarmentMaterialSignal(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  const all = (joined + " " + matJoined).toLowerCase();
+  if (/\bdenim\b/.test(all)) return "denim";
+  if (/\bleather\b/.test(all)) return "leather";
+  if (/\bwool\b/.test(all)) return "wool";
+  if (/\bfleece\b/.test(all)) return "fleece";
+  if (/\b(knit|cable-knit|cable knit)\b/.test(all)) return "knit";
+  if (/\bnylon\b/.test(all)) return "nylon";
+  if (/\bpolyester\b/.test(all)) return "polyester";
+  if (/\b(down|puffer)\b/.test(all)) return "down";
+  if (/\bcotton\b/.test(all)) return "cotton";
+  return null;
+}
+
+const GFEAT_RIBBED_RE = /\b(ribbed cuffs|rib cuff|ribbed hem)\b/i;
+const GFEAT_CHEST_RE = /\b(chest pockets|chest pocket)\b/i;
+const GFEAT_QUILTED_RE = /\b(quilted|quilting)\b/i;
+const GFEAT_COLLAR_RE = /\b(stand collar|standing collar|mock neck|mock-neck)\b/i;
+const GFEAT_DRAW_RE = /\b(drawstring|drawstrings)\b/i;
+const GFEAT_HOOD_RE = /\b(hood|hooded|hoodie)\b/i;
+
+export function deriveGarmentFeatures(identity) {
+  if (!isGarmentOuterwearIdentity(identity)) return [];
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  const features = [];
+  if (GFEAT_RIBBED_RE.test(joined)) features.push("ribbed_cuffs");
+  if (GFEAT_CHEST_RE.test(joined)) features.push("chest_pockets");
+  if (GFEAT_QUILTED_RE.test(joined)) features.push("quilted");
+  if (GFEAT_COLLAR_RE.test(joined)) features.push("stand_collar");
+  if (GFEAT_DRAW_RE.test(joined)) features.push("drawstring");
+  if (GFEAT_HOOD_RE.test(joined)) features.push("hooded");
+  return features;
+}
+
 function computeMissingEvidence(identity) {
   const missing = [];
   if (!identity.brand) missing.push("brand not identified");
@@ -677,6 +868,37 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     }
   }
 
+  // --- Garment taxonomy enrichment (Phase 5B.5) ---
+  const garmentDetected = isGarmentOuterwearIdentity(id);
+  let garmentKind = null;
+  let outerwearType = null;
+  let sweaterType = null;
+  let closureType = null;
+  let hoodType = null;
+  let garmentMaterialSignal = null;
+  let garmentFeatures = [];
+  let garmentEvidence = [];
+
+  if (garmentDetected) {
+    garmentKind = deriveGarmentKind(id);
+    outerwearType = deriveOuterwearType(id);
+    sweaterType = deriveSweaterType(id);
+    closureType = deriveClosureType(id);
+    garmentMaterialSignal = deriveGarmentMaterialSignal(id);
+    garmentFeatures = deriveGarmentFeatures(id);
+    hoodType = (garmentFeatures.includes("hooded") || garmentKind === "hoodie") ? "hooded" : null;
+
+    const ev = [];
+    if (garmentKind) ev.push(`kind:${garmentKind}`);
+    if (outerwearType) ev.push(`outer:${outerwearType}`);
+    if (sweaterType) ev.push(`sweater:${sweaterType}`);
+    if (closureType) ev.push(`closure:${closureType}`);
+    if (hoodType) ev.push(`hood:${hoodType}`);
+    if (garmentMaterialSignal) ev.push(`material:${garmentMaterialSignal}`);
+    for (const f of garmentFeatures) ev.push(`feature:${f}`);
+    garmentEvidence = ev;
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -722,5 +944,13 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     watchFeatures,
     watchEvidence,
     watchLuxurySignal,
+    garmentKind,
+    outerwearType,
+    sweaterType,
+    closureType,
+    hoodType,
+    garmentMaterialSignal,
+    garmentFeatures,
+    garmentEvidence,
   };
 }
