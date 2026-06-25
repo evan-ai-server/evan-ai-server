@@ -1,9 +1,10 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5 — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5+5B.6 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
 // book/video-game recognition, headphone taxonomy enrichment,
-// watch taxonomy enrichment, and jacket/coat/sweater/zip taxonomy enrichment.
+// watch taxonomy enrichment, jacket/coat/sweater/zip taxonomy enrichment,
+// and broader clothing taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -617,6 +618,266 @@ export function deriveGarmentFeatures(identity) {
   return features;
 }
 
+// --- Broader clothing taxonomy (Phase 5B.6) ---
+
+const CLOTHING_ACCESSORY_RE = /\b(pants hanger|pants rack|shirt hanger|skirt hanger|dress hanger|clothes hanger|garment bag|dress form|mannequin|shirt folder|t-shirt press|tee shirt press|heat press|screen printing press|clothing rack|display rack)\b/i;
+const CLOTHING_HOMONYM_RE = /\b(golf tee|tee time|tee ball|tee box|tee off|tee-off|polo cologne|polo horse|polo pony|polo match|polo club|water polo|marco polo|graphic poster|graphic novel|graphic card|graphic design|graphic designer|button battery|push button|belly button|button mushroom|button down folder|panic button|flannel blanket|flannel sheet|flannel fabric|blouse pattern|fish tank|gas tank|water tank|septic tank|think tank|army tank|tank engine|tank toy|tank lid|tank filter|tank top filter|propane tank|storage tank|holding tank|crop tool|crop field|crop circle|crop duster|crop yield|crop rotation|cargo box|cargo ship|cargo van|cargo plane|cargo bay|cargo net|cargo container|cargo bike|cargo trailer|dress shoes|dress shoe|dress watch|dress code|dress rehearsal|dressing|window dressing|salad dressing|dress up|dress-up|dressed|hair dress|wound dressing|fancy pants|smarty pants|pants on fire|short circuit|shortstop|short story|short film|short stack|short squeeze|sell short|skirt steak|grass skirt|outskirts|skirting board|mini fridge|mini keyboard|mini cooper|mini golf|mini me|mini van|minivan|mini bike|mini split|mini pc|mini blind|midi keyboard|midi controller|midi cable|midi file|midi interface|maxi pad|maxi cab|maxi scooter|maxi taxi|record sleeve|album sleeve|cable sleeve|vinyl sleeve|sleeve cover|long sleeve record)\b/i;
+const CLOTHING_EXCLUDED_CAT_RE = /\b(shoe|shoes|sneaker|sneakers|boot|boots|sandal|sandals|heel|heels|loafer|loafers|cleat|cleats|footwear|slipper|slippers|moccasin|hat|cap|beanie|scarf|gloves|glove|socks|sock|belt(?!\s+loops)|necktie|bowtie|mittens|earmuffs|bandana|balaclava)\b/i;
+const CLOTHING_POSITIVE_RE = /\b(t-shirt|t shirt|tshirt|tee shirt|graphic tee|graphic t-shirt|pocket tee|crew tee|polo shirt|polo top|rugby shirt|button-down shirt|button down shirt|button-up shirt|button up shirt|oxford shirt|flannel shirt|dress shirt|henley|blouse|tank top|camisole|cami|long sleeve shirt|long-sleeve shirt|long sleeve tee|long-sleeve tee|short sleeve shirt|short-sleeve shirt|crop top|tube top|halter top|jersey|jeans|denim jeans|skinny jeans|straight leg jeans|bootcut jeans|boyfriend jeans|cargo pants|cargo trousers|dress pants|chinos|chino pants|khakis|trousers|slacks|sweatpants|track pants|joggers|jogger pants|leggings|yoga pants|shorts|cargo shorts|denim shorts|board shorts|chino shorts|athletic shorts|bermuda shorts|dress|maxi dress|midi dress|mini dress|sundress|shirt dress|shirtdress|sweater dress|cocktail dress|wrap dress|bodycon dress|skirt|maxi skirt|midi skirt|mini skirt|pleated skirt|pencil skirt|denim skirt|a-line skirt|skater skirt|pants)\b/i;
+
+export function isClothingIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  // 1. Accessory veto
+  if (CLOTHING_ACCESSORY_RE.test(joined)) return false;
+  // 2. Homonym veto (UNCONDITIONAL — no positive override)
+  if (CLOTHING_HOMONYM_RE.test(joined)) return false;
+  // 3. Excluded-category veto
+  if (CLOTHING_EXCLUDED_CAT_RE.test(joined)) return false;
+  // 4. Positive match
+  if (CLOTHING_POSITIVE_RE.test(joined)) return true;
+  // 5. else false
+  return false;
+}
+
+const CLOTHING_DRESS_GUARD_RE = /\bdress\b(?!\s+(shirt|pants|shoe|shoes|sock|socks|glove|gloves|code|up|form|rehearsal))/i;
+
+export function deriveClothingKind(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // Priority: skirt > dress(guarded) > top > bottom
+  if (/\bskirt\b/i.test(joined)) return "skirt";
+  if (CLOTHING_DRESS_GUARD_RE.test(joined)) return "dress";
+  // Tops
+  if (/\b(t-shirt|t shirt|tshirt|tee shirt|graphic tee|graphic t-shirt|pocket tee|crew tee|polo shirt|polo top|rugby shirt|button-down shirt|button down shirt|button-up shirt|button up shirt|oxford shirt|flannel shirt|dress shirt|henley|blouse|tank top|camisole|cami|long sleeve shirt|long-sleeve shirt|long sleeve tee|long-sleeve tee|short sleeve shirt|short-sleeve shirt|crop top|tube top|halter top|jersey)\b/i.test(joined)) return "top";
+  // Bottoms
+  if (/\b(jeans|cargo pants|cargo trousers|dress pants|chinos|chino pants|khakis|trousers|slacks|sweatpants|track pants|joggers|jogger pants|leggings|yoga pants|shorts|cargo shorts|denim shorts|board shorts|chino shorts|athletic shorts|bermuda shorts|pants)\b/i.test(joined)) return "bottom";
+  return null;
+}
+
+export function deriveTopType(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // graphic_tee wins over t_shirt when graphic/printed/front-print co-occurs with tee/t-shirt
+  if (/\b(graphic tee|graphic t-shirt)\b/i.test(joined)) return "graphic_tee";
+  if (/\b(printed|front.print)\b/i.test(joined) && /\b(t-shirt|t shirt|tshirt|tee shirt|tee)\b/i.test(joined)) return "graphic_tee";
+  if (/\b(polo shirt|polo top)\b/i.test(joined)) return "polo";
+  if (/\b(button-down shirt|button down shirt|button-up shirt|button up shirt|oxford shirt)\b/i.test(joined)) return "button_down";
+  if (/\bflannel shirt\b/i.test(joined)) return "flannel";
+  if (/\bdress shirt\b/i.test(joined)) return "dress_shirt";
+  if (/\bblouse\b/i.test(joined)) return "blouse";
+  if (/\b(tank top|camisole|cami)\b/i.test(joined)) return "tank_top";
+  if (/\b(crop top)\b/i.test(joined)) return "crop_top";
+  if (/\bhenley\b/i.test(joined)) return "henley";
+  if (/\bjersey\b/i.test(joined)) return "jersey";
+  if (/\b(long sleeve shirt|long-sleeve shirt|long sleeve tee|long-sleeve tee)\b/i.test(joined)) return "long_sleeve";
+  if (/\b(t-shirt|t shirt|tshirt|tee shirt)\b/i.test(joined)) return "t_shirt";
+  return null;
+}
+
+export function deriveBottomType(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // Guard: denim jacket / jean jacket must not become jeans
+  if (/\b(denim jacket|jean jacket)\b/i.test(joined)) return null;
+  if (/\b(cargo shorts)\b/i.test(joined)) return "cargo_shorts";
+  if (/\b(cargo pants|cargo trousers|cargo pocket pants)\b/i.test(joined)) return "cargo_pants";
+  if (/\b(dress pants|formal pants|slacks)\b/i.test(joined)) return "dress_pants";
+  if (/\b(chinos|chino pants|khakis)\b/i.test(joined)) return "chinos";
+  if (/\bsweatpants\b/i.test(joined)) return "sweatpants";
+  if (/\b(joggers|jogger pants|track pants)\b/i.test(joined)) return "joggers";
+  if (/\b(leggings|yoga pants)\b/i.test(joined)) return "leggings";
+  if (/\btrousers\b/i.test(joined)) return "trousers";
+  if (/\bjeans\b/i.test(joined)) return "jeans";
+  if (/\b(denim shorts|board shorts|chino shorts|athletic shorts|bermuda shorts|shorts)\b/i.test(joined)) return "shorts";
+  return null;
+}
+
+export function deriveDressSkirtType(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // Guard: "dress shirt"/"dress pants" must NOT become a dress/skirt type
+  if (/\b(dress shirt|dress pants)\b/i.test(joined) && !CLOTHING_DRESS_GUARD_RE.test(joined.replace(/\bdress (shirt|pants)\b/gi, ""))) return null;
+  // Specific dress types before bare dress
+  if (/\b(shirt dress|shirtdress)\b/i.test(joined)) return "shirt_dress";
+  if (/\bsweater dress\b/i.test(joined)) return "sweater_dress";
+  if (/\bcocktail dress\b/i.test(joined)) return "cocktail_dress";
+  if (/\bwrap dress\b/i.test(joined)) return "wrap_dress";
+  if (/\bbodycon dress\b/i.test(joined)) return "bodycon_dress";
+  if (/\bsundress\b/i.test(joined)) return "sundress";
+  if (/\bmaxi dress\b/i.test(joined)) return "maxi_dress";
+  if (/\bmidi dress\b/i.test(joined)) return "midi_dress";
+  if (/\bmini dress\b/i.test(joined)) return "mini_dress";
+  // Specific skirt types before bare skirt
+  if (/\bpleated skirt\b/i.test(joined)) return "pleated_skirt";
+  if (/\bpencil skirt\b/i.test(joined)) return "pencil_skirt";
+  if (/\bdenim skirt\b/i.test(joined)) return "denim_skirt";
+  if (/\ba-line skirt\b/i.test(joined)) return "a_line_skirt";
+  if (/\bskater skirt\b/i.test(joined)) return "skater_skirt";
+  if (/\bmaxi skirt\b/i.test(joined)) return "maxi_skirt";
+  if (/\bmidi skirt\b/i.test(joined)) return "midi_skirt";
+  if (/\bmini skirt\b/i.test(joined)) return "mini_skirt";
+  if (CLOTHING_DRESS_GUARD_RE.test(joined)) return "dress";
+  if (/\bskirt\b/i.test(joined)) return "skirt";
+  return null;
+}
+
+export function deriveSleeveType(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(short sleeve|short-sleeve)\b/i.test(joined)) return "short_sleeve";
+  if (/\b(long sleeve|long-sleeve)\b/i.test(joined)) return "long_sleeve";
+  if (/\b(sleeveless|tank top|camisole|cami|halter)\b/i.test(joined)) return "sleeveless";
+  return null;
+}
+
+export function deriveCollarType(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(crewneck|crew neck)\b/i.test(joined)) return "crewneck";
+  if (/\b(v-neck|v neck)\b/i.test(joined)) return "v_neck";
+  if (/\b(polo shirt|polo collar)\b/i.test(joined)) return "polo_collar";
+  if (/\bbutton-down collar\b/i.test(joined)) return "button_down_collar";
+  if (/\bcollared\b/i.test(joined)) return "collared";
+  return null;
+}
+
+export function deriveFitSignal(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\bslim\b/i.test(joined)) return "slim";
+  if (/\brelaxed\b/i.test(joined)) return "relaxed";
+  if (/\boversized\b/i.test(joined)) return "oversized";
+  if (/\b(wide-leg|wide leg)\b/i.test(joined)) return "wide_leg";
+  if (/\b(straight-leg|straight leg)\b/i.test(joined)) return "straight_leg";
+  if (/\b(skinny jeans|skinny pants|skinny fit)\b/i.test(joined)) return "skinny";
+  return null;
+}
+
+export function deriveClothingPatternSignal(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(graphic|printed|front print)\b/i.test(joined)) return "graphic";
+  if (/\b(stripe|stripes|striped)\b/i.test(joined)) return "striped";
+  if (/\b(plaid|tartan|checkered)\b/i.test(joined)) return "plaid";
+  if (/\bfloral\b/i.test(joined)) return "floral";
+  if (/\b(solid|solid color)\b/i.test(joined)) return "solid";
+  return null;
+}
+
+export function deriveClothingMaterialSignal(identity) {
+  if (!isClothingIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  const all = (joined + " " + matJoined).toLowerCase();
+  if (/\bcotton\b/.test(all)) return "cotton";
+  if (/\bdenim\b/.test(all)) return "denim";
+  if (/\blinen\b/.test(all)) return "linen";
+  if (/\bsilk\b/.test(all)) return "silk";
+  if (/\bpolyester\b/.test(all)) return "polyester";
+  if (/\bwool\b/.test(all)) return "wool";
+  if (/\bcorduroy\b/.test(all)) return "corduroy";
+  return null;
+}
+
+const CFEAT_FRONT_PRINT_RE = /\b(front.print|graphic|printed)\b/i;
+const CFEAT_CARGO_POCKETS_RE = /\b(cargo pockets|cargo pocket)\b/i;
+const CFEAT_DRAWSTRING_RE = /\b(drawstring waist|drawstring)\b/i;
+const CFEAT_PLEATED_RE = /\bpleated\b/i;
+const CFEAT_BUTTON_FRONT_RE = /\b(button front|button-front)\b/i;
+const CFEAT_ELASTIC_WAIST_RE = /\b(elastic waist|elasticized waist)\b/i;
+const CFEAT_BELT_LOOPS_RE = /\bbelt loops\b/i;
+const CFEAT_FIVE_POCKET_RE = /\b(five.pocket|5.pocket)\b/i;
+const CFEAT_EMBROIDERED_RE = /\b(embroidered|embroidery)\b/i;
+const CFEAT_LOGO_PRINT_RE = /\b(logo print|logo printed)\b/i;
+
+export function deriveClothingFeatures(identity) {
+  if (!isClothingIdentity(identity)) return [];
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  const features = [];
+  if (CFEAT_FRONT_PRINT_RE.test(joined)) features.push("front_print");
+  if (CFEAT_CARGO_POCKETS_RE.test(joined)) features.push("cargo_pockets");
+  if (CFEAT_DRAWSTRING_RE.test(joined)) features.push("drawstring_waist");
+  if (CFEAT_PLEATED_RE.test(joined)) features.push("pleated");
+  if (CFEAT_BUTTON_FRONT_RE.test(joined)) features.push("button_front");
+  if (CFEAT_ELASTIC_WAIST_RE.test(joined)) features.push("elastic_waist");
+  if (CFEAT_BELT_LOOPS_RE.test(joined)) features.push("belt_loops");
+  if (CFEAT_FIVE_POCKET_RE.test(joined)) features.push("five_pocket");
+  if (CFEAT_EMBROIDERED_RE.test(joined)) features.push("embroidered");
+  if (CFEAT_LOGO_PRINT_RE.test(joined)) features.push("logo_print");
+  return features;
+}
+
 function computeMissingEvidence(identity) {
   const missing = [];
   if (!identity.brand) missing.push("brand not identified");
@@ -899,6 +1160,44 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     garmentEvidence = ev;
   }
 
+  // --- Broader clothing taxonomy enrichment (Phase 5B.6) ---
+  const clothingDetected = isClothingIdentity(id);
+  let clothingKind = null;
+  let topType = null;
+  let bottomType = null;
+  let dressSkirtType = null;
+  let sleeveType = null;
+  let collarType = null;
+  let fitSignal = null;
+  let patternSignal = null;
+  let clothingMaterialSignal = null;
+  let clothingFeatures = [];
+  let clothingEvidence = [];
+  if (clothingDetected) {
+    clothingKind = deriveClothingKind(id);
+    topType = deriveTopType(id);
+    bottomType = deriveBottomType(id);
+    dressSkirtType = deriveDressSkirtType(id);
+    sleeveType = deriveSleeveType(id);
+    collarType = deriveCollarType(id);
+    fitSignal = deriveFitSignal(id);
+    patternSignal = deriveClothingPatternSignal(id);
+    clothingMaterialSignal = deriveClothingMaterialSignal(id);
+    clothingFeatures = deriveClothingFeatures(id);
+    const ev = [];
+    if (clothingKind) ev.push(`kind:${clothingKind}`);
+    if (topType) ev.push(`top:${topType}`);
+    if (bottomType) ev.push(`bottom:${bottomType}`);
+    if (dressSkirtType) ev.push(`dress_skirt:${dressSkirtType}`);
+    if (sleeveType) ev.push(`sleeve:${sleeveType}`);
+    if (collarType) ev.push(`collar:${collarType}`);
+    if (fitSignal) ev.push(`fit:${fitSignal}`);
+    if (patternSignal) ev.push(`pattern:${patternSignal}`);
+    if (clothingMaterialSignal) ev.push(`material:${clothingMaterialSignal}`);
+    for (const f of clothingFeatures) ev.push(`feature:${f}`);
+    clothingEvidence = ev;
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -952,5 +1251,16 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     garmentMaterialSignal,
     garmentFeatures,
     garmentEvidence,
+    clothingKind,
+    topType,
+    bottomType,
+    dressSkirtType,
+    sleeveType,
+    collarType,
+    fitSignal,
+    patternSignal,
+    clothingMaterialSignal,
+    clothingFeatures,
+    clothingEvidence,
   };
 }

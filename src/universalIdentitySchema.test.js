@@ -30,6 +30,17 @@ import {
   deriveClosureType,
   deriveGarmentMaterialSignal,
   deriveGarmentFeatures,
+  isClothingIdentity,
+  deriveClothingKind,
+  deriveTopType,
+  deriveBottomType,
+  deriveDressSkirtType,
+  deriveSleeveType,
+  deriveCollarType,
+  deriveFitSignal,
+  deriveClothingPatternSignal,
+  deriveClothingMaterialSignal,
+  deriveClothingFeatures,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -1988,6 +1999,16 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.ok(!result.missingEvidence.includes("video game title not readable"));
   });
 
+  it("apparel t-shirt has clothing enrichment (not garment)", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Hanes", model: "ComfortSoft", visibleText: ["Hanes"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.strictEqual(result.clothingKind, "top");
+    assert.strictEqual(result.topType, "t_shirt");
+    assert.strictEqual(result.garmentKind, null);
+  });
+
   it("book existing behavior still passes with all taxonomy fields", () => {
     const result = enrichIdentityWithSchema(
       { itemType: "paperback book", model: "Dune", visibleText: ["Dune", "by Frank Herbert"] },
@@ -2001,6 +2022,17 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.deepStrictEqual(result.watchFeatures, []);
     assert.strictEqual(result.garmentKind, null);
     assert.deepStrictEqual(result.garmentFeatures, []);
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.topType, null);
+    assert.strictEqual(result.bottomType, null);
+    assert.strictEqual(result.dressSkirtType, null);
+    assert.strictEqual(result.sleeveType, null);
+    assert.strictEqual(result.collarType, null);
+    assert.strictEqual(result.fitSignal, null);
+    assert.strictEqual(result.patternSignal, null);
+    assert.strictEqual(result.clothingMaterialSignal, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
   });
 
   it("video game existing behavior still passes with all taxonomy fields", () => {
@@ -2016,6 +2048,9 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.deepStrictEqual(result.watchFeatures, []);
     assert.strictEqual(result.garmentKind, null);
     assert.deepStrictEqual(result.garmentFeatures, []);
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
   });
 
   it("queryTermsAllowed and queryTermsBlocked never overlap across all media types", () => {
@@ -2026,11 +2061,511 @@ describe("enrichIdentityWithSchema — regressions", () => {
       { itemType: "over-ear headphones", category: "electronics", brand: "Sony", visibleText: ["Sony"] },
       { itemType: "analog watch", category: "watch", brand: "Seiko", visibleText: ["Seiko"] },
       { itemType: "denim jacket", category: "apparel", brand: "Levi's", visibleText: ["Levi's"] },
+      { itemType: "graphic tee", category: "apparel", brand: "Uniqlo", visibleText: ["Uniqlo"] },
+      { itemType: "jeans", category: "apparel", brand: "Levi's", visibleText: ["Levi's"] },
+      { itemType: "dress", category: "apparel", brand: "Zara", visibleText: ["Zara"] },
     ];
     for (const id of identities) {
       const result = enrichIdentityWithSchema(id, { overallConfidence: 0.70, attributeCertainty: { brand: 0.55, model: 0.55 } });
       const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
       assert.deepStrictEqual(overlap, [], `overlap found for ${id.itemType}`);
     }
+  });
+});
+
+describe("isClothingIdentity — positive detection", () => {
+  it("detects t-shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "t-shirt" }), true); });
+  it("detects tee shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "tee shirt" }), true); });
+  it("detects graphic tee", () => { assert.strictEqual(isClothingIdentity({ itemType: "graphic tee" }), true); });
+  it("detects graphic t-shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "graphic t-shirt" }), true); });
+  it("detects polo shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "polo shirt" }), true); });
+  it("detects button-down shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "button-down shirt" }), true); });
+  it("detects flannel shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "flannel shirt" }), true); });
+  it("detects dress shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress shirt" }), true); });
+  it("detects blouse", () => { assert.strictEqual(isClothingIdentity({ itemType: "blouse" }), true); });
+  it("detects tank top", () => { assert.strictEqual(isClothingIdentity({ itemType: "tank top" }), true); });
+  it("detects long sleeve shirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "long sleeve shirt" }), true); });
+  it("detects crop top", () => { assert.strictEqual(isClothingIdentity({ itemType: "crop top" }), true); });
+  it("detects henley", () => { assert.strictEqual(isClothingIdentity({ itemType: "henley" }), true); });
+  it("detects jersey", () => { assert.strictEqual(isClothingIdentity({ itemType: "jersey" }), true); });
+  it("detects pants", () => { assert.strictEqual(isClothingIdentity({ itemType: "pants" }), true); });
+  it("detects jeans", () => { assert.strictEqual(isClothingIdentity({ itemType: "jeans" }), true); });
+  it("detects cargo pants", () => { assert.strictEqual(isClothingIdentity({ itemType: "cargo pants" }), true); });
+  it("detects dress pants", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress pants" }), true); });
+  it("detects trousers", () => { assert.strictEqual(isClothingIdentity({ itemType: "trousers" }), true); });
+  it("detects chinos", () => { assert.strictEqual(isClothingIdentity({ itemType: "chinos" }), true); });
+  it("detects sweatpants", () => { assert.strictEqual(isClothingIdentity({ itemType: "sweatpants" }), true); });
+  it("detects joggers", () => { assert.strictEqual(isClothingIdentity({ itemType: "joggers" }), true); });
+  it("detects leggings", () => { assert.strictEqual(isClothingIdentity({ itemType: "leggings" }), true); });
+  it("detects shorts", () => { assert.strictEqual(isClothingIdentity({ itemType: "shorts" }), true); });
+  it("detects cargo shorts", () => { assert.strictEqual(isClothingIdentity({ itemType: "cargo shorts" }), true); });
+  it("detects dress", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress" }), true); });
+  it("detects maxi dress", () => { assert.strictEqual(isClothingIdentity({ itemType: "maxi dress" }), true); });
+  it("detects midi dress", () => { assert.strictEqual(isClothingIdentity({ itemType: "midi dress" }), true); });
+  it("detects mini dress", () => { assert.strictEqual(isClothingIdentity({ itemType: "mini dress" }), true); });
+  it("detects sundress", () => { assert.strictEqual(isClothingIdentity({ itemType: "sundress" }), true); });
+  it("detects shirt dress", () => { assert.strictEqual(isClothingIdentity({ itemType: "shirt dress" }), true); });
+  it("detects skirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "skirt" }), true); });
+  it("detects pleated skirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "pleated skirt" }), true); });
+  it("detects pencil skirt", () => { assert.strictEqual(isClothingIdentity({ itemType: "pencil skirt" }), true); });
+});
+
+describe("isClothingIdentity — false-positive rejection", () => {
+  it("graphic poster is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "graphic poster" }), false); });
+  it("graphic novel is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "graphic novel" }), false); });
+  it("golf tee is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "golf tee" }), false); });
+  it("tee time is not clothing", () => { assert.strictEqual(isClothingIdentity({ styleWords: ["tee time"] }), false); });
+  it("tee ball is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "tee ball set" }), false); });
+  it("polo cologne is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "polo cologne" }), false); });
+  it("polo horse is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "polo horse figurine" }), false); });
+  it("polo match is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "polo match ticket" }), false); });
+  it("water polo is not clothing", () => { assert.strictEqual(isClothingIdentity({ category: "water polo" }), false); });
+  it("button battery is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "button battery" }), false); });
+  it("button-down folder is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "button down folder" }), false); });
+  it("flannel blanket is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "flannel blanket" }), false); });
+  it("tank toy is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "tank toy" }), false); });
+  it("tank top filter is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "tank top filter" }), false); });
+  it("fish tank is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "fish tank" }), false); });
+  it("crop tool is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "crop tool" }), false); });
+  it("crop field is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "crop field" }), false); });
+  it("cargo box is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "cargo box" }), false); });
+  it("cargo ship is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "cargo ship" }), false); });
+  it("cargo van is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "cargo van" }), false); });
+  it("dress shoes is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress shoes" }), false); });
+  it("dress watch is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress watch" }), false); });
+  it("dress code is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "dress code guide" }), false); });
+  it("window dressing is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "window dressing" }), false); });
+  it("pants hanger is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "pants hanger" }), false); });
+  it("pants rack is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "pants rack" }), false); });
+  it("jean jacket stays garment not clothing bottom", () => { assert.strictEqual(isClothingIdentity({ itemType: "jean jacket" }), false); });
+  it("denim jacket stays garment not clothing bottom", () => { assert.strictEqual(isClothingIdentity({ itemType: "denim jacket" }), false); });
+  it("short circuit is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "short circuit" }), false); });
+  it("shortstop is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "shortstop" }), false); });
+  it("skirt steak is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "skirt steak" }), false); });
+  it("grass skirt is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "grass skirt" }), false); });
+  it("mini fridge is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "mini fridge" }), false); });
+  it("mini keyboard is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "mini keyboard" }), false); });
+  it("midi keyboard is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "midi keyboard" }), false); });
+  it("maxi pad is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "maxi pad" }), false); });
+  it("record sleeve is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "record sleeve" }), false); });
+  it("sneakers is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "sneakers", category: "sneakers" }), false); });
+  it("shoes is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "shoes" }), false); });
+  it("boots is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "boots" }), false); });
+  it("sandals is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "sandals" }), false); });
+  it("hat is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "hat" }), false); });
+  it("cap is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "cap" }), false); });
+  it("beanie is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "beanie" }), false); });
+  it("scarf is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "scarf" }), false); });
+  it("gloves is not clothing", () => { assert.strictEqual(isClothingIdentity({ itemType: "gloves" }), false); });
+  it("jacket is not clothing (stays 5B.5)", () => { assert.strictEqual(isClothingIdentity({ itemType: "jacket" }), false); });
+  it("coat is not clothing (stays 5B.5)", () => { assert.strictEqual(isClothingIdentity({ itemType: "coat" }), false); });
+  it("sweater is not clothing (stays 5B.5)", () => { assert.strictEqual(isClothingIdentity({ itemType: "sweater" }), false); });
+  it("hoodie is not clothing (stays 5B.5)", () => { assert.strictEqual(isClothingIdentity({ itemType: "hoodie" }), false); });
+  it("returns false for null", () => { assert.strictEqual(isClothingIdentity(null), false); });
+  it("returns false for empty object", () => { assert.strictEqual(isClothingIdentity({}), false); });
+});
+
+describe("deriveClothingKind", () => {
+  it("returns top for t-shirt", () => { assert.strictEqual(deriveClothingKind({ itemType: "t-shirt" }), "top"); });
+  it("returns top for polo shirt", () => { assert.strictEqual(deriveClothingKind({ itemType: "polo shirt" }), "top"); });
+  it("returns top for blouse", () => { assert.strictEqual(deriveClothingKind({ itemType: "blouse" }), "top"); });
+  it("returns top for tank top", () => { assert.strictEqual(deriveClothingKind({ itemType: "tank top" }), "top"); });
+  it("returns top for dress shirt", () => { assert.strictEqual(deriveClothingKind({ itemType: "dress shirt" }), "top"); });
+  it("returns bottom for jeans", () => { assert.strictEqual(deriveClothingKind({ itemType: "jeans" }), "bottom"); });
+  it("returns bottom for cargo pants", () => { assert.strictEqual(deriveClothingKind({ itemType: "cargo pants" }), "bottom"); });
+  it("returns bottom for shorts", () => { assert.strictEqual(deriveClothingKind({ itemType: "shorts" }), "bottom"); });
+  it("returns bottom for pants", () => { assert.strictEqual(deriveClothingKind({ itemType: "pants" }), "bottom"); });
+  it("returns bottom for dress pants", () => { assert.strictEqual(deriveClothingKind({ itemType: "dress pants" }), "bottom"); });
+  it("returns dress for dress", () => { assert.strictEqual(deriveClothingKind({ itemType: "dress" }), "dress"); });
+  it("returns dress for maxi dress", () => { assert.strictEqual(deriveClothingKind({ itemType: "maxi dress" }), "dress"); });
+  it("returns skirt for skirt", () => { assert.strictEqual(deriveClothingKind({ itemType: "skirt" }), "skirt"); });
+  it("returns skirt for pleated skirt", () => { assert.strictEqual(deriveClothingKind({ itemType: "pleated skirt" }), "skirt"); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveClothingKind({ itemType: "camera" }), null); });
+});
+
+describe("deriveTopType", () => {
+  it("derives t_shirt", () => { assert.strictEqual(deriveTopType({ itemType: "t-shirt" }), "t_shirt"); });
+  it("derives graphic_tee from graphic tee", () => { assert.strictEqual(deriveTopType({ itemType: "graphic tee" }), "graphic_tee"); });
+  it("derives graphic_tee from graphic t-shirt", () => { assert.strictEqual(deriveTopType({ itemType: "graphic t-shirt" }), "graphic_tee"); });
+  it("derives graphic_tee from printed + t-shirt", () => { assert.strictEqual(deriveTopType({ itemType: "t-shirt", styleWords: ["printed"] }), "graphic_tee"); });
+  it("derives polo from polo shirt", () => { assert.strictEqual(deriveTopType({ itemType: "polo shirt" }), "polo"); });
+  it("derives button_down from button-down shirt", () => { assert.strictEqual(deriveTopType({ itemType: "button-down shirt" }), "button_down"); });
+  it("derives button_down from oxford shirt", () => { assert.strictEqual(deriveTopType({ itemType: "oxford shirt" }), "button_down"); });
+  it("derives flannel from flannel shirt", () => { assert.strictEqual(deriveTopType({ itemType: "flannel shirt" }), "flannel"); });
+  it("derives dress_shirt from dress shirt", () => { assert.strictEqual(deriveTopType({ itemType: "dress shirt" }), "dress_shirt"); });
+  it("derives blouse", () => { assert.strictEqual(deriveTopType({ itemType: "blouse" }), "blouse"); });
+  it("derives tank_top from tank top", () => { assert.strictEqual(deriveTopType({ itemType: "tank top" }), "tank_top"); });
+  it("derives tank_top from camisole", () => { assert.strictEqual(deriveTopType({ itemType: "camisole" }), "tank_top"); });
+  it("derives crop_top", () => { assert.strictEqual(deriveTopType({ itemType: "crop top" }), "crop_top"); });
+  it("derives henley", () => { assert.strictEqual(deriveTopType({ itemType: "henley" }), "henley"); });
+  it("derives jersey", () => { assert.strictEqual(deriveTopType({ itemType: "jersey" }), "jersey"); });
+  it("derives long_sleeve from long sleeve shirt", () => { assert.strictEqual(deriveTopType({ itemType: "long sleeve shirt" }), "long_sleeve"); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveTopType({ itemType: "camera" }), null); });
+  it("returns null for jeans (is bottom, not top)", () => { assert.strictEqual(deriveTopType({ itemType: "jeans" }), null); });
+});
+
+describe("deriveBottomType", () => {
+  it("derives jeans", () => { assert.strictEqual(deriveBottomType({ itemType: "jeans" }), "jeans"); });
+  it("derives jeans from skinny jeans", () => { assert.strictEqual(deriveBottomType({ itemType: "skinny jeans" }), "jeans"); });
+  it("derives cargo_pants", () => { assert.strictEqual(deriveBottomType({ itemType: "cargo pants" }), "cargo_pants"); });
+  it("derives cargo_pants from cargo trousers", () => { assert.strictEqual(deriveBottomType({ itemType: "cargo trousers" }), "cargo_pants"); });
+  it("derives dress_pants", () => { assert.strictEqual(deriveBottomType({ itemType: "dress pants" }), "dress_pants"); });
+  it("derives dress_pants from slacks", () => { assert.strictEqual(deriveBottomType({ itemType: "slacks" }), "dress_pants"); });
+  it("derives chinos", () => { assert.strictEqual(deriveBottomType({ itemType: "chinos" }), "chinos"); });
+  it("derives sweatpants", () => { assert.strictEqual(deriveBottomType({ itemType: "sweatpants" }), "sweatpants"); });
+  it("derives joggers", () => { assert.strictEqual(deriveBottomType({ itemType: "joggers" }), "joggers"); });
+  it("derives leggings", () => { assert.strictEqual(deriveBottomType({ itemType: "leggings" }), "leggings"); });
+  it("derives leggings from yoga pants", () => { assert.strictEqual(deriveBottomType({ itemType: "yoga pants" }), "leggings"); });
+  it("derives shorts", () => { assert.strictEqual(deriveBottomType({ itemType: "shorts" }), "shorts"); });
+  it("derives cargo_shorts", () => { assert.strictEqual(deriveBottomType({ itemType: "cargo shorts" }), "cargo_shorts"); });
+  it("derives trousers", () => { assert.strictEqual(deriveBottomType({ itemType: "trousers" }), "trousers"); });
+  it("denim jacket does NOT become jeans", () => { assert.strictEqual(deriveBottomType({ itemType: "denim jacket" }), null); });
+  it("jean jacket does NOT become jeans", () => { assert.strictEqual(deriveBottomType({ itemType: "jean jacket" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveBottomType({ itemType: "camera" }), null); });
+  it("returns null for t-shirt (is top, not bottom)", () => { assert.strictEqual(deriveBottomType({ itemType: "t-shirt" }), null); });
+});
+
+describe("deriveDressSkirtType", () => {
+  it("derives dress for generic dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "dress" }), "dress"); });
+  it("derives maxi_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "maxi dress" }), "maxi_dress"); });
+  it("derives midi_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "midi dress" }), "midi_dress"); });
+  it("derives mini_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "mini dress" }), "mini_dress"); });
+  it("derives sundress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "sundress" }), "sundress"); });
+  it("derives shirt_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "shirt dress" }), "shirt_dress"); });
+  it("derives sweater_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "sweater dress" }), "sweater_dress"); });
+  it("derives cocktail_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "cocktail dress" }), "cocktail_dress"); });
+  it("derives wrap_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "wrap dress" }), "wrap_dress"); });
+  it("derives bodycon_dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "bodycon dress" }), "bodycon_dress"); });
+  it("derives skirt for generic skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "skirt" }), "skirt"); });
+  it("derives pleated_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "pleated skirt" }), "pleated_skirt"); });
+  it("derives pencil_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "pencil skirt" }), "pencil_skirt"); });
+  it("derives denim_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "denim skirt" }), "denim_skirt"); });
+  it("derives a_line_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "a-line skirt" }), "a_line_skirt"); });
+  it("derives maxi_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "maxi skirt" }), "maxi_skirt"); });
+  it("derives midi_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "midi skirt" }), "midi_skirt"); });
+  it("derives mini_skirt", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "mini skirt" }), "mini_skirt"); });
+  it("dress shirt does NOT become dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "dress shirt" }), null); });
+  it("dress pants does NOT become dress", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "dress pants" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "camera" }), null); });
+  it("returns null for jeans", () => { assert.strictEqual(deriveDressSkirtType({ itemType: "jeans" }), null); });
+});
+
+describe("deriveSleeveType", () => {
+  it("derives short_sleeve", () => { assert.strictEqual(deriveSleeveType({ itemType: "short sleeve shirt" }), "short_sleeve"); });
+  it("derives short_sleeve from hyphenated", () => { assert.strictEqual(deriveSleeveType({ itemType: "short-sleeve shirt" }), "short_sleeve"); });
+  it("derives long_sleeve", () => { assert.strictEqual(deriveSleeveType({ itemType: "long sleeve shirt" }), "long_sleeve"); });
+  it("derives sleeveless from sleeveless halter top", () => { assert.strictEqual(deriveSleeveType({ itemType: "halter top", styleWords: ["sleeveless"] }), "sleeveless"); });
+  it("derives sleeveless from tank top", () => { assert.strictEqual(deriveSleeveType({ itemType: "tank top" }), "sleeveless"); });
+  it("derives sleeveless from camisole", () => { assert.strictEqual(deriveSleeveType({ itemType: "camisole" }), "sleeveless"); });
+  it("derives sleeveless from halter", () => { assert.strictEqual(deriveSleeveType({ itemType: "halter top" }), "sleeveless"); });
+  it("returns null for generic t-shirt", () => { assert.strictEqual(deriveSleeveType({ itemType: "t-shirt" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveSleeveType({ itemType: "camera" }), null); });
+});
+
+describe("deriveCollarType", () => {
+  it("derives crewneck", () => { assert.strictEqual(deriveCollarType({ itemType: "t-shirt", styleWords: ["crewneck"] }), "crewneck"); });
+  it("derives crewneck from crew neck", () => { assert.strictEqual(deriveCollarType({ itemType: "t-shirt", styleWords: ["crew neck"] }), "crewneck"); });
+  it("derives v_neck", () => { assert.strictEqual(deriveCollarType({ itemType: "t-shirt", styleWords: ["v-neck"] }), "v_neck"); });
+  it("derives polo_collar from polo shirt", () => { assert.strictEqual(deriveCollarType({ itemType: "polo shirt" }), "polo_collar"); });
+  it("derives button_down_collar", () => { assert.strictEqual(deriveCollarType({ itemType: "dress shirt", styleWords: ["button-down collar"] }), "button_down_collar"); });
+  it("derives collared", () => { assert.strictEqual(deriveCollarType({ itemType: "dress shirt", styleWords: ["collared"] }), "collared"); });
+  it("returns null for generic t-shirt", () => { assert.strictEqual(deriveCollarType({ itemType: "t-shirt" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveCollarType({ itemType: "camera" }), null); });
+});
+
+describe("deriveFitSignal", () => {
+  it("derives slim", () => { assert.strictEqual(deriveFitSignal({ itemType: "jeans", styleWords: ["slim"] }), "slim"); });
+  it("derives relaxed", () => { assert.strictEqual(deriveFitSignal({ itemType: "jeans", styleWords: ["relaxed"] }), "relaxed"); });
+  it("derives oversized", () => { assert.strictEqual(deriveFitSignal({ itemType: "t-shirt", styleWords: ["oversized"] }), "oversized"); });
+  it("derives wide_leg", () => { assert.strictEqual(deriveFitSignal({ itemType: "pants", styleWords: ["wide-leg"] }), "wide_leg"); });
+  it("derives straight_leg", () => { assert.strictEqual(deriveFitSignal({ itemType: "jeans", styleWords: ["straight leg"] }), "straight_leg"); });
+  it("derives skinny from skinny jeans", () => { assert.strictEqual(deriveFitSignal({ itemType: "skinny jeans" }), "skinny"); });
+  it("returns null for generic jeans", () => { assert.strictEqual(deriveFitSignal({ itemType: "jeans" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveFitSignal({ itemType: "camera" }), null); });
+});
+
+describe("deriveClothingPatternSignal", () => {
+  it("derives graphic from graphic tee", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "graphic tee" }), "graphic"); });
+  it("derives graphic from printed", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "t-shirt", styleWords: ["printed"] }), "graphic"); });
+  it("derives striped", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "polo shirt", styleWords: ["striped"] }), "striped"); });
+  it("derives plaid", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "flannel shirt", styleWords: ["plaid"] }), "plaid"); });
+  it("derives plaid from tartan", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "flannel shirt", styleWords: ["tartan"] }), "plaid"); });
+  it("derives floral", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "dress", styleWords: ["floral"] }), "floral"); });
+  it("derives solid", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "t-shirt", styleWords: ["solid"] }), "solid"); });
+  it("returns null for generic t-shirt", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "t-shirt" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveClothingPatternSignal({ itemType: "camera" }), null); });
+});
+
+describe("deriveClothingMaterialSignal", () => {
+  it("derives cotton from materials", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "t-shirt", materials: ["cotton"] }), "cotton"); });
+  it("derives denim from type text", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "denim jeans" }), "denim"); });
+  it("derives linen", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "pants", materials: ["linen"] }), "linen"); });
+  it("derives silk", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "blouse", materials: ["silk"] }), "silk"); });
+  it("derives polyester", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "jersey", materials: ["polyester"] }), "polyester"); });
+  it("derives wool", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "dress pants", materials: ["wool"] }), "wool"); });
+  it("derives corduroy", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "pants", styleWords: ["corduroy"] }), "corduroy"); });
+  it("returns null for generic t-shirt", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "t-shirt" }), null); });
+  it("returns null for non-clothing", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "camera" }), null); });
+  it("does not infer material from brand", () => { assert.strictEqual(deriveClothingMaterialSignal({ itemType: "jeans", brand: "Levi's" }), null); });
+});
+
+describe("deriveClothingFeatures", () => {
+  it("derives front_print from graphic", () => { assert.ok(deriveClothingFeatures({ itemType: "graphic tee" }).includes("front_print")); });
+  it("derives cargo_pockets", () => { assert.ok(deriveClothingFeatures({ itemType: "cargo pants", styleWords: ["cargo pockets"] }).includes("cargo_pockets")); });
+  it("derives drawstring_waist", () => { assert.ok(deriveClothingFeatures({ itemType: "sweatpants", styleWords: ["drawstring waist"] }).includes("drawstring_waist")); });
+  it("derives pleated", () => { assert.ok(deriveClothingFeatures({ itemType: "pleated skirt" }).includes("pleated")); });
+  it("derives button_front", () => { assert.ok(deriveClothingFeatures({ itemType: "dress shirt", styleWords: ["button front"] }).includes("button_front")); });
+  it("derives elastic_waist", () => { assert.ok(deriveClothingFeatures({ itemType: "pants", styleWords: ["elastic waist"] }).includes("elastic_waist")); });
+  it("derives belt_loops", () => { assert.ok(deriveClothingFeatures({ itemType: "jeans", styleWords: ["belt loops"] }).includes("belt_loops")); });
+  it("derives five_pocket", () => { assert.ok(deriveClothingFeatures({ itemType: "jeans", styleWords: ["five-pocket"] }).includes("five_pocket")); });
+  it("derives embroidered from visibleText", () => { assert.ok(deriveClothingFeatures({ itemType: "polo shirt", visibleText: ["embroidered logo"] }).includes("embroidered")); });
+  it("derives logo_print from visibleText", () => { assert.ok(deriveClothingFeatures({ itemType: "t-shirt", visibleText: ["logo print"] }).includes("logo_print")); });
+  it("returns empty for generic t-shirt", () => { assert.deepStrictEqual(deriveClothingFeatures({ itemType: "t-shirt" }), []); });
+  it("returns empty for non-clothing", () => { assert.deepStrictEqual(deriveClothingFeatures({ itemType: "camera" }), []); });
+  it("does not infer logo from brand alone", () => {
+    const result = deriveClothingFeatures({ itemType: "polo shirt", brand: "Ralph Lauren" });
+    assert.ok(!result.includes("logo_print"));
+    assert.ok(!result.includes("embroidered"));
+  });
+});
+
+describe("enrichIdentityWithSchema — clothing", () => {
+  it("populates clothing fields for t-shirt", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "graphic tee", category: "apparel", styleWords: ["printed", "crewneck"], materials: ["cotton"] },
+      { overallConfidence: 0.70, attributeCertainty: { category: 0.80 } }
+    );
+    assert.strictEqual(result.clothingKind, "top");
+    assert.strictEqual(result.topType, "graphic_tee");
+    assert.strictEqual(result.bottomType, null);
+    assert.strictEqual(result.dressSkirtType, null);
+    assert.strictEqual(result.collarType, "crewneck");
+    assert.strictEqual(result.patternSignal, "graphic");
+    assert.strictEqual(result.clothingMaterialSignal, "cotton");
+    assert.ok(result.clothingFeatures.includes("front_print"));
+  });
+
+  it("populates clothing fields for jeans", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "skinny jeans", category: "apparel", styleWords: ["slim", "five-pocket", "belt loops"], materials: ["denim"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "bottom");
+    assert.strictEqual(result.bottomType, "jeans");
+    assert.strictEqual(result.topType, null);
+    assert.strictEqual(result.fitSignal, "slim");
+    assert.strictEqual(result.clothingMaterialSignal, "denim");
+    assert.ok(result.clothingFeatures.includes("five_pocket"));
+    assert.ok(result.clothingFeatures.includes("belt_loops"));
+  });
+
+  it("populates clothing fields for dress", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "maxi dress", category: "apparel", styleWords: ["floral"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "dress");
+    assert.strictEqual(result.dressSkirtType, "maxi_dress");
+    assert.strictEqual(result.patternSignal, "floral");
+  });
+
+  it("populates clothing fields for skirt", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "pleated skirt", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "skirt");
+    assert.strictEqual(result.dressSkirtType, "pleated_skirt");
+    assert.ok(result.clothingFeatures.includes("pleated"));
+  });
+
+  it("clothingEvidence includes expected entries for graphic tee", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "graphic tee", category: "apparel", styleWords: ["crewneck"], materials: ["cotton"] },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.clothingEvidence.includes("kind:top"));
+    assert.ok(result.clothingEvidence.includes("top:graphic_tee"));
+    assert.ok(result.clothingEvidence.includes("collar:crewneck"));
+    assert.ok(result.clothingEvidence.includes("pattern:graphic"));
+    assert.ok(result.clothingEvidence.includes("material:cotton"));
+  });
+
+  it("non-clothing identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "camera", category: "electronics" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.topType, null);
+    assert.strictEqual(result.bottomType, null);
+    assert.strictEqual(result.dressSkirtType, null);
+    assert.strictEqual(result.sleeveType, null);
+    assert.strictEqual(result.collarType, null);
+    assert.strictEqual(result.fitSignal, null);
+    assert.strictEqual(result.patternSignal, null);
+    assert.strictEqual(result.clothingMaterialSignal, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
+  });
+
+  it("empty identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema({}, {});
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.topType, null);
+    assert.strictEqual(result.bottomType, null);
+    assert.strictEqual(result.dressSkirtType, null);
+    assert.strictEqual(result.sleeveType, null);
+    assert.strictEqual(result.collarType, null);
+    assert.strictEqual(result.fitSignal, null);
+    assert.strictEqual(result.patternSignal, null);
+    assert.strictEqual(result.clothingMaterialSignal, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
+  });
+
+  it("clothing fields do NOT appear in queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "graphic tee", category: "apparel", brand: "Uniqlo", visibleText: ["Uniqlo"], materials: ["cotton"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.ok(!result.queryTermsAllowed.includes("graphic_tee"));
+    assert.ok(!result.queryTermsAllowed.includes("top"));
+    assert.ok(!result.queryTermsAllowed.includes("t_shirt"));
+    assert.ok(!result.queryTermsAllowed.includes("crewneck"));
+  });
+
+  it("clothing fields do NOT appear in queryTermsBlocked", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "jeans", category: "apparel", brand: "Levi's", visibleText: ["Levi's"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.ok(!result.queryTermsBlocked.includes("bottom"));
+    assert.ok(!result.queryTermsBlocked.includes("jeans"));
+    assert.ok(!result.queryTermsBlocked.includes("denim"));
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked disjoint for clothing identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "dress", category: "apparel", brand: "Zara", visibleText: ["Zara"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.55 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+
+  it("watch identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
+  });
+
+  it("headphone identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+  });
+
+  it("garment identity (denim jacket) has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "denim jacket", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.garmentKind, "jacket");
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.bottomType, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+  });
+
+  it("book enriched identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "book");
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+    assert.deepStrictEqual(result.clothingEvidence, []);
+  });
+
+  it("video game enriched identity has null clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.mediaKind, "video_game");
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+  });
+});
+
+describe("enrichIdentityWithSchema — clothing regressions", () => {
+  it("dress shirt → clothingKind:top, topType:dress_shirt, not dress", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "dress shirt", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "top");
+    assert.strictEqual(result.topType, "dress_shirt");
+    assert.strictEqual(result.dressSkirtType, null);
+  });
+
+  it("dress pants → clothingKind:bottom, bottomType:dress_pants, not dress", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "dress pants", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "bottom");
+    assert.strictEqual(result.bottomType, "dress_pants");
+    assert.strictEqual(result.dressSkirtType, null);
+  });
+
+  it("denim jacket stays 5B.5 garment (garmentKind set) and is NOT 5B.6 bottom", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "denim jacket", category: "apparel", materials: ["denim"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.garmentKind, "jacket");
+    assert.strictEqual(result.outerwearType, "denim_jacket");
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.bottomType, null);
+  });
+
+  it("t-shirt is 5B.6 top and NOT 5B.5 garment (garmentKind null)", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.clothingKind, "top");
+    assert.strictEqual(result.topType, "t_shirt");
+    assert.strictEqual(result.garmentKind, null);
+  });
+
+  it("model aircraft remains non-high-stakes with clothing fields", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "model airplane", brand: "Gemini Jets" },
+      { overallConfidence: 0.50 }
+    );
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.clothingKind, null);
+    assert.deepStrictEqual(result.clothingFeatures, []);
+  });
+
+  it("high-stakes/luxury behavior unchanged by clothing enrichment", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "luxury", brand: "Gucci", model: "Marmont" },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30 } }
+    );
+    assert.strictEqual(result.luxuryCandidate, true);
+    assert.strictEqual(result.authenticityClaimAllowed, false);
+    assert.ok(result.queryTermsBlocked.includes("Gucci"));
+    assert.strictEqual(result.clothingKind, null);
   });
 });
