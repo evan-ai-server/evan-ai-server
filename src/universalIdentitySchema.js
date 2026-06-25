@@ -1,10 +1,10 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5+5B.6 — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5+5B.6+5B.7 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
 // book/video-game recognition, headphone taxonomy enrichment,
 // watch taxonomy enrichment, jacket/coat/sweater/zip taxonomy enrichment,
-// and broader clothing taxonomy enrichment.
+// broader clothing taxonomy enrichment, and hat/cap/beanie taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -878,6 +878,188 @@ export function deriveClothingFeatures(identity) {
   return features;
 }
 
+// --- Headwear taxonomy (Phase 5B.7) ---
+
+const HEADWEAR_ACCESSORY_RE = /\b(hat rack|hat stand|hat box|hat hook|hat pin|hatpin|hat band|hatband|cap rack|cap holder|cap display|hat display|visor clip|visor mount|hat form)\b/i;
+const HEADWEAR_HOMONYM_RE = /\b(bottle cap|lens cap|hub cap|hubcap|gas cap|fuel cap|oil cap|radiator cap|valve cap|wheel cap|toe cap|cap toe|ice cap|knee cap|kneecap|end cap|dust cap|screw cap|twist cap|flip cap|filler cap|distributor cap|cap screw|cap nut|pen cap|marker cap|cap gun|cap table|cap rate|salary cap|market cap|price cap|debt cap|spending cap|cap sleeve|hat trick|beanie baby|beanie babies|beanie boo|bucket list|bucket seat|bucket bag|bucket truck|fedora linux|fedora os|fedora workstation|fedora server|sun visor|car visor|helmet visor|windshield visor|cowboy boot|cowboy boots|cowboy belt|cowboy bebop|beret pattern)\b/i;
+const HEADWEAR_EXCLUDED_CAT_RE = /\b(headphone|headphones|earbud|earbuds|earmuff|earmuffs|helmet|helmets|mask|wig|wigs|hairpiece|toupee|scarf|gloves|glove|shoe|shoes|sneaker|sneakers|boot|boots|sandal|sandals)\b/i;
+const HEADWEAR_POSITIVE_RE = /\b(headwear|head wear|baseball cap|dad hat|dad cap|snapback cap|snapback|fitted cap|fitted hat|trucker hat|trucker cap|bucket hat|knit beanie|knit cap|knit hat|skull cap|beanie|sun hat|cowboy hat|flat cap|newsboy cap|ball cap|golf cap|cycling cap|mesh cap|painters cap|driver cap|ivy cap|fedora|beret|balaclava|trapper hat|earflap hat|winter hat|visor|hat)\b/i;
+
+export function isHeadwearIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  // 1. Accessory veto
+  if (HEADWEAR_ACCESSORY_RE.test(joined)) return false;
+  // 2. Homonym veto (UNCONDITIONAL — no positive override)
+  if (HEADWEAR_HOMONYM_RE.test(joined)) return false;
+  // 3. Excluded-category veto
+  if (HEADWEAR_EXCLUDED_CAT_RE.test(joined)) return false;
+  // 4. Positive match
+  if (HEADWEAR_POSITIVE_RE.test(joined)) return true;
+  // 5. else false
+  return false;
+}
+
+const HWKIND_BEANIE_RE = /\b(beanie|knit cap|knit hat|skull cap)\b/i;
+const HWKIND_VISOR_RE = /\bvisor\b/i;
+const HWKIND_BALACLAVA_RE = /\bbalaclava\b/i;
+const HWKIND_CAP_RE = /\b(baseball cap|snapback|fitted cap|fitted hat|trucker cap|trucker hat|flat cap|newsboy cap|dad hat|dad cap|ball cap|golf cap|cycling cap|mesh cap|driver cap|ivy cap|painters cap)\b/i;
+const HWKIND_HAT_RE = /\b(hat|fedora|cowboy hat|bucket hat|sun hat|trapper hat|earflap hat|winter hat|beret|straw hat|top hat)\b/i;
+
+export function deriveHeadwearKind(identity) {
+  if (!isHeadwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (HWKIND_BEANIE_RE.test(joined)) return "beanie";
+  if (HWKIND_VISOR_RE.test(joined)) return "visor";
+  if (HWKIND_BALACLAVA_RE.test(joined)) return "balaclava";
+  if (HWKIND_CAP_RE.test(joined)) return "cap";
+  if (HWKIND_HAT_RE.test(joined)) return "hat";
+  return null;
+}
+
+export function deriveHeadwearType(identity) {
+  if (!isHeadwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  // Most-specific first
+  if (/\bsnapback\b/i.test(joined)) return "snapback";
+  if (/\b(dad hat|dad cap)\b/i.test(joined)) return "dad_hat";
+  if (/\b(fitted cap|fitted hat)\b/i.test(joined)) return "fitted_cap";
+  if (/\b(trucker cap|trucker hat)\b/i.test(joined)) return "trucker_cap";
+  if (/\bknit beanie\b/i.test(joined)) return "knit_beanie";
+  if (/\bskull cap\b/i.test(joined)) return "skull_cap";
+  if (/\bbucket hat\b/i.test(joined)) return "bucket_hat";
+  if (/\bvisor\b/i.test(joined)) return "visor";
+  if (/\bsun hat\b/i.test(joined)) return "sun_hat";
+  if (/\bfedora\b/i.test(joined)) return "fedora";
+  if (/\bcowboy hat\b/i.test(joined)) return "cowboy_hat";
+  if (/\bflat cap\b/i.test(joined)) return "flat_cap";
+  if (/\bnewsboy cap\b/i.test(joined)) return "newsboy_cap";
+  if (/\bberet\b/i.test(joined)) return "beret";
+  if (/\bbalaclava\b/i.test(joined)) return "balaclava";
+  if (/\btrapper hat\b/i.test(joined)) return "trapper_hat";
+  if (/\bearflap hat\b/i.test(joined)) return "earflap_hat";
+  if (/\bwinter hat\b/i.test(joined)) return "winter_hat";
+  if (/\b(baseball cap|ball cap)\b/i.test(joined)) return "baseball_cap";
+  if (/\bbeanie\b/i.test(joined)) return "beanie";
+  return null;
+}
+
+export function deriveBrimType(identity) {
+  if (!isHeadwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(curved brim|curved bill)\b/i.test(joined)) return "curved_brim";
+  if (/\b(flat brim|flat bill)\b/i.test(joined)) return "flat_brim";
+  if (/\b(wide brim|wide-brim)\b/i.test(joined)) return "wide_brim";
+  // Structural no_brim for definitionally brimless types
+  const hwType = deriveHeadwearType(identity);
+  if (hwType === "beanie" || hwType === "knit_beanie" || hwType === "skull_cap" || hwType === "balaclava") return "no_brim";
+  return null;
+}
+
+export function deriveClosureAdjustType(identity) {
+  if (!isHeadwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(snapback|snap closure|snap back)\b/i.test(joined)) return "snapback";
+  if (/\b(strapback|strap-back|strap back|buckle back)\b/i.test(joined)) return "strapback";
+  if (/\b(fitted cap|fitted hat)\b/i.test(joined)) return "fitted";
+  if (/\b(adjustable|velcro back|hook and loop)\b/i.test(joined)) return "adjustable";
+  return null;
+}
+
+export function deriveHeadwearMaterialSignal(identity) {
+  if (!isHeadwearIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  const all = (joined + " " + matJoined).toLowerCase();
+  if (/\bcotton\b/.test(all)) return "cotton";
+  if (/\bwool\b/.test(all)) return "wool";
+  // knit: from knit beanie/cap/hat compound OR explicit knit in materials
+  if (/\b(knit beanie|knit cap|knit hat)\b/.test(all)) return "knit";
+  if (/\bknit\b/.test(matJoined)) return "knit";
+  // mesh: from mesh back/mesh cap compound OR explicit mesh in materials
+  if (/\b(mesh back|mesh cap)\b/.test(all)) return "mesh";
+  if (/\bmesh\b/.test(matJoined)) return "mesh";
+  if (/\bfelt\b/.test(all)) return "felt";
+  if (/\bstraw\b/.test(all)) return "straw";
+  if (/\bpolyester\b/.test(all)) return "polyester";
+  if (/\bacrylic\b/.test(all)) return "acrylic";
+  return null;
+}
+
+const HWFEAT_EMBROIDERED_RE = /\b(embroidered|embroidery)\b/i;
+const HWFEAT_PATCH_RE = /\bpatch\b/i;
+const HWFEAT_LOGO_PRINT_RE = /\b(logo print|logo printed)\b/i;
+const HWFEAT_MESH_BACK_RE = /\bmesh back\b/i;
+const HWFEAT_FOLDED_CUFF_RE = /\b(folded cuff|fold.over cuff|cuffed brim|cuffed beanie)\b/i;
+const HWFEAT_POM_POM_RE = /\b(pom pom|pom-pom|pompom)\b/i;
+const HWFEAT_ADJUSTABLE_BACK_RE = /\b(adjustable back|adjustable strap)\b/i;
+const HWFEAT_SNAP_CLOSURE_RE = /\b(snap closure|snap back|snapback closure)\b/i;
+const HWFEAT_CURVED_BILL_RE = /\b(curved bill|curved brim)\b/i;
+const HWFEAT_FLAT_BILL_RE = /\b(flat bill|flat brim)\b/i;
+
+export function deriveHeadwearFeatures(identity) {
+  if (!isHeadwearIdentity(identity)) return [];
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  const features = [];
+  if (HWFEAT_EMBROIDERED_RE.test(joined)) features.push("embroidered");
+  if (HWFEAT_PATCH_RE.test(joined)) features.push("patch");
+  if (HWFEAT_LOGO_PRINT_RE.test(joined)) features.push("logo_print");
+  if (HWFEAT_MESH_BACK_RE.test(joined)) features.push("mesh_back");
+  if (HWFEAT_FOLDED_CUFF_RE.test(joined)) features.push("folded_cuff");
+  if (HWFEAT_POM_POM_RE.test(joined)) features.push("pom_pom");
+  if (HWFEAT_ADJUSTABLE_BACK_RE.test(joined)) features.push("adjustable_back");
+  if (HWFEAT_SNAP_CLOSURE_RE.test(joined)) features.push("snap_closure");
+  if (HWFEAT_CURVED_BILL_RE.test(joined)) features.push("curved_bill");
+  if (HWFEAT_FLAT_BILL_RE.test(joined)) features.push("flat_bill");
+  return features;
+}
+
 function computeMissingEvidence(identity) {
   const missing = [];
   if (!identity.brand) missing.push("brand not identified");
@@ -1198,6 +1380,32 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     clothingEvidence = ev;
   }
 
+  // --- Headwear taxonomy enrichment (Phase 5B.7) ---
+  const headwearDetected = isHeadwearIdentity(id);
+  let headwearKind = null;
+  let headwearType = null;
+  let brimType = null;
+  let closureAdjustType = null;
+  let headwearMaterialSignal = null;
+  let headwearFeatures = [];
+  let headwearEvidence = [];
+  if (headwearDetected) {
+    headwearKind = deriveHeadwearKind(id);
+    headwearType = deriveHeadwearType(id);
+    brimType = deriveBrimType(id);
+    closureAdjustType = deriveClosureAdjustType(id);
+    headwearMaterialSignal = deriveHeadwearMaterialSignal(id);
+    headwearFeatures = deriveHeadwearFeatures(id);
+    const ev = [];
+    if (headwearKind) ev.push(`kind:${headwearKind}`);
+    if (headwearType) ev.push(`type:${headwearType}`);
+    if (brimType) ev.push(`brim:${brimType}`);
+    if (closureAdjustType) ev.push(`closure:${closureAdjustType}`);
+    if (headwearMaterialSignal) ev.push(`material:${headwearMaterialSignal}`);
+    for (const f of headwearFeatures) ev.push(`feature:${f}`);
+    headwearEvidence = ev;
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -1262,5 +1470,12 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     clothingMaterialSignal,
     clothingFeatures,
     clothingEvidence,
+    headwearKind,
+    headwearType,
+    brimType,
+    closureAdjustType,
+    headwearMaterialSignal,
+    headwearFeatures,
+    headwearEvidence,
   };
 }

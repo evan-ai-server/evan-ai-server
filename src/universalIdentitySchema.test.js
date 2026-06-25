@@ -41,6 +41,13 @@ import {
   deriveClothingPatternSignal,
   deriveClothingMaterialSignal,
   deriveClothingFeatures,
+  isHeadwearIdentity,
+  deriveHeadwearKind,
+  deriveHeadwearType,
+  deriveBrimType,
+  deriveClosureAdjustType,
+  deriveHeadwearMaterialSignal,
+  deriveHeadwearFeatures,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -1995,6 +2002,13 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.deepStrictEqual(result.watchEvidence, []);
     assert.strictEqual(result.garmentKind, null);
     assert.deepStrictEqual(result.garmentFeatures, []);
+    assert.strictEqual(result.headwearKind, null);
+    assert.strictEqual(result.headwearType, null);
+    assert.strictEqual(result.brimType, null);
+    assert.strictEqual(result.closureAdjustType, null);
+    assert.strictEqual(result.headwearMaterialSignal, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
     assert.ok(!result.missingEvidence.includes("book title not readable"));
     assert.ok(!result.missingEvidence.includes("video game title not readable"));
   });
@@ -2033,6 +2047,10 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.clothingMaterialSignal, null);
     assert.deepStrictEqual(result.clothingFeatures, []);
     assert.deepStrictEqual(result.clothingEvidence, []);
+    assert.strictEqual(result.headwearKind, null);
+    assert.strictEqual(result.headwearType, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
   });
 
   it("video game existing behavior still passes with all taxonomy fields", () => {
@@ -2051,6 +2069,9 @@ describe("enrichIdentityWithSchema — regressions", () => {
     assert.strictEqual(result.clothingKind, null);
     assert.deepStrictEqual(result.clothingFeatures, []);
     assert.deepStrictEqual(result.clothingEvidence, []);
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
   });
 
   it("queryTermsAllowed and queryTermsBlocked never overlap across all media types", () => {
@@ -2064,6 +2085,8 @@ describe("enrichIdentityWithSchema — regressions", () => {
       { itemType: "graphic tee", category: "apparel", brand: "Uniqlo", visibleText: ["Uniqlo"] },
       { itemType: "jeans", category: "apparel", brand: "Levi's", visibleText: ["Levi's"] },
       { itemType: "dress", category: "apparel", brand: "Zara", visibleText: ["Zara"] },
+      { itemType: "baseball cap", category: "headwear", brand: "New Era", visibleText: ["New Era"] },
+      { itemType: "beanie", category: "headwear", brand: "Carhartt", visibleText: ["Carhartt"] },
     ];
     for (const id of identities) {
       const result = enrichIdentityWithSchema(id, { overallConfidence: 0.70, attributeCertainty: { brand: 0.55, model: 0.55 } });
@@ -2567,5 +2590,504 @@ describe("enrichIdentityWithSchema — clothing regressions", () => {
     assert.strictEqual(result.authenticityClaimAllowed, false);
     assert.ok(result.queryTermsBlocked.includes("Gucci"));
     assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.headwearKind, null);
+  });
+});
+
+// === Phase 5B.7 — Headwear taxonomy tests ===
+
+describe("isHeadwearIdentity — positive detection", () => {
+  it("detects hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hat" }), true); });
+  it("detects headwear via category", () => { assert.strictEqual(isHeadwearIdentity({ category: "headwear" }), true); });
+  it("detects baseball cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "baseball cap" }), true); });
+  it("detects dad hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "dad hat" }), true); });
+  it("detects dad cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "dad cap" }), true); });
+  it("detects snapback", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "snapback" }), true); });
+  it("detects snapback cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "snapback cap" }), true); });
+  it("detects fitted cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "fitted cap" }), true); });
+  it("detects fitted hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "fitted hat" }), true); });
+  it("detects trucker hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "trucker hat" }), true); });
+  it("detects trucker cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "trucker cap" }), true); });
+  it("detects bucket hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bucket hat" }), true); });
+  it("detects beanie", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "beanie" }), true); });
+  it("detects knit beanie", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "knit beanie" }), true); });
+  it("detects knit cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "knit cap" }), true); });
+  it("detects knit hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "knit hat" }), true); });
+  it("detects skull cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "skull cap" }), true); });
+  it("detects visor", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "visor" }), true); });
+  it("detects sun hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "sun hat" }), true); });
+  it("detects fedora", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "fedora" }), true); });
+  it("detects cowboy hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cowboy hat" }), true); });
+  it("detects flat cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "flat cap" }), true); });
+  it("detects newsboy cap", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "newsboy cap" }), true); });
+  it("detects beret", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "beret" }), true); });
+  it("detects balaclava", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "balaclava" }), true); });
+  it("detects trapper hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "trapper hat" }), true); });
+  it("detects earflap hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "earflap hat" }), true); });
+  it("detects winter hat", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "winter hat" }), true); });
+  it("detects from styleWords", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "accessory", styleWords: ["baseball cap"] }), true); });
+  it("returns false for null", () => { assert.strictEqual(isHeadwearIdentity(null), false); });
+  it("returns false for empty object", () => { assert.strictEqual(isHeadwearIdentity({}), false); });
+});
+
+describe("isHeadwearIdentity — false-positive rejection", () => {
+  // Bare cap with non-headwear category
+  it("bare cap with electronics category is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap", category: "electronics" }), false); });
+  // Homonym vetoes (UNCONDITIONAL)
+  it("bottle cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bottle cap" }), false); });
+  it("lens cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "lens cap" }), false); });
+  it("hubcap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hubcap" }), false); });
+  it("gas cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "gas cap" }), false); });
+  it("radiator cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "radiator cap" }), false); });
+  it("valve cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "valve cap" }), false); });
+  it("toe cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "toe cap" }), false); });
+  it("cap toe is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap toe shoe" }), false); });
+  it("knee cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "knee cap" }), false); });
+  it("ice cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "ice cap" }), false); });
+  it("end cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "end cap" }), false); });
+  it("screw cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "screw cap" }), false); });
+  it("pen cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "pen cap" }), false); });
+  it("cap gun is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap gun" }), false); });
+  it("cap table is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap table" }), false); });
+  it("cap rate is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap rate" }), false); });
+  it("salary cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "salary cap" }), false); });
+  it("market cap is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "market cap" }), false); });
+  it("cap sleeve is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cap sleeve dress" }), false); });
+  it("hat trick is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hat trick" }), false); });
+  // Accessory vetoes
+  it("hat rack is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hat rack" }), false); });
+  it("hat stand is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hat stand" }), false); });
+  it("hat box is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hat box" }), false); });
+  // Beanie/bucket/fedora/visor/cowboy homonyms
+  it("beanie baby is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "beanie baby" }), false); });
+  it("beanie boo is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "beanie boo" }), false); });
+  it("bucket alone is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bucket" }), false); });
+  it("bucket list is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bucket list" }), false); });
+  it("bucket seat is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bucket seat" }), false); });
+  it("bucket bag is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "bucket bag" }), false); });
+  it("fedora linux is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "fedora linux" }), false); });
+  it("sun visor is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "sun visor" }), false); });
+  it("car visor is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "car visor" }), false); });
+  it("helmet visor is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "helmet visor" }), false); });
+  it("cowboy boot is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cowboy boot" }), false); });
+  it("cowboy belt is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "cowboy belt" }), false); });
+  it("beret pattern is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "beret pattern" }), false); });
+  // Excluded-category vetoes
+  it("headphones is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "headphones" }), false); });
+  it("earmuffs is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "earmuffs" }), false); });
+  it("helmet is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "helmet" }), false); });
+  it("mask is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "mask" }), false); });
+  it("scarf is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "scarf" }), false); });
+  it("gloves is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "gloves" }), false); });
+  it("shoes is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "shoes" }), false); });
+  it("sneakers is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "sneakers" }), false); });
+  it("boots is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "boots" }), false); });
+  it("sandals is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "sandals" }), false); });
+  // Non-headwear clothing items (not in positive regex)
+  it("shirt is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "shirt" }), false); });
+  it("pants is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "pants" }), false); });
+  it("dress is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "dress" }), false); });
+  it("skirt is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "skirt" }), false); });
+  it("jacket is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "jacket" }), false); });
+  it("coat is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "coat" }), false); });
+  it("sweater is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "sweater" }), false); });
+  it("hoodie is not headwear", () => { assert.strictEqual(isHeadwearIdentity({ itemType: "hoodie" }), false); });
+});
+
+describe("deriveHeadwearKind", () => {
+  it("returns cap for baseball cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "baseball cap" }), "cap"); });
+  it("returns cap for snapback", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "snapback" }), "cap"); });
+  it("returns cap for fitted cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "fitted cap" }), "cap"); });
+  it("returns cap for trucker cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "trucker cap" }), "cap"); });
+  it("returns cap for flat cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "flat cap" }), "cap"); });
+  it("returns cap for dad hat", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "dad hat" }), "cap"); });
+  it("returns beanie for beanie", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "beanie" }), "beanie"); });
+  it("returns beanie for knit cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "knit cap" }), "beanie"); });
+  it("returns beanie for skull cap", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "skull cap" }), "beanie"); });
+  it("returns hat for hat", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "hat" }), "hat"); });
+  it("returns hat for fedora", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "fedora" }), "hat"); });
+  it("returns hat for cowboy hat", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "cowboy hat" }), "hat"); });
+  it("returns hat for bucket hat", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "bucket hat" }), "hat"); });
+  it("returns hat for beret", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "beret" }), "hat"); });
+  it("returns visor for visor", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "visor" }), "visor"); });
+  it("returns balaclava for balaclava", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "balaclava" }), "balaclava"); });
+  it("returns null for non-headwear", () => { assert.strictEqual(deriveHeadwearKind({ itemType: "camera" }), null); });
+});
+
+describe("deriveHeadwearType", () => {
+  it("derives snapback", () => { assert.strictEqual(deriveHeadwearType({ itemType: "snapback cap" }), "snapback"); });
+  it("derives dad_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "dad hat" }), "dad_hat"); });
+  it("derives fitted_cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "fitted cap" }), "fitted_cap"); });
+  it("derives trucker_cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "trucker cap" }), "trucker_cap"); });
+  it("derives knit_beanie", () => { assert.strictEqual(deriveHeadwearType({ itemType: "knit beanie" }), "knit_beanie"); });
+  it("derives skull_cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "skull cap" }), "skull_cap"); });
+  it("derives bucket_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "bucket hat" }), "bucket_hat"); });
+  it("derives visor", () => { assert.strictEqual(deriveHeadwearType({ itemType: "visor" }), "visor"); });
+  it("derives sun_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "sun hat" }), "sun_hat"); });
+  it("derives fedora", () => { assert.strictEqual(deriveHeadwearType({ itemType: "fedora" }), "fedora"); });
+  it("derives cowboy_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "cowboy hat" }), "cowboy_hat"); });
+  it("derives flat_cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "flat cap" }), "flat_cap"); });
+  it("derives newsboy_cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "newsboy cap" }), "newsboy_cap"); });
+  it("derives beret", () => { assert.strictEqual(deriveHeadwearType({ itemType: "beret" }), "beret"); });
+  it("derives balaclava", () => { assert.strictEqual(deriveHeadwearType({ itemType: "balaclava" }), "balaclava"); });
+  it("derives trapper_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "trapper hat" }), "trapper_hat"); });
+  it("derives earflap_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "earflap hat" }), "earflap_hat"); });
+  it("derives winter_hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "winter hat" }), "winter_hat"); });
+  it("derives baseball_cap from baseball cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "baseball cap" }), "baseball_cap"); });
+  it("derives baseball_cap from ball cap", () => { assert.strictEqual(deriveHeadwearType({ itemType: "ball cap" }), "baseball_cap"); });
+  it("derives beanie for bare beanie", () => { assert.strictEqual(deriveHeadwearType({ itemType: "beanie" }), "beanie"); });
+  it("returns null for generic hat", () => { assert.strictEqual(deriveHeadwearType({ itemType: "hat" }), null); });
+  it("returns null for non-headwear", () => { assert.strictEqual(deriveHeadwearType({ itemType: "camera" }), null); });
+});
+
+describe("deriveBrimType", () => {
+  it("derives curved_brim from curved brim", () => { assert.strictEqual(deriveBrimType({ itemType: "baseball cap", styleWords: ["curved brim"] }), "curved_brim"); });
+  it("derives curved_brim from curved bill", () => { assert.strictEqual(deriveBrimType({ itemType: "baseball cap", styleWords: ["curved bill"] }), "curved_brim"); });
+  it("derives flat_brim from flat brim", () => { assert.strictEqual(deriveBrimType({ itemType: "snapback", styleWords: ["flat brim"] }), "flat_brim"); });
+  it("derives flat_brim from flat bill", () => { assert.strictEqual(deriveBrimType({ itemType: "snapback", styleWords: ["flat bill"] }), "flat_brim"); });
+  it("derives wide_brim from wide brim", () => { assert.strictEqual(deriveBrimType({ itemType: "sun hat", styleWords: ["wide brim"] }), "wide_brim"); });
+  it("derives wide_brim from wide-brim", () => { assert.strictEqual(deriveBrimType({ itemType: "sun hat", styleWords: ["wide-brim"] }), "wide_brim"); });
+  it("derives no_brim for beanie", () => { assert.strictEqual(deriveBrimType({ itemType: "beanie" }), "no_brim"); });
+  it("derives no_brim for knit_beanie", () => { assert.strictEqual(deriveBrimType({ itemType: "knit beanie" }), "no_brim"); });
+  it("derives no_brim for skull_cap", () => { assert.strictEqual(deriveBrimType({ itemType: "skull cap" }), "no_brim"); });
+  it("derives no_brim for balaclava", () => { assert.strictEqual(deriveBrimType({ itemType: "balaclava" }), "no_brim"); });
+  it("returns null for generic hat without brim info", () => { assert.strictEqual(deriveBrimType({ itemType: "hat" }), null); });
+  it("returns null for non-headwear", () => { assert.strictEqual(deriveBrimType({ itemType: "camera" }), null); });
+});
+
+describe("deriveClosureAdjustType", () => {
+  it("derives snapback from snapback", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "snapback" }), "snapback"); });
+  it("derives snapback from snap closure", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "baseball cap", styleWords: ["snap closure"] }), "snapback"); });
+  it("derives strapback from strapback", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "baseball cap", styleWords: ["strapback"] }), "strapback"); });
+  it("derives strapback from buckle back", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "baseball cap", styleWords: ["buckle back"] }), "strapback"); });
+  it("derives fitted from fitted cap", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "fitted cap" }), "fitted"); });
+  it("derives fitted from fitted hat", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "fitted hat" }), "fitted"); });
+  it("derives adjustable from adjustable", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "baseball cap", styleWords: ["adjustable"] }), "adjustable"); });
+  it("derives adjustable from velcro back", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "baseball cap", styleWords: ["velcro back"] }), "adjustable"); });
+  it("returns null for generic hat", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "hat" }), null); });
+  it("returns null for non-headwear", () => { assert.strictEqual(deriveClosureAdjustType({ itemType: "camera" }), null); });
+});
+
+describe("deriveHeadwearMaterialSignal", () => {
+  it("derives cotton from materials", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "baseball cap", materials: ["cotton"] }), "cotton"); });
+  it("derives wool from materials", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "beanie", materials: ["wool"] }), "wool"); });
+  it("derives knit from knit beanie", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "knit beanie" }), "knit"); });
+  it("derives knit from knit cap", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "knit cap" }), "knit"); });
+  it("derives knit from knit hat", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "knit hat" }), "knit"); });
+  it("derives knit from explicit knit material", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "beanie", materials: ["knit"] }), "knit"); });
+  it("derives mesh from mesh cap", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "mesh cap" }), "mesh"); });
+  it("derives mesh from explicit mesh material", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "trucker cap", materials: ["mesh"] }), "mesh"); });
+  it("derives felt from felt hat", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "felt hat" }), "felt"); });
+  it("derives felt from explicit felt material", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "fedora", materials: ["felt"] }), "felt"); });
+  it("derives straw from straw hat", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "straw hat" }), "straw"); });
+  it("derives straw from explicit straw material", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "sun hat", materials: ["straw"] }), "straw"); });
+  it("derives polyester from materials", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "baseball cap", materials: ["polyester"] }), "polyester"); });
+  it("derives acrylic from materials", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "beanie", materials: ["acrylic"] }), "acrylic"); });
+  it("returns null for generic hat", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "hat" }), null); });
+  it("returns null for non-headwear", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "camera" }), null); });
+  it("does not infer material from brand", () => { assert.strictEqual(deriveHeadwearMaterialSignal({ itemType: "baseball cap", brand: "New Era" }), null); });
+});
+
+describe("deriveHeadwearFeatures", () => {
+  it("derives embroidered from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "baseball cap", styleWords: ["embroidered"] }).includes("embroidered")); });
+  it("derives embroidered from visibleText", () => { assert.ok(deriveHeadwearFeatures({ itemType: "baseball cap", visibleText: ["embroidered logo"] }).includes("embroidered")); });
+  it("derives patch from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "trucker hat", styleWords: ["patch"] }).includes("patch")); });
+  it("derives logo_print from visibleText", () => { assert.ok(deriveHeadwearFeatures({ itemType: "baseball cap", visibleText: ["logo print"] }).includes("logo_print")); });
+  it("derives mesh_back from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "trucker hat", styleWords: ["mesh back"] }).includes("mesh_back")); });
+  it("derives folded_cuff from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "beanie", styleWords: ["folded cuff"] }).includes("folded_cuff")); });
+  it("derives folded_cuff from cuffed beanie", () => { assert.ok(deriveHeadwearFeatures({ itemType: "beanie", styleWords: ["cuffed beanie"] }).includes("folded_cuff")); });
+  it("derives pom_pom from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "beanie", styleWords: ["pom pom"] }).includes("pom_pom")); });
+  it("derives pom_pom from pom-pom", () => { assert.ok(deriveHeadwearFeatures({ itemType: "beanie", styleWords: ["pom-pom"] }).includes("pom_pom")); });
+  it("derives adjustable_back", () => { assert.ok(deriveHeadwearFeatures({ itemType: "baseball cap", styleWords: ["adjustable back"] }).includes("adjustable_back")); });
+  it("derives snap_closure", () => { assert.ok(deriveHeadwearFeatures({ itemType: "snapback", styleWords: ["snap closure"] }).includes("snap_closure")); });
+  it("derives curved_bill from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "baseball cap", styleWords: ["curved bill"] }).includes("curved_bill")); });
+  it("derives flat_bill from styleWords", () => { assert.ok(deriveHeadwearFeatures({ itemType: "snapback", styleWords: ["flat bill"] }).includes("flat_bill")); });
+  it("supports multiple features", () => {
+    const result = deriveHeadwearFeatures({ itemType: "beanie", styleWords: ["folded cuff", "pom pom"], visibleText: ["embroidered logo"] });
+    assert.ok(result.includes("embroidered"));
+    assert.ok(result.includes("folded_cuff"));
+    assert.ok(result.includes("pom_pom"));
+  });
+  it("returns empty for generic hat", () => { assert.deepStrictEqual(deriveHeadwearFeatures({ itemType: "hat" }), []); });
+  it("returns empty for non-headwear", () => { assert.deepStrictEqual(deriveHeadwearFeatures({ itemType: "camera" }), []); });
+  it("does not infer logo/embroidered/patch from brand alone", () => {
+    const result = deriveHeadwearFeatures({ itemType: "baseball cap", brand: "New Era" });
+    assert.ok(!result.includes("embroidered"));
+    assert.ok(!result.includes("patch"));
+    assert.ok(!result.includes("logo_print"));
+  });
+});
+
+describe("enrichIdentityWithSchema — headwear", () => {
+  it("populates headwear fields for baseball cap", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear", styleWords: ["curved brim"], materials: ["cotton"] },
+      { overallConfidence: 0.70, attributeCertainty: { category: 0.80 } }
+    );
+    assert.strictEqual(result.headwearKind, "cap");
+    assert.strictEqual(result.headwearType, "baseball_cap");
+    assert.strictEqual(result.brimType, "curved_brim");
+    assert.strictEqual(result.headwearMaterialSignal, "cotton");
+  });
+
+  it("populates headwear fields for snapback", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "snapback", category: "headwear", styleWords: ["flat brim"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, "cap");
+    assert.strictEqual(result.headwearType, "snapback");
+    assert.strictEqual(result.closureAdjustType, "snapback");
+    assert.strictEqual(result.brimType, "flat_brim");
+  });
+
+  it("populates headwear fields for knit beanie", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "knit beanie", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, "beanie");
+    assert.strictEqual(result.headwearType, "knit_beanie");
+    assert.strictEqual(result.brimType, "no_brim");
+    assert.strictEqual(result.headwearMaterialSignal, "knit");
+  });
+
+  it("populates headwear fields for bucket hat", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bucket hat", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, "hat");
+    assert.strictEqual(result.headwearType, "bucket_hat");
+  });
+
+  it("populates headwear fields for fitted cap", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "fitted cap", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.closureAdjustType, "fitted");
+  });
+
+  it("headwearEvidence includes expected entries", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "snapback", category: "headwear", styleWords: ["flat brim", "embroidered"] },
+      { overallConfidence: 0.50 }
+    );
+    assert.ok(result.headwearEvidence.includes("kind:cap"));
+    assert.ok(result.headwearEvidence.includes("type:snapback"));
+    assert.ok(result.headwearEvidence.includes("brim:flat_brim"));
+    assert.ok(result.headwearEvidence.includes("closure:snapback"));
+    assert.ok(result.headwearEvidence.includes("feature:embroidered"));
+  });
+
+  it("headwear identity has mediaKind === null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.mediaKind, null);
+  });
+
+  it("non-headwear identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel", brand: "Hanes" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.strictEqual(result.headwearType, null);
+    assert.strictEqual(result.brimType, null);
+    assert.strictEqual(result.closureAdjustType, null);
+    assert.strictEqual(result.headwearMaterialSignal, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
+  });
+
+  it("empty identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema({}, {});
+    assert.strictEqual(result.headwearKind, null);
+    assert.strictEqual(result.headwearType, null);
+    assert.strictEqual(result.brimType, null);
+    assert.strictEqual(result.closureAdjustType, null);
+    assert.strictEqual(result.headwearMaterialSignal, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
+  });
+
+  it("headwear fields do NOT appear in queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear", brand: "New Era", visibleText: ["New Era"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.ok(!result.queryTermsAllowed.includes("cap"));
+    assert.ok(!result.queryTermsAllowed.includes("baseball_cap"));
+    assert.ok(!result.queryTermsAllowed.includes("curved_brim"));
+  });
+
+  it("headwear fields do NOT appear in queryTermsBlocked", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear", brand: "New Era", visibleText: ["New Era"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.60 } }
+    );
+    assert.ok(!result.queryTermsBlocked.includes("cap"));
+    assert.ok(!result.queryTermsBlocked.includes("baseball_cap"));
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked disjoint for headwear identity", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear", brand: "New Era", visibleText: ["New Era"] },
+      { overallConfidence: 0.70, attributeCertainty: { brand: 0.55 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.deepStrictEqual(overlap, []);
+  });
+});
+
+describe("enrichIdentityWithSchema — headwear cross-type", () => {
+  it("baseball cap → garmentKind:null, clothingKind:null, headwearKind:cap", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, "cap");
+    assert.strictEqual(result.garmentKind, null);
+    assert.strictEqual(result.clothingKind, null);
+  });
+
+  it("t-shirt → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+  });
+
+  it("denim jacket → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "denim jacket", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+  });
+
+  it("analog watch → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("over-ear headphones → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("book → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.headwearKind, null);
+  });
+
+  it("video game → headwearKind:null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.headwearKind, null);
+  });
+});
+
+describe("enrichIdentityWithSchema — headwear regressions", () => {
+  it("model aircraft remains non-high-stakes with headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "model airplane", brand: "Gemini Jets" },
+      { overallConfidence: 0.50 }
+    );
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("high-stakes/luxury behavior unchanged by headwear enrichment", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "luxury", brand: "Gucci", model: "Marmont" },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30 } }
+    );
+    assert.strictEqual(result.luxuryCandidate, true);
+    assert.strictEqual(result.authenticityClaimAllowed, false);
+    assert.ok(result.queryTermsBlocked.includes("Gucci"));
+    assert.strictEqual(result.headwearKind, null);
+  });
+
+  it("headwear identity does not have headwearLuxurySignal field", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "fedora", category: "headwear" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearLuxurySignal, undefined);
+  });
+
+  it("watch identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch", category: "watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
+  });
+
+  it("headphone identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones", category: "electronics" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("garment identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "denim jacket", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("clothing identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt", category: "apparel" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+
+  it("book enriched identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
+    assert.deepStrictEqual(result.headwearEvidence, []);
+  });
+
+  it("video game enriched identity has null headwear fields", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.headwearKind, null);
+    assert.deepStrictEqual(result.headwearFeatures, []);
   });
 });
