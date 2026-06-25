@@ -1,10 +1,11 @@
 // src/universalIdentitySchema.js
-// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5+5B.6+5B.7 — Universal identity schema foundation.
+// Phase 5B.1+5B.2+5B.3B+5B.4+5B.5+5B.6+5B.7+5B.8 — Universal identity schema foundation.
 // Enriches the existing vision identity with structured confidence labels,
 // high-stakes flags, evidence metadata, query-safety metadata,
 // book/video-game recognition, headphone taxonomy enrichment,
 // watch taxonomy enrichment, jacket/coat/sweater/zip taxonomy enrichment,
-// broader clothing taxonomy enrichment, and hat/cap/beanie taxonomy enrichment.
+// broader clothing taxonomy enrichment, hat/cap/beanie taxonomy enrichment,
+// and bag/backpack/handbag/wallet taxonomy enrichment.
 // Pure sync functions, no I/O, no side effects.
 
 import { isTrueHighStakesVisionCategory } from "./visionCategoryPolicy.js";
@@ -1060,6 +1061,217 @@ export function deriveHeadwearFeatures(identity) {
   return features;
 }
 
+// --- Bag / wallet taxonomy (Phase 5B.8) ---
+
+const BAG_ACCESSORY_RE = /\b(bag holder|bag rack|bag stand|bag hook|purse hanger|purse organizer)\b/i;
+const BAG_HOMONYM_RE = /\b(bag of|tea bag|coffee bag|grocery bag|plastic bag|trash bag|garbage bag|shopping bag|dust bag|sleeping bag|body bag|air bag|airbag|sandbag|sand bag|punching bag|bean bag|money bag|goody bag|gift bag|lunch bag|barf bag|feed bag|colostomy bag|iv bag|baggage|bagel|bagpipe|bagpipes|tote bin|tote box|crypto wallet|digital wallet|mobile wallet|e-wallet|ewallet|apple wallet|google wallet|samsung wallet|steam wallet|bitcoin wallet|ethereum wallet|hardware wallet|cold wallet|hot wallet|wallet app|wallet case|purse seine|purse string|purse strings|pursed lips|purse lips|clutch pedal|clutch kit|clutch plate|clutch disc|clutch cable|clutch master|clutch cylinder|clutch fork|clutch release|clutch hitter|clutch player|clutch performance|clutch gene|clutch of eggs|messenger app|messenger rna|facebook messenger|messenger pigeon|messenger bird|backpack blower|backpack vacuum|backpack sprayer|backpack leaf blower|pouch cell|battery pouch|tobacco pouch|kangaroo pouch|marsupial pouch|cheek pouch|food pouch|ketchup pouch|briefcase icon|trading card holder|card game holder|toploader|primary cardholder|credit cardholder|phone card holder|duffel coat|duffle coat|satchel paige|baby sling|arm sling|slingshot|sling tv)\b/i;
+const BAG_EXCLUDED_CAT_RE = /\b(shoe|shoes|sneaker|sneakers|boot|boots|sandal|sandals|hat|cap|beanie|watch|headphone|headphones|earbud|earbuds|shirt|pants|jacket|coat|dress|skirt|sweater|hoodie|scarf|gloves|glove|sock|socks)\b/i;
+const BAG_POSITIVE_RE = /\b(backpack|handbag|tote bag|crossbody bag|crossbody purse|crossbody|shoulder bag|messenger bag|satchel|clutch bag|clutch purse|evening clutch|clutch|wristlet|coin purse|coin pouch|purse|bifold wallet|trifold wallet|zip wallet|leather wallet|card holder|cardholder|wallet|fanny pack|belt bag|waist bag|sling bag|duffel bag|duffle bag|gym bag|travel bag|laptop bag|briefcase|cosmetic bag|makeup bag|drawstring bag|pouch|tote|bag)\b/i;
+
+export function isBagIdentity(identity) {
+  if (!identity || typeof identity !== "object") return false;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (!joined) return false;
+  if (BAG_ACCESSORY_RE.test(joined)) return false;
+  if (BAG_HOMONYM_RE.test(joined)) return false;
+  if (BAG_EXCLUDED_CAT_RE.test(joined)) return false;
+  if (BAG_POSITIVE_RE.test(joined)) return true;
+  return false;
+}
+
+const BKIND_WALLET_RE = /\b(wallet|cardholder|card holder|bifold|trifold|coin purse)\b/i;
+const BKIND_BACKPACK_RE = /\bbackpack\b/i;
+const BKIND_HANDBAG_RE = /\b(handbag|purse|shoulder bag|crossbody|crossbody bag|crossbody purse|clutch|clutch bag|satchel)\b/i;
+const BKIND_POUCH_RE = /\b(pouch|wristlet|cosmetic bag|makeup bag|coin pouch)\b/i;
+const BKIND_BAG_RE = /\b(tote|tote bag|messenger bag|duffel bag|duffle bag|gym bag|travel bag|laptop bag|briefcase|sling bag|fanny pack|belt bag|waist bag|drawstring bag|bag)\b/i;
+
+export function deriveBagKind(identity) {
+  if (!isBagIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (BKIND_WALLET_RE.test(joined)) return "wallet";
+  if (BKIND_BACKPACK_RE.test(joined)) return "backpack";
+  if (BKIND_HANDBAG_RE.test(joined)) return "handbag";
+  if (BKIND_POUCH_RE.test(joined)) return "pouch";
+  if (BKIND_BAG_RE.test(joined)) return "bag";
+  return null;
+}
+
+export function deriveBagType(identity) {
+  if (!isBagIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\bbifold wallet\b/i.test(joined)) return "bifold_wallet";
+  if (/\btrifold wallet\b/i.test(joined)) return "trifold_wallet";
+  if (/\bzip wallet\b/i.test(joined)) return "zip_wallet";
+  if (/\b(leather wallet)\b/i.test(joined) && !/\b(bifold|trifold|zip)\b/i.test(joined)) return "wallet";
+  if (/\b(cardholder|card holder)\b/i.test(joined)) return "cardholder";
+  if (/\bcoin purse\b/i.test(joined)) return "coin_purse";
+  if (/\bcrossbody bag\b/i.test(joined)) return "crossbody_bag";
+  if (/\bcrossbody purse\b/i.test(joined)) return "crossbody_bag";
+  if (/\bshoulder bag\b/i.test(joined)) return "shoulder_bag";
+  if (/\btote bag\b/i.test(joined)) return "tote_bag";
+  if (/\bmessenger bag\b/i.test(joined)) return "messenger_bag";
+  if (/\bsatchel\b/i.test(joined)) return "satchel";
+  if (/\b(clutch bag|clutch purse|evening clutch)\b/i.test(joined)) return "clutch";
+  if (/\bwristlet\b/i.test(joined)) return "wristlet";
+  if (/\bfanny pack\b/i.test(joined)) return "fanny_pack";
+  if (/\bbelt bag\b/i.test(joined)) return "belt_bag";
+  if (/\bwaist bag\b/i.test(joined)) return "waist_bag";
+  if (/\bsling bag\b/i.test(joined)) return "sling_bag";
+  if (/\b(duffel bag|duffle bag)\b/i.test(joined)) return "duffel_bag";
+  if (/\bgym bag\b/i.test(joined)) return "gym_bag";
+  if (/\btravel bag\b/i.test(joined)) return "travel_bag";
+  if (/\blaptop bag\b/i.test(joined)) return "laptop_bag";
+  if (/\bbriefcase\b/i.test(joined)) return "briefcase";
+  if (/\bcosmetic bag\b/i.test(joined)) return "cosmetic_bag";
+  if (/\bmakeup bag\b/i.test(joined)) return "makeup_bag";
+  if (/\bdrawstring bag\b/i.test(joined)) return "drawstring_bag";
+  if (/\bbackpack\b/i.test(joined)) return "backpack";
+  if (/\bhandbag\b/i.test(joined)) return "handbag";
+  if (/\bpurse\b/i.test(joined)) return "purse";
+  if (/\bwallet\b/i.test(joined)) return "wallet";
+  if (/\bpouch\b/i.test(joined)) return "pouch";
+  if (/\b(coin pouch)\b/i.test(joined)) return "pouch";
+  if (/\btote\b/i.test(joined)) return "tote_bag";
+  if (/\bclutch\b/i.test(joined)) return "clutch";
+  return null;
+}
+
+const CARRY_CROSSBODY_RE = /\b(crossbody|cross-body)\b/i;
+const CARRY_SHOULDER_RE = /\b(shoulder bag|shoulder strap)\b/i;
+const CARRY_BACKPACK_RE = /\b(backpack|shoulder straps)\b/i;
+const CARRY_WAIST_RE = /\b(fanny pack|belt bag|waist bag)\b/i;
+const CARRY_WRISTLET_RE = /\b(wristlet|wrist strap)\b/i;
+const CARRY_HANDHELD_RE = /\b(top handle|handbag|clutch|briefcase)\b/i;
+
+export function deriveCarryType(identity) {
+  if (!isBagIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (CARRY_CROSSBODY_RE.test(joined)) return "crossbody";
+  if (CARRY_BACKPACK_RE.test(joined)) return "backpack";
+  if (CARRY_SHOULDER_RE.test(joined)) return "shoulder";
+  if (CARRY_WAIST_RE.test(joined)) return "waist";
+  if (CARRY_WRISTLET_RE.test(joined)) return "wristlet";
+  if (CARRY_HANDHELD_RE.test(joined)) return "handheld";
+  return null;
+}
+
+export function deriveBagClosureType(identity) {
+  if (!isBagIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  if (/\b(zipper|zip closure|zip wallet)\b/i.test(joined)) return "zip";
+  if (/\bsnap closure\b/i.test(joined)) return "snap";
+  if (/\bmagnetic closure\b/i.test(joined)) return "magnetic";
+  if (/\bbuckle closure\b/i.test(joined)) return "buckle";
+  if (/\b(drawstring bag|drawstring closure)\b/i.test(joined)) return "drawstring";
+  if (/\b(flap closure|flap bag)\b/i.test(joined)) return "flap";
+  if (/\b(open top|open-top)\b/i.test(joined)) return "open_top";
+  return null;
+}
+
+export function deriveBagMaterialSignal(identity) {
+  if (!isBagIdentity(identity)) return null;
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ");
+  const materials = Array.isArray(identity.materials) ? identity.materials : [];
+  const matJoined = materials.filter((m) => m && typeof m === "string").join(" ").toLowerCase();
+  const all = (joined + " " + matJoined).toLowerCase();
+  if (/\bleather\b/.test(all)) return "leather";
+  if (/\bcanvas\b/.test(all)) return "canvas";
+  if (/\bnylon\b/.test(all)) return "nylon";
+  if (/\bpolyester\b/.test(all)) return "polyester";
+  if (/\bsuede\b/.test(all)) return "suede";
+  if (/\bdenim\b/.test(all)) return "denim";
+  if (/\bstraw\b/.test(all)) return "straw";
+  if (/\bvinyl\b/.test(all)) return "vinyl";
+  if (/\bfabric\b/.test(all)) return "fabric";
+  return null;
+}
+
+const BFEAT_CARD_SLOTS_RE = /\b(card slots|card slot)\b/i;
+const BFEAT_BILL_RE = /\b(bill compartment|bill pocket)\b/i;
+const BFEAT_COIN_POCKET_RE = /\bcoin pocket\b/i;
+const BFEAT_LAPTOP_SLEEVE_RE = /\blaptop sleeve\b/i;
+const BFEAT_ADJ_STRAP_RE = /\badjustable strap\b/i;
+const BFEAT_DET_STRAP_RE = /\bdetachable strap\b/i;
+const BFEAT_CHAIN_STRAP_RE = /\bchain strap\b/i;
+const BFEAT_SHOULDER_STRAP_RE = /\bshoulder strap\b/i;
+const BFEAT_TOP_HANDLE_RE = /\btop handle\b/i;
+const BFEAT_FRONT_POCKET_RE = /\bfront pocket\b/i;
+const BFEAT_ZIP_POCKET_RE = /\bzip pocket\b/i;
+const BFEAT_DRAWSTRING_RE = /\bdrawstring\b/i;
+const BFEAT_QUILTED_RE = /\b(quilted|quilting)\b/i;
+const BFEAT_HARDWARE_RE = /\bhardware\b/i;
+const BFEAT_FEET_RE = /\b(feet|bag feet|bottom feet)\b/i;
+const BFEAT_MONOGRAM_RE = /\b(monogram pattern|monogram print|monogram)\b/i;
+const BFEAT_LOGO_PRINT_RE = /\b(logo print|logo printed)\b/i;
+
+export function deriveBagFeatures(identity) {
+  if (!isBagIdentity(identity)) return [];
+  const fields = [
+    identity.category,
+    identity.itemType,
+    identity.subtype,
+    Array.isArray(identity.styleWords) ? identity.styleWords.join(" ") : null,
+  ];
+  const vt = Array.isArray(identity.visibleText) ? identity.visibleText : [];
+  const joined = fields.filter((f) => f && typeof f === "string").join(" ") +
+    " " + vt.filter((t) => t && typeof t === "string").join(" ");
+  const features = [];
+  if (BFEAT_CARD_SLOTS_RE.test(joined)) features.push("card_slots");
+  if (BFEAT_BILL_RE.test(joined)) features.push("bill_compartment");
+  if (BFEAT_COIN_POCKET_RE.test(joined)) features.push("coin_pocket");
+  if (BFEAT_LAPTOP_SLEEVE_RE.test(joined)) features.push("laptop_sleeve");
+  if (BFEAT_ADJ_STRAP_RE.test(joined)) features.push("adjustable_strap");
+  if (BFEAT_DET_STRAP_RE.test(joined)) features.push("detachable_strap");
+  if (BFEAT_CHAIN_STRAP_RE.test(joined)) features.push("chain_strap");
+  if (BFEAT_SHOULDER_STRAP_RE.test(joined)) features.push("shoulder_strap");
+  if (BFEAT_TOP_HANDLE_RE.test(joined)) features.push("top_handle");
+  if (BFEAT_FRONT_POCKET_RE.test(joined)) features.push("front_pocket");
+  if (BFEAT_ZIP_POCKET_RE.test(joined)) features.push("zip_pocket");
+  if (BFEAT_DRAWSTRING_RE.test(joined)) features.push("drawstring");
+  if (BFEAT_QUILTED_RE.test(joined)) features.push("quilted");
+  if (BFEAT_HARDWARE_RE.test(joined)) features.push("hardware");
+  if (BFEAT_FEET_RE.test(joined)) features.push("feet");
+  if (BFEAT_MONOGRAM_RE.test(joined)) features.push("monogram_pattern");
+  if (BFEAT_LOGO_PRINT_RE.test(joined)) features.push("logo_print");
+  return features;
+}
+
 function computeMissingEvidence(identity) {
   const missing = [];
   if (!identity.brand) missing.push("brand not identified");
@@ -1406,6 +1618,32 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     headwearEvidence = ev;
   }
 
+  // --- Bag / wallet taxonomy enrichment (Phase 5B.8) ---
+  const bagDetected = isBagIdentity(id);
+  let bagKind = null;
+  let bagType = null;
+  let carryType = null;
+  let bagClosureType = null;
+  let bagMaterialSignal = null;
+  let bagFeatures = [];
+  let bagEvidence = [];
+  if (bagDetected) {
+    bagKind = deriveBagKind(id);
+    bagType = deriveBagType(id);
+    carryType = deriveCarryType(id);
+    bagClosureType = deriveBagClosureType(id);
+    bagMaterialSignal = deriveBagMaterialSignal(id);
+    bagFeatures = deriveBagFeatures(id);
+    const ev = [];
+    if (bagKind) ev.push(`kind:${bagKind}`);
+    if (bagType) ev.push(`type:${bagType}`);
+    if (carryType) ev.push(`carry:${carryType}`);
+    if (bagClosureType) ev.push(`closure:${bagClosureType}`);
+    if (bagMaterialSignal) ev.push(`material:${bagMaterialSignal}`);
+    for (const f of bagFeatures) ev.push(`feature:${f}`);
+    bagEvidence = ev;
+  }
+
   const blockedSet = new Set(queryTermsBlocked);
   const queryTermsAllowed = rawQueryTermsAllowed.filter((t) => !blockedSet.has(t));
 
@@ -1477,5 +1715,12 @@ export function enrichIdentityWithSchema(identity = {}, options = {}) {
     headwearMaterialSignal,
     headwearFeatures,
     headwearEvidence,
+    bagKind,
+    bagType,
+    carryType,
+    bagClosureType,
+    bagMaterialSignal,
+    bagFeatures,
+    bagEvidence,
   };
 }

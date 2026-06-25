@@ -48,6 +48,13 @@ import {
   deriveClosureAdjustType,
   deriveHeadwearMaterialSignal,
   deriveHeadwearFeatures,
+  isBagIdentity,
+  deriveBagKind,
+  deriveBagType,
+  deriveCarryType,
+  deriveBagClosureType,
+  deriveBagMaterialSignal,
+  deriveBagFeatures,
 } from "./universalIdentitySchema.js";
 
 describe("CONFIDENCE_LABELS", () => {
@@ -3089,5 +3096,560 @@ describe("enrichIdentityWithSchema — headwear regressions", () => {
     );
     assert.strictEqual(result.headwearKind, null);
     assert.deepStrictEqual(result.headwearFeatures, []);
+  });
+});
+
+// ===== Phase 5B.8 — Bag / Backpack / Handbag / Wallet Taxonomy =====
+
+describe("isBagIdentity — positive detection", () => {
+  it("detects bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bag" }), true); });
+  it("detects backpack", () => { assert.strictEqual(isBagIdentity({ itemType: "backpack" }), true); });
+  it("detects handbag", () => { assert.strictEqual(isBagIdentity({ itemType: "handbag" }), true); });
+  it("detects purse", () => { assert.strictEqual(isBagIdentity({ itemType: "purse" }), true); });
+  it("detects shoulder bag", () => { assert.strictEqual(isBagIdentity({ itemType: "shoulder bag" }), true); });
+  it("detects crossbody bag", () => { assert.strictEqual(isBagIdentity({ itemType: "crossbody bag" }), true); });
+  it("detects crossbody purse", () => { assert.strictEqual(isBagIdentity({ itemType: "crossbody purse" }), true); });
+  it("detects crossbody", () => { assert.strictEqual(isBagIdentity({ itemType: "crossbody" }), true); });
+  it("detects tote bag", () => { assert.strictEqual(isBagIdentity({ itemType: "tote bag" }), true); });
+  it("detects tote", () => { assert.strictEqual(isBagIdentity({ itemType: "tote" }), true); });
+  it("detects messenger bag", () => { assert.strictEqual(isBagIdentity({ itemType: "messenger bag" }), true); });
+  it("detects satchel", () => { assert.strictEqual(isBagIdentity({ itemType: "satchel" }), true); });
+  it("detects clutch bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch bag" }), true); });
+  it("detects clutch", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch" }), true); });
+  it("detects evening clutch", () => { assert.strictEqual(isBagIdentity({ itemType: "evening clutch" }), true); });
+  it("detects clutch purse", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch purse" }), true); });
+  it("detects wristlet", () => { assert.strictEqual(isBagIdentity({ itemType: "wristlet" }), true); });
+  it("detects wallet", () => { assert.strictEqual(isBagIdentity({ itemType: "wallet" }), true); });
+  it("detects cardholder", () => { assert.strictEqual(isBagIdentity({ itemType: "cardholder" }), true); });
+  it("detects card holder", () => { assert.strictEqual(isBagIdentity({ itemType: "card holder" }), true); });
+  it("detects coin purse", () => { assert.strictEqual(isBagIdentity({ itemType: "coin purse" }), true); });
+  it("detects bifold wallet", () => { assert.strictEqual(isBagIdentity({ itemType: "bifold wallet" }), true); });
+  it("detects trifold wallet", () => { assert.strictEqual(isBagIdentity({ itemType: "trifold wallet" }), true); });
+  it("detects zip wallet", () => { assert.strictEqual(isBagIdentity({ itemType: "zip wallet" }), true); });
+  it("detects leather wallet", () => { assert.strictEqual(isBagIdentity({ itemType: "leather wallet" }), true); });
+  it("detects fanny pack", () => { assert.strictEqual(isBagIdentity({ itemType: "fanny pack" }), true); });
+  it("detects belt bag", () => { assert.strictEqual(isBagIdentity({ itemType: "belt bag" }), true); });
+  it("detects waist bag", () => { assert.strictEqual(isBagIdentity({ itemType: "waist bag" }), true); });
+  it("detects sling bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sling bag" }), true); });
+  it("detects duffel bag", () => { assert.strictEqual(isBagIdentity({ itemType: "duffel bag" }), true); });
+  it("detects duffle bag", () => { assert.strictEqual(isBagIdentity({ itemType: "duffle bag" }), true); });
+  it("detects gym bag", () => { assert.strictEqual(isBagIdentity({ itemType: "gym bag" }), true); });
+  it("detects travel bag", () => { assert.strictEqual(isBagIdentity({ itemType: "travel bag" }), true); });
+  it("detects laptop bag", () => { assert.strictEqual(isBagIdentity({ itemType: "laptop bag" }), true); });
+  it("detects briefcase", () => { assert.strictEqual(isBagIdentity({ itemType: "briefcase" }), true); });
+  it("detects cosmetic bag", () => { assert.strictEqual(isBagIdentity({ itemType: "cosmetic bag" }), true); });
+  it("detects makeup bag", () => { assert.strictEqual(isBagIdentity({ itemType: "makeup bag" }), true); });
+  it("detects drawstring bag", () => { assert.strictEqual(isBagIdentity({ itemType: "drawstring bag" }), true); });
+  it("detects pouch", () => { assert.strictEqual(isBagIdentity({ itemType: "pouch" }), true); });
+  it("detects coin pouch", () => { assert.strictEqual(isBagIdentity({ itemType: "coin pouch" }), true); });
+  it("detects from styleWords", () => { assert.strictEqual(isBagIdentity({ itemType: "accessory", styleWords: ["crossbody bag"] }), true); });
+  it("detects from category", () => { assert.strictEqual(isBagIdentity({ category: "handbag" }), true); });
+  it("returns false for null", () => { assert.strictEqual(isBagIdentity(null), false); });
+  it("returns false for empty object", () => { assert.strictEqual(isBagIdentity({}), false); });
+});
+
+describe("isBagIdentity — false-positive rejection", () => {
+  // Homonym vetoes (UNCONDITIONAL)
+  it("bag of chips is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bag of chips" }), false); });
+  it("tea bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "tea bag" }), false); });
+  it("coffee bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "coffee bag" }), false); });
+  it("grocery bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "grocery bag" }), false); });
+  it("plastic bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "plastic bag" }), false); });
+  it("trash bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "trash bag" }), false); });
+  it("garbage bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "garbage bag" }), false); });
+  it("shopping bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "shopping bag" }), false); });
+  it("dust bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "dust bag" }), false); });
+  it("sleeping bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sleeping bag" }), false); });
+  it("body bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "body bag" }), false); });
+  it("airbag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "airbag" }), false); });
+  it("air bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "air bag" }), false); });
+  it("sandbag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sandbag" }), false); });
+  it("sand bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sand bag" }), false); });
+  it("punching bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "punching bag" }), false); });
+  it("bean bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bean bag" }), false); });
+  it("money bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "money bag" }), false); });
+  it("gift bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "gift bag" }), false); });
+  it("lunch bag is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "lunch bag" }), false); });
+  it("baggage is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "baggage" }), false); });
+  it("bagel is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bagel" }), false); });
+  it("bagpipe is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bagpipe" }), false); });
+  it("bagpipes is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bagpipes" }), false); });
+  it("tote bin is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "tote bin" }), false); });
+  it("tote box is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "tote box" }), false); });
+  // Wallet homonyms
+  it("crypto wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "crypto wallet" }), false); });
+  it("digital wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "digital wallet" }), false); });
+  it("mobile wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "mobile wallet" }), false); });
+  it("Apple Wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "Apple Wallet" }), false); });
+  it("Google Wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "Google Wallet" }), false); });
+  it("Steam wallet is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "Steam wallet" }), false); });
+  it("wallet app is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "wallet app" }), false); });
+  it("wallet case is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "wallet case" }), false); });
+  // Purse homonyms
+  it("purse seine is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "purse seine" }), false); });
+  it("purse strings is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "purse strings" }), false); });
+  it("pursed lips is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "pursed lips" }), false); });
+  // Clutch homonyms
+  it("clutch pedal is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch pedal" }), false); });
+  it("clutch kit is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch kit" }), false); });
+  it("clutch plate is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch plate" }), false); });
+  it("clutch performance is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch performance" }), false); });
+  it("clutch of eggs is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "clutch of eggs" }), false); });
+  // Messenger homonyms
+  it("messenger app is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "messenger app" }), false); });
+  it("messenger RNA is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "messenger rna" }), false); });
+  it("Facebook Messenger is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "Facebook Messenger" }), false); });
+  // Backpack homonyms
+  it("backpack blower is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "backpack blower" }), false); });
+  it("backpack vacuum is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "backpack vacuum" }), false); });
+  it("backpack sprayer is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "backpack sprayer" }), false); });
+  // Pouch homonyms
+  it("pouch cell is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "pouch cell" }), false); });
+  it("battery pouch is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "battery pouch" }), false); });
+  it("tobacco pouch is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "tobacco pouch" }), false); });
+  it("kangaroo pouch is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "kangaroo pouch" }), false); });
+  it("cheek pouch is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "cheek pouch" }), false); });
+  // Other homonyms
+  it("briefcase icon is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "briefcase icon" }), false); });
+  it("trading card holder is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "trading card holder" }), false); });
+  it("card game holder is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "card game holder" }), false); });
+  it("credit cardholder (role) is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "credit cardholder" }), false); });
+  it("phone card holder is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "phone card holder" }), false); });
+  it("duffel coat is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "duffel coat" }), false); });
+  it("duffle coat is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "duffle coat" }), false); });
+  it("Satchel Paige is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "satchel paige" }), false); });
+  it("baby sling is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "baby sling" }), false); });
+  it("arm sling is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "arm sling" }), false); });
+  it("slingshot is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "slingshot" }), false); });
+  it("Sling TV is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sling tv" }), false); });
+  // Accessory vetoes
+  it("bag holder is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bag holder" }), false); });
+  it("bag rack is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bag rack" }), false); });
+  it("bag stand is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "bag stand" }), false); });
+  it("purse hanger is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "purse hanger" }), false); });
+  // Cross-type exclusions
+  it("shoes is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "shoes" }), false); });
+  it("sneakers is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sneakers" }), false); });
+  it("boots is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "boots" }), false); });
+  it("sandals is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sandals" }), false); });
+  it("hat is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "hat" }), false); });
+  it("cap is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "cap" }), false); });
+  it("beanie is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "beanie" }), false); });
+  it("watch is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "watch" }), false); });
+  it("headphones is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "headphones" }), false); });
+  it("shirt is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "shirt" }), false); });
+  it("pants is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "pants" }), false); });
+  it("jacket is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "jacket" }), false); });
+  it("coat is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "coat" }), false); });
+  it("dress is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "dress" }), false); });
+  it("skirt is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "skirt" }), false); });
+  it("sweater is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "sweater" }), false); });
+  it("hoodie is not bag", () => { assert.strictEqual(isBagIdentity({ itemType: "hoodie" }), false); });
+});
+
+describe("deriveBagKind", () => {
+  it("returns bag for generic bag", () => { assert.strictEqual(deriveBagKind({ itemType: "bag" }), "bag"); });
+  it("returns bag for tote bag", () => { assert.strictEqual(deriveBagKind({ itemType: "tote bag" }), "bag"); });
+  it("returns bag for tote", () => { assert.strictEqual(deriveBagKind({ itemType: "tote" }), "bag"); });
+  it("returns bag for messenger bag", () => { assert.strictEqual(deriveBagKind({ itemType: "messenger bag" }), "bag"); });
+  it("returns bag for duffel bag", () => { assert.strictEqual(deriveBagKind({ itemType: "duffel bag" }), "bag"); });
+  it("returns bag for briefcase", () => { assert.strictEqual(deriveBagKind({ itemType: "briefcase" }), "bag"); });
+  it("returns bag for fanny pack", () => { assert.strictEqual(deriveBagKind({ itemType: "fanny pack" }), "bag"); });
+  it("returns bag for belt bag", () => { assert.strictEqual(deriveBagKind({ itemType: "belt bag" }), "bag"); });
+  it("returns bag for sling bag", () => { assert.strictEqual(deriveBagKind({ itemType: "sling bag" }), "bag"); });
+  it("returns bag for drawstring bag", () => { assert.strictEqual(deriveBagKind({ itemType: "drawstring bag" }), "bag"); });
+  it("returns backpack for backpack", () => { assert.strictEqual(deriveBagKind({ itemType: "backpack" }), "backpack"); });
+  it("returns handbag for handbag", () => { assert.strictEqual(deriveBagKind({ itemType: "handbag" }), "handbag"); });
+  it("returns handbag for purse", () => { assert.strictEqual(deriveBagKind({ itemType: "purse" }), "handbag"); });
+  it("returns handbag for shoulder bag", () => { assert.strictEqual(deriveBagKind({ itemType: "shoulder bag" }), "handbag"); });
+  it("returns handbag for crossbody bag", () => { assert.strictEqual(deriveBagKind({ itemType: "crossbody bag" }), "handbag"); });
+  it("returns handbag for clutch", () => { assert.strictEqual(deriveBagKind({ itemType: "clutch" }), "handbag"); });
+  it("returns handbag for satchel", () => { assert.strictEqual(deriveBagKind({ itemType: "satchel" }), "handbag"); });
+  it("returns wallet for wallet", () => { assert.strictEqual(deriveBagKind({ itemType: "wallet" }), "wallet"); });
+  it("returns wallet for cardholder", () => { assert.strictEqual(deriveBagKind({ itemType: "cardholder" }), "wallet"); });
+  it("returns wallet for bifold wallet", () => { assert.strictEqual(deriveBagKind({ itemType: "bifold wallet" }), "wallet"); });
+  it("returns wallet for trifold wallet", () => { assert.strictEqual(deriveBagKind({ itemType: "trifold wallet" }), "wallet"); });
+  it("returns wallet for coin purse", () => { assert.strictEqual(deriveBagKind({ itemType: "coin purse" }), "wallet"); });
+  it("returns pouch for pouch", () => { assert.strictEqual(deriveBagKind({ itemType: "pouch" }), "pouch"); });
+  it("returns pouch for wristlet", () => { assert.strictEqual(deriveBagKind({ itemType: "wristlet" }), "pouch"); });
+  it("returns pouch for cosmetic bag", () => { assert.strictEqual(deriveBagKind({ itemType: "cosmetic bag" }), "pouch"); });
+  it("returns pouch for makeup bag", () => { assert.strictEqual(deriveBagKind({ itemType: "makeup bag" }), "pouch"); });
+  it("returns null for non-bag", () => { assert.strictEqual(deriveBagKind({ itemType: "camera" }), null); });
+});
+
+describe("deriveBagType", () => {
+  it("derives tote_bag from tote bag", () => { assert.strictEqual(deriveBagType({ itemType: "tote bag" }), "tote_bag"); });
+  it("derives tote_bag from bare tote", () => { assert.strictEqual(deriveBagType({ itemType: "tote" }), "tote_bag"); });
+  it("derives crossbody_bag", () => { assert.strictEqual(deriveBagType({ itemType: "crossbody bag" }), "crossbody_bag"); });
+  it("derives crossbody_bag from crossbody purse", () => { assert.strictEqual(deriveBagType({ itemType: "crossbody purse" }), "crossbody_bag"); });
+  it("derives shoulder_bag", () => { assert.strictEqual(deriveBagType({ itemType: "shoulder bag" }), "shoulder_bag"); });
+  it("derives messenger_bag", () => { assert.strictEqual(deriveBagType({ itemType: "messenger bag" }), "messenger_bag"); });
+  it("derives satchel", () => { assert.strictEqual(deriveBagType({ itemType: "satchel" }), "satchel"); });
+  it("derives clutch from clutch bag", () => { assert.strictEqual(deriveBagType({ itemType: "clutch bag" }), "clutch"); });
+  it("derives clutch from bare clutch", () => { assert.strictEqual(deriveBagType({ itemType: "clutch" }), "clutch"); });
+  it("derives wristlet", () => { assert.strictEqual(deriveBagType({ itemType: "wristlet" }), "wristlet"); });
+  it("derives backpack", () => { assert.strictEqual(deriveBagType({ itemType: "backpack" }), "backpack"); });
+  it("derives handbag", () => { assert.strictEqual(deriveBagType({ itemType: "handbag" }), "handbag"); });
+  it("derives purse", () => { assert.strictEqual(deriveBagType({ itemType: "purse" }), "purse"); });
+  it("derives wallet", () => { assert.strictEqual(deriveBagType({ itemType: "wallet" }), "wallet"); });
+  it("derives bifold_wallet", () => { assert.strictEqual(deriveBagType({ itemType: "bifold wallet" }), "bifold_wallet"); });
+  it("derives trifold_wallet", () => { assert.strictEqual(deriveBagType({ itemType: "trifold wallet" }), "trifold_wallet"); });
+  it("derives zip_wallet", () => { assert.strictEqual(deriveBagType({ itemType: "zip wallet" }), "zip_wallet"); });
+  it("derives cardholder", () => { assert.strictEqual(deriveBagType({ itemType: "cardholder" }), "cardholder"); });
+  it("derives cardholder from card holder", () => { assert.strictEqual(deriveBagType({ itemType: "card holder" }), "cardholder"); });
+  it("derives coin_purse", () => { assert.strictEqual(deriveBagType({ itemType: "coin purse" }), "coin_purse"); });
+  it("derives fanny_pack", () => { assert.strictEqual(deriveBagType({ itemType: "fanny pack" }), "fanny_pack"); });
+  it("derives belt_bag", () => { assert.strictEqual(deriveBagType({ itemType: "belt bag" }), "belt_bag"); });
+  it("derives waist_bag", () => { assert.strictEqual(deriveBagType({ itemType: "waist bag" }), "waist_bag"); });
+  it("derives sling_bag", () => { assert.strictEqual(deriveBagType({ itemType: "sling bag" }), "sling_bag"); });
+  it("derives duffel_bag", () => { assert.strictEqual(deriveBagType({ itemType: "duffel bag" }), "duffel_bag"); });
+  it("derives duffel_bag from duffle bag", () => { assert.strictEqual(deriveBagType({ itemType: "duffle bag" }), "duffel_bag"); });
+  it("derives gym_bag", () => { assert.strictEqual(deriveBagType({ itemType: "gym bag" }), "gym_bag"); });
+  it("derives travel_bag", () => { assert.strictEqual(deriveBagType({ itemType: "travel bag" }), "travel_bag"); });
+  it("derives laptop_bag", () => { assert.strictEqual(deriveBagType({ itemType: "laptop bag" }), "laptop_bag"); });
+  it("derives briefcase", () => { assert.strictEqual(deriveBagType({ itemType: "briefcase" }), "briefcase"); });
+  it("derives cosmetic_bag", () => { assert.strictEqual(deriveBagType({ itemType: "cosmetic bag" }), "cosmetic_bag"); });
+  it("derives makeup_bag", () => { assert.strictEqual(deriveBagType({ itemType: "makeup bag" }), "makeup_bag"); });
+  it("derives drawstring_bag", () => { assert.strictEqual(deriveBagType({ itemType: "drawstring bag" }), "drawstring_bag"); });
+  it("derives pouch", () => { assert.strictEqual(deriveBagType({ itemType: "pouch" }), "pouch"); });
+  it("bare bag returns null bagType", () => { assert.strictEqual(deriveBagType({ itemType: "bag" }), null); });
+  it("returns null for non-bag", () => { assert.strictEqual(deriveBagType({ itemType: "camera" }), null); });
+});
+
+describe("deriveCarryType", () => {
+  it("derives crossbody from crossbody bag", () => { assert.strictEqual(deriveCarryType({ itemType: "crossbody bag" }), "crossbody"); });
+  it("derives crossbody from cross-body", () => { assert.strictEqual(deriveCarryType({ itemType: "bag", styleWords: ["cross-body"] }), "crossbody"); });
+  it("derives backpack from backpack", () => { assert.strictEqual(deriveCarryType({ itemType: "backpack" }), "backpack"); });
+  it("derives shoulder from shoulder bag", () => { assert.strictEqual(deriveCarryType({ itemType: "shoulder bag" }), "shoulder"); });
+  it("derives shoulder from shoulder strap", () => { assert.strictEqual(deriveCarryType({ itemType: "bag", styleWords: ["shoulder strap"] }), "shoulder"); });
+  it("derives waist from fanny pack", () => { assert.strictEqual(deriveCarryType({ itemType: "fanny pack" }), "waist"); });
+  it("derives waist from belt bag", () => { assert.strictEqual(deriveCarryType({ itemType: "belt bag" }), "waist"); });
+  it("derives waist from waist bag", () => { assert.strictEqual(deriveCarryType({ itemType: "waist bag" }), "waist"); });
+  it("derives wristlet from wristlet", () => { assert.strictEqual(deriveCarryType({ itemType: "wristlet" }), "wristlet"); });
+  it("derives handheld from clutch", () => { assert.strictEqual(deriveCarryType({ itemType: "clutch" }), "handheld"); });
+  it("derives handheld from handbag", () => { assert.strictEqual(deriveCarryType({ itemType: "handbag" }), "handheld"); });
+  it("derives handheld from briefcase", () => { assert.strictEqual(deriveCarryType({ itemType: "briefcase" }), "handheld"); });
+  it("derives handheld from top handle", () => { assert.strictEqual(deriveCarryType({ itemType: "bag", styleWords: ["top handle"] }), "handheld"); });
+  it("returns null for wallet", () => { assert.strictEqual(deriveCarryType({ itemType: "wallet" }), null); });
+  it("returns null for non-bag", () => { assert.strictEqual(deriveCarryType({ itemType: "camera" }), null); });
+});
+
+describe("deriveBagClosureType", () => {
+  it("derives zip from zipper", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["zipper"] }), "zip"); });
+  it("derives zip from zip closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["zip closure"] }), "zip"); });
+  it("derives zip from zip wallet", () => { assert.strictEqual(deriveBagClosureType({ itemType: "zip wallet" }), "zip"); });
+  it("derives snap from snap closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["snap closure"] }), "snap"); });
+  it("derives magnetic from magnetic closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["magnetic closure"] }), "magnetic"); });
+  it("derives buckle from buckle closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["buckle closure"] }), "buckle"); });
+  it("derives drawstring from drawstring bag", () => { assert.strictEqual(deriveBagClosureType({ itemType: "drawstring bag" }), "drawstring"); });
+  it("derives flap from flap closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["flap closure"] }), "flap"); });
+  it("derives open_top from open top", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["open top"] }), "open_top"); });
+  it("derives open_top from open-top", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag", styleWords: ["open-top"] }), "open_top"); });
+  it("returns null for unknown closure", () => { assert.strictEqual(deriveBagClosureType({ itemType: "bag" }), null); });
+  it("returns null for non-bag", () => { assert.strictEqual(deriveBagClosureType({ itemType: "camera" }), null); });
+});
+
+describe("deriveBagMaterialSignal", () => {
+  it("derives leather from material", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["leather"] }), "leather"); });
+  it("derives canvas from styleWords", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", styleWords: ["canvas"] }), "canvas"); });
+  it("derives nylon", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["nylon"] }), "nylon"); });
+  it("derives polyester", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["polyester"] }), "polyester"); });
+  it("derives suede", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["suede"] }), "suede"); });
+  it("derives denim", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["denim"] }), "denim"); });
+  it("derives straw", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["straw"] }), "straw"); });
+  it("derives vinyl", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["vinyl"] }), "vinyl"); });
+  it("derives fabric", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", materials: ["fabric"] }), "fabric"); });
+  it("derives leather from itemType compound", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "leather wallet" }), "leather"); });
+  it("returns null without material evidence", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag" }), null); });
+  it("brand alone does not infer material", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "bag", brand: "Coach" }), null); });
+  it("returns null for non-bag", () => { assert.strictEqual(deriveBagMaterialSignal({ itemType: "camera" }), null); });
+});
+
+describe("deriveBagFeatures", () => {
+  it("derives card_slots", () => { assert.ok(deriveBagFeatures({ itemType: "wallet", styleWords: ["card slots"] }).includes("card_slots")); });
+  it("derives bill_compartment", () => { assert.ok(deriveBagFeatures({ itemType: "wallet", styleWords: ["bill compartment"] }).includes("bill_compartment")); });
+  it("derives coin_pocket", () => { assert.ok(deriveBagFeatures({ itemType: "wallet", styleWords: ["coin pocket"] }).includes("coin_pocket")); });
+  it("derives laptop_sleeve", () => { assert.ok(deriveBagFeatures({ itemType: "backpack", styleWords: ["laptop sleeve"] }).includes("laptop_sleeve")); });
+  it("derives adjustable_strap", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["adjustable strap"] }).includes("adjustable_strap")); });
+  it("derives detachable_strap", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["detachable strap"] }).includes("detachable_strap")); });
+  it("derives chain_strap", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["chain strap"] }).includes("chain_strap")); });
+  it("derives shoulder_strap", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["shoulder strap"] }).includes("shoulder_strap")); });
+  it("derives top_handle", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["top handle"] }).includes("top_handle")); });
+  it("derives front_pocket", () => { assert.ok(deriveBagFeatures({ itemType: "backpack", styleWords: ["front pocket"] }).includes("front_pocket")); });
+  it("derives zip_pocket", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["zip pocket"] }).includes("zip_pocket")); });
+  it("derives drawstring", () => { assert.ok(deriveBagFeatures({ itemType: "drawstring bag" }).includes("drawstring")); });
+  it("derives quilted", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["quilted"] }).includes("quilted")); });
+  it("derives hardware", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["hardware"] }).includes("hardware")); });
+  it("derives feet", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["bag feet"] }).includes("feet")); });
+  it("derives monogram_pattern", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["monogram pattern"] }).includes("monogram_pattern")); });
+  it("derives logo_print", () => { assert.ok(deriveBagFeatures({ itemType: "bag", styleWords: ["logo print"] }).includes("logo_print")); });
+  it("derives from visibleText", () => { assert.ok(deriveBagFeatures({ itemType: "wallet", visibleText: ["card slots"] }).includes("card_slots")); });
+  it("brand alone does not infer features", () => { assert.deepStrictEqual(deriveBagFeatures({ itemType: "bag", brand: "Coach" }), []); });
+  it("returns empty for non-bag", () => { assert.deepStrictEqual(deriveBagFeatures({ itemType: "camera" }), []); });
+});
+
+describe("enrichIdentityWithSchema — bags", () => {
+  it("enriches canvas tote bag with shoulder straps", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "tote bag", styleWords: ["canvas", "shoulder strap", "open top"], materials: ["canvas"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "bag");
+    assert.strictEqual(result.bagType, "tote_bag");
+    assert.strictEqual(result.bagMaterialSignal, "canvas");
+    assert.ok(result.bagFeatures.includes("shoulder_strap"));
+    assert.strictEqual(result.bagClosureType, "open_top");
+    assert.ok(result.bagEvidence.length > 0);
+  });
+
+  it("enriches black leather crossbody purse with zipper", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "crossbody purse", styleWords: ["zipper", "adjustable strap"], materials: ["leather"], colors: ["black"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "handbag");
+    assert.strictEqual(result.bagType, "crossbody_bag");
+    assert.strictEqual(result.carryType, "crossbody");
+    assert.strictEqual(result.bagMaterialSignal, "leather");
+    assert.strictEqual(result.bagClosureType, "zip");
+    assert.ok(result.bagFeatures.includes("adjustable_strap"));
+  });
+
+  it("enriches brown leather bifold wallet with card slots and bill compartment", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bifold wallet", styleWords: ["card slots", "bill compartment"], materials: ["leather"], colors: ["brown"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "wallet");
+    assert.strictEqual(result.bagType, "bifold_wallet");
+    assert.strictEqual(result.bagMaterialSignal, "leather");
+    assert.ok(result.bagFeatures.includes("card_slots"));
+    assert.ok(result.bagFeatures.includes("bill_compartment"));
+  });
+
+  it("enriches backpack with laptop sleeve", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "backpack", styleWords: ["laptop sleeve", "front pocket"], materials: ["nylon"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "backpack");
+    assert.strictEqual(result.bagType, "backpack");
+    assert.strictEqual(result.carryType, "backpack");
+    assert.strictEqual(result.bagMaterialSignal, "nylon");
+    assert.ok(result.bagFeatures.includes("laptop_sleeve"));
+    assert.ok(result.bagFeatures.includes("front_pocket"));
+  });
+
+  it("bare bag gets bagKind bag but bagType null", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bag" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "bag");
+    assert.strictEqual(result.bagType, null);
+  });
+
+  it("wristlet gets pouch kind and wristlet carry", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "wristlet" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "pouch");
+    assert.strictEqual(result.bagType, "wristlet");
+    assert.strictEqual(result.carryType, "wristlet");
+  });
+
+  it("fanny pack gets waist carry", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "fanny pack" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, "bag");
+    assert.strictEqual(result.bagType, "fanny_pack");
+    assert.strictEqual(result.carryType, "waist");
+  });
+});
+
+describe("enrichIdentityWithSchema — bags cross-type", () => {
+  it("bag identity has null mediaKind/audioKind/watchKind/garmentKind/clothingKind/headwearKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "backpack" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.mediaKind, null);
+    assert.strictEqual(result.audioKind, null);
+    assert.strictEqual(result.watchKind, null);
+    assert.strictEqual(result.garmentKind, null);
+    assert.strictEqual(result.clothingKind, null);
+    assert.strictEqual(result.headwearKind, null);
+    assert.strictEqual(result.bagKind, "backpack");
+  });
+
+  it("hat identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "baseball cap" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, null);
+    assert.deepStrictEqual(result.bagFeatures, []);
+  });
+
+  it("t-shirt identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "t-shirt" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, null);
+  });
+
+  it("denim jacket identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "denim jacket" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, null);
+  });
+
+  it("analog watch identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "analog watch" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, null);
+  });
+
+  it("over-ear headphones identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "over-ear headphones" },
+      { overallConfidence: 0.70 }
+    );
+    assert.strictEqual(result.bagKind, null);
+  });
+
+  it("book identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "paperback book", model: "Dune", visibleText: ["Dune"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.bagKind, null);
+    assert.deepStrictEqual(result.bagFeatures, []);
+  });
+
+  it("video game identity has null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "video game case", model: "Zelda", visibleText: ["Nintendo Switch"] },
+      { overallConfidence: 0.70, attributeCertainty: { model: 0.60 } }
+    );
+    assert.strictEqual(result.bagKind, null);
+  });
+});
+
+describe("enrichIdentityWithSchema — bags regressions", () => {
+  it("category handbag stays highStakes true", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "handbag", itemType: "crossbody bag", brand: "TestBrand" },
+      { overallConfidence: 0.50, attributeCertainty: { brand: 0.40 } }
+    );
+    assert.strictEqual(result.highStakes, true);
+    assert.strictEqual(result.bagKind, "handbag");
+  });
+
+  it("unconfirmed brand on handbag is blocked", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "handbag", itemType: "handbag", brand: "DesignerBrand" },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30, category: 0.50 } }
+    );
+    assert.strictEqual(result.highStakes, true);
+    assert.strictEqual(result.authenticityClaimAllowed, false);
+    assert.ok(result.queryTermsBlocked.includes("DesignerBrand"));
+  });
+
+  it("monogram_pattern does not affect luxury/highStakes/brand/queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bag", styleWords: ["monogram pattern"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(result.bagFeatures.includes("monogram_pattern"));
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.luxuryCandidate, false);
+    assert.ok(!result.queryTermsAllowed.includes("monogram_pattern"));
+  });
+
+  it("quilted does not affect luxury/highStakes/brand/queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bag", styleWords: ["quilted"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(result.bagFeatures.includes("quilted"));
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.luxuryCandidate, false);
+  });
+
+  it("hardware does not affect luxury/highStakes/brand/queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bag", styleWords: ["hardware"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(result.bagFeatures.includes("hardware"));
+    assert.strictEqual(result.highStakes, false);
+  });
+
+  it("logo_print does not affect luxury/highStakes/brand/queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "bag", styleWords: ["logo print"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(result.bagFeatures.includes("logo_print"));
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.luxuryCandidate, false);
+  });
+
+  it("queryTermsAllowed and queryTermsBlocked never overlap on bag identity", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "handbag", itemType: "crossbody bag", brand: "LuxBrand", model: "Model1" },
+      { overallConfidence: 0.40, attributeCertainty: { brand: 0.30, category: 0.50 } }
+    );
+    const overlap = result.queryTermsAllowed.filter((t) => result.queryTermsBlocked.includes(t));
+    assert.strictEqual(overlap.length, 0, "queryTermsAllowed must not contain any term from queryTermsBlocked");
+  });
+
+  it("model aircraft remains non-high-stakes with null bagKind", () => {
+    const result = enrichIdentityWithSchema(
+      { category: "collectible", itemType: "diecast model airplane", brand: "GeminiJets" },
+      { overallConfidence: 0.80, attributeCertainty: { brand: 0.70 } }
+    );
+    assert.strictEqual(result.highStakes, false);
+    assert.strictEqual(result.bagKind, null);
+    assert.deepStrictEqual(result.bagFeatures, []);
+  });
+
+  it("empty identity has null bag fields", () => {
+    const result = enrichIdentityWithSchema({}, { overallConfidence: 0.10 });
+    assert.strictEqual(result.bagKind, null);
+    assert.strictEqual(result.bagType, null);
+    assert.strictEqual(result.carryType, null);
+    assert.strictEqual(result.bagClosureType, null);
+    assert.strictEqual(result.bagMaterialSignal, null);
+    assert.deepStrictEqual(result.bagFeatures, []);
+    assert.deepStrictEqual(result.bagEvidence, []);
+  });
+
+  it("bag fields do not enter queryTermsAllowed", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "leather backpack", materials: ["leather"], styleWords: ["card slots", "adjustable strap"] },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(!result.queryTermsAllowed.includes("backpack_kind"));
+    assert.ok(!result.queryTermsAllowed.includes("card_slots"));
+    assert.ok(!result.queryTermsAllowed.includes("adjustable_strap"));
+  });
+
+  it("bag fields do not enter queryTermsBlocked", () => {
+    const result = enrichIdentityWithSchema(
+      { itemType: "backpack" },
+      { overallConfidence: 0.70 }
+    );
+    assert.ok(!result.queryTermsBlocked.includes("backpack"));
+    assert.ok(!result.queryTermsBlocked.includes("bag"));
   });
 });
