@@ -1346,6 +1346,7 @@ import { storeScanLearning, getCategoryPerformance, getTopFailingCategories, get
 import { refreshThresholdCache, getAllAdaptiveOverrides } from "./src/adaptiveThresholds.js";
 import { isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategoryPolicy } from "./src/visionCategoryPolicy.js";
 import { enrichIdentityWithSchema } from "./src/universalIdentitySchema.js";
+import { sanitizeQueryAgainstBlocked } from "./src/querySanitizer.js";
 import { sanitizeAircraftVariants } from "./src/aircraftCacheSafeGuard.js";
 import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
 import {
@@ -22067,6 +22068,21 @@ if (
       queryTermsBlockedCount: enrichedIdentity.queryTermsBlocked?.length || 0,
       identityWarningsCount: enrichedIdentity.identityWarnings?.length || 0,
     });
+
+    try {
+      const _sanitizePreview = sanitizeQueryAgainstBlocked(query, variants, enrichedIdentity.queryTermsBlocked || []);
+      console.log("QUERY_SANITIZE_PREVIEW", {
+        rid: req.rid,
+        original: query,
+        sanitized: _sanitizePreview.sanitizedQuery,
+        removedTerms: _sanitizePreview.removedTerms,
+        wouldChange: _sanitizePreview.wouldChange,
+        highStakes: enrichedIdentity.highStakes,
+        luxuryCandidate: enrichedIdentity.luxuryCandidate,
+        blockedCount: Array.isArray(enrichedIdentity.queryTermsBlocked) ? enrichedIdentity.queryTermsBlocked.length : 0,
+        noopReason: _sanitizePreview.noopReason,
+      });
+    } catch (_sanitizeErr) { /* preview-only — must never affect scan */ }
 
     return {
       ok: true,
