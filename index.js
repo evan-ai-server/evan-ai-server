@@ -21451,12 +21451,25 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                 wallMs: _hfWallMs, deadlineMs: VISION_BAD_SCAN_HARD_FAIL_MS,
                 driftMs: _hfWallMs - VISION_BAD_SCAN_HARD_FAIL_MS,
               });
+              // Phase 5C.3A: master is still running in background and will likely return a
+              // correct identity. Signal soft handoff so the frontend shows "Still identifying…"
+              // and holds on the existing background-result poll instead of a terminal fail card.
+              const _softHandoff = masterLaunched && !!imageHash;
+              if (_softHandoff) {
+                console.log("VISION_NO_SEED_SOFT_HANDOFF", {
+                  rid: req.rid,
+                  imageHashPrefix: (imageHash || "").slice(0, 12),
+                  masterLaunched,
+                  reason: "master_in_flight_no_seed",
+                });
+              }
               return {
                 ok: false,
                 query: null,
                 confidence: 0,
                 imageHash: imageHash || null,
                 visionTier: "hard_fail_no_seed",
+                ...(_softHandoff ? { backgroundPending: true, backgroundReason: "master_in_flight_no_seed" } : {}),
                 visionTimings: {
                   fastMs, visualMs, masterMs: null,
                   visionWallMs: _hfWallMs,
@@ -21466,7 +21479,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
                   downscaleMs: _vpMs, queryFastUsage: _queryFastSettled?.usage ? extractOpenAiUsage(_queryFastSettled.usage) : null,
                 },
                 error: "INSUFFICIENT_IDENTITY",
-                userMessage: "Couldn't identify this item — try scanning again",
+                userMessage: _softHandoff ? "Still identifying…" : "Couldn't identify this item — try scanning again",
                 retryable: true,
               };
             }
