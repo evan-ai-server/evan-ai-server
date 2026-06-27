@@ -20474,6 +20474,11 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     // master-skip threshold. Falls through to Promise.all(fast, visual) when
     // neither pass is individually decisive.
     let raceWinner = null; // 'query_fast' | 'fast' | 'visual_early' | 'consensus'
+    // Phase 5C.5A.2: if any early pass detects a true-high-stakes category,
+    // visual_shape is not allowed to skip master even when its own category is null.
+    let _hasHighStakesEarlySignal = false;
+    let _highStakesEarlyCategory  = null;
+    let _highStakesEarlySource    = null;
     await new Promise((resolve) => {
       let done = false;
       const finish = (winner) => {
@@ -20489,6 +20494,13 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       queryFastPromise.then((r) => {
         const acc = shouldAcceptQueryFast(r, mode);
         if (acc.accepted) finish("query_fast");
+        // Phase 5C.5A.2: record high-stakes category signal even when query_fast is
+        // rejected — so visual_shape cannot early-exit over it.
+        if (isTrueHighStakesVisionCategory(acc.category)) {
+          _hasHighStakesEarlySignal = true;
+          _highStakesEarlyCategory  = acc.category || null;
+          _highStakesEarlySource    = "query_fast";
+        }
       }).catch(() => {});
 
       fastPromise.then((r) => {
@@ -20504,7 +20516,10 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         // Brand-useful collectibles (diecast, model planes) ARE allowed through:
         // the brand text is the identity, and aircraft locks protect against drift.
         const cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
-        const isHighStakes = !!cat && isTrueHighStakesVisionCategory(cat);
+        // Phase 5C.5A.2: also block early exit when any previous pass already set the
+        // high-stakes signal (e.g. query_fast saw category "watch" but visual_shape
+        // returned category null — the global flag closes the cross-pass gap).
+        const isHighStakes = (!!cat && isTrueHighStakesVisionCategory(cat)) || _hasHighStakesEarlySignal;
         const brandCertainty = Number(r?.parsed?.attributeCertainty?.brand ?? 0);
         if (
           skipMasterAllowed &&
@@ -20527,6 +20542,16 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         ) {
           finish("visual_early");
         } else {
+          if (_hasHighStakesEarlySignal && !(!!cat && isTrueHighStakesVisionCategory(cat))) {
+            console.log("VISION_VISUAL_EARLY_BLOCKED_HIGH_STAKES_SIGNAL", {
+              rid:                req.rid,
+              visualQuery:        r?.parsed?.query || null,
+              visualConfidence:   conf,
+              highStakesCategory: _highStakesEarlyCategory,
+              signalSource:       _highStakesEarlySource,
+              reason:             "early_high_stakes_requires_master",
+            });
+          }
           // visual_shape didn't meet the early-exit bar — launch master now
           // rather than waiting for the timer. This minimises the uncertain-
           // path wall-time penalty: master starts as soon as we know we need
@@ -21250,6 +21275,7 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       visualResult &&
       Number.isFinite(visualConfidence) &&
       !visualHighStakes &&
+      !_hasHighStakesEarlySignal &&
       (
         // Standard path: high confidence + brand/model identity
         (
@@ -21986,6 +22012,55 @@ if (
       .slice(0, 8);
   } else {
     variants = [];
+  }
+
+  // Phase 5C.5A.1 — Piece A: For high-stakes confirmed identity, lock mergedIdentity
+  // to the master-confirmed query so rejected fast-seed band/color/material details
+  // do not propagate into market routes, caches, or prediction snapshots.
+  if (trustedPass?.query && query && isTrueHighStakesVisionCategory(mergedIdentity?.category)) {
+    const _prevExact = mergedIdentity?.exactQuery || null;
+    const _confirmedQ = normalizeQuery(query) || query;
+
+    // Build the set of tokens master explicitly confirmed (trusted pass + its identity).
+    const _trustedTokens = new Set([
+      ...titleTokens(_confirmedQ),
+      ...titleTokens(normalizeQuery(trustedPass.query) || ""),
+      ...(Array.isArray(trustedPass?.identity?.searchQueries)
+        ? trustedPass.identity.searchQueries.flatMap((q) => titleTokens(normalizeQuery(q) || q))
+        : []),
+      ...(trustedPass?.identity?.exactQuery
+        ? titleTokens(normalizeQuery(trustedPass.identity.exactQuery) || "")
+        : []),
+    ]);
+
+    const _prevSQCount = Array.isArray(mergedIdentity?.searchQueries) ? mergedIdentity.searchQueries.length : 0;
+    const _prevVCount  = variants.length;
+
+    mergedIdentity.exactQuery = _confirmedQ;
+    if (Array.isArray(mergedIdentity.searchQueries)) {
+      mergedIdentity.searchQueries = mergedIdentity.searchQueries.filter(
+        (q) => q && titleTokens(normalizeQuery(q) || q).every((t) => _trustedTokens.has(t))
+      );
+      if (!mergedIdentity.searchQueries.includes(_confirmedQ)) {
+        mergedIdentity.searchQueries.unshift(_confirmedQ);
+      }
+    }
+
+    variants = variants.filter(
+      (v) => v && titleTokens(normalizeQuery(v) || v).every((t) => _trustedTokens.has(t))
+    );
+
+    const _droppedSQ = _prevSQCount - (Array.isArray(mergedIdentity.searchQueries) ? mergedIdentity.searchQueries.length : 0);
+    const _droppedV  = _prevVCount - variants.length;
+    console.log("VISION_HIGH_STAKES_IDENTITY_QUERY_LOCKED", {
+      rid: req.rid,
+      category: mergedIdentity.category,
+      finalQuery: _confirmedQ,
+      previousExactQuery: _prevExact,
+      droppedSearchQueryCount: _droppedSQ,
+      droppedVariantCount: _droppedV,
+      reason: "trusted_high_stakes_query",
+    });
   }
 
   confidence = clamp01(confidence);
@@ -30116,7 +30191,9 @@ if (identityPreferredQuery) {
     isGarbageQuery(currentNorm) ||
     (!currentHasBrand && preferredHasBrand) ||
     (!currentHasModel && preferredHasModel) ||
-    titleTokens(preferredNorm).length > titleTokens(currentNorm).length + 1
+    // Phase 5C.5A.1: for high-stakes categories, the base query is master-confirmed;
+    // don't promote a longer identity query that may carry rejected fast-seed details.
+    (!isTrueHighStakesVisionCategory(visionIdentity?.category) && titleTokens(preferredNorm).length > titleTokens(currentNorm).length + 1)
   ) {
     query = preferredNorm;
   }
@@ -31479,7 +31556,14 @@ app.post("/market/search/stream", async (req, res) => {
     const _queryNormForBudget = normalizeTitleKey(query);
     const _airlineLockForBudget = detectAirlineLockInQuery(_queryNormForBudget);
     const _isExactAircraftIdentity = !!_airlineLockForBudget?.requiredAirline && !!_airlineLockForBudget?.requiredFamily;
-    const _isHighConfExactIdentity = (_isExactAircraftIdentity || _visionConf >= 0.85) && !_isBackgroundRecovery;
+    // Phase 5C.5A.1: backend enrichment sets highStakes on the confirmed identity object;
+    // this survives the frontend handoff intact and is not subject to frontend smoothing.
+    // Identity category is authoritative; body.category may be re-inferred by the frontend
+    // (e.g. inferCategory returns "General" for "apple watch ultra") and must not win.
+    const _isHighStakesConfirmed = isTrueHighStakesVisionCategory(
+      req.body?.visionIdentity?.category || req.body?.identity?.category || req.body?.category
+    ) && req.body?.visionIdentity?.highStakes === true;
+    const _isHighConfExactIdentity = (_isExactAircraftIdentity || _visionConf >= 0.85 || _isHighStakesConfirmed) && !_isBackgroundRecovery;
     const _notHighStakesForCache = !isTrueHighStakesVisionCategory(req.body?.category);
     const _marketDeadlineMs = _isHighConfExactIdentity
       ? Math.max(_marketDeadlineBase, MARKET_EXACT_IDENTITY_MIN_MS)
@@ -31504,8 +31588,12 @@ app.post("/market/search/stream", async (req, res) => {
     // _slaMsRemaining≤0 even though identity is now confirmed. Bypass isSlaExhausted
     // for this case only — _marketDeadlineMs is already MARKET_EXACT_IDENTITY_MIN_MS
     // via the _isHighConfExactIdentity upgrade above, so no extra budget is added.
+    // Phase 5C.5A.1: resolve category from visionIdentity (backend-set, not re-inferred
+    // by frontend inferCategory which returns "General" for "apple watch ultra").
+    // Identity category must take priority over body.category.
+    const _resolvedHighStakesCategory = req.body?.visionIdentity?.category || req.body?.identity?.category || req.body?.category || null;
     const _isMasterConfirmedHighStakes =
-      isTrueHighStakesVisionCategory(req.body?.category) &&
+      isTrueHighStakesVisionCategory(_resolvedHighStakesCategory) &&
       _isHighConfExactIdentity &&
       isSlaExhausted(_slaMsRemaining);
     if (_isMasterConfirmedHighStakes) {
