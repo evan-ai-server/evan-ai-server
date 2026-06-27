@@ -31499,6 +31499,28 @@ app.post("/market/search/stream", async (req, res) => {
       isBackgroundRecovery: _isBackgroundRecovery, visionConfidence: _visionConf,
       isExactAircraftIdentity: _isExactAircraftIdentity,
     });
+    // Phase 5C.5A: high-stakes categories (watch, electronics, luxury) require master
+    // by policy. Mandatory master wait can exhaust the original scan SLA, leaving
+    // _slaMsRemaining≤0 even though identity is now confirmed. Bypass isSlaExhausted
+    // for this case only — _marketDeadlineMs is already MARKET_EXACT_IDENTITY_MIN_MS
+    // via the _isHighConfExactIdentity upgrade above, so no extra budget is added.
+    const _isMasterConfirmedHighStakes =
+      isTrueHighStakesVisionCategory(req.body?.category) &&
+      _isHighConfExactIdentity &&
+      isSlaExhausted(_slaMsRemaining);
+    if (_isMasterConfirmedHighStakes) {
+      console.log("MARKET_BUDGET_FRESH_HIGH_STAKES", {
+        rid: req.rid, scanId,
+        query, category: req.body?.category || null,
+        visionConfidence: _visionConf,
+        visionTier: safeStr(req.body?.visionTier, 40) || null,
+        selectedPass: safeStr(req.body?.selectedPass, 40) || null,
+        fromRemainingMs: _slaMsRemaining,
+        toDeadlineMs: _marketDeadlineMs,
+        elapsedMs: _clampedElapsedMs,
+        reason: "master_confirmed_high_stakes",
+      });
+    }
 
     const sizeHint      = safeStr(req.body?.sizeHint, 40) || null;
     const sizeAugmented = sizeHint && query ? normalizeQuery(`${query} ${sizeHint}`) : null;
@@ -31794,7 +31816,7 @@ app.post("/market/search/stream", async (req, res) => {
     // computeCleanRetrievalPool + the payload builder's own locks); no
     // oracle/fake listings enter, and the snapshot is read directly so no SWR
     // refresh (paid) is scheduled.
-    if (isSlaExhausted(_slaMsRemaining)) {
+    if (isSlaExhausted(_slaMsRemaining) && !_isMasterConfirmedHighStakes) {
       // 1) zero-cost in-memory cross-route cache (payload by scan/img, or query+user).
       let _slaCached = null;
       try { _slaCached = getMarketScanResult({ scanId, imageHash, query, userId: _budgetUserIdStream }); } catch {}
