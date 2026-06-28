@@ -1348,6 +1348,7 @@ import { isBrandUsefulCategory, isTrueHighStakesVisionCategory, getVisionCategor
 import { enrichIdentityWithSchema } from "./src/universalIdentitySchema.js";
 import { sanitizeQueryAgainstBlocked } from "./src/querySanitizer.js";
 import { sanitizeAircraftVariants } from "./src/aircraftCacheSafeGuard.js";
+import { evaluateHighStakesProvisional } from "./src/highStakesProvisionalGate.js";
 import { runSelfHealingCycle, getHealingHistory, getModelReviewQueue } from "./workers/selfHealingWorker.js";
 import {
   storeSignalSnapshot,
@@ -20567,12 +20568,14 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
     // Resolve immediately when fast is acceptable OR visual_shape clears the
     // master-skip threshold. Falls through to Promise.all(fast, visual) when
     // neither pass is individually decisive.
-    let raceWinner = null; // 'query_fast' | 'fast' | 'visual_early' | 'consensus'
+    let raceWinner = null; // 'query_fast' | 'fast' | 'visual_early' | 'consensus' | 'high_stakes_provisional'
     // Phase 5C.5A.2: if any early pass detects a true-high-stakes category,
     // visual_shape is not allowed to skip master even when its own category is null.
     let _hasHighStakesEarlySignal = false;
     let _highStakesEarlyCategory  = null;
     let _highStakesEarlySource    = null;
+    // Phase 5D.1D: stashed query_fast result for the high-stakes provisional path.
+    let _hsProvisionalResult = null;
     await new Promise((resolve) => {
       let done = false;
       const finish = (winner) => {
@@ -20594,6 +20597,13 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           _hasHighStakesEarlySignal = true;
           _highStakesEarlyCategory  = acc.category || null;
           _highStakesEarlySource    = "query_fast";
+          // Phase 5D.1D: when result has enough signal, resolve the race early so a
+          // provisional response returns under ~2.2s while master confirms async.
+          // Guards: not cancelled, not a garbled/unusable query, confidence >= 0.50.
+          if (!r?.cancelled && acc.reason !== "unusable_query" && Number(acc.confidence) >= 0.50) {
+            _hsProvisionalResult = r;
+            finish("high_stakes_provisional");
+          }
         }
       }).catch(() => {});
 
@@ -20889,6 +20899,22 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
         refinementApplied: _refinementApplied, refinementSource: _refinementSource,
       });
 
+      // Phase 5D.1C: safe query_fast speed lock — log whether the 2.2s target was met.
+      console.log("VISION_SAFE_QUERY_FAST_LOCKED", {
+        rid: req.rid, query: _finalQuery, category: qfCategory,
+        confidence: qfConf, elapsedMs: qfWallMs,
+        accepted: true, reason: "query_fast_safe_accepted",
+        under2200: qfWallMs <= 2200,
+      });
+      if (qfWallMs > 2200) {
+        console.log("VISION_SAFE_QUERY_FAST_2200_MISS", {
+          rid: req.rid, queryFastMs, preConsensusMs: null,
+          downscaleMs: _vpMs, deadlineMs: VISION_FIRST_QUERY_DEADLINE_MS,
+          graceUsed: false,
+          missReason: queryFastMs != null && queryFastMs > 2200 ? "model_floor" : "overhead",
+        });
+      }
+
       console.log("VISION_MASTER_POLICY", {
         rid: req.rid, mode, shouldLaunchMaster: false, reason: "query_fast_won",
         visualConfidence: 0, fastConfidence: 0, brandCertainty: qfBrand,
@@ -21023,6 +21049,134 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
           downscaleMs: _vpMs, queryFastUsage: extractOpenAiUsage(qfResult?.usage),
         },
         debug: { passQueries: [_finalQuery, qfQuery].filter(Boolean), passLabels: ["query_fast"] },
+      };
+    }
+
+    // Phase 5D.1D: high-stakes provisional path.
+    // query_fast identified a true-high-stakes item at ~2.6s (warm) but is blocked from
+    // finalizing identity — master (gpt-4.1) is required for confirmation. Instead of
+    // silently waiting 6-7s, return a clearly-labeled provisional response immediately and
+    // let master continue in background. The frontend polls /api/vision/background-result
+    // for the master-confirmed identity.
+    //
+    // Trust locks enforced here (never relaxed downstream):
+    //   • query: null                → no market search triggered
+    //   • provisional: true          → UI must show "Likely X — confirming…" not "Confirmed"
+    //   • marketAllowed: false       → market search must not fire until master confirms
+    //   • affiliateAllowed: false    → affiliate must not fire on provisional identity
+    //   • verifiedLanguageAllowed: false → no "verified" language
+    if (raceWinner === "high_stakes_provisional" && _hsProvisionalResult) {
+      // Cancel fast and visual — save tokens. Do NOT cancel master.
+      try { queryFastAbortCtrl.abort(); } catch {}
+      try { fastAbortCtrl.abort(); } catch {}
+      try { visualAbortCtrl.abort(); } catch {}
+
+      const _hspR          = _hsProvisionalResult;
+      const _hspQuery      = String(_hspR?.parsed?.query ?? "").trim() || null;
+      const _hspCategory   = String(_hspR?.parsed?.category || "").trim().toLowerCase();
+      const _hspConf       = clamp01(Number(_hspR?.parsed?.confidence ?? 0));
+      const _hspBrand      = clamp01(Number(_hspR?.parsed?.brandCertainty ?? 0));
+      const _hspWallMs     = Date.now() - passT0;
+
+      // Ensure master is running for background confirmation (idempotent).
+      launchMasterNow();
+      _registerMasterBackgroundRecovery();
+
+      // Option B guard: is the query_fast result specific enough for "Likely X" provisional?
+      const _hspEval = evaluateHighStakesProvisional({
+        query: _hspQuery, category: _hspCategory,
+        confidence: _hspConf, brandCertainty: _hspBrand, mode,
+      });
+
+      const _hspSpecific      = _hspEval.eligible && _hspEval.specificProvisional;
+      const _hspProvisionalQ  = _hspSpecific ? _hspEval.provisionalQuery : null;
+
+      if (!_hspSpecific) {
+        console.log("VISION_HIGH_STAKES_PROVISIONAL_SPECIFIC_REJECTED", {
+          rid: req.rid, query: _hspQuery, category: _hspCategory,
+          confidence: _hspConf, brandCertainty: _hspBrand,
+          eligible: _hspEval.eligible, reason: _hspEval.reason,
+          elapsedMs: _hspWallMs,
+        });
+      }
+
+      console.log("VISION_HIGH_STAKES_PROVISIONAL_EMITTED", {
+        rid: req.rid,
+        query:              _hspProvisionalQ,
+        category:           _hspCategory,
+        confidence:         _hspConf,
+        brandCertainty:     _hspBrand,
+        elapsedMs:          _hspWallMs,
+        specificProvisional: _hspSpecific,
+        backgroundPending:  true,
+        masterLaunched:     true,
+        reason:             _hspEval.reason,
+      });
+      console.log("VISION_HIGH_STAKES_PROVISIONAL_BACKGROUND_REGISTERED", {
+        rid: req.rid, imageHash: imageHash || null, elapsedMs: _hspWallMs,
+      });
+
+      // Minimal identity shape — category present, no specific model until master confirms.
+      const _hspIdentity = {
+        itemType:             _hspCategory,
+        category:             _hspCategory,
+        brand:                null,
+        model:                null,
+        colors:               [],
+        materials:            [],
+        patterns:             [],
+        styleWords:           [],
+        visibleText:          [],
+        condition:            null,
+        conditionNotes:       null,
+        sizeHint:             null,
+        exactQuery:           null,
+        searchQueries:        [],
+        substituteCandidates: [],
+        marketSegment:        null,
+      };
+
+      return {
+        ok:                      true,
+        // query is ALWAYS null for provisional — prevents market search from firing.
+        // provisionalQuery carries the "Likely X" display text for the frontend to show.
+        query:                   null,
+        provisionalQuery:        _hspProvisionalQ,
+        variants:                [],
+        confidence:              Math.min(_hspConf, 0.75), // cap provisional confidence
+        identity:                _hspIdentity,
+        visionSource:            _hspR?.source || "openai",
+        visionTier:              "high_stakes_provisional",
+        // ── Trust locks — never loosened on provisional identity ──────────
+        provisional:             true,
+        highStakesProvisional:   true,
+        backgroundPending:       true,
+        provisionalReason:       "high_stakes_requires_master",
+        finalIdentityPending:    true,
+        marketAllowed:           false,
+        affiliateAllowed:        false,
+        verifiedLanguageAllowed: false,
+        imageHash:               imageHash || null,
+        // ── Timing ───────────────────────────────────────────────────────
+        visionTimings: {
+          queryFastMs,
+          fastMs:              null,
+          visualMs:            null,
+          masterMs:            null,
+          visionWallMs:        _hspWallMs,
+          raceWinner:          "high_stakes_provisional",
+          masterLaunched:      true,
+          tier:                "high_stakes_provisional",
+          timeToProvisionalMs: _hspWallMs,
+          timeToConfirmedMs:   null, // set later when master completes
+          responseMode:        "high_stakes_provisional",
+          downscaleMs: _vpMs, queryFastUsage: extractOpenAiUsage(_hspR?.usage),
+        },
+        userMessage: _hspSpecific
+          ? `Likely ${_hspProvisionalQ} — confirming exact model…`
+          : `Identifying ${_hspCategory} — confirming exact model…`,
+        retryable:   false,
+        debug: { passQueries: [], passLabels: ["query_fast_provisional"] },
       };
     }
 
@@ -23494,6 +23648,17 @@ if (!openai) {
           ...(result?.error       ? { error:       result.error }       : {}),
           ...(result?.userMessage ? { userMessage: result.userMessage } : {}),
           ...(result?.retryable   ? { retryable:   result.retryable }  : {}),
+          // Phase 5D.1D: propagate provisional trust-lock and background-pending fields.
+          // These are additive — only added when present in result, never overwrite.
+          ...(result?.backgroundPending       ? { backgroundPending:       result.backgroundPending }       : {}),
+          ...(result?.provisional             ? { provisional:             result.provisional }             : {}),
+          ...(result?.highStakesProvisional   ? { highStakesProvisional:   result.highStakesProvisional }   : {}),
+          ...(result?.provisionalQuery        ? { provisionalQuery:        result.provisionalQuery }        : {}),
+          ...(result?.provisionalReason       ? { provisionalReason:       result.provisionalReason }       : {}),
+          ...(result?.finalIdentityPending    ? { finalIdentityPending:    result.finalIdentityPending }    : {}),
+          ...(result?.marketAllowed     === false ? { marketAllowed:             false } : {}),
+          ...(result?.affiliateAllowed  === false ? { affiliateAllowed:          false } : {}),
+          ...(result?.verifiedLanguageAllowed === false ? { verifiedLanguageAllowed: false } : {}),
         };
 
         // Phase 5A.4A+B.2: queryFastUsage/downscaleMs in visionTimings are log-only
@@ -23779,14 +23944,21 @@ if (!openai) {
           }
         } catch (e) { console.warn("platform_fee_error", e?.message || e); }
 
-        visionCache.set(cacheKey, shaped);
-        await cacheSet(cacheKey, shaped, 86400);
+        // Phase 5D.1D: never cache provisional results in the exact-cache.
+        // The next scan of the same image must reach the master-confirmed identity,
+        // not a stale provisional. (Background result store handles the upgrade.)
+        if (shaped?.provisional !== true) {
+          visionCache.set(cacheKey, shaped);
+          await cacheSet(cacheKey, shaped, 86400);
+        }
 
         // Register this scan in the similarity index so the next visually-
         // similar upload can early-return without paying the vision cost.
         // Skip if vision identity is empty — caching a no-op identity would
         // satisfy future similarity hits with garbage.
-        if (shaped?.identity || shaped?.visionIdentity) {
+        // Phase 5D.1D: also skip for provisional — pHash of an unconfirmed identity
+        // would seed wrong results into future near-dup lookups.
+        if (shaped?.provisional !== true && (shaped?.identity || shaped?.visionIdentity)) {
           if (_embedDeferred && _embedPromise) {
             // Phase 5A.4D.1: deferred embed resolves after the response. Register
             // in its .then() when the vector is actually ready (never blocks
@@ -23873,6 +24045,10 @@ if (!openai) {
           masterBlocked: shaped?.visionTimings?.raceWinner === "consensus",
           hardDeadlineFired: shaped?.visionTimings?.raceWinner === "hard_deadline",
           selectedPass: shaped?.visionTier ?? null,
+          // Phase 5D.1F: provisional and response-mode fields
+          timeToProvisionalMs: shaped?.visionTimings?.timeToProvisionalMs ?? null,
+          responseMode:        shaped?.visionTimings?.responseMode ?? null,
+          backgroundPending:   shaped?.backgroundPending ?? false,
         });
         if (shaped?.visionTier === "hard_fail_no_seed" || shaped?.visionTier === "rejected_generic") {
           console.log("VISION_HARD_FAIL_RESPONSE_WITH_IMAGE_HASH", {
