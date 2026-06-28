@@ -21605,12 +21605,32 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               { r: fastResult,   sourcePass: "fast" },
             ];
             let _hardSeed = null;
-            for (const { r, sourcePass } of _hardCandidates) {
-              if (r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)) {
-                const _cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
-                if (!_cat || !isTrueHighStakesVisionCategory(_cat)) {
-                  _hardSeed = { r, sourcePass };
-                  break;
+            // Phase 5C.5A.3: if any early pass signaled a high-stakes category
+            // (e.g. query_fast saw Apple Watch), no non-master seed may finalize
+            // the identity — only master may. Skip seed selection and fall through
+            // to await masterPromise (master is still in flight, not aborted).
+            if (_hasHighStakesEarlySignal) {
+              const _blockedCandidate = _hardCandidates.find(({ r }) =>
+                r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)
+              );
+              console.log("VISION_HARD_RETURN_SEED_BLOCKED_HIGH_STAKES_SIGNAL", {
+                rid:                req.rid,
+                selectedPass:       _blockedCandidate?.sourcePass || null,
+                seedQuery:          _blockedCandidate?.r?.parsed?.query || null,
+                seedConfidence:     Number(_blockedCandidate?.r?.parsed?.confidence ?? 0),
+                highStakesCategory: _highStakesEarlyCategory,
+                signalSource:       _highStakesEarlySource,
+                masterStillRunning: !masterAbortCtrl.signal.aborted,
+                reason:             "early_high_stakes_requires_master",
+              });
+            } else {
+              for (const { r, sourcePass } of _hardCandidates) {
+                if (r && !r.cancelled && isUsableVisionQuery(r?.parsed?.query)) {
+                  const _cat = String(r?.parsed?.identity?.category || "").trim().toLowerCase();
+                  if (!_cat || !isTrueHighStakesVisionCategory(_cat)) {
+                    _hardSeed = { r, sourcePass };
+                    break;
+                  }
                 }
               }
             }
