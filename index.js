@@ -17271,6 +17271,76 @@ if (!isEyewear) {
 return uniqueQueries([...enhanced]).slice(0, isEyewear ? 2 : 8);
 }
 
+// ── deriveHighStakesDeviceMarketQuery ─────────────────────────────────────
+// Phase 5C.6B: for master-confirmed high-stakes device categories (watches),
+// derive a device-first primary SERP query by promoting the broadest clean
+// master variant over the accessory-burdened confirmed query.
+// Trust-first: prefers a master-validated variant that carries no band/strap
+// terms. Falls back to regex-strip for Apple Watch only (where colors are
+// band colors, not dial/bezel identity markers). Only broadens by removing
+// terms — never adds model/generation words.
+// Returns the device-first query string, or null if no simplification found.
+function deriveHighStakesDeviceMarketQuery(query, category, variants) {
+  if (!query || !category) return null;
+  const cat = String(category).toLowerCase();
+  if (cat !== "watch") return null;
+
+  const q = normalizeQuery(query);
+  if (!q) return null;
+  const qWords = q.split(/\s+/);
+  if (qWords.length < 3) return null;
+
+  const hasAccessoryTerm = (s) =>
+    /\b(?:alpine|sport|trail|ocean|milanese|braided|solo)\s+(?:loop|band)\b/i.test(s) ||
+    /\b(?:link\s+bracelet|leather\s+band|nylon\s+band|watch\s+band|watch\s+strap)\b/i.test(s) ||
+    /\b(?:band|strap|loop|nylon|fabric)\b/i.test(s);
+
+  if (!hasAccessoryTerm(q)) return null;
+
+  const brand = qWords[0];
+  const normalizedVariants = Array.isArray(variants)
+    ? variants.map((v) => normalizeQuery(v)).filter(Boolean)
+    : [];
+
+  // Trust-first: shortest master variant with no accessory terms and same brand.
+  const cleanVariant = normalizedVariants
+    .filter((v) => {
+      const vWords = v.split(/\s+/);
+      return (
+        vWords.length >= 2 &&
+        vWords.length < qWords.length &&
+        vWords[0] === brand &&
+        !hasAccessoryTerm(v)
+      );
+    })
+    .sort((a, b) => a.split(/\s+/).length - b.split(/\s+/).length)[0] || null;
+
+  if (cleanVariant) return cleanVariant;
+
+  // Regex-strip fallback: only safe for Apple Watch (color = band color, not dial identity).
+  if (!/\bapple\s+watch\b/i.test(q)) return null;
+
+  const stripPatterns = [
+    /\balpine\s+loop\b/gi, /\bsport\s+loop\b/gi, /\bsport\s+band\b/gi,
+    /\btrail\s+loop\b/gi, /\bocean\s+band\b/gi, /\bmilanese\s+loop\b/gi,
+    /\bbraided\s+loop\b/gi, /\bsolo\s+loop\b/gi, /\blink\s+bracelet\b/gi,
+    /\bleather\s+band\b/gi, /\bnylon\s+band\b/gi, /\btitanium\s+case\b/gi,
+    /\b(?:band|strap|loop|nylon|fabric|case)\b/gi,
+    /\b(?:green|blue|black|orange|red|white|yellow|midnight|starlight|purple|pink|beige|clay)\b/gi,
+  ];
+  let stripped = q;
+  for (const pat of stripPatterns) stripped = stripped.replace(pat, " ");
+  stripped = stripped.replace(/\s+/g, " ").trim();
+
+  if (
+    !stripped ||
+    stripped === q ||
+    stripped.split(/\s+/)[0] !== brand ||
+    stripped.split(/\s+/).length < 2
+  ) return null;
+  return stripped;
+}
+
 // ── buildSearchIntentLadder ────────────────────────────────────────────────
 // Generic query expansion that works for ANY category.
 // Produces a tiered ladder from exact → used/resale → platform → broader.
@@ -30673,7 +30743,28 @@ const _packedMarketResult = _preMarketAircraftCheck.incomplete ? packMarketItems
     `market:${cacheKey}`,
     async () => {
       const _sfSummary = createEmptyIdentitySummary();
-      const fresh = await mergeCheapestSources(query, variants, visionIdentity, {
+      // Phase 5C.6B: apply device-first query for high-stakes watches in non-stream path.
+      const _nsHighStakes =
+        isTrueHighStakesVisionCategory(visionIdentity?.category) &&
+        (req.body?.visionIdentity?.highStakes === true || req.body?.identity?.highStakes === true);
+      let _nsMktQuery = query;
+      let _nsMktVariants = variants;
+      if (_nsHighStakes) {
+        const _nsDeviceQ = deriveHighStakesDeviceMarketQuery(query, visionIdentity?.category, variants);
+        if (_nsDeviceQ && _nsDeviceQ !== query) {
+          const _nsDemoted = query.split(/\s+/).filter((w) => !_nsDeviceQ.split(/\s+/).includes(w));
+          _nsMktVariants = uniqueQueries([query, ...variants.filter((v) => v !== _nsDeviceQ)]);
+          console.log("MARKET_HIGH_STAKES_DEVICE_QUERY_SELECTED", {
+            scanId: _budgetScanIdEarly, category: visionIdentity?.category,
+            originalQuery: query, selectedMarketQuery: _nsDeviceQ,
+            demotedTerms: _nsDemoted,
+            ladder: [_nsDeviceQ, ..._nsMktVariants.slice(0, 3)],
+            reason: "device_first_high_stakes",
+          });
+          _nsMktQuery = _nsDeviceQ;
+        }
+      }
+      const fresh = await mergeCheapestSources(_nsMktQuery, _nsMktVariants, visionIdentity, {
         identitySummaryOut: _sfSummary,
       });
 
@@ -32729,7 +32820,27 @@ app.post("/market/search/stream", async (req, res) => {
           reason: "serpapi_timeout_ceiling",
         });
       }
-      phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
+      // Phase 5C.6B: for master-confirmed high-stakes devices, promote the broadest
+      // clean master variant as primary SERP query so device listings outrank
+      // band/accessory results from the accessory-laden confirmed query.
+      let _streamMktQuery = query;
+      let _streamMktVariants = variants;
+      if (_isMasterConfirmedHighStakes) {
+        const _deviceQ = deriveHighStakesDeviceMarketQuery(query, _resolvedHighStakesCategory, variants);
+        if (_deviceQ && _deviceQ !== query) {
+          const _demoted = query.split(/\s+/).filter((w) => !_deviceQ.split(/\s+/).includes(w));
+          _streamMktVariants = uniqueQueries([query, ...variants.filter((v) => v !== _deviceQ)]);
+          console.log("MARKET_HIGH_STAKES_DEVICE_QUERY_SELECTED", {
+            rid: req.rid, scanId, category: _resolvedHighStakesCategory,
+            originalQuery: query, selectedMarketQuery: _deviceQ,
+            demotedTerms: _demoted,
+            ladder: [_deviceQ, ..._streamMktVariants.slice(0, 3)],
+            reason: "device_first_high_stakes",
+          });
+          _streamMktQuery = _deviceQ;
+        }
+      }
+      phase1Promise = mergeCheapestSources(_streamMktQuery, _streamMktVariants, visionIdentity, {
         skipOracle: true, earlyItemsCb: _onEarlyItemsWrapped,
         identitySummaryOut: _retrievalIdentitySummary,
         phase1TimeoutMs: _phase1TimeoutMsForStream,
