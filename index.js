@@ -32711,10 +32711,28 @@ app.post("/market/search/stream", async (req, res) => {
       // No earlyItemsCb for inflight hits — they receive full phase1Items when promise resolves.
       // _retrievalIdentitySummary stays empty for inflight; calibration gracefully handles it.
     } else {
+      // Phase 5C.6A: for exact/high-stakes searches the only live source
+      // (serpShopping) is allowed to run up to SERPAPI_TIMEOUT_MS (4500ms).
+      // If _marketDeadlineMs < SERPAPI_TIMEOUT_MS the phase1 kill timer
+      // would abort before serpShopping can respond, producing structural 0s.
+      const _phase1TimeoutMsForStream = (_isHighConfExactIdentity || _isMasterConfirmedHighStakes)
+        ? Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS)
+        : _marketDeadlineMs;
+      if (_phase1TimeoutMsForStream > _marketDeadlineMs) {
+        console.log("MARKET_PHASE1_TIMEOUT_ALIGNED_FOR_SERPAPI", {
+          rid: req.rid, scanId, query,
+          fromPhase1TimeoutMs: _marketDeadlineMs,
+          toPhase1TimeoutMs: _phase1TimeoutMsForStream,
+          serpApiTimeoutMs: SERPAPI_TIMEOUT_MS,
+          isHighConfExactIdentity: _isHighConfExactIdentity,
+          isMasterConfirmedHighStakes: _isMasterConfirmedHighStakes,
+          reason: "serpapi_timeout_ceiling",
+        });
+      }
       phase1Promise = mergeCheapestSources(query, variants, visionIdentity, {
         skipOracle: true, earlyItemsCb: _onEarlyItemsWrapped,
         identitySummaryOut: _retrievalIdentitySummary,
-        phase1TimeoutMs: _marketDeadlineMs,
+        phase1TimeoutMs: _phase1TimeoutMsForStream,
       });
       STREAM_PHASE1_INFLIGHT.set(cacheKey, phase1Promise);
       phase1Promise.finally(() => setTimeout(() => STREAM_PHASE1_INFLIGHT.delete(cacheKey), 500));
