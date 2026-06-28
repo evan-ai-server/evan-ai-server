@@ -17283,12 +17283,17 @@ return uniqueQueries([...enhanced]).slice(0, isEyewear ? 2 : 8);
 function deriveHighStakesDeviceMarketQuery(query, category, variants) {
   if (!query || !category) return null;
   const cat = String(category).toLowerCase();
-  if (cat !== "watch") return null;
 
   const q = normalizeQuery(query);
   if (!q) return null;
   const qWords = q.split(/\s+/);
   if (qWords.length < 3) return null;
+
+  // Allow "watch" category, or "electronics" only when query contains "apple watch".
+  // Apple Watch band colors identify the strap, not the case — safe to strip.
+  // Do NOT generalize to all electronics (Garmin, Casio, Samsung, etc. are excluded).
+  const _isAppleWatchQuery = /\bapple\s+watch\b/i.test(q);
+  if (cat !== "watch" && !(cat === "electronics" && _isAppleWatchQuery)) return null;
 
   const hasAccessoryTerm = (s) =>
     /\b(?:alpine|sport|trail|ocean|milanese|braided|solo)\s+(?:loop|band)\b/i.test(s) ||
@@ -17339,6 +17344,25 @@ function deriveHighStakesDeviceMarketQuery(query, category, variants) {
     stripped.split(/\s+/).length < 2
   ) return null;
   return stripped;
+}
+
+// ── deriveHighStakesDeviceMarketQuery selftest ─────────────────────────────
+// Phase 5C.6B.1: verify Apple Watch device-first query derivation,
+// electronics category passthrough, and non-Apple guard.
+{
+  const _dhmqCases = [
+    { q: "apple watch ultra green alpine loop",           cat: "electronics", vs: [], expected: "apple watch ultra" },
+    { q: "apple watch ultra titanium case green alpine loop", cat: "watch",  vs: [], expected: "apple watch ultra" },
+    { q: "samsung galaxy watch ultra",                   cat: "electronics", vs: [], expected: null },
+    { q: "rolex submariner date 40mm black dial",         cat: "watch",      vs: [], expected: null },
+  ];
+  let _dhmqPass = 0;
+  for (const { q, cat, vs, expected } of _dhmqCases) {
+    const got = deriveHighStakesDeviceMarketQuery(q, cat, vs);
+    if (got === expected) _dhmqPass++;
+    else console.warn("DERIVE_HIGH_STAKES_DEVICE_QUERY_SELFTEST_FAIL", { q, cat, expected, got });
+  }
+  console.log("DERIVE_HIGH_STAKES_DEVICE_QUERY_SELFTEST_PASS", { passed: _dhmqPass, total: _dhmqCases.length });
 }
 
 // ── buildSearchIntentLadder ────────────────────────────────────────────────
@@ -30973,7 +30997,23 @@ if (!_oracleOnlyResult && Array.isArray(items)) {
     });
 
     if (_raResult.refinedQuery && _raResult.refinedQuery !== normalizeQuery(query)) {
-      query = _raResult.refinedQuery;
+      // Phase 5C.6B.1: for master-confirmed high-stakes Apple Watch scans, block
+      // result-aware refinement from replacing the device query with an
+      // accessory/band-only variant. Master-confirmed identity must stay primary.
+      const _isHighStakesAppleWatch =
+        isTrueHighStakesVisionCategory(visionIdentity?.category) &&
+        (req.body?.visionIdentity?.highStakes === true || req.body?.identity?.highStakes === true) &&
+        /\bapple\s+watch\b/i.test(normalizeQuery(query));
+      if (_isHighStakesAppleWatch) {
+        console.log("MARKET_HIGH_STAKES_DEVICE_QUERY_REFINEMENT_BLOCKED", {
+          scanId: _budgetScanIdEarly,
+          originalQuery: normalizeQuery(query),
+          blockedRefinedQuery: _raResult.refinedQuery,
+          reason: "master_confirmed_high_stakes_apple_watch",
+        });
+      } else {
+        query = _raResult.refinedQuery;
+      }
     }
     if (Array.isArray(_raResult.refinedItems) && _raResult.refinedItems.length > items.length) {
       items = _raResult.refinedItems;
