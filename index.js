@@ -20590,6 +20590,18 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // query at or above QUERY_FAST_CONFIDENCE_THRESHOLD.
       queryFastPromise.then((r) => {
         const acc = shouldAcceptQueryFast(r, mode);
+        // Phase 5D.1A-hotfix diagnostic: always log the query_fast race decision so a
+        // live scan reveals exactly why the high-stakes provisional path did or didn't fire.
+        console.log("VISION_QUERY_FAST_RACE_DECISION", {
+          rid: req.rid,
+          accepted: acc.accepted,
+          reason: acc.reason,
+          category: acc.category ?? null,
+          confidence: acc.confidence ?? null,
+          isTrueHighStakes: isTrueHighStakesVisionCategory(acc.category),
+          cancelled: !!r?.cancelled,
+          parsedQuery: r?.parsed?.query ?? null,
+        });
         if (acc.accepted) finish("query_fast");
         // Phase 5C.5A.2: record high-stakes category signal even when query_fast is
         // rejected — so visual_shape cannot early-exit over it.
@@ -23567,6 +23579,27 @@ if (!openai) {
         return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
       }
 
+      // Phase 5D.1A-hotfix: high-stakes provisional — return verbatim, BEFORE the
+      // shaped-construction + market/enrichment/cache pipeline below. Matches the
+      // visionUnavailable / incompleteIdentity idiom above. This guarantees the
+      // trust-lock fields (query:null, provisional, backgroundPending, marketAllowed:false,
+      // provisionalQuery, userMessage) reach the client intact, and prevents the
+      // enrichment pipeline from running market/affiliate/serial/signal work on an
+      // unconfirmed identity. Master already continues in the background via
+      // _registerMasterBackgroundRecovery() (set inside runVisionConsensus); the client
+      // long-polls /api/vision/background-result for the confirmed identity.
+      if (result?.highStakesProvisional === true) {
+        console.log("VISION_HIGH_STAKES_PROVISIONAL_RESPONSE", {
+          rid: req.rid,
+          imageHash: originalHash || result.imageHash || null,
+          provisionalQuery: result.provisionalQuery || null,
+          backgroundPending: result.backgroundPending === true,
+          marketAllowed: result.marketAllowed === true,
+          totalMs: Date.now() - _epT0,
+        });
+        return res.status(200).json({ ...result, imageHash: originalHash || result.imageHash || null });
+      }
+
       // Phase 5A.4D: start deferred embed now that consensus is done and the
       // event loop is free. The embed resolves after res.json; similarity
       // registration happens in its .then() at the end of this handler (5A.4D.1),
@@ -23648,17 +23681,9 @@ if (!openai) {
           ...(result?.error       ? { error:       result.error }       : {}),
           ...(result?.userMessage ? { userMessage: result.userMessage } : {}),
           ...(result?.retryable   ? { retryable:   result.retryable }  : {}),
-          // Phase 5D.1D: propagate provisional trust-lock and background-pending fields.
-          // These are additive — only added when present in result, never overwrite.
-          ...(result?.backgroundPending       ? { backgroundPending:       result.backgroundPending }       : {}),
-          ...(result?.provisional             ? { provisional:             result.provisional }             : {}),
-          ...(result?.highStakesProvisional   ? { highStakesProvisional:   result.highStakesProvisional }   : {}),
-          ...(result?.provisionalQuery        ? { provisionalQuery:        result.provisionalQuery }        : {}),
-          ...(result?.provisionalReason       ? { provisionalReason:       result.provisionalReason }       : {}),
-          ...(result?.finalIdentityPending    ? { finalIdentityPending:    result.finalIdentityPending }    : {}),
-          ...(result?.marketAllowed     === false ? { marketAllowed:             false } : {}),
-          ...(result?.affiliateAllowed  === false ? { affiliateAllowed:          false } : {}),
-          ...(result?.verifiedLanguageAllowed === false ? { verifiedLanguageAllowed: false } : {}),
+          // Phase 5D.1A-hotfix: high-stakes provisional results early-return verbatim
+          // above (alongside visionUnavailable/incompleteIdentity), so they never reach
+          // this shaped construction — no propagation needed here.
         };
 
         // Phase 5A.4A+B.2: queryFastUsage/downscaleMs in visionTimings are log-only
