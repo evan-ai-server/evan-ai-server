@@ -20262,7 +20262,7 @@ async function prepareVisionBufferWithBudget(buffer, rid, maxEdgePx, budgetMs) {
 // _embedPromise: the in-flight image-embedding promise from the pre-consensus
 // block. Passed so the grace window can inspect the similarity vector without
 // reaching into an out-of-scope outer-handler variable.
-async function runVisionConsensus({ req, file, mode, propContext, imageHash = null, _embedPromise = null }) {
+async function runVisionConsensus({ req, file, mode, propContext, imageHash = null, _embedPromise = null, exactCacheKey = null }) {
   // Downscale before encoding. Text-sensitive modes (label/barcode/mark) keep
   // a larger edge for legibility; item/prop use a smaller edge to reduce token
   // count and OpenAI latency without hurting object identification.
@@ -20509,6 +20509,41 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
               rid: req.rid, imageHash, query: _storedQuery,
               originalQuery: _storedQuery !== _bgQuery ? _bgQuery : undefined,
               elapsedMs: _bgElapsedMs, needsFamilyRecovery: _needsFamily || undefined,
+            });
+          }
+
+          // Phase 5D.1B: after a high-stakes PROVISIONAL response, write the master-
+          // confirmed identity into the SAME exact vision cache the analyze endpoint uses
+          // (exactCacheKey === that endpoint's cacheKey). A repeat scan of this image then
+          // hits the confirmed result (sub-500ms) instead of re-running the provisional+
+          // background flow. Scoped to the provisional path only (raceWinner) so other
+          // background-recovery callers are unaffected, and skipped when identity is
+          // incomplete (_needsFamily) so no unstable identity enters the exact cache.
+          // Provisional responses themselves are never cached — they early-return before
+          // any cache write; only this confirmed master result is persisted.
+          if (raceWinner === "high_stakes_provisional" && !_needsFamily && exactCacheKey) {
+            const _bgCachePayload = {
+              ok:                 true,
+              query:              _storedQuery,
+              variants:           _bgVariants,
+              confidence:         Number(m?.parsed?.confidence || 0.7),
+              identity:           { ...(m?.parsed?.identity || {}), imageHash },
+              visionIdentity:     { ...(m?.parsed?.identity || {}), imageHash },
+              imageHash,
+              attributeCertainty: m?.parsed?.attributeCertainty || null,
+              authenticityFlags:  Array.isArray(m?.parsed?.authenticityFlags) ? m.parsed.authenticityFlags : [],
+              conditionFlags:     Array.isArray(m?.parsed?.conditionFlags)    ? m.parsed.conditionFlags    : [],
+              visionSource:       m?.source || "openai",
+              visionTier:         "master_confirmed",
+              visionTimings:      { masterMs: _bgElapsedMs, raceWinner: "master_background", tier: "master_confirmed" },
+              cacheSource:        "background_master",
+            };
+            visionCache.set(exactCacheKey, _bgCachePayload);
+            cacheSet(exactCacheKey, _bgCachePayload, 86400).catch(() => {});
+            console.log("VISION_BACKGROUND_CONFIRMED_CACHE_WRITE", {
+              rid: req.rid, imageHash, query: _storedQuery,
+              confidence: _bgCachePayload.confidence,
+              visionTier: "master_confirmed", elapsedMs: _bgElapsedMs,
             });
           }
         } else if (_bgQuery) {
@@ -23527,6 +23562,7 @@ if (!openai) {
                   propContext,
                   imageHash: originalHash || null,
                   _embedPromise,  // V3.10A.2: lets grace window check late similarity hit
+                  exactCacheKey: cacheKey, // 5D.1B: background master writes confirmed result here
                 }),
                 20000,
                 "vision_consensus_timeout"
