@@ -33118,6 +33118,7 @@ app.post("/market/search/stream", async (req, res) => {
       // band/accessory results from the accessory-laden confirmed query.
       let _streamMktQuery = query;
       let _streamMktVariants = variants;
+      let _deviceFirstSelected = false;
       if (_isMasterConfirmedHighStakes || _isHighStakesBackgroundRecovery) {
         const _deviceQ = deriveHighStakesDeviceMarketQuery(query, _resolvedHighStakesCategory, variants);
         if (_deviceQ && _deviceQ !== query) {
@@ -33131,6 +33132,7 @@ app.post("/market/search/stream", async (req, res) => {
             reason: "device_first_high_stakes",
           });
           _streamMktQuery = _deviceQ;
+          _deviceFirstSelected = true;
         }
       }
       phase1Promise = mergeCheapestSources(_streamMktQuery, _streamMktVariants, visionIdentity, {
@@ -33288,7 +33290,15 @@ app.post("/market/search/stream", async (req, res) => {
       // budget-blocked and falling through 6s of empty rescue.
       let _snapshotProvisionalSent = false;
       if (phase1Items.length < 2) {
-        try {
+        // Phase 5D.1D: device-first query was selected (e.g. "apple watch ultra" from
+        // "apple watch ultra green alpine loop"). Never resurrect a stale snapshot keyed
+        // by the original accessory-laden query — it would serve band comps for a device scan.
+        if (_deviceFirstSelected) {
+          console.log("MARKET_DEVICE_FIRST_SNAPSHOT_FALLBACK_BLOCKED", {
+            scanId, originalQuery: query, selectedMarketQuery: _streamMktQuery,
+            reason: "accessory_snapshot_would_violate_device_first",
+          });
+        } else try {
           const _snapFallback = await readInternalMarketSnapshot(query);
           const _snapItems = Array.isArray(_snapFallback?.items)
             ? _snapFallback.items.map(hydrateMarketSnapshotItem).filter((x) => x?.title)
