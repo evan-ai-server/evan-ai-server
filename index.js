@@ -31972,6 +31972,14 @@ app.post("/market/search/stream", async (req, res) => {
       isTrueHighStakesVisionCategory(_resolvedHighStakesCategory) &&
       _isHighConfExactIdentity &&
       isSlaExhausted(_slaMsRemaining);
+    // Phase 5D.1C: background master recovery arrives after SLA is exhausted, so
+    // _isHighConfExactIdentity is always false (!_isBackgroundRecovery guard exists
+    // to skip budget upgrades for background calls). Detect high-stakes separately
+    // so 5C.6B.1 device-first ladder still fires on confirmed Apple Watch / electronics.
+    const _isHighStakesBackgroundRecovery =
+      _isBackgroundRecovery &&
+      isTrueHighStakesVisionCategory(_resolvedHighStakesCategory) &&
+      _visionConf >= 0.85;
     if (_isMasterConfirmedHighStakes) {
       console.log("MARKET_BUDGET_FRESH_HIGH_STAKES", {
         rid: req.rid, scanId,
@@ -33110,7 +33118,7 @@ app.post("/market/search/stream", async (req, res) => {
       // band/accessory results from the accessory-laden confirmed query.
       let _streamMktQuery = query;
       let _streamMktVariants = variants;
-      if (_isMasterConfirmedHighStakes) {
+      if (_isMasterConfirmedHighStakes || _isHighStakesBackgroundRecovery) {
         const _deviceQ = deriveHighStakesDeviceMarketQuery(query, _resolvedHighStakesCategory, variants);
         if (_deviceQ && _deviceQ !== query) {
           const _demoted = query.split(/\s+/).filter((w) => !_deviceQ.split(/\s+/).includes(w));
