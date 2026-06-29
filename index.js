@@ -20590,18 +20590,6 @@ async function runVisionConsensus({ req, file, mode, propContext, imageHash = nu
       // query at or above QUERY_FAST_CONFIDENCE_THRESHOLD.
       queryFastPromise.then((r) => {
         const acc = shouldAcceptQueryFast(r, mode);
-        // Phase 5D.1A-hotfix diagnostic: always log the query_fast race decision so a
-        // live scan reveals exactly why the high-stakes provisional path did or didn't fire.
-        console.log("VISION_QUERY_FAST_RACE_DECISION", {
-          rid: req.rid,
-          accepted: acc.accepted,
-          reason: acc.reason,
-          category: acc.category ?? null,
-          confidence: acc.confidence ?? null,
-          isTrueHighStakes: isTrueHighStakesVisionCategory(acc.category),
-          cancelled: !!r?.cancelled,
-          parsedQuery: r?.parsed?.query ?? null,
-        });
         if (acc.accepted) finish("query_fast");
         // Phase 5C.5A.2: record high-stakes category signal even when query_fast is
         // rejected — so visual_shape cannot early-exit over it.
