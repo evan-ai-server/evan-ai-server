@@ -24560,9 +24560,12 @@ async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) 
         clearTimeout(t);
         const data = await r.json();
         if (!r.ok) {
-          if (r.status === 401 || (r.status === 400 && String(data?.error || "").includes("Unsupported"))) {
+          const _gpErrMsg = String(data?.error || "");
+          const _gpRetired = r.status === 400 && /no longer offered|retired|discontinued/i.test(_gpErrMsg);
+          if (r.status === 401 || (r.status === 400 && _gpErrMsg.includes("Unsupported")) || _gpRetired) {
             _googleProductApiAvailable = false;
-            console.warn("DIRECT_URL_RECOVERY_PLAN_LIMIT", { status: r.status, error: (data?.error || "unknown").slice(0, 120), note: "google_product engine not in SerpAPI plan — recovery disabled. Upgrade plan to enable direct merchant URL recovery." });
+            const _gpReason = _gpRetired ? "retired_service" : "plan_limit";
+            console.warn("GOOGLE_PRODUCT_RECOVERY_DISABLED", { status: r.status, reason: _gpReason, error: _gpErrMsg.slice(0, 120), note: "google_product engine unavailable — recovery disabled until restart." });
           } else {
             console.log("DIRECT_URL_RECOVERY_API_ERR", { productId: it._productId, status: r.status, error: (data?.error || "unknown").slice(0, 80) });
           }
@@ -24768,8 +24771,11 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
     clearTimeout(t);
     const data = await r.json();
     if (!r.ok) {
-      if (r.status === 401 || (r.status === 400 && String(data?.error || "").includes("Unsupported"))) {
+      const _gpErrMsg2 = String(data?.error || "");
+      const _gpRetired2 = r.status === 400 && /no longer offered|retired|discontinued/i.test(_gpErrMsg2);
+      if (r.status === 401 || (r.status === 400 && _gpErrMsg2.includes("Unsupported")) || _gpRetired2) {
         _googleProductApiAvailable = false;
+        if (_gpRetired2) console.warn("GOOGLE_PRODUCT_RECOVERY_DISABLED", { status: r.status, reason: "retired_service", error: _gpErrMsg2.slice(0, 120) });
       }
       console.log("DIRECT_URL_RECOVERY_REJECTED", {
         scanId: scanId || null,

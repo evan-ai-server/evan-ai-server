@@ -267,7 +267,7 @@ test("URL_RECOVERY_CACHE_INJECTED appears after identity recheck pass, not befor
 test("_verifyOneItem return persists write-time guard metadata", () => {
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("async function _verifyOneItem"),
-    INDEX_SRC.indexOf("async function _verifyOneItem") + 5500
+    INDEX_SRC.indexOf("async function _verifyOneItem") + 5600
   );
   assert.ok(block.includes("recoveryGuardVersion"), "must persist recoveryGuardVersion");
   assert.ok(block.includes("origTitle:"), "must persist origTitle");
