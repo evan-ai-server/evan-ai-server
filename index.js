@@ -25115,18 +25115,29 @@ async function upgradeToVerifiedListings(uiItems, serpApiKey, { scanId = null, q
   const upgraded = uiItems.map(it => {
     if (!it._productId || !recovered.has(it._productId)) return it;
     const rec = recovered.get(it._productId);
-    return {
+    const _recoveredFields = {
       ...it,
-      directUrl:        rec.directUrl,
-      link:             rec.directUrl,
-      url:              rec.directUrl,
-      buyLink:          rec.directUrl,
-      clickable:        true,
-      urlQuality:       "merchant_direct",
-      urlHost:          rec.urlHost,
-      evidenceQuality:  "verified_listing",
-      isVerifiedListing: true,
-      isPricingEvidenceOnly: false,
+      directUrl:  rec.directUrl,
+      link:       rec.directUrl,
+      url:        rec.directUrl,
+      buyLink:    rec.directUrl,
+      clickable:  true,
+      urlQuality: "merchant_direct",
+      urlHost:    rec.urlHost,
+    };
+    // Phase 2B.3: a SerpAPI google_product recovered seller URL is real,
+    // clickable evidence but not an API-backed item record, so it can reach
+    // marketplace_direct/merchant_direct here — never verified_listing.
+    const _recoveredTier = deriveListingEvidenceTier(_recoveredFields);
+    return {
+      ..._recoveredFields,
+      evidenceQuality:       _recoveredTier.evidenceTier === "verified_listing" ? "verified_listing" : "pricing_signal",
+      isVerifiedListing:     _recoveredTier.verified,
+      isPricingEvidenceOnly: !_recoveredTier.verified,
+      evidenceTier:          _recoveredTier.evidenceTier,
+      evidenceBadge:         _recoveredTier.evidenceBadge,
+      verified:              _recoveredTier.verified,
+      pricingSignalOnly:     _recoveredTier.pricingSignalOnly,
     };
   });
 
@@ -26437,13 +26448,24 @@ function sanitizeOutboundListingForClient(item, context = {}) {
 
   // Step 4: classify evidenceQuality and verification flags
   const isOracle    = urlQuality === "oracle_pricing_estimate";
-  const isMerchant  = urlQuality === "merchant_direct" || urlQuality === "merchant_resolved" || urlQuality === "google_redirect_unwrapped";
   const isGoogleBad = urlQuality === "google_unresolved" || urlQuality === "google_unresolved_stale_cache";
   const isLegacy    = urlQuality === "unknown_legacy_no_url" || urlQuality === "unknown_legacy_has_url";
 
+  // Phase 2B.3: single strict trust classification, shared by the new
+  // evidenceTier fields and the legacy evidenceQuality/isVerifiedListing
+  // fields below. Only a true API-backed marketplace record (eBay Browse
+  // today — see src/listingEvidenceTier.js) can reach verified_listing; a
+  // merely well-shaped direct/merchant URL (SerpAPI or otherwise) cannot.
+  const _evidenceTierInfo = deriveListingEvidenceTier({
+    ...item,
+    directUrl,
+    clickable,
+    urlQuality,
+  });
+
   let evidenceQuality;
   if (isOracle)   evidenceQuality = "oracle_estimate";
-  else if (isMerchant && clickable !== false && directUrl) evidenceQuality = "verified_listing";
+  else if (_evidenceTierInfo.evidenceTier === "verified_listing") evidenceQuality = "verified_listing";
   else if (isGoogleBad || clickable === false) evidenceQuality = "pricing_signal";
   else if (isLegacy)  evidenceQuality = "legacy_unknown";
   else               evidenceQuality = "pricing_signal";
@@ -26451,12 +26473,9 @@ function sanitizeOutboundListingForClient(item, context = {}) {
   const isVerifiedListing    = evidenceQuality === "verified_listing";
   const isPricingEvidenceOnly = !isVerifiedListing;
 
-  // Phase 2B.1: additive per-listing evidence schema. Derived purely from the
-  // evidenceQuality computed above — mirrors isVerifiedListing exactly in this
-  // phase (stricter verified definition lands in Phase 2B.3). fetchedAt/provider
-  // pass through best-effort existing fields; no provider stamps fetchedAt yet,
-  // so sourceFreshness stays "unknown" until Phase 2B.4 wires real freshness.
-  const _evidenceTierInfo = deriveListingEvidenceTier({ evidenceQuality });
+  // fetchedAt passes through best-effort existing fields; no provider stamps
+  // fetchedAt yet, so sourceFreshness stays "unknown" until Phase 2B.4 wires
+  // real freshness.
   const _evidenceFetchedAt = Number.isFinite(Number(item.fetchedAt)) ? Number(item.fetchedAt) : null;
 
   if (changed) {
@@ -26488,7 +26507,7 @@ function sanitizeOutboundListingForClient(item, context = {}) {
     isVerifiedListing,
     isPricingEvidenceOnly,
 
-    // Phase 2B.1 additive schema (see src/listingEvidenceTier.js):
+    // Phase 2B.1 additive schema, Phase 2B.3 strict tiers (see src/listingEvidenceTier.js):
     evidenceTier:      _evidenceTierInfo.evidenceTier,
     evidenceBadge:     _evidenceTierInfo.evidenceBadge,
     verified:          _evidenceTierInfo.verified,
@@ -27901,6 +27920,10 @@ async function buildMarketSearchResponsePayload({
   // read from or write to _confidenceCalibration, and does not affect verdict,
   // affiliate eligibility, or cache behavior.
   const _evidenceVerifiedCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "verified_listing").length;
+  // Phase 2B.3: honest counts for the two new strict tiers — a clickable
+  // direct URL that is NOT an API-backed marketplace record.
+  const _evidenceMarketplaceDirectCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "marketplace_direct").length;
+  const _evidenceMerchantDirectCount   = uiItemsForCalibration.filter((it) => it?.evidenceTier === "merchant_direct").length;
   const _evidencePricingCount  = uiItemsForCalibration.filter((it) => it?.evidenceTier === "pricing_signal_only").length;
   const _evidenceModelEstCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "model_estimate").length;
   const _evidenceProvidersUsed = [...new Set(
@@ -27922,8 +27945,8 @@ async function buildMarketSearchResponsePayload({
   const _evidenceSummary = {
     scanEvidenceTier:       _evidenceScanTier,
     verifiedListingCount:   _evidenceVerifiedCount,
-    marketplaceDirectCount: 0,
-    merchantDirectCount:    0,
+    marketplaceDirectCount: _evidenceMarketplaceDirectCount,
+    merchantDirectCount:    _evidenceMerchantDirectCount,
     pricingSignalCount:     _evidencePricingCount,
     olderReferenceCount:    0,
     modelEstimateCount:     _evidenceModelEstCount,
@@ -27945,6 +27968,8 @@ async function buildMarketSearchResponsePayload({
     scanId: retrievalMeta?.scanId || null,
     tierCounts: {
       verified_listing:    _evidenceVerifiedCount,
+      marketplace_direct:  _evidenceMarketplaceDirectCount,
+      merchant_direct:     _evidenceMerchantDirectCount,
       pricing_signal_only: _evidencePricingCount,
       model_estimate:      _evidenceModelEstCount,
     },
@@ -44305,20 +44330,29 @@ app.post("/api/profile/flip", async (req, res) => {
     console.warn("EBAY_ENABLEMENT_DIAGNOSTIC_ERROR", { error: String(_e) });
   }
 
-  // Phase 4I.6: verified-pipeline selftest — proves a real eBay item URL becomes
-  // isVerifiedListing:true and a null-URL oracle item stays false. Runs at every
-  // boot so a future regression in the URL classifier breaks loudly here first.
+  // Phase 4I.6 / 2B.3: verified-pipeline selftest — proves a real eBay Browse
+  // item (provider+itemId+canonicalUrl proof) becomes isVerifiedListing:true,
+  // an eBay-URL lookalike with NO such proof does not (Phase 2B.3), and a
+  // null-URL oracle item stays false. Runs at every boot so a future
+  // regression in the URL classifier or the Phase 2B.3 trust classifier
+  // breaks loudly here first.
   try {
     const _vA = sanitizeOutboundListingForClient(
-      normalizeItem({ title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast", extracted_price: 79.99,
-        source: "eBay", link: "https://www.ebay.com/itm/123456789012" }),
+      {
+        ...normalizeItem({ title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast", extracted_price: 79.99,
+          source: "eBay", link: "https://www.ebay.com/itm/123456789012" }),
+        provider:     "ebay_browse",
+        itemId:       "v1|123456789012|0",
+        legacyItemId: "123456789012",
+        canonicalUrl: "https://www.ebay.com/itm/123456789012",
+      },
       { scanId: "selftest" }
     );
-    if (!_vA.isVerifiedListing || _vA.urlQuality !== "merchant_direct" || !_vA.clickable || !_vA.directUrl) {
+    if (!_vA.isVerifiedListing || _vA.evidenceTier !== "verified_listing" || _vA.urlQuality !== "merchant_direct" || !_vA.clickable || !_vA.directUrl) {
       console.error("EBAY_VERIFIED_PIPELINE_SELFTEST_FAIL", {
-        case: "verified_case", isVerifiedListing: _vA.isVerifiedListing,
+        case: "verified_case", isVerifiedListing: _vA.isVerifiedListing, evidenceTier: _vA.evidenceTier,
         urlQuality: _vA.urlQuality, clickable: _vA.clickable, hasDirectUrl: !!_vA.directUrl,
-        error: "Real eBay item URL should classify as isVerifiedListing:true with urlQuality:merchant_direct",
+        error: "Real eBay Browse item (provider+itemId+canonicalUrl) should classify as isVerifiedListing:true, evidenceTier:verified_listing, urlQuality:merchant_direct",
       });
     } else {
       const _vB = sanitizeOutboundListingForClient(
@@ -44326,13 +44360,23 @@ app.post("/api/profile/flip", async (req, res) => {
           extracted_price: 79.99, source: "eBay - fake_oracle_seller", link: null }),
         { scanId: "selftest" }
       );
+      const _vC = sanitizeOutboundListingForClient(
+        normalizeItem({ title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast (lookalike, no API proof)",
+          extracted_price: 74.99, source: "google shopping", link: "https://www.ebay.com/itm/987654321098" }),
+        { scanId: "selftest" }
+      );
       if (_vB.isVerifiedListing || _vB.directUrl) {
         console.error("EBAY_VERIFIED_PIPELINE_SELFTEST_FAIL", {
           case: "oracle_case", isVerifiedListing: _vB.isVerifiedListing, hasDirectUrl: !!_vB.directUrl,
           error: "Null-URL oracle item must not classify as isVerifiedListing:true",
         });
+      } else if (_vC.isVerifiedListing || _vC.evidenceTier !== "marketplace_direct") {
+        console.error("EBAY_VERIFIED_PIPELINE_SELFTEST_FAIL", {
+          case: "lookalike_no_proof_case", isVerifiedListing: _vC.isVerifiedListing, evidenceTier: _vC.evidenceTier,
+          error: "An eBay item URL with no provider/itemId proof must classify as marketplace_direct, not verified_listing",
+        });
       } else {
-        console.log("EBAY_VERIFIED_PIPELINE_SELFTEST_PASS", { verifiedCase: true, oracleCase: false });
+        console.log("EBAY_VERIFIED_PIPELINE_SELFTEST_PASS", { verifiedCase: true, oracleCase: false, lookalikeNoProofCase: "marketplace_direct" });
       }
     }
   } catch (_e) {

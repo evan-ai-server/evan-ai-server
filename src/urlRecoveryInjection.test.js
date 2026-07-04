@@ -63,13 +63,20 @@ test("valid merchant URL passes _isValidMerchantUrl logic", () => {
   assert.ok(!/(^|\.)doubleclick\.net$/i.test(host), "not a DoubleClick host");
 });
 
-test("sanitizeOutboundListingForClient classifies merchant_direct + clickable as verified_listing", () => {
+// Phase 2B.3: bare merchant_direct + clickable + directUrl is NO LONGER
+// sufficient for verified_listing (that was the SerpAPI-merchant-URL
+// overclaim this phase fixes) — verified_listing now requires the strict
+// per-item trust classifier (src/listingEvidenceTier.js) to agree, which in
+// turn requires real API-backed marketplace proof (provider/itemId/
+// canonicalUrl), not just a well-shaped URL.
+test("sanitizeOutboundListingForClient requires the strict evidenceTier classifier — not bare merchant_direct+clickable — for verified_listing", () => {
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("function sanitizeOutboundListingForClient"),
-    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 3000
+    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 3200
   );
-  assert.ok(block.includes('urlQuality === "merchant_direct"'), "merchant_direct must be in isMerchant");
-  assert.ok(block.includes('isMerchant && clickable !== false && directUrl) evidenceQuality = "verified_listing"'), "merchant_direct + clickable + directUrl must become verified_listing");
+  assert.ok(block.includes("deriveListingEvidenceTier({"), "must delegate to the strict per-item trust classifier");
+  assert.ok(block.includes('_evidenceTierInfo.evidenceTier === "verified_listing") evidenceQuality = "verified_listing"'), "evidenceQuality:verified_listing must be gated by the strict classifier's evidenceTier, not by urlQuality/clickable alone");
+  assert.ok(!block.includes('isMerchant && clickable !== false && directUrl) evidenceQuality = "verified_listing"'), "the old bare merchant_direct+clickable+directUrl shortcut to verified_listing must be gone");
   assert.ok(block.includes('isVerifiedListing    = evidenceQuality === "verified_listing"'), "isVerifiedListing must derive from evidenceQuality");
 });
 
@@ -135,9 +142,11 @@ test("_scheduleAsyncUrlRecovery checks circuit breaker before running", () => {
 // ── I. Oracle/fallback estimate cannot become verified ────────────────────────
 
 test("sanitizeOutboundListingForClient: oracle urlQuality stays non-verified", () => {
+  // Window widened 2500→3200 (Phase 2B.3 added the strict-classifier block
+  // above this assignment); the assertions themselves are unchanged.
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("function sanitizeOutboundListingForClient"),
-    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 2500
+    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 3200
   );
   assert.ok(block.includes('urlQuality === "oracle_pricing_estimate"'), "oracle must be detected");
   assert.ok(block.includes('evidenceQuality = "oracle_estimate"'), "oracle must stay oracle_estimate, not verified");
