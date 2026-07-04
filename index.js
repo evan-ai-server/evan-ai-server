@@ -2482,11 +2482,23 @@ async function incrementDistributedWindowCounter(key, windowMs) {
     return incrementLocalWindowCounter(key, windowMs);
   }
 
-  const count = await redis.incr(key);
-  if (count === 1) {
-    await redis.pexpire(key, windowMs);
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.pexpire(key, windowMs);
+    }
+    return count;
+  } catch (err) {
+    // SECURITY: Redis error mid-request — degrade to the same per-instance
+    // local counter used when Redis isn't configured, so an outage narrows
+    // quota/abuse protection to per-instance limits instead of silently
+    // removing it (previously this threw, which made callers fail open).
+    logEvent("warn", "distributed_counter_fallback_local", {
+      key,
+      error: err?.message || String(err),
+    });
+    return incrementLocalWindowCounter(key, windowMs);
   }
-  return count;
 }
 
 // Phase 11: Deterministic 0–1 float from a string key — used for canary cohort routing.
@@ -2625,12 +2637,22 @@ async function phase1AbuseProtection(req, res, next) {
 
     return next();
   } catch (err) {
-    logEvent("warn", "abuse_guard_failed_open", {
+    // SECURITY: fail CLOSED — this guard only reaches here for routes that
+    // already matched routeNeedsPhase1AbuseGuard (vision/analyze, upload,
+    // market/*, search/serp|ebay|etsy, watch/*), so an unexpected error must
+    // not grant unlimited access to those paid/expensive routes.
+    // incrementDistributedWindowCounter already degrades to a local counter
+    // on Redis errors, so this only fires for genuinely unexpected failures.
+    logEvent("warn", "abuse_guard_fail_closed", {
       route: req.path,
       method: req.method,
       error: err?.message || String(err),
     });
-    return next();
+    return res.status(503).json({
+      ok: false,
+      error: "quota_check_unavailable",
+      message: "Temporary quota check unavailable. Please try again shortly.",
+    });
   }
 }
 
@@ -2800,19 +2822,26 @@ function getScanPlanLimit(plan = "free") {
 
 // Issue 5: Per-user per-minute rate limits (scans and clicks).
 // Uses simple INCR+EXPIRE pattern consistent with existing quota infrastructure.
-// Fails OPEN — never blocks on Redis error.
+// SECURITY: fails CLOSED by default on Redis error — degrades to the same
+// per-instance local window counter used elsewhere, so an outage narrows
+// the limit to per-instance instead of removing it. Callers that guard a
+// non-expensive route (e.g. click attribution) may opt into the old
+// fail-OPEN behavior via { failOpen: true }.
 // Env-overridable so the bench harness (12 sequential scans) can lift the
 // free-tier cap without dropping prod's protection.
 const RATE_LIMIT_SCAN_FREE_PER_MIN  = Number(process.env.RATE_LIMIT_SCAN_FREE_PER_MIN || 3);
 const RATE_LIMIT_SCAN_PRO_PER_MIN   = Number(process.env.RATE_LIMIT_SCAN_PRO_PER_MIN  || 10);
 const RATE_LIMIT_CLICK_PER_MIN      = Number(process.env.RATE_LIMIT_CLICK_PER_MIN     || 10);
 
-async function checkPerMinuteRateLimit(redisClient, key, limit) {
+async function checkPerMinuteRateLimit(redisClient, key, limit, { failOpen = false } = {}) {
   try {
     const count = await redisClient.incr(key);
     if (count === 1) await redisClient.expire(key, 60);
     return count <= limit;
-  } catch { return true; } // fail open
+  } catch {
+    if (failOpen) return true;
+    return incrementLocalWindowCounter(key, 60_000) <= limit;
+  }
 }
 
 function scanRateLimitKey(userId, plan) {
@@ -2961,11 +2990,19 @@ async function enforceScanQuota(req, res, next) {
 
     return next();
   } catch (err) {
-    logEvent("warn", "scan_quota_guard_failed_open", {
+    // SECURITY: fail CLOSED — an unexpected error here must not grant
+    // unlimited scan access. incrementDistributedWindowCounter already
+    // degrades to a local counter on Redis errors, so this only fires for
+    // genuinely unexpected failures.
+    logEvent("warn", "scan_quota_guard_fail_closed", {
       route: req.path,
       error: err?.message || String(err),
     });
-    return next();
+    return res.status(503).json({
+      ok: false,
+      error: "quota_check_unavailable",
+      message: "Temporary quota check unavailable. Please try again shortly.",
+    });
   }
 }
 
@@ -30778,10 +30815,10 @@ if (internalHit.hit && Array.isArray(internalHit.items) && internalHit.items.len
   const _scanIdA = responsePayload.scanId || _budgetScanIdEarly || null;
   // Issue 5: per-minute scan rate limit (bench bypass honored)
   if (_userId && !isBenchBypass(req) && !isPaidPlan(_planA)) {
-    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_FREE_PER_MIN).catch(() => true);
+    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_FREE_PER_MIN).catch(() => false);
     if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
   } else if (_userId && !isBenchBypass(req) && isPaidPlan(_planA)) {
-    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_PRO_PER_MIN).catch(() => true);
+    const _rlOk = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planA), RATE_LIMIT_SCAN_PRO_PER_MIN).catch(() => false);
     if (!_rlOk) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
   }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planA }).catch(() => {});
@@ -30937,7 +30974,7 @@ if (cached && Array.isArray(cached) && cached.length > 0) {
   // Issue 5: per-minute scan rate limit (bench bypass honored)
   if (_userId && !isBenchBypass(req)) {
     const _rlLimitB = isPaidPlan(_planB) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
-    const _rlOkB = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planB), _rlLimitB).catch(() => true);
+    const _rlOkB = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planB), _rlLimitB).catch(() => false);
     if (!_rlOkB) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
   }
   await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planB }).catch(() => {});
@@ -31431,7 +31468,7 @@ const _scanIdC = responsePayload.scanId || _budgetScanIdEarly || null;
 // Issue 5: per-minute scan rate limit (bench bypass honored)
 if (_userId && !isBenchBypass(req)) {
   const _rlLimitC = isPaidPlan(_planC) ? RATE_LIMIT_SCAN_PRO_PER_MIN : RATE_LIMIT_SCAN_FREE_PER_MIN;
-  const _rlOkC = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planC), _rlLimitC).catch(() => true);
+  const _rlOkC = await checkPerMinuteRateLimit(redis, scanRateLimitKey(_userId, _planC), _rlLimitC).catch(() => false);
   if (!_rlOkC) return res.status(429).json({ ok: false, error: "scan_rate_limit_exceeded", retryAfterSeconds: 60 });
 }
 await _applyPersonalDecisionToPayload(responsePayload, { userId: _userId, category, scannedPrice, plan: _planC }).catch(() => {});
@@ -45382,7 +45419,7 @@ app.post("/attribution/click", async (req, res) => {
     const durationMs = req.body?.durationMs != null ? Number(req.body.durationMs) : null;
     if (userId) {
       // Issue 5: per-minute click rate limit — fail silently, don't block
-      const _clickRlOk = await checkPerMinuteRateLimit(redis, clickRateLimitKey(userId), RATE_LIMIT_CLICK_PER_MIN).catch(() => true);
+      const _clickRlOk = await checkPerMinuteRateLimit(redis, clickRateLimitKey(userId), RATE_LIMIT_CLICK_PER_MIN, { failOpen: true }).catch(() => true);
       if (_clickRlOk) {
         recordAffiliateClick(redis, userId, { scanId, source, category, program, url }).catch(() => {});
         recordAffiliateClickEvent(redis, userId, { scanId, source, category, program, durationMs }).catch(() => {});
