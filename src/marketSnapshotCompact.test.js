@@ -212,3 +212,86 @@ describe("compactMarketSnapshotItem — existing non-URL fields unaffected by V3
     assert.equal(c.clickable, false);
   });
 });
+
+// ── Phase 2B.4: direct-listing API proof fields are preserved ────────────────
+
+const ebayBrowseItem = {
+  title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast", source: "eBay", price: 79.99, totalPrice: 79.99,
+  directUrl: "https://www.ebay.com/itm/123456789012", clickable: true, urlQuality: "merchant_direct",
+  provider: "ebay_browse", marketplace: "ebay",
+  itemId: "v1|123456789012|0", legacyItemId: "123456789012",
+  canonicalUrl: "https://www.ebay.com/itm/123456789012",
+  affiliateUrl: "https://www.ebay.com/itm/123456789012?campid=affiliate123",
+  seller: { username: "diecastplanes", feedbackPercentage: 99.5, feedbackScore: 4200 },
+  conditionId: "1000", availability: "IN_STOCK", buyingOptions: ["FIXED_PRICE"],
+  itemLocation: { country: "US", postalCode: "941**" },
+  fetchedAt: 1750000000000,
+  evidenceTier: "verified_listing", evidenceBadge: "Verified", verified: true, pricingSignalOnly: false,
+  isVerifiedListing: true, evidenceQuality: "verified_listing",
+};
+
+describe("compactMarketSnapshotItem — Phase 2B.4 API proof fields preserved", () => {
+  it("provider/marketplace/itemId/legacyItemId/canonicalUrl/affiliateUrl are preserved", () => {
+    const c = compactMarketSnapshotItem(ebayBrowseItem);
+    assert.equal(c.provider, "ebay_browse");
+    assert.equal(c.marketplace, "ebay");
+    assert.equal(c.itemId, "v1|123456789012|0");
+    assert.equal(c.legacyItemId, "123456789012");
+    assert.equal(c.canonicalUrl, "https://www.ebay.com/itm/123456789012");
+    assert.equal(c.affiliateUrl, "https://www.ebay.com/itm/123456789012?campid=affiliate123");
+  });
+
+  it("seller sub-fields are preserved and re-sanitized to the known shape only", () => {
+    const c = compactMarketSnapshotItem(ebayBrowseItem);
+    assert.deepEqual(c.seller, { username: "diecastplanes", feedbackPercentage: 99.5, feedbackScore: 4200 });
+  });
+
+  it("conditionId/availability/buyingOptions/itemLocation are preserved", () => {
+    const c = compactMarketSnapshotItem(ebayBrowseItem);
+    assert.equal(c.conditionId, "1000");
+    assert.equal(c.availability, "IN_STOCK");
+    assert.deepEqual(c.buyingOptions, ["FIXED_PRICE"]);
+    assert.deepEqual(c.itemLocation, { country: "US", postalCode: "941**" });
+  });
+
+  it("fetchedAt is preserved as a number", () => {
+    const c = compactMarketSnapshotItem(ebayBrowseItem);
+    assert.equal(c.fetchedAt, 1750000000000);
+  });
+
+  it("evidenceTier/evidenceBadge/verified/pricingSignalOnly are preserved", () => {
+    const c = compactMarketSnapshotItem(ebayBrowseItem);
+    assert.equal(c.evidenceTier, "verified_listing");
+    assert.equal(c.evidenceBadge, "Verified");
+    assert.equal(c.verified, true);
+    assert.equal(c.pricingSignalOnly, false);
+  });
+
+  it("a giant/oversized seller object is rebuilt to only the known-safe sub-fields, never stored raw", () => {
+    const c = compactMarketSnapshotItem({
+      ...ebayBrowseItem,
+      seller: { username: "x", feedbackPercentage: 100, feedbackScore: 1, rawAuthToken: "should-never-be-stored", registrationDate: "2001-01-01", hugeBlob: "y".repeat(10000) },
+    });
+    assert.deepEqual(Object.keys(c.seller).sort(), ["feedbackPercentage", "feedbackScore", "username"]);
+  });
+
+  it("SerpAPI-sourced item (no proof fields) compacts to all-null proof fields, no crash", () => {
+    const c = compactMarketSnapshotItem(merchantDirect);
+    assert.equal(c.provider, null);
+    assert.equal(c.itemId, null);
+    assert.equal(c.canonicalUrl, null);
+    assert.equal(c.seller, null);
+    assert.equal(c.buyingOptions, null);
+    assert.equal(c.itemLocation, null);
+    assert.equal(c.fetchedAt, null);
+  });
+
+  it("empty input returns null proof fields, no crash", () => {
+    const c = compactMarketSnapshotItem();
+    assert.equal(c.provider, null);
+    assert.equal(c.itemId, null);
+    assert.equal(c.seller, null);
+    assert.equal(c.verified, false);
+    assert.equal(c.pricingSignalOnly, false);
+  });
+});

@@ -84,5 +84,40 @@ export function compactMarketSnapshotItem(it = {}) {
     clickable:             it?.clickable === true,
     directUrl:             _directUrl,
     isVerifiedListing:     it?.isVerifiedListing === true,
+
+    // ── Phase 2B.4: direct-listing API proof + evidence/freshness fields ──
+    // Additive only. Harmless if stale: sanitizeOutboundListingForClient
+    // always recomputes evidenceTier/verified/cacheStatus/sourceFreshness/
+    // stale fresh at serve time (via deriveListingEvidenceTier +
+    // applyListingFreshness) — these are never trusted as-is, only used as
+    // the fetchedAt/proof INPUT to that recomputation. Only the small,
+    // already-sanitized shape extractEbayBrowseEvidenceFields() produces —
+    // never a raw provider payload, auth header, or unbounded object.
+    provider:     typeof it?.provider    === "string" ? it.provider    : null,
+    marketplace:  typeof it?.marketplace === "string" ? it.marketplace : null,
+    itemId:       typeof it?.itemId       === "string" ? it.itemId       : null,
+    legacyItemId: typeof it?.legacyItemId === "string" ? it.legacyItemId : null,
+    canonicalUrl: typeof it?.canonicalUrl === "string" ? it.canonicalUrl : null,
+    affiliateUrl: typeof it?.affiliateUrl === "string" ? it.affiliateUrl : null,
+    seller: it?.seller && typeof it.seller === "object"
+      ? {
+          username:           it.seller.username || null,
+          feedbackPercentage: Number.isFinite(Number(it.seller.feedbackPercentage)) ? Number(it.seller.feedbackPercentage) : null,
+          feedbackScore:      Number.isFinite(Number(it.seller.feedbackScore))      ? Number(it.seller.feedbackScore)      : null,
+        }
+      : null,
+    conditionId:  (typeof it?.conditionId === "string" || typeof it?.conditionId === "number") ? it.conditionId : null,
+    availability: typeof it?.availability === "string" ? it.availability : null,
+    buyingOptions: Array.isArray(it?.buyingOptions)
+      ? it.buyingOptions.filter((x) => typeof x === "string").slice(0, 6)
+      : null,
+    itemLocation: it?.itemLocation && typeof it.itemLocation === "object"
+      ? { country: it.itemLocation.country || null, postalCode: it.itemLocation.postalCode || null }
+      : null,
+    fetchedAt: Number.isFinite(Number(it?.fetchedAt)) ? Number(it.fetchedAt) : null,
+    evidenceTier:  typeof it?.evidenceTier  === "string" ? it.evidenceTier  : null,
+    evidenceBadge: typeof it?.evidenceBadge === "string" ? it.evidenceBadge : null,
+    verified:          it?.verified === true,
+    pricingSignalOnly: it?.pricingSignalOnly === true,
   };
 }

@@ -70,9 +70,12 @@ test("valid merchant URL passes _isValidMerchantUrl logic", () => {
 // turn requires real API-backed marketplace proof (provider/itemId/
 // canonicalUrl), not just a well-shaped URL.
 test("sanitizeOutboundListingForClient requires the strict evidenceTier classifier — not bare merchant_direct+clickable — for verified_listing", () => {
+  // Window generous (6000 chars, comfortably past the whole function body)
+  // so Phase 2B.4's added freshness block doesn't push these substrings out
+  // of range again — see the identical note on the oracle test below.
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("function sanitizeOutboundListingForClient"),
-    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 3200
+    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 6000
   );
   assert.ok(block.includes("deriveListingEvidenceTier({"), "must delegate to the strict per-item trust classifier");
   assert.ok(block.includes('_evidenceTierInfo.evidenceTier === "verified_listing") evidenceQuality = "verified_listing"'), "evidenceQuality:verified_listing must be gated by the strict classifier's evidenceTier, not by urlQuality/clickable alone");
@@ -142,11 +145,12 @@ test("_scheduleAsyncUrlRecovery checks circuit breaker before running", () => {
 // ── I. Oracle/fallback estimate cannot become verified ────────────────────────
 
 test("sanitizeOutboundListingForClient: oracle urlQuality stays non-verified", () => {
-  // Window widened 2500→3200 (Phase 2B.3 added the strict-classifier block
-  // above this assignment); the assertions themselves are unchanged.
+  // Window widened 2500→3200 (Phase 2B.3) →6000 (Phase 2B.4 added the
+  // freshness-layer block above this assignment); the assertions themselves
+  // are unchanged both times.
   const block = INDEX_SRC.slice(
     INDEX_SRC.indexOf("function sanitizeOutboundListingForClient"),
-    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 3200
+    INDEX_SRC.indexOf("function sanitizeOutboundListingForClient") + 6000
   );
   assert.ok(block.includes('urlQuality === "oracle_pricing_estimate"'), "oracle must be detected");
   assert.ok(block.includes('evidenceQuality = "oracle_estimate"'), "oracle must stay oracle_estimate, not verified");

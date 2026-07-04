@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveListingEvidenceTier } from "./listingEvidenceTier.js";
+import { deriveListingEvidenceTier, applyListingFreshness } from "./listingEvidenceTier.js";
 
 // ── Phase 2B.3 required scenarios ───────────────────────────────────────────
 
@@ -185,4 +185,135 @@ test("missing/empty item defaults to pricing_signal_only without throwing", () =
     verified: false,
     pricingSignalOnly: true,
   });
+});
+
+// ── Phase 2B.4 — applyListingFreshness ──────────────────────────────────────
+
+const VERIFIED_TIER = deriveListingEvidenceTier({
+  provider: "ebay_browse",
+  itemId: "v1|123456789012|0",
+  legacyItemId: "123456789012",
+  canonicalUrl: "https://www.ebay.com/itm/123456789012",
+  directUrl: "https://www.ebay.com/itm/123456789012",
+  clickable: true,
+  urlQuality: "merchant_direct",
+  price: 79.99,
+  totalPrice: 79.99,
+});
+
+test("live eBay Browse fetch (fetchedAt ~ now) stays verified_listing, fresh", () => {
+  const now = Date.now();
+  const result = applyListingFreshness(VERIFIED_TIER, { fetchedAt: now - 1000, now });
+  assert.deepEqual(result, {
+    evidenceTier: "verified_listing", evidenceBadge: "Verified",
+    verified: true, pricingSignalOnly: false,
+    cacheStatus: null, sourceFreshness: "fresh", stale: false,
+  });
+});
+
+test("verified_listing with no fetchedAt and no cache signal at all (live, unknown-shape) stays verified, not demoted", () => {
+  const result = applyListingFreshness(VERIFIED_TIER, {});
+  assert.equal(result.evidenceTier, "verified_listing");
+  assert.equal(result.verified, true);
+  assert.equal(result.stale, false);
+});
+
+test("verified_listing snapshot round-trip within 15min stays verified_listing, fresh", () => {
+  const now = Date.now();
+  const result = applyListingFreshness(VERIFIED_TIER, { fetchedAt: now - 5 * 60 * 1000, now });
+  assert.equal(result.evidenceTier, "verified_listing");
+  assert.equal(result.verified, true);
+  assert.equal(result.sourceFreshness, "fresh");
+  assert.equal(result.stale, false);
+});
+
+test("verified_listing snapshot round-trip at 45min → still verified_listing, sourceFreshness recent", () => {
+  const now = Date.now();
+  const result = applyListingFreshness(VERIFIED_TIER, { fetchedAt: now - 45 * 60 * 1000, now });
+  assert.equal(result.evidenceTier, "verified_listing");
+  assert.equal(result.verified, true);
+  assert.equal(result.sourceFreshness, "recent");
+  assert.equal(result.stale, false);
+});
+
+test("verified_listing snapshot round-trip beyond 60min → demoted to older_price_reference, verified:false", () => {
+  const now = Date.now();
+  const result = applyListingFreshness(VERIFIED_TIER, { fetchedAt: now - 3 * 60 * 60 * 1000, now });
+  assert.deepEqual(result, {
+    evidenceTier: "older_price_reference", evidenceBadge: "Earlier price",
+    verified: false, pricingSignalOnly: false,
+    cacheStatus: null, sourceFreshness: "older", stale: true,
+  });
+});
+
+test("verified_listing served from stale_snapshot with no precise age → demoted, sourceFreshness unknown", () => {
+  const result = applyListingFreshness(VERIFIED_TIER, { cacheKind: "stale_snapshot" });
+  assert.equal(result.evidenceTier, "older_price_reference");
+  assert.equal(result.verified, false);
+  assert.equal(result.sourceFreshness, "unknown");
+  assert.equal(result.stale, true);
+  assert.equal(result.cacheStatus, "market_snapshot");
+});
+
+test("verified_listing served from fresh_snapshot with precise snapshotAgeMs within 15min stays verified", () => {
+  const result = applyListingFreshness(VERIFIED_TIER, { cacheKind: "fresh_snapshot", snapshotAgeMs: 5 * 60 * 1000 });
+  assert.equal(result.evidenceTier, "verified_listing");
+  assert.equal(result.verified, true);
+  assert.equal(result.sourceFreshness, "fresh");
+  assert.equal(result.cacheStatus, "market_snapshot");
+});
+
+const MERCHANT_TIER = deriveListingEvidenceTier({
+  directUrl: "https://www.some-store.com/product/abc123",
+  clickable: true, urlQuality: "merchant_direct", price: 49.99,
+});
+
+test("merchant_direct (never verified) live with no cache signal → unchanged, fresh label unknown, not stale", () => {
+  const result = applyListingFreshness(MERCHANT_TIER, {});
+  assert.equal(result.evidenceTier, "merchant_direct");
+  assert.equal(result.verified, false);
+  assert.equal(result.sourceFreshness, "unknown");
+  assert.equal(result.stale, false);
+  assert.equal(result.cacheStatus, null);
+});
+
+test("merchant_direct served from stale_snapshot within 2hr → tier unchanged, fresh", () => {
+  const result = applyListingFreshness(MERCHANT_TIER, { cacheKind: "stale_snapshot", snapshotAgeMs: 30 * 60 * 1000 });
+  assert.equal(result.evidenceTier, "merchant_direct");
+  assert.equal(result.sourceFreshness, "fresh");
+  assert.equal(result.stale, false);
+});
+
+test("merchant_direct served from stale_snapshot beyond 6hr → tier unchanged, marked older/stale", () => {
+  const result = applyListingFreshness(MERCHANT_TIER, { cacheKind: "stale_snapshot", snapshotAgeMs: 7 * 60 * 60 * 1000 });
+  assert.equal(result.evidenceTier, "merchant_direct");
+  assert.equal(result.verified, false);
+  assert.equal(result.sourceFreshness, "older");
+  assert.equal(result.stale, true);
+});
+
+const MODEL_ESTIMATE_TIER = deriveListingEvidenceTier({ urlQuality: "oracle_pricing_estimate" });
+
+test("model_estimate stays weak (never verified) regardless of freshness — live", () => {
+  const result = applyListingFreshness(MODEL_ESTIMATE_TIER, {});
+  assert.equal(result.evidenceTier, "model_estimate");
+  assert.equal(result.verified, false);
+  assert.equal(result.stale, false);
+});
+
+test("model_estimate stays weak (never verified) regardless of freshness — cache-served", () => {
+  const result = applyListingFreshness(MODEL_ESTIMATE_TIER, { cacheKind: "stale_snapshot" });
+  assert.equal(result.evidenceTier, "model_estimate");
+  assert.equal(result.verified, false);
+  assert.equal(result.stale, true);
+});
+
+test("internal_seed cacheKind (a different, out-of-scope cache system) is not treated as a snapshot cache serve", () => {
+  // Guards against snapshotAgeMs (present on resolveInternalMarketHit's
+  // return regardless of branch) being misread as "this pool is stale"
+  // when the items actually came from the internal_seed branch instead.
+  const result = applyListingFreshness(VERIFIED_TIER, { cacheKind: "internal_seed", snapshotAgeMs: 7 * 60 * 60 * 1000 });
+  assert.equal(result.evidenceTier, "verified_listing");
+  assert.equal(result.verified, true);
+  assert.equal(result.cacheStatus, null);
 });

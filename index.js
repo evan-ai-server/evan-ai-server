@@ -1321,7 +1321,7 @@ import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, 
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 // Phase 2B.1 — pure per-listing evidence tier derivation (additive schema only).
-import { deriveListingEvidenceTier } from "./src/listingEvidenceTier.js";
+import { deriveListingEvidenceTier, applyListingFreshness, SNAPSHOT_CACHE_KINDS } from "./src/listingEvidenceTier.js";
 // Phase 2B.2 — eBay Browse direct-listing evidence field capture (additive only).
 import { extractEbayBrowseEvidenceFields } from "./src/ebayBrowseMapper.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
@@ -15676,6 +15676,39 @@ function hydrateMarketSnapshotItem(it = {}) {
     clickable:             it?.clickable === true,
     directUrl:             it?.clickable === true ? (it?.directUrl || null) : null,
     isVerifiedListing:     it?.isVerifiedListing === true,
+
+    // Phase 2B.4: restore direct-listing API proof + evidence/freshness
+    // fields from the compact snapshot record, when present. Harmless if
+    // stale: sanitizeOutboundListingForClient always recomputes evidenceTier/
+    // verified/cacheStatus/sourceFreshness/stale fresh at serve time — these
+    // are only used as the fetchedAt/proof INPUT to that recomputation, never
+    // trusted as the final answer.
+    provider:     typeof it?.provider    === "string" ? it.provider    : null,
+    marketplace:  typeof it?.marketplace === "string" ? it.marketplace : null,
+    itemId:       typeof it?.itemId       === "string" ? it.itemId       : null,
+    legacyItemId: typeof it?.legacyItemId === "string" ? it.legacyItemId : null,
+    canonicalUrl: typeof it?.canonicalUrl === "string" ? it.canonicalUrl : null,
+    affiliateUrl: typeof it?.affiliateUrl === "string" ? it.affiliateUrl : null,
+    seller: it?.seller && typeof it.seller === "object"
+      ? {
+          username:           it.seller.username || null,
+          feedbackPercentage: Number.isFinite(Number(it.seller.feedbackPercentage)) ? Number(it.seller.feedbackPercentage) : null,
+          feedbackScore:      Number.isFinite(Number(it.seller.feedbackScore))      ? Number(it.seller.feedbackScore)      : null,
+        }
+      : null,
+    conditionId:  (typeof it?.conditionId === "string" || typeof it?.conditionId === "number") ? it.conditionId : null,
+    availability: typeof it?.availability === "string" ? it.availability : null,
+    buyingOptions: Array.isArray(it?.buyingOptions)
+      ? it.buyingOptions.filter((x) => typeof x === "string").slice(0, 6)
+      : null,
+    itemLocation: it?.itemLocation && typeof it.itemLocation === "object"
+      ? { country: it.itemLocation.country || null, postalCode: it.itemLocation.postalCode || null }
+      : null,
+    fetchedAt: Number.isFinite(Number(it?.fetchedAt)) ? Number(it.fetchedAt) : null,
+    evidenceTier:  typeof it?.evidenceTier  === "string" ? it.evidenceTier  : null,
+    evidenceBadge: typeof it?.evidenceBadge === "string" ? it.evidenceBadge : null,
+    verified:          it?.verified === true,
+    pricingSignalOnly: it?.pricingSignalOnly === true,
   };
 }
 
@@ -26456,11 +26489,28 @@ function sanitizeOutboundListingForClient(item, context = {}) {
   // fields below. Only a true API-backed marketplace record (eBay Browse
   // today — see src/listingEvidenceTier.js) can reach verified_listing; a
   // merely well-shaped direct/merchant URL (SerpAPI or otherwise) cannot.
-  const _evidenceTierInfo = deriveListingEvidenceTier({
+  const _baseTierInfo = deriveListingEvidenceTier({
     ...item,
     directUrl,
     clickable,
     urlQuality,
+  });
+
+  // fetchedAt passes through best-effort existing fields; only eBay Browse
+  // stamps a real per-item fetch time today (src/ebayBrowseMapper.js).
+  const _evidenceFetchedAt = Number.isFinite(Number(item.fetchedAt)) ? Number(item.fetchedAt) : null;
+
+  // Phase 2B.4: cache/freshness honesty layer on top of the Phase 2B.3 tier.
+  // Demotes a stale cache-served verified_listing to older_price_reference;
+  // never demotes a live item (see applyListingFreshness in
+  // src/listingEvidenceTier.js — it only demotes given positive evidence of
+  // a stale cache serve, via fetchedAt age and/or context.cacheKind/
+  // snapshotAgeMs threaded from buildMarketSearchResponsePayload's
+  // retrievalMeta).
+  const _evidenceTierInfo = applyListingFreshness(_baseTierInfo, {
+    fetchedAt:     _evidenceFetchedAt,
+    cacheKind:     context.cacheKind ?? null,
+    snapshotAgeMs: context.snapshotAgeMs ?? null,
   });
 
   let evidenceQuality;
@@ -26472,11 +26522,6 @@ function sanitizeOutboundListingForClient(item, context = {}) {
 
   const isVerifiedListing    = evidenceQuality === "verified_listing";
   const isPricingEvidenceOnly = !isVerifiedListing;
-
-  // fetchedAt passes through best-effort existing fields; no provider stamps
-  // fetchedAt yet, so sourceFreshness stays "unknown" until Phase 2B.4 wires
-  // real freshness.
-  const _evidenceFetchedAt = Number.isFinite(Number(item.fetchedAt)) ? Number(item.fetchedAt) : null;
 
   if (changed) {
     try {
@@ -26507,16 +26552,21 @@ function sanitizeOutboundListingForClient(item, context = {}) {
     isVerifiedListing,
     isPricingEvidenceOnly,
 
-    // Phase 2B.1 additive schema, Phase 2B.3 strict tiers (see src/listingEvidenceTier.js):
+    // Phase 2B.1 additive schema, Phase 2B.3 strict tiers, Phase 2B.4 cache/
+    // freshness honesty (see src/listingEvidenceTier.js):
     evidenceTier:      _evidenceTierInfo.evidenceTier,
     evidenceBadge:     _evidenceTierInfo.evidenceBadge,
     verified:          _evidenceTierInfo.verified,
     pricingSignalOnly: _evidenceTierInfo.pricingSignalOnly,
     provider:          item.provider || item.source || null,
     fetchedAt:         _evidenceFetchedAt,
-    cacheStatus:       null,
-    sourceFreshness:   "unknown",
-    stale:             false,
+    cacheStatus:       _evidenceTierInfo.cacheStatus,
+    sourceFreshness:   _evidenceTierInfo.sourceFreshness,
+    stale:             _evidenceTierInfo.stale,
+    // Affiliate eligibility is computed later at the route layer
+    // (attachAffiliateLinksToPayload) and already never turns true from this
+    // function; a stale/demoted item is doubly covered since it also fails
+    // the route layer's verifiedListingCount>0 gate (Phase 2B.3 evidence chain).
     affiliateEligible: false,
   };
 }
@@ -26620,7 +26670,16 @@ async function buildMarketSearchResponsePayload({
           scanId: retrievalMeta?.scanId || null, query: baseQuery, productId: _pid, host: _cachedRec.urlHost || null, urlQuality: "merchant_direct",
         });
       }
-      return sanitizeOutboundListingForClient(_injResult.item, { scanId: retrievalMeta?.scanId || null });
+      // Phase 2B.4: thread the internal-market-snapshot cache signal through so
+      // a stale cache-served verified_listing gets honestly demoted. cacheKind
+      // only matches resolveInternalMarketHit's own "fresh_snapshot"/
+      // "stale_snapshot" kinds (see SNAPSHOT_CACHE_KINDS) — other cache layers
+      // (route cache, enriched cache, background refresh) are unaffected.
+      return sanitizeOutboundListingForClient(_injResult.item, {
+        scanId:        retrievalMeta?.scanId || null,
+        cacheKind:     retrievalMeta?.kind || null,
+        snapshotAgeMs: Number.isFinite(Number(retrievalMeta?.snapshotAgeMs)) ? Number(retrievalMeta.snapshotAgeMs) : null,
+      });
     });
 
   // Phase V3.9A — audit: URL/recovery-field presence on the INBOUND items (before
@@ -27926,12 +27985,22 @@ async function buildMarketSearchResponsePayload({
   const _evidenceMerchantDirectCount   = uiItemsForCalibration.filter((it) => it?.evidenceTier === "merchant_direct").length;
   const _evidencePricingCount  = uiItemsForCalibration.filter((it) => it?.evidenceTier === "pricing_signal_only").length;
   const _evidenceModelEstCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "model_estimate").length;
+  // Phase 2B.4: honest count of items demoted from verified_listing due to
+  // cache/freshness (applyListingFreshness in src/listingEvidenceTier.js).
+  const _evidenceOlderReferenceCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "older_price_reference").length;
   const _evidenceProvidersUsed = [...new Set(
     uiItemsForCalibration.map((it) => it?.provider || it?.source || null).filter(Boolean).map(String)
   )];
   const _evidenceFetchTimes = uiItemsForCalibration
     .map((it) => Number(it?.fetchedAt))
     .filter((n) => Number.isFinite(n));
+  // Phase 2B.4: honest cache/serve labeling. servedFromCache only reflects the
+  // internal market snapshot system (resolveInternalMarketHit's own
+  // "fresh_snapshot"/"stale_snapshot" kinds) — matches the same cacheKind
+  // recognized by applyListingFreshness, so this never disagrees with the
+  // per-item cacheStatus each listing already carries.
+  const _evidenceServedFromCache = SNAPSHOT_CACHE_KINDS.has(retrievalMeta?.kind || null);
+  const _evidenceSnapshotAgeMs = Number.isFinite(Number(retrievalMeta?.snapshotAgeMs)) ? Number(retrievalMeta.snapshotAgeMs) : null;
   const _evidenceScanTier = _confidenceCalibration?.evidenceTier ?? null;
   // Savings-language strength by scan tier. pricing_signal_only/thin_pricing_signal
   // are this codebase's real names for the "range_only" tiers described in the
@@ -27948,12 +28017,12 @@ async function buildMarketSearchResponsePayload({
     marketplaceDirectCount: _evidenceMarketplaceDirectCount,
     merchantDirectCount:    _evidenceMerchantDirectCount,
     pricingSignalCount:     _evidencePricingCount,
-    olderReferenceCount:    0,
+    olderReferenceCount:    _evidenceOlderReferenceCount,
     modelEstimateCount:     _evidenceModelEstCount,
     providersUsed:          _evidenceProvidersUsed,
     freshestFetchAt:        _evidenceFetchTimes.length ? Math.max(..._evidenceFetchTimes) : null,
-    servedFromCache:        null,
-    snapshotAgeMs:          null,
+    servedFromCache:        _evidenceServedFromCache,
+    snapshotAgeMs:          _evidenceSnapshotAgeMs,
     canSayVerified:         !!(_confidenceCalibration?.canShowVerifiedLanguage && _evidenceVerifiedCount > 0),
     savingsMode:            _evidenceSavingsMode,
     headline:               null,
@@ -27967,13 +28036,16 @@ async function buildMarketSearchResponsePayload({
   console.log("EVIDENCE_SCHEMA_STAMPED", {
     scanId: retrievalMeta?.scanId || null,
     tierCounts: {
-      verified_listing:    _evidenceVerifiedCount,
-      marketplace_direct:  _evidenceMarketplaceDirectCount,
-      merchant_direct:     _evidenceMerchantDirectCount,
-      pricing_signal_only: _evidencePricingCount,
-      model_estimate:      _evidenceModelEstCount,
+      verified_listing:      _evidenceVerifiedCount,
+      marketplace_direct:    _evidenceMarketplaceDirectCount,
+      merchant_direct:       _evidenceMerchantDirectCount,
+      pricing_signal_only:   _evidencePricingCount,
+      older_price_reference: _evidenceOlderReferenceCount,
+      model_estimate:        _evidenceModelEstCount,
     },
-    canSayVerified: _evidenceSummary.canSayVerified,
+    canSayVerified:  _evidenceSummary.canSayVerified,
+    servedFromCache: _evidenceServedFromCache,
+    snapshotAgeMs:   _evidenceSnapshotAgeMs,
   });
 
   const _responsePayload = {
@@ -44381,6 +44453,69 @@ app.post("/api/profile/flip", async (req, res) => {
     }
   } catch (_e) {
     console.warn("EBAY_VERIFIED_PIPELINE_SELFTEST_ERROR", { error: String(_e) });
+  }
+
+  // Phase 2B.4: cache/freshness selftest — proves the FULL compact→hydrate→
+  // sanitize round-trip (not just the pure applyListingFreshness function in
+  // isolation): a fresh eBay Browse item stays verified_listing after a
+  // snapshot round-trip with a fresh fetchedAt, and the SAME item served
+  // through a stale_snapshot context with an old fetchedAt is honestly
+  // demoted to older_price_reference. Runs at every boot so a regression in
+  // compact/hydrate field preservation or the freshness layer breaks loudly
+  // here first.
+  try {
+    const _now = Date.now();
+    const _rawEbayItem = {
+      ...normalizeItem({ title: "Hawaiian Airlines Boeing 787-9 1:400 Diecast", extracted_price: 79.99,
+        source: "eBay", link: "https://www.ebay.com/itm/123456789012" }),
+      provider: "ebay_browse", itemId: "v1|123456789012|0", legacyItemId: "123456789012",
+      canonicalUrl: "https://www.ebay.com/itm/123456789012",
+    };
+
+    // Fresh: fetchedAt ~ now, round-tripped through compact/hydrate.
+    const _freshHydrated = hydrateMarketSnapshotItem(
+      compactMarketSnapshotItem({ ..._rawEbayItem, fetchedAt: _now - 1000 })
+    );
+    const _freshResult = sanitizeOutboundListingForClient(_freshHydrated, {
+      scanId: "selftest", cacheKind: "fresh_snapshot", snapshotAgeMs: 1000,
+    });
+
+    // Stale: fetchedAt 3 hours old, round-tripped the same way, served from a
+    // stale_snapshot context — must demote, never stay verified.
+    const _staleHydrated = hydrateMarketSnapshotItem(
+      compactMarketSnapshotItem({ ..._rawEbayItem, fetchedAt: _now - 3 * 60 * 60 * 1000 })
+    );
+    const _staleResult = sanitizeOutboundListingForClient(_staleHydrated, {
+      scanId: "selftest", cacheKind: "stale_snapshot", snapshotAgeMs: 3 * 60 * 60 * 1000,
+    });
+
+    const _freshOk =
+      _freshResult.isVerifiedListing === true &&
+      _freshResult.evidenceTier === "verified_listing" &&
+      _freshResult.sourceFreshness === "fresh" &&
+      _freshResult.itemId === "v1|123456789012|0";
+    const _staleOk =
+      _staleResult.isVerifiedListing === false &&
+      _staleResult.evidenceTier === "older_price_reference" &&
+      _staleResult.evidenceBadge === "Earlier price" &&
+      _staleResult.verified === false &&
+      _staleResult.sourceFreshness === "older" &&
+      _staleResult.stale === true;
+
+    if (!_freshOk || !_staleOk) {
+      console.error("CACHE_FRESHNESS_SELFTEST_FAIL", {
+        freshOk: _freshOk, staleOk: _staleOk,
+        freshEvidenceTier: _freshResult.evidenceTier, freshIsVerified: _freshResult.isVerifiedListing,
+        staleEvidenceTier: _staleResult.evidenceTier, staleIsVerified: _staleResult.isVerifiedListing,
+        error: "eBay Browse proof fields must survive compact/hydrate (fresh case verified) and a stale round-trip must demote to older_price_reference (never stay verified)",
+      });
+    } else {
+      console.log("CACHE_FRESHNESS_SELFTEST_PASS", {
+        freshCase: "verified_listing", staleCase: "older_price_reference",
+      });
+    }
+  } catch (_e) {
+    console.warn("CACHE_FRESHNESS_SELFTEST_ERROR", { error: String(_e) });
   }
 
   // Production safety: warn loudly if any of the new env-overridable rate
