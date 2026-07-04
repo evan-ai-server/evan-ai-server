@@ -32696,6 +32696,16 @@ app.post("/market/search/stream", async (req, res) => {
             endStream(); return;
           }
 
+          // Phase 1B.2C: client already disconnected before the refresh call —
+          // skip the paid live-source refresh entirely, nobody will read the result.
+          if (clientClosed) {
+            console.log("CACHE_BACKGROUND_REFRESH_SKIPPED_CLIENT_CLOSED", {
+              rid: req.rid, scanId, refreshScanId, query, reason: "client_closed",
+            });
+            _recordStreamMetric("totalCompleted", 1);
+            endStream(); return;
+          }
+
           // Isolated refresh budget context — does not inherit cacheHit:true or prior calls.
           const _refreshCtx = {
             scanId: refreshScanId,
@@ -33484,7 +33494,11 @@ app.post("/market/search/stream", async (req, res) => {
     const _agg = new LiveAggregator();
     _agg.ingest("phase1", phase1Items);
 
-    if (needsOracle) {
+    if (needsOracle && clientClosed) {
+      // Phase 1B.2C: client already gone — don't start a paid OpenAI oracle
+      // call whose result nobody will read.
+      console.log("ORACLE_SKIPPED_CLIENT_CLOSED", { rid: req.rid, scanId, query, reason: "client_closed" });
+    } else if (needsOracle) {
       _recordStreamMetric("oracleInvocations", 1);
       const _tOracle = Date.now();
       let _oracleTimedOut = false;
@@ -33915,6 +33929,10 @@ app.post("/market/search/stream", async (req, res) => {
 
           for (const q of _bgVariants) {
             if (Date.now() - _bgT0 > BACKGROUND_RETRIEVAL_EXPANSION_MS) break;
+            if (clientClosed) {
+              console.log("BACKGROUND_EXPANSION_STOPPED_CLIENT_CLOSED", { scanId, reason: "client_closed" });
+              break;
+            }
 
             const _qResults = await marketSearchConcurrency(
               () => serpShopping(q, { softFail: true })
