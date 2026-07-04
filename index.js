@@ -33172,6 +33172,11 @@ app.post("/market/search/stream", async (req, res) => {
     // earlyItemsCb is only wired for the FIRST request — inflight hits get phase1Items directly.
     const _retrievalIdentitySummary = createEmptyIdentitySummary();
     let phase1Promise;
+    // Phase 1B.2C-Hotfix: hoisted out of the else-block below so the reads at
+    // the empty-snapshot-fallback branch (after this if/else closes) stay in
+    // scope instead of throwing ReferenceError.
+    let _streamMktQuery = query;
+    let _deviceFirstSelected = false;
     if (STREAM_PHASE1_INFLIGHT.has(cacheKey)) {
       _recordStreamMetric("inflightHits", 1);
       phase1Promise = STREAM_PHASE1_INFLIGHT.get(cacheKey);
@@ -33199,9 +33204,8 @@ app.post("/market/search/stream", async (req, res) => {
       // Phase 5C.6B: for master-confirmed high-stakes devices, promote the broadest
       // clean master variant as primary SERP query so device listings outrank
       // band/accessory results from the accessory-laden confirmed query.
-      let _streamMktQuery = query;
+      _streamMktQuery = query;
       let _streamMktVariants = variants;
-      let _deviceFirstSelected = false;
       if (_isMasterConfirmedHighStakes || _isHighStakesBackgroundRecovery) {
         const _deviceQ = deriveHighStakesDeviceMarketQuery(query, _resolvedHighStakesCategory, variants);
         if (_deviceQ && _deviceQ !== query) {
