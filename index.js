@@ -2656,6 +2656,74 @@ async function phase1AbuseProtection(req, res, next) {
   }
 }
 
+// Phase 1B.2D: shared Sybil/identity-mint abuse guard factory. Bounds routes
+// that mint a fresh free-tier identity (account or guest id) by hardened
+// client IP (Phase 1B.1's getClientIp — proxy-depth aware, not a spoofable
+// header), hourly AND daily, via incrementDistributedWindowCounter
+// (Redis-backed, degrades to a local per-instance counter on Redis error —
+// never fails open; Phase 1B.2A). Each caller supplies its own scope prefix
+// and limits; counting/fail-closed behavior is identical for every caller.
+//
+// IP-only (no separate fingerprint/UA scope): live-tested during
+// implementation that a fixed IP with a rotated User-Agent is still caught
+// by the IP check alone (fingerprint = IP+UA, so it can never be a LOOSER
+// bound than IP given equal limits). A fingerprint scope only adds real
+// value at a *lower* limit than IP's, which this phase doesn't need — and
+// each extra sequential Redis round-trip compounds latency when Redis is
+// unreachable (measured ~10s per call in a full Redis outage), so checks
+// are also run in parallel rather than sequentially.
+function makeIdentityMintGuard(scopePrefix, { ipHourlyMax, ipDailyMax }) {
+  const HOUR_MS = 60 * 60 * 1000;
+  const DAY_MS  = 24 * 60 * 60 * 1000;
+
+  return async function identityMintGuard(req, res, next) {
+    try {
+      if (shouldSkipInfraGuard(req)) return next();
+
+      const ip = getClientIp(req) || "unknown";
+
+      const checks = [
+        { scope: `${scopePrefix}_ip_hourly`, windowMs: HOUR_MS, limit: ipHourlyMax },
+        { scope: `${scopePrefix}_ip_daily`,  windowMs: DAY_MS,  limit: ipDailyMax },
+      ];
+
+      const counts = await Promise.all(
+        checks.map((check) =>
+          incrementDistributedWindowCounter(`abuse:${check.scope}:${ip}`, check.windowMs)
+        )
+      );
+
+      for (let i = 0; i < checks.length; i++) {
+        if (counts[i] > checks[i].limit) {
+          logEvent("warn", "identity_mint_rate_limited", { scope: checks[i].scope, route: req.path });
+          return res.status(429).json({
+            ok: false,
+            error: "too_many_attempts",
+            message: "Too many attempts. Please try again later.",
+          });
+        }
+      }
+
+      return next();
+    } catch (err) {
+      // SECURITY: fail CLOSED — these routes mint free-tier identities; an
+      // unexpected error must not grant unlimited account/guest creation.
+      // incrementDistributedWindowCounter already degrades to a local
+      // counter on Redis errors, so this only fires for genuinely
+      // unexpected failures (mirrors phase1AbuseProtection/enforceScanQuota).
+      logEvent("warn", "identity_mint_guard_fail_closed", {
+        route: req.path,
+        error: err?.message || String(err),
+      });
+      return res.status(503).json({
+        ok: false,
+        error: "registration_check_unavailable",
+        message: "Temporary registration check unavailable. Please try again shortly.",
+      });
+    }
+  };
+}
+
 function base64UrlToBuffer(value = "") {
   const normalized = String(value || "")
     .replace(/-/g, "+")
@@ -29647,7 +29715,16 @@ app.post("/api/debug/reset-quota", async (req, res) => {
 // Issues or recovers a persistent guestId tied to device fingerprint (installId).
 // Anti-bypass: fingerprint is hashed server-side; new installs on same device
 // recover the same guestId (preventing reinstall abuse).
-app.post("/api/guest/identify", bodySchemaMiddleware(SCHEMAS.guestIdentify), async (req, res) => {
+// Phase 1B.2D: this route does not itself mint a JWT or grant scan quota
+// (quota is resolved by _resolveActor/enforceScanQuota from userId/guestId/IP,
+// not from having called this endpoint), so it is not the actual Sybil
+// boundary — but it still does an unbounded Redis write per novel
+// fingerprint, so a generous bound is applied here too.
+const guestIdentifyAbuseGuard = makeIdentityMintGuard("guest_identify", {
+  ipHourlyMax: Number(process.env.GUEST_IDENTIFY_IP_HOURLY_MAX || 20),
+  ipDailyMax:  Number(process.env.GUEST_IDENTIFY_IP_DAILY_MAX  || 60),
+});
+app.post("/api/guest/identify", guestIdentifyAbuseGuard, bodySchemaMiddleware(SCHEMAS.guestIdentify), async (req, res) => {
   try {
     const fp = String(req.body?.fingerprint || req.body?.installId || "").trim().slice(0, 128);
     if (!fp) return res.status(400).json({ ok: false, error: "fingerprint_required" });
@@ -43507,7 +43584,17 @@ Return valid JSON only:
     return path.join(AUTH_USERS_DIR, `${key}.json`);
   }
 
-  app.post("/api/auth/register", async (req, res) => {
+  // Phase 1B.2D: bound account creation so a single IP/fingerprint can't
+  // script unlimited registrations to farm fresh free-tier scan quota
+  // (each new userId gets its own DAILY_FREE_SCANS / enforceScanQuota
+  // allowance). future: require verified email or device attestation
+  // before production-scale public launch.
+  const registerAbuseGuard = makeIdentityMintGuard("register", {
+    ipHourlyMax: Number(process.env.REGISTER_IP_HOURLY_MAX || 3),
+    ipDailyMax:  Number(process.env.REGISTER_IP_DAILY_MAX  || 10),
+  });
+
+  app.post("/api/auth/register", registerAbuseGuard, async (req, res) => {
     try {
       const email = String(req.body?.email || "").toLowerCase().trim();
       const password = String(req.body?.password || "");
