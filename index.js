@@ -1320,6 +1320,8 @@ import { recordScan as harnessRecordScan, recordVerdictPayload as harnessRecordV
 import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, findScanReviewByScanId, updateScanReview } from "./src/scanReviewStore.js";
 // Phase 4C.1 — affiliate eligibility gate (verdict + verified-evidence aware).
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
+// Phase 2B.1 — pure per-listing evidence tier derivation (additive schema only).
+import { deriveListingEvidenceTier } from "./src/listingEvidenceTier.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { computeDHash } from "./src/perceptualHash.js";
 import { registerPHash, findNearPHash, removePHash, getPHashStats } from "./src/perceptualHashIndex.js";
@@ -26443,6 +26445,14 @@ function sanitizeOutboundListingForClient(item, context = {}) {
   const isVerifiedListing    = evidenceQuality === "verified_listing";
   const isPricingEvidenceOnly = !isVerifiedListing;
 
+  // Phase 2B.1: additive per-listing evidence schema. Derived purely from the
+  // evidenceQuality computed above — mirrors isVerifiedListing exactly in this
+  // phase (stricter verified definition lands in Phase 2B.3). fetchedAt/provider
+  // pass through best-effort existing fields; no provider stamps fetchedAt yet,
+  // so sourceFreshness stays "unknown" until Phase 2B.4 wires real freshness.
+  const _evidenceTierInfo = deriveListingEvidenceTier({ evidenceQuality });
+  const _evidenceFetchedAt = Number.isFinite(Number(item.fetchedAt)) ? Number(item.fetchedAt) : null;
+
   if (changed) {
     try {
       console.log("OUTBOUND_LISTING_URL_SANITIZED", {
@@ -26471,6 +26481,18 @@ function sanitizeOutboundListingForClient(item, context = {}) {
     evidenceQuality,
     isVerifiedListing,
     isPricingEvidenceOnly,
+
+    // Phase 2B.1 additive schema (see src/listingEvidenceTier.js):
+    evidenceTier:      _evidenceTierInfo.evidenceTier,
+    evidenceBadge:     _evidenceTierInfo.evidenceBadge,
+    verified:          _evidenceTierInfo.verified,
+    pricingSignalOnly: _evidenceTierInfo.pricingSignalOnly,
+    provider:          item.provider || item.source || null,
+    fetchedAt:         _evidenceFetchedAt,
+    cacheStatus:       null,
+    sourceFreshness:   "unknown",
+    stale:             false,
+    affiliateEligible: false,
   };
 }
 
@@ -27865,6 +27887,64 @@ async function buildMarketSearchResponsePayload({
       });
   }
 
+  // Phase 2B.1: additive scan-level evidence summary. Built from
+  // uiItemsForCalibration — the same array sent to the client as
+  // items/top3/market/results — so counts always match what the user sees.
+  // Reads evidenceTier/provider/fetchedAt already stamped onto each item by
+  // sanitizeOutboundListingForClient (Phase 2B.1). Purely additive: does not
+  // read from or write to _confidenceCalibration, and does not affect verdict,
+  // affiliate eligibility, or cache behavior.
+  const _evidenceVerifiedCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "verified_listing").length;
+  const _evidencePricingCount  = uiItemsForCalibration.filter((it) => it?.evidenceTier === "pricing_signal_only").length;
+  const _evidenceModelEstCount = uiItemsForCalibration.filter((it) => it?.evidenceTier === "model_estimate").length;
+  const _evidenceProvidersUsed = [...new Set(
+    uiItemsForCalibration.map((it) => it?.provider || it?.source || null).filter(Boolean).map(String)
+  )];
+  const _evidenceFetchTimes = uiItemsForCalibration
+    .map((it) => Number(it?.fetchedAt))
+    .filter((n) => Number.isFinite(n));
+  const _evidenceScanTier = _confidenceCalibration?.evidenceTier ?? null;
+  // Savings-language strength by scan tier. pricing_signal_only/thin_pricing_signal
+  // are this codebase's real names for the "range_only" tiers described in the
+  // Phase 2A spec (pricing_signal_basic/thin/weak do not exist here).
+  const _evidenceSavingsMode =
+    (_evidenceScanTier === "verified_strong" || _evidenceScanTier === "verified_moderate") ? "confident" :
+    (_evidenceScanTier === "verified_thin"   || _evidenceScanTier === "pricing_signal_strong") ? "estimated" :
+    (_evidenceScanTier === "pricing_signal_only" || _evidenceScanTier === "thin_pricing_signal") ? "range_only" :
+    "none";
+
+  const _evidenceSummary = {
+    scanEvidenceTier:       _evidenceScanTier,
+    verifiedListingCount:   _evidenceVerifiedCount,
+    marketplaceDirectCount: 0,
+    merchantDirectCount:    0,
+    pricingSignalCount:     _evidencePricingCount,
+    olderReferenceCount:    0,
+    modelEstimateCount:     _evidenceModelEstCount,
+    providersUsed:          _evidenceProvidersUsed,
+    freshestFetchAt:        _evidenceFetchTimes.length ? Math.max(..._evidenceFetchTimes) : null,
+    servedFromCache:        null,
+    snapshotAgeMs:          null,
+    canSayVerified:         !!(_confidenceCalibration?.canShowVerifiedLanguage && _evidenceVerifiedCount > 0),
+    savingsMode:            _evidenceSavingsMode,
+    headline:               null,
+    userExplanation:        _confidenceCalibration?.explanationForUI ?? null,
+    // Affiliate eligibility is computed later at the route layer
+    // (attachAffiliateLinksToPayload), not inside this function — no safe
+    // existing signal to mirror yet, so this stays false in this phase.
+    affiliateEligible:      false,
+  };
+
+  console.log("EVIDENCE_SCHEMA_STAMPED", {
+    scanId: retrievalMeta?.scanId || null,
+    tierCounts: {
+      verified_listing:    _evidenceVerifiedCount,
+      pricing_signal_only: _evidencePricingCount,
+      model_estimate:      _evidenceModelEstCount,
+    },
+    canSayVerified: _evidenceSummary.canSayVerified,
+  });
+
   const _responsePayload = {
     ok: true,
     query: baseQuery,
@@ -27940,6 +28020,7 @@ async function buildMarketSearchResponsePayload({
       evanExplainer,
       buyOrPass:             safeEnforceVerdict(buyOrPassResult?.buyOrPass, "scan/main-response"),
       confidenceCalibration: _confidenceCalibration || null,  // Phase 4A.1
+      evidenceSummary:       _evidenceSummary,                // Phase 2B.1: additive, mirrors confidenceCalibration
       marketStructure:       _marketStructure,                // Phase 4F: additive display-only
       directClickableListings: _directClickableMeta,          // Phase 4 (Prompt 3): observation-only, not verified
       multiAngle:            null, // populated by route layer from multiAngleResult
