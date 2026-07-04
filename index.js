@@ -45435,14 +45435,19 @@ app.post("/attribution/click", async (req, res) => {
 // Record a subscription lifecycle event (from RevenueCat webhook or client).
 // Body: { userId, event, plan?, source? }
 // event: "activated" | "renewed" | "cancelled" | "restored" | "trial_started"
+// SECURITY: unauthenticated + client-suppliable. plan is stored ONLY as
+// clientReportedPlan (analytics-only, trusted:false) — never defaulted to
+// "pro" and never trusted entitlement. True plan/entitlement resolution is
+// JWT/server-verified only (see getResolvedPlan). Do not read this record
+// as subscription truth.
 app.post("/attribution/subscription", async (req, res) => {
   try {
     const userId = safeStr(req.body?.userId, 64);
     const event  = safeStr(req.body?.event,  30);
-    const plan   = safeStr(req.body?.plan,   20) || "pro";
+    const clientReportedPlan = safeStr(req.body?.plan, 20) || null;
     const source = safeStr(req.body?.source, 60) || "client_report";
     if (!userId || !event) return res.status(200).json({ ok: false, error: "userId and event required" });
-    await recordSubscriptionEvent(redis, userId, { event, plan, source });
+    await recordSubscriptionEvent(redis, userId, { event, clientReportedPlan, source });
     return res.status(200).json({ ok: true });
   } catch (err) {
     return res.status(200).json({ ok: false, error: "attribution_subscription_failed", reason: err?.message });

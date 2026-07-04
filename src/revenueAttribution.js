@@ -159,10 +159,17 @@ export async function recordAffiliateClickEvent(redis, userId, {
  * Called from POST /attribution/subscription (RevenueCat webhook or client report).
  *
  * event: "activated" | "renewed" | "cancelled" | "restored" | "trial_started"
+ *
+ * SECURITY: this record is ANALYTICS-ONLY. clientReportedPlan is
+ * self-reported by whatever called the endpoint (today: the mobile client;
+ * there is no signed webhook source yet) and must never be read as trusted
+ * entitlement — true plan/entitlement resolution is JWT/server-verified only
+ * (see getResolvedPlan in index.js). trusted/entitlement/verifiedPlan/
+ * verifiedAt are fixed at their safe defaults until a verified source exists.
  */
 export async function recordSubscriptionEvent(redis, userId, {
   event  = null,
-  plan   = "pro",
+  clientReportedPlan = null,
   source = null,  // "revenuecat_webhook" | "client_report" | "manual"
 } = {}) {
   if (!redis || !userId) return;
@@ -171,7 +178,10 @@ export async function recordSubscriptionEvent(redis, userId, {
     const pipe = redis.pipeline();
 
     // Update user's subscription record
-    const record = JSON.stringify({ plan, event, source, at: Date.now() });
+    const record = JSON.stringify({
+      clientReportedPlan, event, source, at: Date.now(),
+      trusted: false, entitlement: false, verifiedPlan: null, verifiedAt: null,
+    });
     pipe.set(KEY_SUB(userId), record, "EX", SUB_TTL);
 
     // Global aggregate
@@ -181,7 +191,7 @@ export async function recordSubscriptionEvent(redis, userId, {
 
     // Raw event stream
     const ev = JSON.stringify({
-      t: "subscription", uid: userId, event, plan, source, at: Date.now(),
+      t: "subscription", uid: userId, event, clientReportedPlan, source, at: Date.now(),
     });
     pipe.lpush(KEY_DAILY(date), ev);
     pipe.ltrim(KEY_DAILY(date), 0, MAX_EVENTS_PER_DAY - 1);
