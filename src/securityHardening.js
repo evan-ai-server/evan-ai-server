@@ -435,7 +435,9 @@ export function abuseTrackerMiddleware({ limitPaths = ["/market/search", "/api/v
 
     const ip = _getIp(req);
     // Private-network IPs (developer devices on LAN) are never abuse-blocked.
-    if (_isPrivateIp(ip)) return next();
+    // SECURITY: non-production only — a public prod deploy must never exempt
+    // a caller just because their IP looks like a private range.
+    if (process.env.NODE_ENV !== "production" && _isPrivateIp(ip)) return next();
     const now = Date.now();
 
     // Check if blocked
@@ -653,12 +655,7 @@ export function entropyHoneypotMiddleware() {
 
     if (!triggered) return next();
 
-    const ip = String(
-      req.headers["cf-connecting-ip"] ||
-      (req.headers["x-forwarded-for"] || "").split(",")[0] ||
-      req.socket?.remoteAddress ||
-      "unknown"
-    ).trim();
+    const ip = String(req.ip || req.socket?.remoteAddress || "unknown").trim();
 
     console.warn("[ENTROPY_HONEYPOT]", ip, req.path, "shadow-banned");
 
@@ -730,12 +727,12 @@ export function applyB2BJitter(obj, pct = 0.5) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function _getIp(req) {
-  return (
-    String(req.headers["cf-connecting-ip"] || "").trim() ||
-    String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-    req.socket?.remoteAddress ||
-    "unknown"
-  );
+  // SECURITY: req.ip is resolved by Express using the app's configured
+  // "trust proxy" depth, which trusts only real reverse-proxy hops. Reading
+  // cf-connecting-ip / x-forwarded-for directly here is client-spoofable and
+  // previously let a single forged header dodge the abuse/honeytoken checks
+  // below (e.g. by claiming a private-LAN IP).
+  return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
 function _sleep(ms) {

@@ -1819,6 +1819,28 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
 const IS_PROD =
   String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
+// SECURITY: HOST defaults to 0.0.0.0 (public, all interfaces) below when unset,
+// and several protections in this file (dev auth-body fallback, ops/dev-route
+// guards, private-LAN rate-limit bypass) only lock down when IS_PROD is true.
+// A deploy that forgets to set NODE_ENV=production would otherwise run
+// publicly with all of them open. Refuse to boot that combination outright —
+// local dev on a loopback host is unaffected.
+{
+  const _bootHost = String(process.env.HOST || "0.0.0.0").toLowerCase();
+  const _bootHostIsLoopback =
+    _bootHost === "127.0.0.1" ||
+    _bootHost === "localhost" ||
+    _bootHost === "::1" ||
+    _bootHost === "[::1]";
+  if (!IS_PROD && !_bootHostIsLoopback) {
+    console.error(
+      `FATAL: refusing to start — HOST="${_bootHost}" is not loopback but NODE_ENV is not "production". ` +
+      `Set NODE_ENV=production for any public/non-loopback deploy, or bind HOST=127.0.0.1 for local development.`
+    );
+    process.exit(1);
+  }
+}
+
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "2mb";
 const URLENCODED_BODY_LIMIT = process.env.URLENCODED_BODY_LIMIT || "1mb";
 
@@ -2056,14 +2078,12 @@ function safeTimingEqual(a = "", b = "") {
 }
 
 function getClientIp(req) {
-  const cfIp = String(req.headers["cf-connecting-ip"] || "").trim();
-  if (cfIp) return cfIp;
-
-  const xff = String(req.headers["x-forwarded-for"] || "")
-    .split(",")[0]
-    .trim();
-  if (xff) return xff;
-
+  // SECURITY: req.ip is resolved by Express using the configured "trust proxy"
+  // depth (see app.set("trust proxy", ...) above), which trusts exactly N real
+  // reverse-proxy hops and ignores anything a client prepends beyond that.
+  // Do NOT read cf-connecting-ip / x-forwarded-for directly here — both are
+  // fully client-controlled and previously let a single spoofed header reset
+  // every rate limiter and trip the private-LAN infra-guard bypass below.
   return req.ip || req.socket?.remoteAddress || "unknown";
 }
 
@@ -2310,11 +2330,15 @@ function shouldSkipInfraGuard(req) {
   // Private LAN IPs (developer devices) bypass all infra-guard rate limits.
   // Mirrors the same exemption in abuseTrackerMiddleware so a dev phone
   // never hits a 429 from our own rate limiters during rapid test scanning.
-  const ip = getClientIp(req);
-  if (ip === "::1" || ip === "127.0.0.1" || ip?.startsWith("::ffff:127.")) return true;
-  if (ip?.startsWith("10.")) return true;
-  if (ip?.startsWith("192.168.")) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip || "")) return true;
+  // SECURITY: non-production only. A public prod deploy must never exempt a
+  // caller just because their IP looks like a private range.
+  if (!IS_PROD) {
+    const ip = getClientIp(req);
+    if (ip === "::1" || ip === "127.0.0.1" || ip?.startsWith("::ffff:127.")) return true;
+    if (ip?.startsWith("10.")) return true;
+    if (ip?.startsWith("192.168.")) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip || "")) return true;
+  }
   return false;
 }
 
@@ -2483,6 +2507,9 @@ function routeNeedsPhase1AbuseGuard(req) {
     p === "/api/vision/analyze" ||
     p === "/upload/image" ||
     p === "/api/upload/image" ||
+    p === "/search/serp" ||
+    p === "/search/ebay" ||
+    p === "/search/etsy" ||
     p.startsWith("/market/") ||
     p.startsWith("/watch/")
   );
@@ -2883,6 +2910,9 @@ function routeAllowsUserOrApiKey(pathname = "") {
     p === "/api/upload/image" ||
     p === "/vision/analyze" ||
     p === "/api/vision/analyze" ||
+    p === "/search/serp" ||
+    p === "/search/ebay" ||
+    p === "/search/etsy" ||
     p.startsWith("/market/")
   );
 }
@@ -3027,7 +3057,7 @@ app.use(globalApiLimiter);
 app.use(writeApiLimiter);
 // Second-layer burst abuse detection (10-scan/10s hard limit per IP on scan routes)
 app.use(abuseTrackerMiddleware({
-  limitPaths: ["/market/search", "/api/vision/analyze", "/upload/presign", "/vision/enrich"],
+  limitPaths: ["/market/search", "/api/vision/analyze", "/upload/presign", "/vision/enrich", "/search/serp", "/search/ebay", "/search/etsy"],
 }));
 // Honeytoken bot detection — absent/invalid X-Ev-Client-Token → shadow-ban
 app.use(honeytokenMiddleware({ required: false }));
