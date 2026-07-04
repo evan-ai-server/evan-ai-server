@@ -1322,6 +1322,8 @@ import { createScanReviewRecord, appendScanReviewRecord, readRecentScanReviews, 
 import { evaluateAffiliateEligibilityForPayload } from "./src/affiliateGate.js";
 // Phase 2B.1 — pure per-listing evidence tier derivation (additive schema only).
 import { deriveListingEvidenceTier } from "./src/listingEvidenceTier.js";
+// Phase 2B.2 — eBay Browse direct-listing evidence field capture (additive only).
+import { extractEbayBrowseEvidenceFields } from "./src/ebayBrowseMapper.js";
 import { register as similarityRegister, findSimilar as similarityFindSimilar, remove as similarityRemove, getStats as similarityGetStats, loadFromDisk as similarityLoadFromDisk } from "./src/scanSimilarity.js";
 import { computeDHash } from "./src/perceptualHash.js";
 import { registerPHash, findNearPHash, removePHash, getPHashStats } from "./src/perceptualHashIndex.js";
@@ -8519,6 +8521,10 @@ async function searchEbayBrowse(query = "") {
           linkVerified: Boolean(
             normalized?.url || normalized?.buyLink || normalized?.link
           ),
+          // Phase 2B.2: additive direct-listing evidence fields (itemId,
+          // seller, availability, canonicalUrl, ...) — does not touch any
+          // field normalizeItem already produced above.
+          ...extractEbayBrowseEvidenceFields(it),
         };
       })
       .filter((it) => it?.title)
