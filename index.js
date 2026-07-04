@@ -3014,6 +3014,10 @@ function routeAllowsUserOrApiKey(pathname = "") {
     p === "/search/serp" ||
     p === "/search/ebay" ||
     p === "/search/etsy" ||
+    p === "/vision/enrich" ||
+    p === "/api/receipt/analyze" ||
+    p === "/api/auth/deep-scan" ||
+    p === "/api/arbitrage/flip-scanner" ||
     p.startsWith("/market/")
   );
 }
@@ -3166,7 +3170,7 @@ app.use(globalApiLimiter);
 app.use(writeApiLimiter);
 // Second-layer burst abuse detection (10-scan/10s hard limit per IP on scan routes)
 app.use(abuseTrackerMiddleware({
-  limitPaths: ["/market/search", "/api/vision/analyze", "/upload/presign", "/vision/enrich", "/search/serp", "/search/ebay", "/search/etsy"],
+  limitPaths: ["/market/search", "/api/vision/analyze", "/upload/presign", "/vision/enrich", "/search/serp", "/search/ebay", "/search/etsy", "/api/receipt/analyze", "/api/auth/deep-scan", "/api/arbitrage/flip-scanner"],
 }));
 // Honeytoken bot detection — absent/invalid X-Ev-Client-Token → shadow-ban
 app.use(honeytokenMiddleware({ required: false }));
