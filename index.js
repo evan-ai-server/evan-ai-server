@@ -33325,19 +33325,23 @@ app.post("/market/search/stream", async (req, res) => {
     // matching _phase1TimeoutMsForStream ceiling). Give them the same fair
     // SERPAPI_TIMEOUT_MS window for the OUTER stream deadline too, so the stream
     // doesn't end as rescan_needed while phase1 is still usefully in flight within
-    // the provider's own ceiling. Exact/high-stakes scans keep their existing
-    // outer deadline unchanged — only their inner phase1 kill timer was ever
-    // widened before this fix, and that stays true here.
-    const _streamDeadlineMs = (_isHighConfExactIdentity || _isMasterConfirmedHighStakes)
-      ? _marketDeadlineMs
-      : Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS);
+    // the provider's own ceiling.
+    // Phase 4B.1: exact/high-stakes scans now get this same outer alignment too.
+    // Their inner phase1 kill timer (Phase 5C.6A, below) was already widened to
+    // this ceiling, but the outer timer had stayed at the shorter, unwidened
+    // _marketDeadlineMs (e.g. 3000ms) — meaning it could still end the stream
+    // before the inner, correctly-aligned phase1 call legitimately returned.
+    // Both timers now always agree for every scan that reaches Phase 1.
+    const _streamDeadlineMs = Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS);
     if (_streamDeadlineMs > _marketDeadlineMs) {
       console.log("MARKET_STREAM_DEADLINE_ALIGNED_FOR_SERPAPI", {
         rid: req.rid, scanId, query,
         fromDeadlineMs: _marketDeadlineMs,
         toDeadlineMs: _streamDeadlineMs,
         serpApiTimeoutMs: SERPAPI_TIMEOUT_MS,
-        reason: "normal_cache_cold_scan_fair_provider_window",
+        isHighConfExactIdentity: _isHighConfExactIdentity,
+        isMasterConfirmedHighStakes: _isMasterConfirmedHighStakes,
+        reason: "phase1_provider_ceiling_alignment",
       });
     }
     const marketDeadlineTimer = setTimeout(() => {

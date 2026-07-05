@@ -990,13 +990,19 @@ test("4K: startup selftests are gated behind RUN_STARTUP_SELFTESTS env", () => {
 // 2-4.5s. A correct identity + a slow-but-working provider still produced
 // rescan_needed on the FIRST scan, redeemed only by a manual retry hitting
 // the cache the abandoned worker wrote in the background.
+//
+// Phase 4B.1: closes the narrower same-class gap Phase 4B intentionally left
+// out of scope — exact/high-stakes scans already had their INNER phase1 kill
+// timer widened to the SerpAPI ceiling (Phase 5C.6A), but the OUTER stream
+// deadline stayed at the shorter, unwidened marketDeadlineMs (e.g. 3000ms).
+// The outer deadline no longer branches on identity at all; it is now the
+// same Math.max(marketDeadlineMs, SERPAPI_TIMEOUT_MS) formula as the inner
+// timer for every scan that reaches Phase 1.
 
 const SERPAPI_TIMEOUT_MS_TEST = 4500;
 
-function computeStreamPhase1DeadlineMs(marketDeadlineMs, isHighConfExactOrHighStakes, serpApiTimeoutMs = SERPAPI_TIMEOUT_MS_TEST) {
-  return isHighConfExactOrHighStakes
-    ? marketDeadlineMs
-    : Math.max(marketDeadlineMs, serpApiTimeoutMs);
+function computeStreamPhase1DeadlineMs(marketDeadlineMs, serpApiTimeoutMs = SERPAPI_TIMEOUT_MS_TEST) {
+  return Math.max(marketDeadlineMs, serpApiTimeoutMs);
 }
 
 function computePhase1TimeoutMsForStream(marketDeadlineMs, serpApiTimeoutMs = SERPAPI_TIMEOUT_MS_TEST) {
@@ -1005,20 +1011,20 @@ function computePhase1TimeoutMsForStream(marketDeadlineMs, serpApiTimeoutMs = SE
 
 test("4B: normal cache-cold scan — outer stream deadline widens from 1700ms to the SerpAPI ceiling", () => {
   const marketDeadlineMs = 1700; // typical normal real-time scan (no exact/high-stakes upgrade)
-  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs);
   assert.equal(streamDeadline, 4500, "normal scan must get the full SerpAPI window, not the short 1700ms first-payload deadline");
   assert.ok(streamDeadline > marketDeadlineMs, "widened deadline must exceed the original short deadline");
 });
 
 test("4B: normal cache-cold scan at the 800ms SLA floor also widens to the SerpAPI ceiling", () => {
   const marketDeadlineMs = 800; // worst-case SLA-squeezed normal scan
-  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs);
   assert.equal(streamDeadline, 4500, "even the 800ms SLA floor must widen to the fair provider window");
 });
 
 test("4B: a provider response at 2.5s would have missed the old 1700ms deadline but is caught by the new one", () => {
   const oldDeadlineMs = 1700;
-  const newDeadlineMs = computeStreamPhase1DeadlineMs(oldDeadlineMs, false);
+  const newDeadlineMs = computeStreamPhase1DeadlineMs(oldDeadlineMs);
   const simulatedSerpResponseMs = 2500;
   assert.ok(simulatedSerpResponseMs > oldDeadlineMs, "sanity: old deadline would have fired first (rescan_needed) before this response arrived");
   assert.ok(simulatedSerpResponseMs < newDeadlineMs, "new deadline must still be open when the real response arrives");
@@ -1026,39 +1032,44 @@ test("4B: a provider response at 2.5s would have missed the old 1700ms deadline 
 
 test("4B: provider wait is bounded — a response slower than the SerpAPI ceiling still ends as honest rescan_needed", () => {
   const marketDeadlineMs = 1700;
-  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs);
   const simulatedSerpResponseMs = 5200; // slower than even the widened ceiling
   assert.ok(simulatedSerpResponseMs > streamDeadline, "an unusually slow provider must still hit the bounded ceiling, not wait forever");
   assert.equal(streamDeadline, SERPAPI_TIMEOUT_MS_TEST, "the ceiling itself must equal the existing SERPAPI_TIMEOUT_MS constant — no new, separate cap introduced");
 });
 
-test("4B: exact/high-stakes-confirmed scans keep their existing outer deadline unchanged", () => {
-  // MARKET_EXACT_IDENTITY_MIN_MS already puts these at 3000ms; that value
-  // must pass through untouched — only the INNER phase1 kill timer (Phase
-  // 5C.6A, tested below) was ever widened for this branch, before or after
-  // this fix.
+test("4B.1: exact/high-stakes-confirmed scans now get their outer deadline aligned to the SerpAPI ceiling too", () => {
+  // MARKET_EXACT_IDENTITY_MIN_MS puts these at 3000ms. Phase 4B left the
+  // outer stream deadline at this unwidened value while the inner phase1
+  // kill timer (Phase 5C.6A) was already 4500ms — a narrower version of the
+  // same bug class Phase 4B fixed for normal scans. Phase 4B.1 closes it.
   const marketDeadlineMs = 3000;
-  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, true);
-  assert.equal(streamDeadline, 3000, "exact/high-stakes outer deadline must stay exactly as before this fix");
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs);
+  assert.equal(streamDeadline, 4500, "exact/high-stakes outer deadline must now match the inner ceiling, not stay at the shorter 3000ms");
 });
 
 test("4B: background-recovery scans (6000ms deadline) are unaffected — already above the SerpAPI ceiling", () => {
   const marketDeadlineMs = 6000; // MARKET_BACKGROUND_RECOVERY_DEADLINE_MS
-  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs);
   assert.equal(streamDeadline, 6000, "background recovery deadline must not change — 6000ms already exceeds the 4500ms ceiling");
 });
 
-test("4B: inner phase1 kill timer matches the outer ceiling for every branch (no independent-timer race)", () => {
-  // Before this fix the outer marketDeadlineTimer and the inner
-  // mergeCheapestSources killTimer could use DIFFERENT values — for normal
-  // scans (short vs short, i.e. no alignment at all) and, subtly, even for
-  // exact/high-stakes scans (outer stayed at marketDeadlineMs=3000 while
-  // inner widened to 4500) — meaning the outer timer could fire before the
-  // inner one legitimately resolved. The inner value is now unconditionally
-  // the SerpAPI ceiling for every branch that reaches Phase 1.
+test("4B/4B.1: outer stream deadline and inner phase1 kill timer always agree (no independent-timer race)", () => {
+  // Phase 4B fixed this for normal scans (outer + inner both widened to the
+  // SerpAPI ceiling). Phase 4B.1 closed the remaining narrower gap: exact/
+  // high-stakes scans had their inner phase1 kill timer widened (Phase
+  // 5C.6A) but the outer marketDeadlineTimer stayed at the shorter,
+  // unwidened marketDeadlineMs (e.g. 3000ms) — meaning the outer timer could
+  // still fire before the inner one legitimately resolved. Both timers are
+  // now the identical Math.max(marketDeadlineMs, SERPAPI_TIMEOUT_MS) formula
+  // for every branch that reaches Phase 1, so they can never disagree again.
   assert.equal(computePhase1TimeoutMsForStream(1700), 4500, "normal scan inner ceiling");
-  assert.equal(computePhase1TimeoutMsForStream(3000), 4500, "exact/high-stakes inner ceiling (unchanged from before this fix)");
+  assert.equal(computePhase1TimeoutMsForStream(3000), 4500, "exact/high-stakes inner ceiling");
   assert.equal(computePhase1TimeoutMsForStream(6000), 6000, "background recovery inner ceiling stays at its own larger deadline");
+
+  assert.equal(computeStreamPhase1DeadlineMs(1700), 4500, "normal scan outer ceiling matches inner");
+  assert.equal(computeStreamPhase1DeadlineMs(3000), 4500, "exact/high-stakes outer ceiling now matches inner (Phase 4B.1)");
+  assert.equal(computeStreamPhase1DeadlineMs(6000), 6000, "background recovery outer ceiling matches inner");
 });
 
 test("4B: widening the deadline does not add a second SerpAPI call — same single call, longer patience only", async () => {
