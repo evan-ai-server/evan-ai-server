@@ -33318,9 +33318,31 @@ app.post("/market/search/stream", async (req, res) => {
 
     // Phase 4H.5: dynamic deadline from SLA budget; Phase 4H.3 hard cap as fallback
     let firstPayloadSent = false;
+    // Phase 4B: normal (non-exact, non-high-stakes) cache-cold scans reaching this
+    // point have already cleared the generic-query and incomplete-aircraft identity
+    // gates above and every cache-hit check, so they are just as "valid to search"
+    // as the exact/high-stakes scans Phase 5C.6A already widens below (see the
+    // matching _phase1TimeoutMsForStream ceiling). Give them the same fair
+    // SERPAPI_TIMEOUT_MS window for the OUTER stream deadline too, so the stream
+    // doesn't end as rescan_needed while phase1 is still usefully in flight within
+    // the provider's own ceiling. Exact/high-stakes scans keep their existing
+    // outer deadline unchanged — only their inner phase1 kill timer was ever
+    // widened before this fix, and that stays true here.
+    const _streamDeadlineMs = (_isHighConfExactIdentity || _isMasterConfirmedHighStakes)
+      ? _marketDeadlineMs
+      : Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS);
+    if (_streamDeadlineMs > _marketDeadlineMs) {
+      console.log("MARKET_STREAM_DEADLINE_ALIGNED_FOR_SERPAPI", {
+        rid: req.rid, scanId, query,
+        fromDeadlineMs: _marketDeadlineMs,
+        toDeadlineMs: _streamDeadlineMs,
+        serpApiTimeoutMs: SERPAPI_TIMEOUT_MS,
+        reason: "normal_cache_cold_scan_fair_provider_window",
+      });
+    }
     const marketDeadlineTimer = setTimeout(() => {
       if (!firstPayloadSent && !clientClosed && !res.writableEnded) {
-        console.log("MARKET_FIRST_PAYLOAD_DEADLINE_FIRED", { rid: req.rid, scanId, elapsedMs: Date.now() - _t1, deadlineMs: _marketDeadlineMs });
+        console.log("MARKET_FIRST_PAYLOAD_DEADLINE_FIRED", { rid: req.rid, scanId, elapsedMs: Date.now() - _t1, deadlineMs: _streamDeadlineMs });
         send("complete", {
           items: [], status: "complete", enriching: false, dataDepth: "thin",
           reason: "market_first_payload_timeout",
@@ -33330,7 +33352,7 @@ app.post("/market/search/stream", async (req, res) => {
         });
         endStream();
       }
-    }, _marketDeadlineMs);
+    }, _streamDeadlineMs);
 
     // Sold comps + local comps fire immediately — independent of marketplace results
     const _ebaySoldPromise   = serpEbaySold(query).catch(() => null);
@@ -33452,9 +33474,10 @@ app.post("/market/search/stream", async (req, res) => {
       // (serpShopping) is allowed to run up to SERPAPI_TIMEOUT_MS (4500ms).
       // If _marketDeadlineMs < SERPAPI_TIMEOUT_MS the phase1 kill timer
       // would abort before serpShopping can respond, producing structural 0s.
-      const _phase1TimeoutMsForStream = (_isHighConfExactIdentity || _isMasterConfirmedHighStakes)
-        ? Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS)
-        : _marketDeadlineMs;
+      // Phase 4B: this same ceiling now applies to every scan reaching Phase 1
+      // (see _streamDeadlineMs above) since all of them are cache-cold and
+      // identity-valid, not just exact/high-stakes ones.
+      const _phase1TimeoutMsForStream = Math.max(_marketDeadlineMs, SERPAPI_TIMEOUT_MS);
       if (_phase1TimeoutMsForStream > _marketDeadlineMs) {
         console.log("MARKET_PHASE1_TIMEOUT_ALIGNED_FOR_SERPAPI", {
           rid: req.rid, scanId, query,

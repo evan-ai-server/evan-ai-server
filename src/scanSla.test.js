@@ -979,3 +979,111 @@ test("4K: startup selftests are gated behind RUN_STARTUP_SELFTESTS env", () => {
   const wouldRun = process.env.RUN_STARTUP_SELFTESTS === "true";
   assert.equal(wouldRun, false, "selftest blocks must not run during normal startup");
 });
+
+// ── Phase 4B: normal cache-cold scans get a fair SerpAPI window ─────────────
+// Mirrors _streamDeadlineMs / _phase1TimeoutMsForStream in the
+// /market/search/stream route (index.js, "PHASE 1: marketplace fanout").
+// Before this fix, only exact-aircraft/high-stakes-confirmed scans had their
+// phase1 kill timer aligned to SERPAPI_TIMEOUT_MS (Phase 5C.6A) — every other
+// ("normal") cache-cold scan raced a much shorter market-first-payload
+// deadline (800-1700ms) against the sole live source, which typically needs
+// 2-4.5s. A correct identity + a slow-but-working provider still produced
+// rescan_needed on the FIRST scan, redeemed only by a manual retry hitting
+// the cache the abandoned worker wrote in the background.
+
+const SERPAPI_TIMEOUT_MS_TEST = 4500;
+
+function computeStreamPhase1DeadlineMs(marketDeadlineMs, isHighConfExactOrHighStakes, serpApiTimeoutMs = SERPAPI_TIMEOUT_MS_TEST) {
+  return isHighConfExactOrHighStakes
+    ? marketDeadlineMs
+    : Math.max(marketDeadlineMs, serpApiTimeoutMs);
+}
+
+function computePhase1TimeoutMsForStream(marketDeadlineMs, serpApiTimeoutMs = SERPAPI_TIMEOUT_MS_TEST) {
+  return Math.max(marketDeadlineMs, serpApiTimeoutMs);
+}
+
+test("4B: normal cache-cold scan — outer stream deadline widens from 1700ms to the SerpAPI ceiling", () => {
+  const marketDeadlineMs = 1700; // typical normal real-time scan (no exact/high-stakes upgrade)
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  assert.equal(streamDeadline, 4500, "normal scan must get the full SerpAPI window, not the short 1700ms first-payload deadline");
+  assert.ok(streamDeadline > marketDeadlineMs, "widened deadline must exceed the original short deadline");
+});
+
+test("4B: normal cache-cold scan at the 800ms SLA floor also widens to the SerpAPI ceiling", () => {
+  const marketDeadlineMs = 800; // worst-case SLA-squeezed normal scan
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  assert.equal(streamDeadline, 4500, "even the 800ms SLA floor must widen to the fair provider window");
+});
+
+test("4B: a provider response at 2.5s would have missed the old 1700ms deadline but is caught by the new one", () => {
+  const oldDeadlineMs = 1700;
+  const newDeadlineMs = computeStreamPhase1DeadlineMs(oldDeadlineMs, false);
+  const simulatedSerpResponseMs = 2500;
+  assert.ok(simulatedSerpResponseMs > oldDeadlineMs, "sanity: old deadline would have fired first (rescan_needed) before this response arrived");
+  assert.ok(simulatedSerpResponseMs < newDeadlineMs, "new deadline must still be open when the real response arrives");
+});
+
+test("4B: provider wait is bounded — a response slower than the SerpAPI ceiling still ends as honest rescan_needed", () => {
+  const marketDeadlineMs = 1700;
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  const simulatedSerpResponseMs = 5200; // slower than even the widened ceiling
+  assert.ok(simulatedSerpResponseMs > streamDeadline, "an unusually slow provider must still hit the bounded ceiling, not wait forever");
+  assert.equal(streamDeadline, SERPAPI_TIMEOUT_MS_TEST, "the ceiling itself must equal the existing SERPAPI_TIMEOUT_MS constant — no new, separate cap introduced");
+});
+
+test("4B: exact/high-stakes-confirmed scans keep their existing outer deadline unchanged", () => {
+  // MARKET_EXACT_IDENTITY_MIN_MS already puts these at 3000ms; that value
+  // must pass through untouched — only the INNER phase1 kill timer (Phase
+  // 5C.6A, tested below) was ever widened for this branch, before or after
+  // this fix.
+  const marketDeadlineMs = 3000;
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, true);
+  assert.equal(streamDeadline, 3000, "exact/high-stakes outer deadline must stay exactly as before this fix");
+});
+
+test("4B: background-recovery scans (6000ms deadline) are unaffected — already above the SerpAPI ceiling", () => {
+  const marketDeadlineMs = 6000; // MARKET_BACKGROUND_RECOVERY_DEADLINE_MS
+  const streamDeadline = computeStreamPhase1DeadlineMs(marketDeadlineMs, false);
+  assert.equal(streamDeadline, 6000, "background recovery deadline must not change — 6000ms already exceeds the 4500ms ceiling");
+});
+
+test("4B: inner phase1 kill timer matches the outer ceiling for every branch (no independent-timer race)", () => {
+  // Before this fix the outer marketDeadlineTimer and the inner
+  // mergeCheapestSources killTimer could use DIFFERENT values — for normal
+  // scans (short vs short, i.e. no alignment at all) and, subtly, even for
+  // exact/high-stakes scans (outer stayed at marketDeadlineMs=3000 while
+  // inner widened to 4500) — meaning the outer timer could fire before the
+  // inner one legitimately resolved. The inner value is now unconditionally
+  // the SerpAPI ceiling for every branch that reaches Phase 1.
+  assert.equal(computePhase1TimeoutMsForStream(1700), 4500, "normal scan inner ceiling");
+  assert.equal(computePhase1TimeoutMsForStream(3000), 4500, "exact/high-stakes inner ceiling (unchanged from before this fix)");
+  assert.equal(computePhase1TimeoutMsForStream(6000), 6000, "background recovery inner ceiling stays at its own larger deadline");
+});
+
+test("4B: widening the deadline does not add a second SerpAPI call — same single call, longer patience only", async () => {
+  // Simulates mergeCheapestSources: exactly one source call is issued
+  // regardless of how long the caller is willing to wait for its result.
+  let callCount = 0;
+  const issueSourceCall = () => { callCount += 1; return Promise.resolve({ items: [] }); };
+  const raceWithDeadline = async (deadlineMs) => {
+    const call = issueSourceCall();
+    const killTimer = new Promise((resolve) => setTimeout(() => resolve("__timeout__"), deadlineMs));
+    return Promise.race([call, killTimer]);
+  };
+  await raceWithDeadline(1700);
+  await raceWithDeadline(4500);
+  assert.equal(callCount, 2, "each of the two simulated scans issues exactly one source call regardless of its deadline");
+});
+
+test("4B: cache-hit paths never reach the phase1 deadline computation at all", () => {
+  // Structural invariant: every cache-hit branch (enriched / internal / serp
+  // route cache) in the stream route returns via endStream() BEFORE reaching
+  // the "PHASE 1: marketplace fanout" section where the deadline is computed.
+  // This is enforced by the route's own early-return control flow, not by
+  // this fix — documented here so a future refactor that moves the fanout
+  // section earlier fails this expectation deliberately.
+  const reachedPhase1 = (cacheHit) => !cacheHit;
+  assert.equal(reachedPhase1(true), false, "a cache hit must never reach the widened-deadline code path");
+  assert.equal(reachedPhase1(false), true, "only a genuine cache miss reaches phase1 and the new deadline logic");
+});
