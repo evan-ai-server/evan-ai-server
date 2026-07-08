@@ -822,6 +822,11 @@ import {
   resolveLivePlan,
   mapRevenueCatEventToPlan,
 } from "./src/entitlementStore.js";
+// Phase B2: unified backend daily + weekly usage enforcement
+import {
+  consumeUsage,
+  getUsageStatus,
+} from "./src/usageLimitEngine.js";
 import {
   AFFILIATE_DISCLOSURE,
   attachAffiliateLinksToPayload,
@@ -2008,6 +2013,7 @@ const AUTH_ALLOW_DEV_BODY_FALLBACK =
 
 const PLAN_SCAN_LIMIT_ANON = Number(process.env.PLAN_SCAN_LIMIT_ANON || 15);
 const PLAN_SCAN_LIMIT_FREE = Number(process.env.PLAN_SCAN_LIMIT_FREE || 75);
+const PLAN_SCAN_LIMIT_HUNTER = Number(process.env.PLAN_SCAN_LIMIT_HUNTER || 200);
 const PLAN_SCAN_LIMIT_PRO = Number(process.env.PLAN_SCAN_LIMIT_PRO || 500);
 
 const OBJECT_STORE_PROVIDER = String(
@@ -2900,6 +2906,13 @@ function getResolvedPlan(req) {
 function getScanPlanLimit(plan = "free") {
   if (plan === "internal") return Number.POSITIVE_INFINITY;
   if (plan === "pro") return PLAN_SCAN_LIMIT_PRO;
+  // Phase B2: without this case, "hunter" fell through to the 15/day ANON
+  // backstop below — tighter than the real hunter limit (30/day) enforced
+  // by the new usage engine, which would have silently mis-blocked paying
+  // Hunter users. This backstop must stay looser than every real plan
+  // limit so the new engine (see src/usageLimitEngine.js) is always the
+  // effective gate.
+  if (plan === "hunter") return PLAN_SCAN_LIMIT_HUNTER;
   if (plan === "free") return PLAN_SCAN_LIMIT_FREE;
   return PLAN_SCAN_LIMIT_ANON;
 }
@@ -23209,6 +23222,64 @@ if (!file && uploadedObjectKey) {
         });
       }
 
+      // Phase B2: unified daily + weekly usage enforcement — the real
+      // money-route gate now. Runs before any OpenAI/vision work so a
+      // blocked or unauthenticated caller never creates cost. Trusted
+      // plan/userId only (req.auth, set by attachAuthContext) — client-
+      // provided plan/isPro is never read here. The older enforceScanQuota
+      // middleware (75/day free backstop) still runs earlier in the
+      // request chain but is now strictly looser than every plan's real
+      // limit here, so it never fires first — see getScanPlanLimit.
+      const _usagePlan   = getResolvedPlan(req);
+      const _usageUserId = getResolvedUserId(req);
+
+      if (_usagePlan !== "internal" && !_usageUserId) {
+        return res.status(401).json({ ok: false, error: "auth_required" });
+      }
+
+      const _usageScanId = safeStr(req.body?.scanId, 128) || req.rid;
+      // Security: idempotency is bound to a server-computed hash of the
+      // actual uploaded bytes, never to any client-supplied value — a
+      // scanId alone would let a caller replay the same "already
+      // consumed, allowed" quota decision across unlimited different
+      // images. See consumeUsage in src/usageLimitEngine.js.
+      const _usageFingerprint = crypto.createHash("sha256").update(file.buffer).digest("hex");
+
+      const _usageResult = await consumeUsage({
+        userId: _usageUserId,
+        plan: _usagePlan,
+        scanId: _usageScanId,
+        requestFingerprint: _usageFingerprint,
+        redisClient: redis,
+      });
+
+      if (_usageResult.error === "idempotency_conflict") {
+        return res.status(409).json({
+          ok: false,
+          error: "idempotency_conflict",
+          message: "Scan retry token does not match this image.",
+        });
+      }
+
+      if (!_usageResult.ok) {
+        return res.status(503).json({
+          ok: false,
+          error: "usage_check_unavailable",
+          message: "Temporary usage check unavailable. Please try again shortly.",
+        });
+      }
+
+      if (!_usageResult.canScan) {
+        return res.status(429).json({
+          ok: false,
+          error: "usage_limit_reached",
+          reason: _usageResult.reason,
+          plan: _usagePlan,
+          daily: _usageResult.daily,
+          weekly: _usageResult.weekly,
+        });
+      }
+
       console.log("✅ VISION FILE ACCEPTED", {
         rid: req.rid,
         size: file.size,
@@ -29678,6 +29749,13 @@ function round2(v) { return Math.round(v * 100) / 100; }
 // ─────────────────────────────────────────────────────────────────────────────
 // SCAN LIMIT SYSTEM — Server-side daily quota (2 free scans/day)
 //
+// LEGACY as of Phase B2: this actor-keyed (userId/guestId/IP), client-
+// cooperative system is no longer the real enforcement point. The trusted
+// gate is now src/usageLimitEngine.js — enforced on POST /api/vision/analyze
+// via req.auth.{userId,plan} — with GET /api/usage/status as its read-only
+// status endpoint. These routes below are kept only for existing-frontend
+// compatibility (guest/anonymous quota display) and are advisory only.
+//
 // POST /api/scan/check       — Check if actor can scan today
 // POST /api/scan/consume     — Atomically consume a scan slot (with dedup)
 // POST /api/guest/identify   — Issue or recover durable guestId from fingerprint
@@ -29803,6 +29881,31 @@ app.post("/api/scan/consume", clockSkewMiddleware(), bodySchemaMiddleware(SCHEMA
     console.warn("⚠️ /api/scan/consume error", e?.message);
     return res.json({ ok: true, consumed: true, deduped: false, scansUsed: 1,
       scansRemaining: 1, dailyLimit: DAILY_FREE_SCANS, resetAt: _resetAtISO() });
+  }
+});
+
+// ── GET /api/usage/status ───────────────────────────────────────────────────
+// Phase B2: read-only status for the trusted daily+weekly usage engine
+// (src/usageLimitEngine.js). Uses req.auth.{userId,plan} only — never
+// client-provided plan/isPro. No consumption. Frontend can use this later
+// for daily/weekly UI (not wired yet — backend only per this phase).
+app.get("/api/usage/status", async (req, res) => {
+  try {
+    const plan   = getResolvedPlan(req);
+    const userId = getResolvedUserId(req);
+
+    if (plan !== "internal" && !userId) {
+      return res.status(401).json({ ok: false, error: "auth_required" });
+    }
+
+    const status = await getUsageStatus({ userId, plan, redisClient: redis });
+    if (!status.ok) {
+      return res.status(503).json({ ok: false, error: "usage_check_unavailable" });
+    }
+    return res.status(200).json(status);
+  } catch (e) {
+    console.error("❌ /api/usage/status error:", e?.message);
+    return res.status(503).json({ ok: false, error: "usage_check_unavailable" });
   }
 });
 
