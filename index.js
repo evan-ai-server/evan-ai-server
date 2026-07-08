@@ -816,6 +816,12 @@ import {
   applyPlanGatingToPayload,
   gateFeedItemsForPlan,
 } from "./src/planGateEngine.js";
+// Phase B1: server-side entitlement source of truth
+import {
+  writeAuthUserPlan,
+  resolveLivePlan,
+  mapRevenueCatEventToPlan,
+} from "./src/entitlementStore.js";
 import {
   AFFILIATE_DISCLOSURE,
   attachAffiliateLinksToPayload,
@@ -2330,6 +2336,11 @@ function pushOpsAlert(code, payload = {}, cooldownMs = ALERT_COOLDOWN_MS) {
 
 function shouldSkipInfraGuard(req) {
   if (req.path === "/health" || req.path === "/ready") return true;
+  // Phase B1: RevenueCat's webhook servers cannot send our client-side
+  // edge-secret/rate-limit headers. This only bypasses infra-layer guards —
+  // the route's own RC_WEBHOOK_SECRET check (constant-time, fail-closed) is
+  // mandatory and enforced inside the handler.
+  if (req.path === "/api/webhooks/revenuecat") return true;
   if (isBenchBypass(req)) return true;
   // Private LAN IPs (developer devices) bypass all infra-guard rate limits.
   // Mirrors the same exemption in abuseTrackerMiddleware so a dev phone
@@ -2755,6 +2766,7 @@ function parseBearerToken(req) {
 function normalizePlan(plan = "") {
   const p = String(plan || "").toLowerCase().trim();
   if (p === "pro") return "pro";
+  if (p === "hunter") return "hunter";
   if (p === "internal" || p === "admin") return "internal";
   if (p === "free") return "free";
   return "free";
@@ -2955,7 +2967,17 @@ async function attachAuthContext(req, _res, next) {
     }
 
     req.auth = auth;
-    incMetric("auth_success_total", 1, { plan: auth.plan });
+
+    // Phase B1: JWT plan is a non-authoritative hint (always "free" at
+    // issuance today). Enforcement resolves the live, RevenueCat-verified
+    // plan from the entitlement store — skip for "internal" tokens, whose
+    // authority comes from JWT roles, not the consumer entitlement store.
+    if (auth.userId && auth.plan !== "internal") {
+      const livePlan = await resolveLivePlan(auth.userId, redis).catch(() => null);
+      if (livePlan) req.auth.plan = livePlan;
+    }
+
+    incMetric("auth_success_total", 1, { plan: req.auth.plan });
     return next();
   } catch (err) {
     req.authError = err?.message || "invalid_auth_token";
@@ -43842,6 +43864,13 @@ Return valid JSON only:
         passwordHash,
         displayName: displayName || null,
         createdAt: new Date().toISOString(),
+        // Phase B1: entitlement fields. Non-authoritative until a
+        // RevenueCat webhook writes a real plan; resolveLivePlan treats a
+        // missing plan the same as "free", so pre-B1 users need no backfill.
+        plan: "free",
+        planExpiresAt: null,
+        entitlementSource: null,
+        entitlementUpdatedAt: null,
       };
 
       await fs.writeFile(filePath, JSON.stringify(userRecord, null, 2), "utf8");
@@ -43903,6 +43932,88 @@ Return valid JSON only:
     } catch (e) {
       console.error("❌ /api/auth/login error:", e?.message);
       return res.status(500).json({ ok: false, error: "login_failed" });
+    }
+  });
+
+  // -------------------- Phase B1: RevenueCat entitlement webhook --------------------
+  //
+  // POST /api/webhooks/revenuecat
+  // Server-side entitlement source of truth. RevenueCat is the only system
+  // allowed to grant/revoke a paid plan — client-reported isPro is never
+  // trusted (see attachAuthContext / resolveLivePlan).
+  //
+  // Auth: configure the RC dashboard "Authorization Header Value" to the
+  // exact same string as RC_WEBHOOK_SECRET (RC sends it verbatim in the
+  // Authorization header, no prefix imposed). An optional "Bearer " prefix
+  // is tolerated on the inbound side in case ops configures it that way.
+  //
+  // app_user_id mapping (KNOWN GAP as of Phase B1): the frontend does not
+  // currently guarantee RevenueCat's appUserID equals the backend userId —
+  // identifyUser(id) is called once at app-mount with a locally-generated
+  // AsyncStorage id (app/index.tsx:1683) and is never re-called with the
+  // real backend userId after login/register. Until that frontend gap is
+  // closed (or a verified sync route is added), most webhook events will
+  // safely no-op below with reason "user_not_found" — expected, not a bug
+  // in this route. See the Phase B1 report for the required frontend fix.
+  app.post("/api/webhooks/revenuecat", async (req, res) => {
+    try {
+      const configuredSecret = String(process.env.RC_WEBHOOK_SECRET || "");
+      if (!configuredSecret) {
+        console.error("❌ RC_WEBHOOK_SECRET not configured — rejecting webhook");
+        return res.status(401).json({ ok: false, error: "webhook_not_configured" });
+      }
+
+      let inbound = String(req.headers["authorization"] || "");
+      if (/^Bearer\s+/i.test(inbound)) inbound = inbound.replace(/^Bearer\s+/i, "");
+
+      if (!safeTimingEqual(inbound, configuredSecret)) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
+
+      const event = req.body?.event || req.body || {};
+      const appUserId = safeStr(event?.app_user_id, 128) || null;
+      const type = safeStr(event?.type, 40) || "UNKNOWN";
+
+      if (!appUserId) {
+        console.warn("⚠️ RC_WEBHOOK missing app_user_id", { type });
+        return res.status(200).json({ ok: true, noop: true, reason: "missing_app_user_id" });
+      }
+
+      const mapping = mapRevenueCatEventToPlan(event, {
+        entitlementHunterId: process.env.RC_ENTITLEMENT_HUNTER || "hunter",
+        entitlementProId: process.env.RC_ENTITLEMENT_PRO || "pro",
+      });
+
+      if (!mapping.changed) {
+        console.log("ℹ️ RC_WEBHOOK no-op event type", { type, appUserId });
+        return res.status(200).json({ ok: true, noop: true, reason: "event_type_not_entitlement_changing", type });
+      }
+
+      const result = await writeAuthUserPlan(
+        appUserId,
+        {
+          plan: mapping.plan,
+          planExpiresAt: event?.expiration_at_ms
+            ? new Date(Number(event.expiration_at_ms)).toISOString()
+            : null,
+          source: "revenuecat",
+          eventTsMs: Number(event?.event_timestamp_ms) || Date.now(),
+        },
+        { redisClient: redis }
+      );
+
+      if (!result.ok) {
+        // Expected today for most events — see app_user_id mapping note
+        // above. Safe no-op; never fake a mapping.
+        console.warn("⚠️ RC_WEBHOOK unmapped/stale event", { type, appUserId, reason: result.reason });
+        return res.status(200).json({ ok: true, noop: true, reason: result.reason });
+      }
+
+      console.log("✅ RC_WEBHOOK plan updated", { type, appUserId, plan: result.plan });
+      return res.status(200).json({ ok: true, plan: result.plan });
+    } catch (err) {
+      console.error("❌ /api/webhooks/revenuecat error:", err?.message);
+      return res.status(200).json({ ok: false, error: "webhook_processing_failed" });
     }
   });
 

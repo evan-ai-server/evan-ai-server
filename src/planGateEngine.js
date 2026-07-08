@@ -38,6 +38,7 @@
 
 export const PLANS = {
   FREE:     "free",
+  HUNTER:   "hunter",
   PRO:      "pro",
   INTERNAL: "internal",
 };
@@ -72,27 +73,31 @@ export const FEATURES = {
   B2B_VALUATION:        "b2b_valuation",
 };
 
+// Phase B1: Hunter currently unlocks the same feature set as Pro — the two
+// paid tiers are meant to differ by usage volume (see B2), not capability.
+// TODO(product): trim Hunter's feature set here if the tiers should later
+// differ by capability instead of just daily/weekly volume.
 const FEATURE_ACCESS = {
-  [FEATURES.CORE_SIGNAL]:          ["free", "pro", "internal"],
-  [FEATURES.SYSTEM_WARNINGS]:      ["free", "pro", "internal"],
-  [FEATURES.SAFETY_SUSPENSION]:    ["free", "pro", "internal"],
-  [FEATURES.BASIC_PRICE_INTEL]:    ["free", "pro", "internal"],
-  [FEATURES.BASIC_FEED]:           ["free", "pro", "internal"],
-  [FEATURES.PERSONAL_DECISION]:    ["pro", "internal"],
-  [FEATURES.CATEGORY_MASTERY]:     ["pro", "internal"],
-  [FEATURES.SIGNAL_WIN_RATES]:     ["pro", "internal"],
-  [FEATURES.PROBABILITY_EXPR]:     ["pro", "internal"],
-  [FEATURES.CAPITAL_LOCK_RISK]:    ["pro", "internal"],
-  [FEATURES.ARBITRAGE_DETECTION]:  ["pro", "internal"],
-  [FEATURES.PERSONAL_EXPLAIN]:     ["pro", "internal"],
-  [FEATURES.WORST_CAT_WARNING]:    ["pro", "internal"],
-  [FEATURES.FULL_COMP_LIST]:       ["pro", "internal"],
-  [FEATURES.FINANCIAL_IDENTITY]:   ["pro", "internal"],
-  [FEATURES.CATEGORY_PERFORMANCE]: ["pro", "internal"],
-  [FEATURES.TACTIC_SUMMARY]:       ["pro", "internal"],
-  [FEATURES.FULL_FEED]:            ["pro", "internal"],
-  [FEATURES.EXIT_INTELLIGENCE]:    ["pro", "internal"],
-  [FEATURES.DEAL_SCOUT]:           ["pro", "internal"],
+  [FEATURES.CORE_SIGNAL]:          ["free", "hunter", "pro", "internal"],
+  [FEATURES.SYSTEM_WARNINGS]:      ["free", "hunter", "pro", "internal"],
+  [FEATURES.SAFETY_SUSPENSION]:    ["free", "hunter", "pro", "internal"],
+  [FEATURES.BASIC_PRICE_INTEL]:    ["free", "hunter", "pro", "internal"],
+  [FEATURES.BASIC_FEED]:           ["free", "hunter", "pro", "internal"],
+  [FEATURES.PERSONAL_DECISION]:    ["hunter", "pro", "internal"],
+  [FEATURES.CATEGORY_MASTERY]:     ["hunter", "pro", "internal"],
+  [FEATURES.SIGNAL_WIN_RATES]:     ["hunter", "pro", "internal"],
+  [FEATURES.PROBABILITY_EXPR]:     ["hunter", "pro", "internal"],
+  [FEATURES.CAPITAL_LOCK_RISK]:    ["hunter", "pro", "internal"],
+  [FEATURES.ARBITRAGE_DETECTION]:  ["hunter", "pro", "internal"],
+  [FEATURES.PERSONAL_EXPLAIN]:     ["hunter", "pro", "internal"],
+  [FEATURES.WORST_CAT_WARNING]:    ["hunter", "pro", "internal"],
+  [FEATURES.FULL_COMP_LIST]:       ["hunter", "pro", "internal"],
+  [FEATURES.FINANCIAL_IDENTITY]:   ["hunter", "pro", "internal"],
+  [FEATURES.CATEGORY_PERFORMANCE]: ["hunter", "pro", "internal"],
+  [FEATURES.TACTIC_SUMMARY]:       ["hunter", "pro", "internal"],
+  [FEATURES.FULL_FEED]:            ["hunter", "pro", "internal"],
+  [FEATURES.EXIT_INTELLIGENCE]:    ["hunter", "pro", "internal"],
+  [FEATURES.DEAL_SCOUT]:           ["hunter", "pro", "internal"],
   [FEATURES.BATCH_SCAN]:           ["internal"],
   [FEATURES.B2B_VALUATION]:        ["internal"],
 };
@@ -127,10 +132,10 @@ export function canAccessFeature(plan, featureKey) {
 }
 
 /**
- * True if plan is pro or internal.
+ * True if plan is hunter, pro, or internal.
  */
 export function isPaidPlan(plan) {
-  return plan === "pro" || plan === "internal";
+  return plan === "hunter" || plan === "pro" || plan === "internal";
 }
 
 /**
