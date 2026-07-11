@@ -1343,6 +1343,10 @@ import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
 import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
+// Phase C0.1 — shared usability test for the cross-route market payload cache
+// (fixes empty-payload cache poisoning: a 0-item full payload must never
+// replay as a terminal cache hit for a later fallback request).
+import { hasUsablePayload, usableItemCount, isUsablePayloadCacheEntry } from "./src/marketPayloadCacheUsability.js";
 import { approximateMarketDecision, rescueOracleDecision } from "./src/incompleteAircraftMarketPolicy.js";
 // Phase V3.9A — URL evidence audit (logging-only; pure field-presence summaries).
 import { summarizeUrlEvidence, diffUrlEvidence, recoveryEligibilitySummary, extractProductIdFromGoogleUrl } from "./src/urlEvidenceAudit.js";
@@ -5138,12 +5142,43 @@ function getMarketScanResult(ctxSeed) {
       MARKET_SCAN_RESULT_CACHE.delete(key);
       continue;
     }
+    // Phase C0.1: a zero-usable-item entry (live poisoned write, or a
+    // legacy entry already in memory from before this fix shipped) must
+    // never replay as a successful terminal hit — treat it as a miss so
+    // the caller's fresh-provider path stays eligible, and self-heal by
+    // deleting it so it can't be hit again.
+    if (!isUsablePayloadCacheEntry(entry)) {
+      console.log("MARKET_EMPTY_PAYLOAD_CACHE_IGNORED", {
+        hitKey: typeof key === "string" ? key.slice(0, 80) : null,
+        itemCount: usableItemCount(entry.payload),
+        ageMs: Date.now() - entry.ts,
+        route: entry.route || null,
+      });
+      MARKET_SCAN_RESULT_CACHE.delete(key);
+      continue;
+    }
     return { ...entry, hitKey: key };
   }
   return null;
 }
 
 function setMarketScanResult(ctxSeed, payload) {
+  // Phase C0.1: never persist a zero-usable-item full payload as a reusable
+  // cross-route success. This only guards what gets CACHED for a LATER
+  // request — the current caller's own response is unaffected. Without this,
+  // an aircraft-identity-locked (or any other) 0-item payload built by one
+  // route poisons every subsequent fallback read for the TTL window (see the
+  // 2026-07-10 incident: L1 "internal" branch wrote a 0-item payload that a
+  // later /market/search fallback replayed as a successful cache hit).
+  if (!hasUsablePayload(payload?.payload)) {
+    console.log("MARKET_EMPTY_PAYLOAD_CACHE_WRITE_SKIPPED", {
+      scanId: ctxSeed?.scanId || null,
+      route: payload?.route || ctxSeed?.route || null,
+      layer: payload?.layer || null,
+      itemCount: usableItemCount(payload?.payload),
+    });
+    return;
+  }
   const keys = _makeAllBudgetKeys(ctxSeed);
   const ts = Date.now();
   // Pin the original query on the entry so a later cross-route hit can
