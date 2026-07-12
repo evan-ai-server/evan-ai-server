@@ -2396,7 +2396,15 @@ function requireEdgeSecret(req, res, next) {
 }
 
 function requireOpsAccess(req, res, next) {
-  if (!IS_PROD || !OPS_SECRET) return next();
+  if (!IS_PROD) return next();
+
+  // SECURITY: previously `!IS_PROD || !OPS_SECRET` fell through to next()
+  // when OPS_SECRET was unset in production, silently reopening every
+  // ops-gated route (including the Phase 6A.1 legacy-route gate below) if
+  // the env var was ever missing at deploy time. Fail closed instead.
+  if (!OPS_SECRET) {
+    return res.status(503).json({ ok: false, error: "ops_access_not_configured" });
+  }
 
   const inbound = String(req.headers["x-ops-secret"] || "");
   if (safeTimingEqual(inbound, OPS_SECRET)) {
@@ -3061,6 +3069,31 @@ function routeAllowsUserOrApiKey(pathname = "") {
   );
 }
 
+// Phase 6A.1 — legacy internal/B2B routes (partner platform, webhook
+// dispatch, widget embed, internal analytics, trust-packet, trustmark,
+// distribution, autopilot, scan-replay). No mobile frontend consumer exists
+// for any of these (verified by full-repo grep). All prefixes below are
+// slash-bounded so they cannot capture a same-stem production route —
+// notably "/api/webhook/" (singular, this list) never matches
+// "/api/webhooks/revenuecat" (plural, RevenueCat's own fail-closed secret
+// check, untouched by this predicate) because the character after
+// "/api/webhook" differs ("/" here vs "s" there).
+function isLegacyOpsGatedRoute(pathname = "") {
+  const p = String(pathname || "");
+  return (
+    p === "/autopilot/run" ||
+    p.startsWith("/scan/replay/") ||
+    p.startsWith("/api/partner/") ||
+    p.startsWith("/api/webhook/") ||
+    p.startsWith("/api/widget/") ||
+    p.startsWith("/api/analytics/") ||
+    p.startsWith("/api/verify/") ||
+    p.startsWith("/api/trust/") ||
+    p.startsWith("/api/trustmark/") ||
+    p.startsWith("/api/distribution/")
+  );
+}
+
 function isScanQuotaRoute(req) {
   return (
     req.method === "POST" &&
@@ -3123,6 +3156,16 @@ async function enforceScanQuota(req, res, next) {
 
 async function phase2RouteProtection(req, res, next) {
   const path = String(req.path || "");
+
+  // Phase 6A.1 — legacy/internal routes (partner, webhook dispatch, widget,
+  // analytics, trust/trustmark, distribution, autopilot, scan-replay) never
+  // reach a handler, queue insertion, or provider-spending work without a
+  // valid ops secret. Checked first and returns early; unrelated to the
+  // signed-user/product-access checks below.
+  if (isLegacyOpsGatedRoute(path)) {
+    return requireOpsAccess(req, res, next);
+  }
+
   const hasSignedUser = !!req.auth?.userId;
   const hasDevFallbackUser = !!resolveDevelopmentFallbackUserId(req);
   const hasProductAccess = hasSignedUser || hasDevFallbackUser || hasValidApiKey(req);
