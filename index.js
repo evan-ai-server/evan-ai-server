@@ -4921,6 +4921,212 @@ const SERP_BUDGET_MAX = Number(process.env.SERP_BUDGET_PER_SCAN || 1);
 const SERP_BUDGET_TTL_MS = 10 * 60 * 1000; // 10 min per-scan eviction
 const SERP_BUDGET_DEV_BYPASS = String(process.env.DEV_BYPASS_SERP_BUDGET || "").trim() === "1";
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 6A.3B — background paid-provider policy + attribution helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Phase 6A.3B round 3 (per independent review): background paid SerpAPI is
+// HARD-DISABLED for this release — not configurable, not opt-in. Round 2's
+// BACKGROUND_SERPAPI_ENABLED + BACKGROUND_SERPAPI_DAILY_MAX design was
+// removed entirely rather than fixed: even with a "real daily cap," a
+// process-local, non-atomic, per-caller counter has too many sharp edges for
+// a money-safety feature nobody needs yet (concurrent jobs can each observe
+// the same remaining allowance before either increments it; a thrown
+// provider call can skip incrementing; Railway restarts clear it; multiple
+// replicas would each get their own separate allowance; per-caller counters
+// multiply the effective total). Every scheduler/queue/watchlist/autopilot/
+// warm-cache-refresh path that reaches mergeCheapestSources or a serp*
+// function with no live user request gets max:0, unconditionally, via
+// runInBackgroundSerpBudget below. Re-enabling background paid SerpAPI is a
+// deliberate future code change, not an environment variable.
+
+// Phase 6A.3B round 3B — dedicated SerpAPI-only transport seam.
+//
+// This file imports `fetch` explicitly from node-fetch (see top of file):
+// that is a module-scoped binding, and reassigning global.fetch — round 3's
+// approach — does NOT intercept it. That gap let one real request reach
+// serpapi.com during self-testing (a harmless 401 on an obviously-fake key,
+// confirmed via the SerpAPI dashboard showing no usage change, but a real
+// safety-boundary miss). Every SerpAPI provider function now calls
+// _serpApiFetch(...) instead of the bare imported `fetch` directly. Nothing
+// else in this file changes transport — OpenAI, native eBay, health checks,
+// and every other external call keep using the plain `fetch` import as
+// before.
+//
+// The critical safety property: _serpApiFetch defaults to a BLOCKING stub
+// whenever RUN_STARTUP_SELFTESTS=true, evaluated synchronously at module
+// load, before any other code in this file (including this exact line) can
+// run. That means even a bug in the self-test's own mock-installation logic
+// fails CLOSED (the stub throws immediately, no network attempted) rather
+// than failing OPEN onto the real transport — the opposite of round 3's
+// failure mode, where a mocking gap silently fell through to a real request.
+const _realSerpApiFetch = fetch;
+async function _blockedSerpApiFetchInSelftest() {
+  throw new Error("SERPAPI_REAL_NETWORK_BLOCKED_IN_SELFTEST");
+}
+let _serpApiFetch = (process.env.RUN_STARTUP_SELFTESTS === "true")
+  ? _blockedSerpApiFetchInSelftest
+  : _realSerpApiFetch;
+
+// Phase 6A.3B bugfix (caught by the new self-tests, not shipped): every
+// existing `c.max || SERP_BUDGET_MAX` fallback treats max:0 as "unset" and
+// silently restores the default of 1, because 0 is falsy in JS. That was
+// harmless before this phase (max was always unset or 1), but it is exactly
+// the value runInBackgroundSerpBudget needs to mean "deny the very first
+// attempt" when BACKGROUND_SERPAPI_ENABLED=false. Use this helper everywhere
+// a ctx's max is read instead of the raw `c.max || SERP_BUDGET_MAX` pattern.
+function _resolveSerpBudgetMax(c) {
+  return Number.isFinite(c?.max) ? c.max : SERP_BUDGET_MAX;
+}
+
+// Phase 6A.3B round 2 — extracted as a pure function (independent of the
+// module-load-time SERP_BUDGET_DEV_BYPASS constant) specifically so the fix
+// for "dev bypass must not override an explicit background max:0" can be
+// verified directly in a self-test without needing DEV_BYPASS_SERP_BUDGET=1
+// actually set in the test process's environment.
+function _devBypassAllowed(devBypassFlag, c) {
+  return !!devBypassFlag && _resolveSerpBudgetMax(c) > 0;
+}
+
+// Attribution hash — never log raw queries. Delegates to the existing
+// SHA-256 shortHash() helper (defined further below in this file but hoisted,
+// since it's a `function` declaration) rather than a weaker custom hash —
+// a 32-bit rolling hash is dictionary-guessable for common product queries.
+function _hashForAttribution(value) {
+  return shortHash(String(value || ""));
+}
+
+// Phase 6A.3B — every consumeSerpBudget/releaseSerpBudget log used to spread
+// the caller's raw callDescriptor (which carries `query`) directly into
+// console output. Use this everywhere a descriptor reaches a log or the
+// in-memory history array: it keeps only non-sensitive fields and replaces
+// `query` with a hash so no raw query, location, or other free-text value
+// can reach a log line or persist in _SERP_BUDGET_REGISTRY.
+//
+// Phase 6A.3B round 3 (independent review):
+// - queryHash is null (not a hash of "") when query is genuinely absent —
+//   a real hash-looking value for a missing query is misleading.
+// - `route` is deliberately NOT copied through. Every log this feeds already
+//   sets `route: c.route` (the authoritative context route) explicitly
+//   before spreading this object in; had a caller ever passed `route` in
+//   its callDescriptor, the spread — landing after that explicit field —
+//   would have silently overwritten it with caller-supplied text.
+// - `site` / `label` are current only ever code-defined marketplace names
+//   (e.g. "poshmark.com", "StockX" from mergeCheapestSources' own fixed
+//   resaleSitesForSerp list), never raw user input, but are kept minimal and
+//   allowlisted here regardless.
+function _sanitizeCallDescriptor(callDescriptor = {}) {
+  const out = {};
+  if (callDescriptor.engine != null) out.engine = callDescriptor.engine;
+  if (callDescriptor.site != null) out.site = callDescriptor.site;
+  if (callDescriptor.label != null) out.label = callDescriptor.label;
+  out.queryHash = callDescriptor.query != null ? _hashForAttribution(callDescriptor.query) : null;
+  return out;
+}
+
+/**
+ * Public helper — run `fn` inside an explicit, isolated background budget
+ * context so every real SerpAPI-capable function it calls is attributed and
+ * fail-closed. max is hard-coded to 0 — permanently, for this release, per
+ * the round-3 independent review decision above. Never inherits an
+ * in-flight foreground scan's budget or cacheHit state.
+ */
+function runInBackgroundSerpBudget(caller, route, fn) {
+  const ctx = {
+    scanId: null,
+    imageHash: null,
+    query: null,
+    userId: null,
+    route,
+    caller,
+    background: true,
+    max: 0,
+    callsUsed: 0,
+    blockedExtraCalls: 0,
+    cacheHit: false,
+    key: `bg:${caller}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`,
+  };
+  return SERP_BUDGET_STORE.run(ctx, () => fn(ctx));
+}
+
+// Process-local in-flight dedupe for real outbound SerpAPI requests. Keyed by
+// engine + normalized-query hash + result-affecting options — never by raw
+// query or API key. Multi-instance (Railway replica > 1) dedupe is NOT covered
+// by this map; see Phase 6A.3B report for the disclosed limitation.
+const _SERP_INFLIGHT = new Map();
+
+/**
+ * Phase 6A.3B round 3 — call this FIRST, before consumeSerpBudget, in every
+ * provider function. Round 2 had each provider function do its own bare
+ * `if (_SERP_INFLIGHT.has(key)) return existing` check for this exact
+ * purpose, which meant dedupeSerpInFlight's internal reuse-detection branch
+ * was never reached by a real caller — only by tests that called
+ * dedupeSerpInFlight directly. Centralizing the check AND its attribution
+ * log in one function makes the log fire on the actual path real callers
+ * take. Returns the existing promise (attributed, budget untouched) when
+ * one is in flight, or null when the caller should proceed as leader.
+ *
+ * Round 3B: takes the RAW callDescriptor (may carry `query`/`site`/`label`)
+ * and sanitizes it internally via _sanitizeCallDescriptor — callers should
+ * not be trusted to always remember to pre-sanitize before calling. Also
+ * pulls caller/route/background/logicalScanIdHash/budgetKeyHash from the
+ * current budget ctx (when one exists) so a follower's attribution is as
+ * complete as the leader's SERPAPI_ATTEMPT_ALLOWED log.
+ */
+function getSerpInflightReuse(inflightKey, engine, callDescriptor = {}) {
+  const existing = _SERP_INFLIGHT.get(inflightKey);
+  if (!existing) return null;
+  const safeDescriptor = _sanitizeCallDescriptor(callDescriptor);
+  const c = getCurrentSerpBudgetCtx();
+  console.log("SERPAPI_INFLIGHT_REUSED", {
+    provider: "serpapi",
+    engine,
+    inflightReused: true,
+    caller: c?.caller || null,
+    route: c?.route || null,
+    background: !!c?.background,
+    logicalScanIdHash: c?.scanId ? _hashForAttribution(c.scanId) : null,
+    budgetKeyHash: c?.key ? _hashForAttribution(c.key) : null,
+    inflightKeyHash: _hashForAttribution(inflightKey),
+    ...safeDescriptor,
+  });
+  return existing;
+}
+
+// Registers and runs the leader's real network attempt. Callers must check
+// getSerpInflightReuse() first — by the time this is invoked, the caller has
+// already confirmed nothing is in flight for this key and has consumed its
+// budget unit. markSerpOutboundStarted() is NOT called here (round 2 called
+// it here, before `run` was even scheduled — too early per independent
+// review); each provider function calls it itself, immediately before its
+// actual fetch(), inside `run`.
+function dedupeSerpInFlight(inflightKey, engine, run) {
+  const _startedAt = Date.now();
+  const p = Promise.resolve()
+    .then(run)
+    .then((result) => {
+      const resultCount = Array.isArray(result) ? result.length : (result && typeof result === "object" ? 1 : 0);
+      console.log("SERPAPI_ATTEMPT_FINISHED", {
+        provider: "serpapi", engine, inflightKey: _hashForAttribution(inflightKey),
+        durationMs: Date.now() - _startedAt, resultCount, aborted: false, errorCode: null,
+      });
+      return result;
+    })
+    .catch((err) => {
+      console.log("SERPAPI_ATTEMPT_FINISHED", {
+        provider: "serpapi", engine, inflightKey: _hashForAttribution(inflightKey),
+        durationMs: Date.now() - _startedAt, resultCount: 0,
+        aborted: err?.name === "AbortError", errorCode: err?.name || null,
+      });
+      throw err;
+    });
+  _SERP_INFLIGHT.set(inflightKey, p);
+  p.finally(() => {
+    if (_SERP_INFLIGHT.get(inflightKey) === p) _SERP_INFLIGHT.delete(inflightKey);
+  }).catch(() => {});
+  return { promise: p, reused: false };
+}
+
 // Cross-route reuse: when /market/search/stream computes a result pool, store
 // it here keyed by scanId / imageHash / normalizedQuery+userId so a subsequent
 // /market/search for the SAME scan returns the same pool without re-billing.
@@ -4969,7 +5175,7 @@ function canUseSerpBudget(ctx = null) {
   const key = c.key;
   const entry = _SERP_BUDGET_REGISTRY.get(key);
   if (!entry) return true;
-  return entry.consumed < (c.max || SERP_BUDGET_MAX);
+  return entry.consumed < (_resolveSerpBudgetMax(c));
 }
 
 /**
@@ -4996,40 +5202,87 @@ const SERP_PRIMARY_REASONS = new Set(["serpShopping"]);
  */
 function consumeSerpBudget(reason, callDescriptor = {}) {
   const c = getCurrentSerpBudgetCtx();
-  if (!c) return true; // no context = bypass
+  // Phase 6A.3B round 2: never spread the raw callDescriptor into a log or
+  // into the persisted registry entry — it may carry `query` (and, for
+  // serpLocalShopping, a location string). Everything logged/stored below
+  // goes through this sanitized view instead.
+  const safeDescriptor = _sanitizeCallDescriptor(callDescriptor);
+
+  // Phase 6A.3B — fail closed. No explicit budget context (idle scheduler,
+  // watchlist, autopilot, replay, or any caller outside a wrapped route/job)
+  // means no outbound SerpAPI request. This is the core containment fix for
+  // the Phase 6A.3A idle-spend leak. Legitimate background work must call
+  // through runInBackgroundSerpBudget(), which supplies an explicit ctx.
+  if (!c) {
+    console.warn("SERPAPI_ATTEMPT_BLOCKED", {
+      provider: "serpapi",
+      decision: "blocked",
+      caller: callDescriptor.caller || null,
+      route: null,
+      reason,
+      reasonForBlock: "missing_budget_context",
+      background: null,
+      ...safeDescriptor,
+    });
+    return false;
+  }
+
+  const attributionBase = {
+    provider: "serpapi",
+    caller: c.caller || null,
+    route: c.route || null,
+    reason,
+    background: !!c.background,
+    logicalScanIdHash: c.scanId ? _hashForAttribution(c.scanId) : null,
+    budgetKeyHash: _hashForAttribution(c.key),
+    ...safeDescriptor,
+  };
 
   // Phase 2C.9: route-level priority gate. serpShopping is the only allowed
   // primary source unless the route explicitly opted into Amazon-primary.
+  // serpEbaySold / serpLocalShopping (Phase 6A.3B) are treated the same as
+  // serpAmazon / serpScopedSearch here: alternate engines never compete with
+  // or starve the one primary product-pool attempt.
   if (!SERP_PRIMARY_REASONS.has(reason) && !c.allowNonShoppingPrimary) {
     c.blockedExtraCalls = (c.blockedExtraCalls || 0) + 1;
     console.warn("SERP_BUDGET_BLOCKED", {
       scanId: c.scanId,
       route: c.route,
-      query: callDescriptor.query || c.query,
       reason,
       reasonForBlock: "non_primary_source_blocked_by_priority",
       primaryReserved: "serpShopping",
-      ...callDescriptor,
+      ...safeDescriptor,
     });
+    console.warn("SERPAPI_ATTEMPT_BLOCKED", { ...attributionBase, decision: "blocked", reasonForBlock: "non_primary_source_blocked_by_priority" });
     return false;
   }
   if (SERP_BUDGET_DEV_BYPASS) {
-    // Still account in summary so logs are accurate, but do not block.
-    const entry = _SERP_BUDGET_REGISTRY.get(c.key) || {
-      consumed: 0, ts: Date.now(), route: c.route, query: c.query, scanId: c.scanId, history: [],
-    };
-    entry.consumed += 1;
-    entry.ts = Date.now();
-    entry.history.push({ reason, ts: Date.now(), bypassed: true, ...callDescriptor });
-    _SERP_BUDGET_REGISTRY.set(c.key, entry);
-    c.callsUsed = (c.callsUsed || 0) + 1;
-    console.log("SERP_BUDGET_CONSUMED", {
-      scanId: c.scanId, route: c.route, reason, consumed: entry.consumed,
-      max: c.max || SERP_BUDGET_MAX, devBypass: true, ...callDescriptor,
-    });
-    return true;
+    // Phase 6A.3B: dev bypass must never override an explicit background
+    // max:0 — that would let DEV_BYPASS_SERP_BUDGET=1 turn a scheduler/
+    // watchlist/autopilot job into live paid traffic. Fall through to the
+    // normal (non-bypass) path below instead of short-circuiting here.
+    // Extracted as a pure function (rather than inlined) so this exact
+    // condition is directly testable without needing DEV_BYPASS_SERP_BUDGET
+    // set in the process environment — see the self-test below.
+    if (_devBypassAllowed(SERP_BUDGET_DEV_BYPASS, c)) {
+      // Still account in summary so logs are accurate, but do not block.
+      const entry = _SERP_BUDGET_REGISTRY.get(c.key) || {
+        consumed: 0, ts: Date.now(), route: c.route, scanId: c.scanId, history: [],
+      };
+      entry.consumed += 1;
+      entry.ts = Date.now();
+      entry.history.push({ reason, ts: Date.now(), bypassed: true, ...safeDescriptor });
+      _SERP_BUDGET_REGISTRY.set(c.key, entry);
+      c.callsUsed = (c.callsUsed || 0) + 1;
+      console.log("SERP_BUDGET_CONSUMED", {
+        scanId: c.scanId, route: c.route, reason, consumed: entry.consumed,
+        max: _resolveSerpBudgetMax(c), devBypass: true, ...safeDescriptor,
+      });
+      console.log("SERPAPI_ATTEMPT_ALLOWED", { ...attributionBase, decision: "allowed", attemptIndex: entry.consumed, devBypass: true });
+      return true;
+    }
   }
-  const max = c.max || SERP_BUDGET_MAX;
+  const max = _resolveSerpBudgetMax(c);
   const existing = _SERP_BUDGET_REGISTRY.get(c.key);
   const current = existing?.consumed || 0;
   if (current >= max) {
@@ -5037,27 +5290,114 @@ function consumeSerpBudget(reason, callDescriptor = {}) {
     console.warn("SERP_BUDGET_BLOCKED", {
       scanId: c.scanId,
       route: c.route,
-      query: callDescriptor.query || c.query,
       reason,
       alreadyConsumedBy: existing?.history?.[0]?.reason || null,
-      alreadyConsumedQuery: existing?.history?.[0]?.query || existing?.query || null,
+      alreadyConsumedQueryHash: existing?.history?.[0]?.queryHash || null,
       consumed: current,
       max,
+      ...safeDescriptor,
     });
+    console.warn("SERPAPI_ATTEMPT_BLOCKED", { ...attributionBase, decision: "blocked", reasonForBlock: current >= max ? "budget_exhausted" : "unknown", consumed: current, max });
     return false;
   }
   const entry = existing || {
-    consumed: 0, ts: Date.now(), route: c.route, query: c.query, scanId: c.scanId, history: [],
+    consumed: 0, ts: Date.now(), route: c.route, scanId: c.scanId, history: [],
   };
   entry.consumed += 1;
   entry.ts = Date.now();
-  entry.history.push({ reason, ts: Date.now(), ...callDescriptor });
+  // Phase 6A.3B round 2: outboundStarted is NO LONGER set here. Reserving a
+  // budget unit is not the same event as beginning a potentially billable
+  // network request — see markSerpOutboundStarted(), which every real
+  // provider function calls (via dedupeSerpInFlight) immediately before its
+  // actual fetch(), never before. This keeps refund eligibility honest for
+  // any pre-network exit that might exist between the two events.
+  entry.history.push({ reason, ts: Date.now(), ...safeDescriptor });
   _SERP_BUDGET_REGISTRY.set(c.key, entry);
   c.callsUsed = (c.callsUsed || 0) + 1;
   console.log("SERP_BUDGET_CONSUMED", {
-    scanId: c.scanId, route: c.route, reason, consumed: entry.consumed, max, ...callDescriptor,
+    scanId: c.scanId, route: c.route, reason, consumed: entry.consumed, max, ...safeDescriptor,
+  });
+  console.log("SERPAPI_ATTEMPT_ALLOWED", { ...attributionBase, decision: "allowed", attemptIndex: entry.consumed, max });
+  return true;
+}
+
+/**
+ * Public helper — mark the current scan's registry entry as having begun a
+ * real outbound network request. Idempotent (safe to call more than once).
+ * Must be called immediately before the actual fetch/axios invocation, never
+ * earlier — consumeSerpBudget reserving a unit is a distinct event from a
+ * potentially billable request actually starting. Once set, the entry can
+ * never be refunded (see releaseSerpBudget). Never called for an in-flight
+ * follower (dedupeSerpInFlight only calls this for the leader).
+ */
+// Round 3B: accepts an optional raw callDescriptor (engine/query/site/label)
+// so each provider function can attach its own attribution — sanitized
+// internally, same as getSerpInflightReuse, never trusting the caller to
+// pre-sanitize.
+function markSerpOutboundStarted(callDescriptor = {}) {
+  const c = getCurrentSerpBudgetCtx();
+  if (!c) return false;
+  const entry = _SERP_BUDGET_REGISTRY.get(c.key);
+  if (!entry) return false;
+  if (entry.outboundStarted) return true;
+  entry.outboundStarted = true;
+  const safeDescriptor = _sanitizeCallDescriptor(callDescriptor);
+  console.log("SERPAPI_OUTBOUND_STARTED", {
+    provider: "serpapi",
+    caller: c.caller || null,
+    route: c.route || null,
+    background: !!c.background,
+    logicalScanIdHash: c.scanId ? _hashForAttribution(c.scanId) : null,
+    budgetKeyHash: _hashForAttribution(c.key),
+    attemptIndex: entry.consumed,
+    ...safeDescriptor,
   });
   return true;
+}
+
+/**
+ * Phase 6A.3B round 3 — extracted from the /market/search/stream warm-cache
+ * revalidation block so it can be invoked and behaviorally tested directly
+ * (the enclosing route is an Express closure that can't be called in
+ * isolation). Routes through the hard-disabled background budget (max:0,
+ * permanently, for this release), so this always returns raw:[] and never
+ * reaches a real fetch — proven by the self-test, not merely read from
+ * source. Returns { raw, ctx } — ctx.callsUsed is read by the caller's
+ * existing net-new merge/logging logic, unchanged.
+ *
+ * Round 3B: optional safeContext ({rid, scanId, refreshScanId} — correlation
+ * identifiers only, never the raw query) is threaded into the error log so
+ * moving this out of the route didn't lose the correlation the inline
+ * version had. Callers that don't have route context (e.g. the self-test)
+ * can omit it.
+ */
+async function performStreamWarmCacheRefresh(query, variants, visionIdentity, safeContext = {}) {
+  let ctxOut = { callsUsed: 0 };
+  let raw = [];
+  try {
+    raw = await runInBackgroundSerpBudget(
+      "streamWarmCacheRefresh",
+      "/market/search/stream/cache_refresh",
+      (ctx) => {
+        ctxOut = ctx;
+        return mergeCheapestSources(query, variants, visionIdentity, {
+          skipOracle: true,
+          phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
+          skipInstantCache: true,
+          forceSourceRefresh: true,
+          recordActivity: false,
+        });
+      }
+    );
+  } catch (_re) {
+    console.warn("CACHE_BACKGROUND_REFRESH_ERROR", {
+      rid: safeContext.rid || null,
+      scanId: safeContext.scanId || null,
+      refreshScanId: safeContext.refreshScanId || null,
+      error: _re?.message,
+    });
+  }
+  return { raw, ctx: ctxOut };
 }
 
 /**
@@ -5071,13 +5411,26 @@ function releaseSerpBudget(reason, callDescriptor = {}) {
     if (!c) return false;
     const entry = _SERP_BUDGET_REGISTRY.get(c.key);
     if (!entry || entry.consumed <= 0 || entry._refundedOnce) return false;
+    // Phase 6A.3B — refund safety. Once markSerpOutboundStarted() has fired
+    // (called immediately before the actual fetch/axios invocation — never
+    // by consumeSerpBudget itself, which only reserves the unit), the
+    // attempt is potentially billable and can never be refunded —
+    // regardless of timeout, abort, empty result, HTTP error, or parse
+    // failure downstream. Refund is only for pre-outbound denials.
+    if (entry.outboundStarted) {
+      console.warn("SERPAPI_REFUND_REFUSED_OUTBOUND_STARTED", {
+        scanId: c.scanId, route: callDescriptor.route || c.route, reason,
+        consumed: entry.consumed, max: _resolveSerpBudgetMax(c),
+      });
+      return false;
+    }
     entry.consumed = Math.max(0, entry.consumed - 1);
     entry._refundedOnce = true;
     entry.ts = Date.now();
-    entry.history.push({ reason, ts: Date.now(), refund: true, ...callDescriptor });
+    entry.history.push({ reason, ts: Date.now(), refund: true, ..._sanitizeCallDescriptor(callDescriptor) });
     console.log("SERP_BUDGET_REFUNDED", {
       scanId: c.scanId, route: callDescriptor.route || c.route, reason,
-      consumed: entry.consumed, max: c.max || SERP_BUDGET_MAX,
+      consumed: entry.consumed, max: _resolveSerpBudgetMax(c),
     });
     return true;
   } catch (_e) { return false; }
@@ -5092,7 +5445,7 @@ function getSerpBudgetStatus(ctx = null) {
   if (!c) return { key: null, consumed: 0, max: SERP_BUDGET_MAX, available: SERP_BUDGET_MAX, devBypass: SERP_BUDGET_DEV_BYPASS };
   const entry = _SERP_BUDGET_REGISTRY.get(c.key);
   const consumed = entry?.consumed || 0;
-  const max = c.max || SERP_BUDGET_MAX;
+  const max = _resolveSerpBudgetMax(c);
   return {
     key: c.key,
     consumed,
@@ -5116,7 +5469,7 @@ function withSerpBudget(ctxSeed, fn) {
     query: ctxSeed.query || null,
     userId: ctxSeed.userId || null,
     route: ctxSeed.route || null,
-    max: ctxSeed.max || SERP_BUDGET_MAX,
+    max: _resolveSerpBudgetMax(ctxSeed),
     callsUsed: 0,
     blockedExtraCalls: 0,
     cacheHit: false,
@@ -10667,7 +11020,7 @@ if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
         query: seed.query || null,
         userId: seed.userId || null,
         route: seed.route || "/test",
-        max: seed.max || SERP_BUDGET_MAX,
+        max: _resolveSerpBudgetMax(seed),
         callsUsed: 0,
         blockedExtraCalls: 0,
         cacheHit: false,
@@ -10707,15 +11060,18 @@ if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
     }
   });
 
-  // Case 3 — no context = legacy bypass.
+  // Case 3 — Phase 6A.3B: no context now FAILS CLOSED (was legacy bypass).
+  // canUseSerpBudget (a cheap pre-check with no side effects, used by
+  // read-only status callers) still returns true with no ctx by design —
+  // but the actual spend gate, consumeSerpBudget, must deny.
   _budgetTotal++;
   {
     const before = canUseSerpBudget(null);
     const consumed = consumeSerpBudget("no_ctx", { query: "anywhere" });
-    if (before === true && consumed === true) {
+    if (before === true && consumed === false) {
       _budgetPass++;
     } else {
-      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "no_ctx_legacy", before, consumed });
+      console.warn("SERP_BUDGET_SELFTEST_FAIL", { case: "no_ctx_fail_closed", before, consumed });
     }
   }
 
@@ -10786,6 +11142,377 @@ if (process.env.RUN_STARTUP_SELFTESTS === "true") try {
 } catch (_e) {
   console.warn("SERP_BUDGET_SELFTEST_ERROR", { error: String(_e) });
 } // end RUN_STARTUP_SELFTESTS budget
+
+// ── Phase 6A.3B — idle-spend containment self-test (round 3B, post-independent-review) ──
+// Gated behind RUN_STARTUP_SELFTESTS=true, same convention as the block above.
+//
+// Round 3B change (independent review): round 3 mocked global.fetch, but
+// this file imports `fetch` explicitly from node-fetch — a module-scoped
+// binding global.fetch reassignment cannot intercept. That gap let one real
+// request reach serpapi.com during round-3 testing (a harmless 401 on an
+// obviously-fake key, confirmed via the SerpAPI dashboard showing no usage
+// change — but a real safety-boundary miss). Every provider function now
+// calls the dedicated _serpApiFetch(...) seam (defined near the other
+// Phase 6A.3B budget helpers), which defaults to a BLOCKING stub whenever
+// RUN_STARTUP_SELFTESTS=true — evaluated at module load, before this block
+// even runs. That means a bug in this block's own mock-installation logic
+// fails CLOSED (the stub throws) rather than falling through to the real
+// transport. This block installs a strict mock ON _serpApiFetch (never
+// global.fetch), requires the EXACT fake test key (not a heuristic), and
+// sets process.exitCode=1 on any failure — a failed Phase 6A.3B run must be
+// a real, externally-visible failure, not just a console warning.
+if (process.env.RUN_STARTUP_SELFTESTS === "true") {
+  // Deferred to setImmediate: this block calls the real serpShopping et al.,
+  // which transitively read module-level consts (e.g. SOURCE_HEALTH) that
+  // are declared much later in this file. Those declarations haven't run
+  // yet at this textual position during initial top-to-bottom module
+  // evaluation — calling into them here throws a TDZ ReferenceError.
+  // setImmediate defers this whole body until after the entire module has
+  // finished loading, without needing to physically relocate ~250 lines.
+  setImmediate(async () => {
+  let _c3bPass = 0;
+  let _c3bTotal = 0;
+  const _fail = (label, extra) => { console.warn("PHASE_6A3B_SELFTEST_FAIL", { case: label, ...extra }); process.exitCode = 1; };
+  const _pass = () => { _c3bPass++; };
+
+  // Captured BEFORE any mock is installed: whatever _serpApiFetch currently
+  // is (the blocking stub, since RUN_STARTUP_SELFTESTS=true) — restoring to
+  // THIS in the outer finally, not to _realSerpApiFetch, keeps real
+  // networking structurally unreachable for the entire process lifetime.
+  const _originalSerpApiFetch = _serpApiFetch;
+  let _mockFetchLog = [];
+  let _mockResponders = [];
+  const _strictMockSerpApiFetch = async (url, opts) => {
+    const urlStr = String(url);
+    _mockFetchLog.push(urlStr);
+    const responder = _mockResponders.find((r) => r.match(urlStr));
+    if (!responder) {
+      throw new Error(`SELFTEST_UNEXPECTED_FETCH_URL:${urlStr.slice(0, 120)}`);
+    }
+    return responder.respond(urlStr, opts);
+  };
+  const _mockEngine = (engineParam, respond) => ({ match: (url) => url.includes(`engine=${engineParam}`), respond });
+  const _okShoppingResponse = () => ({ ok: true, status: 200, json: async () => ({ shopping_results: [{ title: "Mock Item", price: "$19.99", source: "MockStore" }] }) });
+  const _slowOkShoppingResponse = (ms) => async () => { await new Promise((r) => setTimeout(r, ms)); return _okShoppingResponse(); };
+  const _abortErrorResponse = async (url, opts) => {
+    if (opts?.signal?.throwIfAborted) { try { opts.signal.throwIfAborted(); } catch {} }
+    const e = new Error("The operation was aborted"); e.name = "AbortError"; throw e;
+  };
+  const _httpErrorResponse = (status) => async () => ({ ok: false, status, json: async () => ({ error: "mock_http_error" }) });
+  const _emptyOkResponse = () => ({ ok: true, status: 200, json: async () => ({ shopping_results: [] }) });
+  const _parseFailureResponse = () => ({ ok: true, status: 200, json: async () => { throw new Error("mock JSON parse failure"); } });
+
+  const _EXACT_FAKE_TEST_KEY = "phase-6a3b-fake-test-key";
+  if (SERPAPI_KEY !== _EXACT_FAKE_TEST_KEY) {
+    // Not a heuristic (length/prefix) — an exact match requirement. When
+    // absent, provider-function cases are skipped (not silently passed),
+    // logged as a real failure, and the transport remains at whatever
+    // _serpApiFetch already was (the blocking stub) — never assigned to
+    // the mock or the real transport in this branch.
+    console.warn("PHASE_6A3B_SELFTEST_FAIL", { case: "exact_fake_key_required", reason: "SERPAPI_KEY does not exactly match the required fake test key; provider-function cases skipped", present: !!SERPAPI_KEY });
+    process.exitCode = 1;
+  } else try {
+    _serpApiFetch = _strictMockSerpApiFetch;
+    // Case 1 — missing context fails closed (the core Phase 6A.3A fix).
+    _c3bTotal++;
+    {
+      const consumed = consumeSerpBudget("serpShopping", { engine: "google_shopping", query: "no ctx test" });
+      if (consumed === false) _pass(); else _fail("missing_context_denies", { consumed });
+    }
+
+    // Case 2 — background ctx: max is hard-coded 0 (round 3 removed the
+    // speculative daily-allowance opt-in entirely), denies every attempt.
+    _c3bTotal++;
+    await runInBackgroundSerpBudget("selftest_bg", "/test/bg", async (ctx) => {
+      const first  = consumeSerpBudget("serpShopping", { engine: "google_shopping", query: "bg test" });
+      const second = consumeSerpBudget("serpShopping", { engine: "google_shopping", query: "bg test" });
+      if (ctx.max === 0 && first === false && second === false) _pass();
+      else _fail("background_hard_max_zero_denies_every_attempt", { max: ctx.max, first, second });
+    });
+
+    // Case 3 — cold foreground scan through the REAL serpShopping function:
+    // exactly one mocked fetch call, budget consumed exactly once.
+    _c3bTotal++;
+    await (async () => {
+      _mockResponders = [_mockEngine("google_shopping", _okShoppingResponse)];
+      const beforeCount = _mockFetchLog.length;
+      const ctx = {
+        scanId: "selftest_cold_scan", route: "/test", max: 1,
+        callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+        key: _makeBudgetKey({ scanId: "selftest_cold_scan" }),
+      };
+      const result = await SERP_BUDGET_STORE.run(ctx, () => serpShopping("selftest cold scan unique query 7c1", {}));
+      const callsAfter = _mockFetchLog.length - beforeCount;
+      if (Array.isArray(result) && result.length > 0 && callsAfter === 1 && ctx.callsUsed === 1) _pass();
+      else _fail("cold_scan_exactly_one_real_call", { resultLen: result?.length, callsAfter, callsUsed: ctx.callsUsed });
+    })();
+
+    // Case 4 — concurrent identical serpShopping calls dedupe to one real
+    // fetch, and the follower emits SERPAPI_INFLIGHT_REUSED via the actual
+    // call path (not a direct dedupeSerpInFlight call, per the round-2 gap).
+    _c3bTotal++;
+    await (async () => {
+      _mockResponders = [_mockEngine("google_shopping", _slowOkShoppingResponse(15))];
+      const beforeCount = _mockFetchLog.length;
+      const _capturedLogs = [];
+      const _origLog = console.log;
+      console.log = (...args) => { _capturedLogs.push(args); _origLog.apply(console, args); };
+      const ctx = {
+        scanId: "selftest_concurrent_dedupe", route: "/test", max: 1,
+        callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+        key: _makeBudgetKey({ scanId: "selftest_concurrent_dedupe" }),
+      };
+      let r1, r2;
+      try {
+        [r1, r2] = await SERP_BUDGET_STORE.run(ctx, () => Promise.all([
+          serpShopping("selftest concurrent dedupe unique query 7c2", {}),
+          serpShopping("selftest concurrent dedupe unique query 7c2", {}),
+        ]));
+      } finally {
+        console.log = _origLog;
+      }
+      const callsAfter = _mockFetchLog.length - beforeCount;
+      const reusedLogged = _capturedLogs.some((a) => a[0] === "SERPAPI_INFLIGHT_REUSED");
+      if (r1 === r2 && callsAfter === 1 && ctx.callsUsed === 1 && reusedLogged) _pass();
+      else _fail("concurrent_calls_dedupe_with_real_attribution", { sameResult: r1 === r2, callsAfter, callsUsed: ctx.callsUsed, reusedLogged });
+    })();
+
+    // Case 5 — alternate engines (serpAmazon / serpScopedSearch / previously
+    // fully-unguarded serpEbaySold / serpLocalShopping) cannot spend after
+    // the primary has already consumed the scan's one unit — through the
+    // REAL functions this time, confirmed by zero additional mocked calls.
+    _c3bTotal++;
+    await (async () => {
+      _mockResponders = [_mockEngine("google_shopping", _okShoppingResponse)];
+      const ctx = {
+        scanId: "selftest_alt_engine_real", route: "/test", max: 1,
+        callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+        key: _makeBudgetKey({ scanId: "selftest_alt_engine_real" }),
+      };
+      const outcome = await SERP_BUDGET_STORE.run(ctx, async () => {
+        await serpShopping("selftest alt engine primary unique query 7c3", {});
+        const beforeCount = _mockFetchLog.length;
+        const sold  = await serpEbaySold("selftest alt engine unique query 7c3");
+        const local = await serpLocalShopping("selftest alt engine unique query 7c3", "10001");
+        const amazon = await serpAmazon("selftest alt engine unique query 7c3");
+        const scoped = await serpScopedSearch("selftest alt engine unique query 7c3", "poshmark.com");
+        return { additionalCalls: _mockFetchLog.length - beforeCount, sold, local, amazon, scoped };
+      });
+      const noneSpent = outcome.additionalCalls === 0;
+      // serpEbaySold's budget-blocked contract is null (unlike its no-key
+      // contract, which is []) — matching each function's actual established
+      // shape, not a single assumed shape for all four.
+      const shapesOk = (outcome.sold === null || outcome.sold === undefined) &&
+        (outcome.local === null || outcome.local === undefined) &&
+        Array.isArray(outcome.amazon) && outcome.amazon.length === 0 &&
+        Array.isArray(outcome.scoped) && outcome.scoped.length === 0;
+      if (noneSpent && shapesOk && ctx.callsUsed === 1) _pass();
+      else _fail("alternate_engines_zero_additional_calls", { additionalCalls: outcome.additionalCalls, shapesOk, callsUsed: ctx.callsUsed });
+    })();
+
+    // Case 6 — refund safety across failure modes AFTER outbound start: for
+    // each of timeout(abort)/HTTP-failure/empty-response/parse-failure, the
+    // real function's own catch/handling runs, and releaseSerpBudget must
+    // refuse afterward because markSerpOutboundStarted already fired at the
+    // real fetch line.
+    _c3bTotal++;
+    {
+      const _failureModes = [
+        ["abort_timeout", _abortErrorResponse],
+        ["http_failure", _httpErrorResponse(500)],
+        ["empty_response", async () => _emptyOkResponse()],
+        ["parse_failure", async () => _parseFailureResponse()],
+      ];
+      let _allRefused = true;
+      const _details = {};
+      for (const [label, handler] of _failureModes) {
+        _mockResponders = [_mockEngine("google_shopping", handler)];
+        const ctx = {
+          scanId: `selftest_refund_${label}`, route: "/test", max: 1,
+          callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+          key: _makeBudgetKey({ scanId: `selftest_refund_${label}` }),
+        };
+        const refused = await SERP_BUDGET_STORE.run(ctx, async () => {
+          // softFail:true — without it, serpShopping's own failure handling
+          // calls markSourceFailure("serpapi", ...), which trips a cooldown
+          // in the shared, process-lifetime SOURCE_HEALTH map and silently
+          // short-circuits every subsequent serpShopping call in later test
+          // cases (isSourceCoolingDown("serpapi") returns true before ever
+          // reaching consumeSerpBudget) — a real test-isolation bug this
+          // caught on first run, not a containment-logic bug.
+          try { await serpShopping(`selftest refund ${label} unique query 7c4`, { softFail: true }); } catch {}
+          return releaseSerpBudget(`simulated_${label}`, { route: "/test" }) === false;
+        });
+        _details[label] = refused;
+        if (!refused) _allRefused = false;
+      }
+      if (_allRefused) _pass();
+      else _fail("refund_refused_after_outbound_all_failure_modes", _details);
+    }
+
+    // Case 7 — pre-fetch reservation without any outbound attempt remains
+    // refundable (the legitimate pre-network-denial path) — proves
+    // consumeSerpBudget reserving is a distinct event from the network
+    // attempt actually beginning.
+    _c3bTotal++;
+    await (() => {
+      const ctx = {
+        scanId: "selftest_split_timing", route: "/test", max: 1,
+        callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+        key: _makeBudgetKey({ scanId: "selftest_split_timing" }),
+      };
+      return SERP_BUDGET_STORE.run(ctx, () => {
+        const consumed = consumeSerpBudget("serpShopping", { engine: "google_shopping", query: "split timing test" });
+        const notYetOutbound = _SERP_BUDGET_REGISTRY.get(ctx.key)?.outboundStarted !== true;
+        const refundSucceeded = releaseSerpBudget("pre_outbound_reason", { route: "/test" });
+        if (consumed === true && notYetOutbound && refundSucceeded === true) _pass();
+        else _fail("pre_outbound_reservation_refundable", { consumed, notYetOutbound, refundSucceeded });
+      });
+    })();
+
+    // Case 8 — pre-outbound denial (budget already exhausted) must not
+    // create an entry or mark outbound for a key that never had a real
+    // attempt.
+    _c3bTotal++;
+    await (() => {
+      const ctx = {
+        scanId: "selftest_pre_outbound_deny", route: "/test", max: 0,
+        callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+        key: _makeBudgetKey({ scanId: "selftest_pre_outbound_deny" }),
+      };
+      return SERP_BUDGET_STORE.run(ctx, () => {
+        const consumed = consumeSerpBudget("serpShopping", { engine: "google_shopping", query: "denied before outbound" });
+        const entry = _SERP_BUDGET_REGISTRY.get(ctx.key);
+        if (consumed === false && !entry) _pass();
+        else _fail("pre_outbound_denial_no_entry", { consumed, entryExists: !!entry });
+      });
+    })();
+
+    // Case 9 — _devBypassAllowed: dev bypass cannot override background
+    // max:0. Tested as a pure function since SERP_BUDGET_DEV_BYPASS is fixed
+    // at module load and this test process does not set that env var.
+    _c3bTotal++;
+    {
+      const blockedWithBypassAndZeroMax = _devBypassAllowed(true, { max: 0 }) === false;
+      const allowedWithBypassAndPositiveMax = _devBypassAllowed(true, { max: 1 }) === true;
+      const blockedWithNoBypass = _devBypassAllowed(false, { max: 1 }) === false;
+      if (blockedWithBypassAndZeroMax && allowedWithBypassAndPositiveMax && blockedWithNoBypass) _pass();
+      else _fail("dev_bypass_respects_background_max_zero", { blockedWithBypassAndZeroMax, allowedWithBypassAndPositiveMax, blockedWithNoBypass });
+    }
+
+    // Case 10 — the previously-inverted google_product resolver
+    // (_resolveGoogleShoppingProductUrls) is now hard-disabled: zero mocked
+    // calls regardless of context, with real candidate items.
+    _c3bTotal++;
+    await (async () => {
+      const beforeCount = _mockFetchLog.length;
+      const items = [{ clickable: false, _productId: "selftest_pid_1", title: "x" }, { clickable: false, _productId: "selftest_pid_2", title: "y" }];
+      const result = await _resolveGoogleShoppingProductUrls(items, SERPAPI_KEY, 3);
+      const callsAfter = _mockFetchLog.length - beforeCount;
+      if (callsAfter === 0 && result && Object.keys(result).length === 0) _pass();
+      else _fail("google_product_resolver_hard_disabled", { callsAfter, resultKeys: Object.keys(result || {}) });
+    })();
+
+    // Case 11 — the extracted warm-cache refresh helper makes zero real
+    // calls (behavioral, not source-inspection) and does not record market
+    // activity for the query it processes.
+    _c3bTotal++;
+    await (async () => {
+      const beforeCount = _mockFetchLog.length;
+      const _wcQuery = "selftest warm cache helper unique query 7c5";
+      const { raw, ctx } = await performStreamWarmCacheRefresh(_wcQuery, [], null);
+      const callsAfter = _mockFetchLog.length - beforeCount;
+      const heat = marketHeat(normalizeQuery(_wcQuery));
+      if (Array.isArray(raw) && raw.length === 0 && callsAfter === 0 && ctx.callsUsed === 0 && heat === 0) _pass();
+      else _fail("warm_cache_helper_zero_spend", { rawLen: raw?.length, callsAfter, callsUsed: ctx.callsUsed, heat });
+    })();
+
+    // Case 12 — attribution logs (both legacy SERP_BUDGET_* and the new
+    // SERPAPI_ATTEMPT_*/OUTBOUND_STARTED/INFLIGHT_REUSED families) never
+    // carry the raw query string, across a real cold-scan + reuse + refund
+    // cycle, not just a single blocked call.
+    _c3bTotal++;
+    await (async () => {
+      _mockResponders = [_mockEngine("google_shopping", _slowOkShoppingResponse(10))];
+      const _rawNeedle = "UNIQUE_RAW_QUERY_MARKER_9f2a";
+      const _capturedLogs = [];
+      const _origLog = console.log;
+      const _origWarn = console.warn;
+      console.log = (...args) => { _capturedLogs.push(args); };
+      console.warn = (...args) => { _capturedLogs.push(args); };
+      try {
+        consumeSerpBudget("serpShopping", { engine: "google_shopping", query: _rawNeedle }); // no ctx → blocked
+        const ctx = {
+          scanId: "selftest_attrib_logs", route: "/test", max: 1,
+          callsUsed: 0, blockedExtraCalls: 0, cacheHit: false,
+          key: _makeBudgetKey({ scanId: "selftest_attrib_logs" }),
+        };
+        await SERP_BUDGET_STORE.run(ctx, async () => {
+          await Promise.all([serpShopping(_rawNeedle, {}), serpShopping(_rawNeedle, {})]); // leader + follower
+          releaseSerpBudget("attempt_refund_after_outbound", { route: "/test" });
+        });
+      } finally {
+        console.log = _origLog;
+        console.warn = _origWarn;
+      }
+      const _relevantLogs = _capturedLogs.filter((a) =>
+        ["SERP_BUDGET_CONSUMED", "SERP_BUDGET_BLOCKED", "SERPAPI_ATTEMPT_ALLOWED", "SERPAPI_ATTEMPT_BLOCKED", "SERPAPI_OUTBOUND_STARTED", "SERPAPI_INFLIGHT_REUSED", "SERPAPI_ATTEMPT_FINISHED", "SERPAPI_REFUND_REFUSED_OUTBOUND_STARTED"].includes(a[0])
+      );
+      const _anyRawQuery = _relevantLogs.some((a) => JSON.stringify(a).includes(_rawNeedle));
+      if (_relevantLogs.length >= 4 && !_anyRawQuery) _pass();
+      else _fail("no_raw_query_in_any_budget_log", { logCount: _relevantLogs.length, anyRawQuery: _anyRawQuery, logNames: _relevantLogs.map((a) => a[0]) });
+    })();
+
+    // Case 13 — recordActivity behavioral proof via the real
+    // recordMarketActivity/marketHeat pair.
+    _c3bTotal++;
+    {
+      const _testQueryOff = "selftest unique query no activity 8f1a";
+      const _testQueryOn  = "selftest unique query with activity 8f1a";
+      const _seedHit = (q) => {
+        const normalized = selfHealQuery(normalizeQuery(q));
+        const key = scanFingerprint(normalized, []);
+        INSTANT_SCAN_CACHE.set(key, packMarketItemsWithIdentity([{ title: "seed", price: 1, totalPrice: 1 }], null));
+      };
+      _seedHit(_testQueryOff);
+      _seedHit(_testQueryOn);
+      await mergeCheapestSources(_testQueryOff, [], null, { recordActivity: false });
+      await mergeCheapestSources(_testQueryOn, [], null, { recordActivity: true });
+      const heatOff = marketHeat(normalizeQuery(_testQueryOff));
+      const heatOn  = marketHeat(normalizeQuery(_testQueryOn));
+      if (heatOff === 0 && heatOn > 0) _pass();
+      else _fail("record_activity_behavioral", { heatOff, heatOn });
+    }
+
+  } catch (_e) {
+    console.warn("PHASE_6A3B_SELFTEST_ERROR", { error: String(_e), stack: _e?.stack?.split("\n").slice(0, 3).join(" | ") });
+    process.exitCode = 1;
+  } finally {
+    // Restore to whatever _serpApiFetch was before this block installed its
+    // mock — during a self-test run that is always the blocking stub, never
+    // _realSerpApiFetch. Real networking stays structurally unreachable for
+    // the entire lifetime of this process, not just for the duration of the
+    // try block above.
+    _serpApiFetch = _originalSerpApiFetch;
+    for (const k of Array.from(_SERP_BUDGET_REGISTRY.keys())) {
+      if (k.startsWith("scan:selftest_") || k.startsWith("bg:selftest_")) _SERP_BUDGET_REGISTRY.delete(k);
+    }
+  }
+
+  if (_c3bPass === _c3bTotal && _c3bTotal > 0 && process.exitCode !== 1) {
+    console.log("PHASE_6A3B_SELFTEST_PASS", {
+      passed: _c3bPass, total: _c3bTotal,
+      mockedTransportCallsExpected: _mockFetchLog.length,
+      unexpectedTransportCalls: 0,
+      realProviderCallsPossible: false,
+      note: "real SerpAPI networking was structurally unreachable: _serpApiFetch defaulted to a throwing stub at module load (before this block ran) and was only ever swapped for the strict mock above, never for _realSerpApiFetch",
+    });
+  } else {
+    console.warn("PHASE_6A3B_SELFTEST_FAIL", { passed: _c3bPass, total: _c3bTotal, mockedTransportCallsObserved: _mockFetchLog.length });
+    process.exitCode = 1;
+  }
+  }); // end setImmediate
+} // end RUN_STARTUP_SELFTESTS Phase 6A.3B
 
 // ── SERP fanout query builder ─────────────────────────────────────────────────
 // Generates safe, category-aware SERP query variants for retrieval expansion.
@@ -13268,10 +13995,18 @@ function queueWatchRefresh(userId, query, extra = {}) {
       "autopilot_run",
       { userId },
       async (payload) => {
+        // Phase 6A.3B: runAutopilotForUser calls mergeCheapestSourcesFn once
+        // per portfolio item with no bound on item count — previously
+        // reached SerpAPI with no budget context at all (unbounded per run).
+        // Each item now gets its own explicit background-budget context,
+        // zero paid SerpAPI by default.
         const result = await runAutopilotForUser(redis, payload.userId, {
           listPortfolioItemsFn:    listPortfolioItems,
           computeLiquidityScoreFn: computeLiquidityScore,
-          mergeCheapestSourcesFn:  mergeCheapestSources,
+          mergeCheapestSourcesFn:  (q, variants, identity) =>
+            runInBackgroundSerpBudget("autopilot", "autopilot_run", () =>
+              mergeCheapestSources(q, variants, identity, { recordActivity: false })
+            ),
         });
         return { ok: true, count: result?.count ?? 0 };
       }
@@ -13369,7 +14104,13 @@ function scheduleCrawlerRefresh(query = "", reason = "phase4_loop") {
     CRAWLER_REFRESH_ACTIVE.add(q);
 
     try {
-      const items = await mergeCheapestSources(q, [], null);
+      // Phase 6A.3B: explicit background budget (max=0 by default) instead of
+      // calling mergeCheapestSources with no context at all — this idle loop
+      // was the Phase 6A.3A root cause. recordActivity:false so processing a
+      // query here doesn't re-promote it back into the crawler queue.
+      const items = await runInBackgroundSerpBudget("scheduleCrawlerRefresh", "phase4_crawler_refresh", () =>
+        mergeCheapestSources(q, [], null, { recordActivity: false })
+      );
       await recordCrawlerRefresh(q, items, { reason });
 
       return {
@@ -13530,7 +14271,11 @@ function schedulePhase5PrecomputeRefresh(query = "", reason = "phase5_loop") {
     PRECOMPUTE_ACTIVE.add(q);
 
     try {
-      const items = await mergeCheapestSources(q, [], null);
+      // Phase 6A.3B: explicit background budget (max=0 by default); see
+      // scheduleCrawlerRefresh above for why.
+      const items = await runInBackgroundSerpBudget("schedulePhase5PrecomputeRefresh", "phase5_precompute_refresh", () =>
+        mergeCheapestSources(q, [], null, { recordActivity: false })
+      );
       const { uiItems, intelligence } = await buildFinalUiItemsWithIntelligence(q, items, {
         scannedPrice: null,
         visionConfidence: 0.5,
@@ -14100,7 +14845,7 @@ function buildExpansionVariants(query) {
   return kept;
 }
 
-async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null, skipInstantCache = false, forceSourceRefresh = false } = {}) {
+async function mergeCheapestSources(query, extraVariants = [], identity = null, { skipOracle = false, earlyItemsCb = null, identitySummaryOut = null, phase1TimeoutMs = null, skipInstantCache = false, forceSourceRefresh = false, recordActivity = true } = {}) {
 
   // Budget: SerpAPI lanes each carry their own SERPAPI_TIMEOUT_MS=4500ms cap.
   // phase1TimeoutMs is passed from the stream route — background recovery gets
@@ -14118,7 +14863,11 @@ async function mergeCheapestSources(query, extraVariants = [], identity = null, 
   const worker = (async () => {
 
   let normalizedQuery = selfHealQuery(normalizeQuery(query));
-  recordMarketActivity(normalizedQuery);
+  // Phase 6A.3B: background/scheduler maintenance passes recordActivity:false
+  // so processing a query doesn't re-promote it back into the hot queue —
+  // that self-perpetuation was why idle loops never drained (Phase 6A.3A).
+  // User-triggered scans keep the default (true) and record as before.
+  if (recordActivity) recordMarketActivity(normalizedQuery);
 
   const learnedQuery = QUERY_LEARNING.get(normalizedQuery);
   if (learnedQuery) {
@@ -16109,10 +16858,18 @@ function scheduleInternalMarketRefresh(query = "", identity = null, reason = "ph
       visionIdentity: sanitizeVisionIdentityForSnapshot(identity || null),
     },
     async (payload) => {
-      const liveItems = await mergeCheapestSources(
-        payload.query,
-        [],
-        payload.visionIdentity || null
+      // Phase 6A.3B: explicit background budget (max=0 by default). This
+      // function is reached both by the idle refresh loop and by
+      // resolveInternalMarketHit's stale-snapshot path during a live route —
+      // both are automatic revalidation, not the scan's own primary
+      // retrieval, so neither should silently spend by default.
+      const liveItems = await runInBackgroundSerpBudget("scheduleInternalMarketRefresh", "phase4_internal_market_refresh", () =>
+        mergeCheapestSources(
+          payload.query,
+          [],
+          payload.visionIdentity || null,
+          { recordActivity: false }
+        )
       );
 
       if (Array.isArray(liveItems) && liveItems.length > 0) {
@@ -24835,6 +25592,15 @@ Be specific. Be accurate. This data is used to find real resale prices — wrong
 
 let _googleProductApiAvailable = true; // set false on first 401 or engine error
 
+// Phase 6A.3B round 3 (independent review, release-blocking): this lane's own
+// budget gate was inverted — `if (ctx && !DEV_BYPASS)` blocks WITH a context
+// and allows WITHOUT one, the same anti-pattern as the original Phase 6A.3A
+// idle-spend leak. Rather than try to fold an extra-paid-call-per-item lane
+// into the shared one-call budget, it is simply hard-disabled for this
+// release: true means zero network calls, unconditionally, regardless of
+// context, budget, or DEV_BYPASS_SERP_BUDGET.
+const _GOOGLE_PRODUCT_RECOVERY_HARD_DISABLED_RC0 = true;
+
 const _RECOVERY_SEARCH_PATHS = ["/search", "/s/", "/sch/", "/shop", "/catalog", "/collections/all", "/category", "/find", "/browse"];
 
 function _isMerchantSearchPage(url) {
@@ -24868,21 +25634,19 @@ async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) 
     }
     return {};
   }
-  // ── Phase 2C.8: direct URL recovery is an EXTRA paid call per item. Block
-  // it entirely unless DEV_BYPASS_SERP_BUDGET is set OR no scan context is
-  // active (e.g. background batch job). Production scan context always has
-  // already consumed its one allowed call on serpShopping above this point.
-  const _ctx = getCurrentSerpBudgetCtx();
-  if (_ctx && !SERP_BUDGET_DEV_BYPASS) {
-    console.warn("SERP_BUDGET_BLOCKED", {
-      scanId: _ctx.scanId,
-      route: _ctx.route,
-      query: _ctx.query,
-      reason: "direct_url_recovery_google_product",
-      alreadyConsumedBy: "serpShopping_primary",
+  // Phase 6A.3B round 3: this recovery lane makes an extra paid google_product
+  // call per candidate item on top of serpShopping's own primary call. Its
+  // previous gate — `if (ctx && !DEV_BYPASS)` — blocked WITH a budget context
+  // and allowed WITHOUT one, the same inverted anti-pattern as the original
+  // Phase 6A.3A idle-spend leak. Hard-disabled for this release instead of
+  // re-gated: existing pricing_signal_only / affiliate behavior downstream is
+  // unaffected — items simply keep whatever URL quality serpShopping already
+  // resolved.
+  if (_GOOGLE_PRODUCT_RECOVERY_HARD_DISABLED_RC0) {
+    console.log("DIRECT_URL_RECOVERY_DISABLED_RC0", {
+      reason: "google_product_hard_disabled_for_release",
       candidates: items.filter(it => !it.clickable && it._productId).length,
     });
-    _ctx.blockedExtraCalls = (_ctx.blockedExtraCalls || 0) + 1;
     return {};
   }
   const candidates = items
@@ -24907,7 +25671,7 @@ async function _resolveGoogleShoppingProductUrls(items, serpApiKey, budget = 3) 
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 2500);
       try {
-        const r = await fetch(apiUrl, { signal: ctrl.signal });
+        const r = await _serpApiFetch(apiUrl, { signal: ctrl.signal });
         clearTimeout(t);
         const data = await r.json();
         if (!r.ok) {
@@ -25003,10 +25767,9 @@ if (!URL_RECOVERY_ASYNC_ENABLED) {
 // Key + engine diagnostic emitted once at startup so ops can confirm the
 // SerpAPI key is wired and the google_product circuit state is visible.
 // _googleProductApiAvailable latches false on first 401 and stays false until restart.
-console.log("URL_RECOVERY_KEY_DIAGNOSTIC", {
+const _urlRecoveryKeyDiagPayload = {
   serpApiKeyPresent:         !!SERPAPI_KEY,
   serpApiKeySource:          "SERPAPI_KEY",
-  serpApiKeyHint:            SERPAPI_KEY ? `${SERPAPI_KEY.slice(0, 4)}...${SERPAPI_KEY.slice(-4)}` : null,
   googleProductApiAvailable: _googleProductApiAvailable,
   urlVerificationEnabled:    URL_VERIFICATION_ENABLED,
   urlRecoveryAsyncEnabled:   URL_RECOVERY_ASYNC_ENABLED,
@@ -25021,7 +25784,27 @@ console.log("URL_RECOVERY_KEY_DIAGNOSTIC", {
     : URL_VERIFICATION_ENABLED
     ? "sync_verification_armed"
     : "all_recovery_disabled_set_URL_RECOVERY_ASYNC_ENABLED=true_to_enable",
-});
+};
+console.log("URL_RECOVERY_KEY_DIAGNOSTIC", _urlRecoveryKeyDiagPayload);
+
+// Phase 6A.3B round 2 self-test: check the ACTUAL payload just logged above
+// (not a freshly-constructed stand-in — this is the real diagnostic ops see
+// in production) for the removed key-hint field. This has to live here
+// rather than in the main PHASE_6A3B_SELFTEST block, which runs earlier in
+// module load, before this log exists yet.
+if (process.env.RUN_STARTUP_SELFTESTS === "true") {
+  const _diagSerialized = JSON.stringify(_urlRecoveryKeyDiagPayload);
+  const _keyPrefixLeak = SERPAPI_KEY && _diagSerialized.includes(SERPAPI_KEY.slice(0, 4));
+  if ("serpApiKeyPresent" in _urlRecoveryKeyDiagPayload && !("serpApiKeyHint" in _urlRecoveryKeyDiagPayload) && !_keyPrefixLeak) {
+    console.log("PHASE_6A3B_KEY_DIAGNOSTIC_SELFTEST_PASS", { passed: 1, total: 1 });
+  } else {
+    console.warn("PHASE_6A3B_KEY_DIAGNOSTIC_SELFTEST_FAIL", {
+      hasPresenceField: "serpApiKeyPresent" in _urlRecoveryKeyDiagPayload,
+      hasHintField: "serpApiKeyHint" in _urlRecoveryKeyDiagPayload,
+      keyPrefixLeak: _keyPrefixLeak,
+    });
+  }
+}
 
 /**
  * Post-response async URL recovery. Fires AFTER first payload is on the wire so
@@ -25115,10 +25898,18 @@ async function _verifyOneItem(it, serpApiKey, scanId) {
     method: "serpapi_google_product",
   });
 
+  // Phase 6A.3B round 3B: routed through the SerpAPI transport seam for
+  // consistency. This function is currently reachable only via two callers
+  // that are each independently gated off by default (URL_RECOVERY_ASYNC_
+  // ENABLED and URL_VERIFICATION_ENABLED, both false unless explicitly set)
+  // and has no budget/context check of its own — flagged, not fixed here,
+  // since adding new budget logic to a dormant path risks unintended scope
+  // for this phase. Needs its own consumeSerpBudget gate before either flag
+  // is ever turned on.
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), URL_VERIFICATION_ITEM_TIMEOUT_MS);
   try {
-    const r = await fetch(apiUrl, { signal: ctrl.signal });
+    const r = await _serpApiFetch(apiUrl, { signal: ctrl.signal });
     clearTimeout(t);
     const data = await r.json();
     if (!r.ok) {
@@ -25430,6 +26221,17 @@ async function serpShopping(query, opts = {}) {
     });
   }
 
+  // Phase 6A.3B round 2: primary-engine in-flight dedupe, checked BEFORE the
+  // budget gate — a follower must never consume its own budget unit just to
+  // then discover it can join an existing request. Keyed by query only (not
+  // bypassHardenedCache) — the outbound params below are identical whether
+  // this call came from a fresh foreground request or the stale-while-
+  // revalidate self-recursion above, so both should be able to share one
+  // real fetch when they land at the same instant.
+  const _inflightKeyShopping = `serpShopping|${_hashForAttribution(query)}`;
+  const _reuseShopping = getSerpInflightReuse(_inflightKeyShopping, "google_shopping", { engine: "google_shopping", query });
+  if (_reuseShopping) return _reuseShopping;
+
   // ── Phase 2C.8: per-scan SerpAPI budget gate ─────────────────────────────────
   // Cache hits above this point are free (no budget consumed). A real network
   // call beyond this point requires the scan to have at least 1 unit left.
@@ -25444,6 +26246,7 @@ async function serpShopping(query, opts = {}) {
     return [];
   }
 
+  const { promise: _serpShoppingPromiseResult } = dedupeSerpInFlight(_inflightKeyShopping, "google_shopping", async () => {
   const startedAt = Date.now();
 
   const params = new URLSearchParams({
@@ -25459,7 +26262,11 @@ async function serpShopping(query, opts = {}) {
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const r = await fetch(url, { signal: controller.signal });
+    // Phase 6A.3B round 3: marked immediately before the real network call,
+    // not by the generic dedupe wrapper (which fired before AbortController/
+    // URLSearchParams setup — too early per independent review).
+    markSerpOutboundStarted({ engine: "google_shopping", query });
+    const r = await _serpApiFetch(url, { signal: controller.signal });
 
       if (!r.ok) {
         if (r.status === 429) {
@@ -25672,6 +26479,8 @@ async function serpShopping(query, opts = {}) {
   } finally {
     clearTimeout(t);
   }
+  });
+  return _serpShoppingPromiseResult;
 }
 
 // -------------------- SERP: eBay Sold Comps (Feature 4) --------------------
@@ -25682,6 +26491,20 @@ async function serpEbaySold(query) {
   if (process.env.DISABLE_SERP === "true") return [];
   if (isSourceCoolingDown("serpapi")) return [];
 
+  // Phase 6A.3B: this real SerpAPI boundary previously had NO budget check at
+  // all (unlike serpShopping/serpAmazon/serpScopedSearch) and fired
+  // unconditionally on every /market/search call, cache hit or not. It is
+  // now gated like the other non-primary engines: fails closed with no
+  // context, and never competes with/starves the one primary serpShopping
+  // attempt when a scan context exists.
+  const _inflightKeyEbaySold = `serpEbaySold|${_hashForAttribution(query)}`;
+  const _reuseEbaySold = getSerpInflightReuse(_inflightKeyEbaySold, "ebay_sold", { engine: "ebay_sold", query });
+  if (_reuseEbaySold) return _reuseEbaySold;
+  if (!consumeSerpBudget("serpEbaySold", { engine: "ebay_sold", query })) {
+    return null;
+  }
+
+  const { promise: _ebaySoldPromiseResult } = dedupeSerpInFlight(_inflightKeyEbaySold, "ebay_sold", async () => {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
@@ -25698,7 +26521,8 @@ async function serpEbaySold(query) {
     });
 
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const r = await fetch(url, { signal: controller.signal });
+    markSerpOutboundStarted({ engine: "ebay_sold", query });
+    const r = await _serpApiFetch(url, { signal: controller.signal });
 
     if (!r.ok) {
       if (r.status === 429) {
@@ -25825,6 +26649,8 @@ async function serpEbaySold(query) {
   } finally {
     clearTimeout(t);
   }
+  });
+  return _ebaySoldPromiseResult;
 }
 
 // -------------------- SERP: Local / Hyperlocal Shopping (Feature 5) --------------------
@@ -25836,6 +26662,17 @@ async function serpLocalShopping(query, location) {
   if (!location) return null;
   if (isSourceCoolingDown("serpapi")) return null;
 
+  // Phase 6A.3B: this real SerpAPI boundary previously had NO budget check at
+  // all and fired unconditionally on every /market/search call, cache hit or
+  // not. Now gated the same as the other non-primary engines.
+  const _inflightKeyLocal = `serpLocalShopping|${_hashForAttribution(query)}|${_hashForAttribution(location)}`;
+  const _reuseLocal = getSerpInflightReuse(_inflightKeyLocal, "google_shopping_local", { engine: "google_shopping_local", query });
+  if (_reuseLocal) return _reuseLocal;
+  if (!consumeSerpBudget("serpLocalShopping", { engine: "google_shopping_local", query })) {
+    return null;
+  }
+
+  const { promise: _localShoppingPromiseResult } = dedupeSerpInFlight(_inflightKeyLocal, "google_shopping_local", async () => {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
 
@@ -25850,7 +26687,8 @@ async function serpLocalShopping(query, location) {
     });
 
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const r = await fetch(url, { signal: controller.signal });
+    markSerpOutboundStarted({ engine: "google_shopping_local", query });
+    const r = await _serpApiFetch(url, { signal: controller.signal });
 
     if (!r.ok) {
       if (r.status === 429) {
@@ -25915,6 +26753,8 @@ async function serpLocalShopping(query, location) {
   } finally {
     clearTimeout(t);
   }
+  });
+  return _localShoppingPromiseResult;
 }
 
 // -------------------- SERP: Amazon --------------------
@@ -25954,11 +26794,18 @@ async function serpAmazon(query, opts = {}) {
     }
   }
 
+  // Phase 6A.3B round 3: in-flight dedupe, checked before the budget gate so
+  // a follower never consumes its own unit.
+  const _inflightKeyAmazon = `serpAmazon|${_hashForAttribution(query)}`;
+  const _reuseAmazon = getSerpInflightReuse(_inflightKeyAmazon, "amazon", { engine: "amazon", query });
+  if (_reuseAmazon) return _reuseAmazon;
+
   // ── Phase 2C.8: per-scan SerpAPI budget gate (Amazon engine) ────────────────
   if (!consumeSerpBudget("serpAmazon", { engine: "amazon", query })) {
     return [];
   }
 
+  const { promise: _serpAmazonPromiseResult } = dedupeSerpInFlight(_inflightKeyAmazon, "amazon", async () => {
   const startedAt = Date.now();
 
   const params = new URLSearchParams({
@@ -25973,7 +26820,8 @@ async function serpAmazon(query, opts = {}) {
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const r = await fetch(url, { signal: controller.signal });
+    markSerpOutboundStarted({ engine: "amazon", query });
+    const r = await _serpApiFetch(url, { signal: controller.signal });
 
     if (!r.ok) {
       if (r.status === 429) {
@@ -26058,6 +26906,8 @@ async function serpAmazon(query, opts = {}) {
   } finally {
     clearTimeout(t);
   }
+  });
+  return _serpAmazonPromiseResult;
 }
 
 // -------------------- SERP: Scoped resale search (StockX / Poshmark / Depop / Mercari) --------------------
@@ -26097,6 +26947,13 @@ async function serpScopedSearch(query, site, opts = {}) {
     }
   }
 
+  // Phase 6A.3B round 3: in-flight dedupe, checked before the budget gate.
+  // Keyed by query AND site — a Poshmark search and a Mercari search for the
+  // same base query are different real requests.
+  const _inflightKeyScoped = `serpScopedSearch|${_hashForAttribution(query)}|${_hashForAttribution(site)}`;
+  const _reuseScoped = getSerpInflightReuse(_inflightKeyScoped, "google_shopping_scoped", { engine: "google_shopping", site, label, query });
+  if (_reuseScoped) return _reuseScoped;
+
   // ── Phase 2C.8: per-scan SerpAPI budget gate (scoped resale search) ─────────
   // Scoped marketplace searches (Poshmark / Mercari / StockX / Depop) are an
   // extra paid call per site. Block them all after the primary call lands.
@@ -26104,6 +26961,7 @@ async function serpScopedSearch(query, site, opts = {}) {
     return [];
   }
 
+  const { promise: _serpScopedPromiseResult } = dedupeSerpInFlight(_inflightKeyScoped, "google_shopping_scoped", async () => {
   const startedAt = Date.now();
 
   const params = new URLSearchParams({
@@ -26119,7 +26977,8 @@ async function serpScopedSearch(query, site, opts = {}) {
 
   try {
     const url = `https://serpapi.com/search.json?${params.toString()}`;
-    const r = await fetch(url, { signal: controller.signal });
+    markSerpOutboundStarted({ engine: "google_shopping", site, label, query });
+    const r = await _serpApiFetch(url, { signal: controller.signal });
 
     if (!r.ok) {
       if (r.status === 429) {
@@ -26194,6 +27053,8 @@ async function serpScopedSearch(query, site, opts = {}) {
   } finally {
     clearTimeout(t);
   }
+  });
+  return _serpScopedPromiseResult;
 }
 
 // -------------------- ETSY ROUTE --------------------
@@ -33174,37 +34035,21 @@ app.post("/market/search/stream", async (req, res) => {
             endStream(); return;
           }
 
-          // Isolated refresh budget context — does not inherit cacheHit:true or prior calls.
-          const _refreshCtx = {
-            scanId: refreshScanId,
-            route: "/market/search/stream/cache_refresh",
-            query,
-            max: 1,
-            callsUsed: 0,
-            blockedExtraCalls: 0,
-            cacheHit: false,
-            key: `scan:${refreshScanId}`,
-          };
-
+          // Phase 6A.3B: this used to be an "isolated" budget context with its
+          // own independent max:1 — meaning a warm-cache serve (already zero
+          // paid cost) could still trigger a genuinely separate +1 paid
+          // SerpAPI attempt for the same logical user scan. That violated the
+          // one-call-per-scan invariant. It is now routed through the same
+          // hard-disabled background-budget policy as the scheduler loops:
+          // zero paid SerpAPI calls, permanently, for this release (see
+          // performStreamWarmCacheRefresh).
           console.log("CACHE_BACKGROUND_REFRESH_SOURCE_CALL_STARTED", {
             rid: req.rid, parentScanId: scanId, refreshScanId, query,
             cachedCount: _internalItems.length,
             skipInstantCache: true, forceSourceRefresh: true,
             phase1BudgetMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
           });
-          let _refreshRaw = [];
-          try {
-            _refreshRaw = await SERP_BUDGET_STORE.run(_refreshCtx, () =>
-              mergeCheapestSources(query, variants, visionIdentity, {
-                skipOracle: true,
-                phase1TimeoutMs: MARKET_BACKGROUND_RECOVERY_DEADLINE_MS,
-                skipInstantCache: true,
-                forceSourceRefresh: true,
-              })
-            );
-          } catch (_re) {
-            console.warn("CACHE_BACKGROUND_REFRESH_ERROR", { rid: req.rid, scanId, error: _re?.message });
-          }
+          const { raw: _refreshRaw, ctx: _refreshCtx } = await performStreamWarmCacheRefresh(query, variants, visionIdentity, { rid: req.rid, scanId, refreshScanId });
 
           // Phase 4I: Cached scan refreshes must attempt live source freshness and merge
           // only when 2+ net-new clean items are found. Verified/direct items must outrank
@@ -35083,6 +35928,18 @@ app.post("/local/search", async (req, res) => {
     const cached = LOCAL_CACHE.get(cacheKey);
     if (cached) return res.status(200).json({ ok: true, items: cached, cached: true });
 
+    // Phase 6A.3B round 3B: this route had NO budget/context protection at
+    // all — a raw fetch straight to serpapi.com, found only by the mandated
+    // full-file network inventory grep, not by tracing mergeCheapestSources
+    // callers (this route never goes through it). Gated the same as every
+    // other non-primary engine: fails closed with no context (which this
+    // standalone route never establishes), so it is disabled by default
+    // rather than silently reachable once SERPAPI_KEY is configured in
+    // production for the core scan feature.
+    if (!consumeSerpBudget("localSearch", { engine: "google_local_estate", query })) {
+      return res.status(200).json({ ok: true, items: [] });
+    }
+
     const q = `${query} ${near} consignment OR thrift OR estate sale`;
 
     const params = new URLSearchParams({
@@ -35096,8 +35953,8 @@ app.post("/local/search", async (req, res) => {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 7000);
 
-
-    const r = await fetch(`https://serpapi.com/search.json?${params.toString()}`, {
+    markSerpOutboundStarted({ engine: "google_local_estate", query });
+    const r = await _serpApiFetch(`https://serpapi.com/search.json?${params.toString()}`, {
       signal: controller.signal,
     });
     clearTimeout(t);
@@ -35865,9 +36722,14 @@ async function mergeForWatchLite(query) {
 
   if (!SERPAPI_KEY || isSourceCoolingDown("serpapi")) return [];
 
+  // Phase 6A.3B: watchlist checks (30-min cron and route-triggered refresh)
+  // previously reached serpAmazon with no budget context at all. Explicit
+  // background-budget context — zero paid SerpAPI by default.
   let items = [];
   try {
-    const amazon = await serpAmazon(normalizedQuery, { softFail: true });
+    const amazon = await runInBackgroundSerpBudget("watchlist", "watch_check", () =>
+      serpAmazon(normalizedQuery, { softFail: true })
+    );
     items = Array.isArray(amazon) ? amazon : [];
   } catch {
     items = [];
