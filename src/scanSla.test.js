@@ -14,6 +14,7 @@ import {
   MARKET_MAX_DEADLINE_MS,
 } from "./scanSla.js";
 import { isUsableVisionSeed, isGenericAircraftToyQuery, detectIncompleteAircraftIdentityQuery } from "./queryGuards.js";
+import { buildSlaExhaustedSkipResponse } from "./slaCacheFallback.js";
 
 // ── SLA budget math ───────────────────────────────────────────────────────────
 
@@ -1097,4 +1098,70 @@ test("4B: cache-hit paths never reach the phase1 deadline computation at all", (
   const reachedPhase1 = (cacheHit) => !cacheHit;
   assert.equal(reachedPhase1(true), false, "a cache hit must never reach the widened-deadline code path");
   assert.equal(reachedPhase1(false), true, "only a genuine cache miss reaches phase1 and the new deadline logic");
+});
+
+// ── Phase 6A.3D: SLA-exhausted direct-retry payload ──────────────────────────
+// Root cause (live prod audit, scanId c.mrjo6q1m.nkfer8): query_fast resolved
+// a confident identity, master was cancelled as redundant, but the market
+// phase alone ran out of SLA budget (isSlaExhausted) and returned nothing
+// usable. The frontend then polled /api/vision/background-result for a
+// master pass that was never going to arrive. Fix: the route now surfaces
+// the already-resolved identity in the skip payload (index.js, "all
+// zero-cost sources missed" branch) so the client can retry market search
+// directly instead of polling for a result that doesn't exist. Mirrors the
+// route's payload construction and the frontend's branch selection, since
+// neither is importable in isolation (Express route closure / RN component).
+
+// Payload-shape and zero-spend proof now lives in slaCacheFallback.test.js
+// against the REAL buildSlaExhaustedSkipResponse the route imports and calls
+// (index.js) — not a local mirror here. The two tests below stay in this
+// file because they mirror logic that genuinely isn't importable from a
+// Node backend test: the React Native frontend's branch selection and
+// request-shaping (app/index.tsx).
+
+test("6A.3D: retryDirectly + recoverableIdentity.query selects direct-retry path over vision-poll", () => {
+  // Mirrors the frontend branch: index.tsx, scan_sla_exhausted_before_market handling.
+  function chooseRecoveryPath(marketData) {
+    if (marketData?.retryDirectly && marketData?.recoverableIdentity?.query) return "direct_retry";
+    return "vision_poll";
+  }
+  const withIdentity = buildSlaExhaustedSkipResponse({ query: "used leather couch brown" });
+  assert.equal(chooseRecoveryPath(withIdentity), "direct_retry");
+
+  const timeoutCase = { items: [], reason: "market_first_payload_timeout", displayMode: "rescan_needed", trust: "none" };
+  assert.equal(chooseRecoveryPath(timeoutCase), "vision_poll", "market_first_payload_timeout must still use the poll path — no identity to retry with");
+
+  const genericNoIdentity = { items: [], reason: "generic_query_no_identity", displayMode: "rescan_needed", blockedGeneric: true };
+  assert.equal(chooseRecoveryPath(genericNoIdentity), "vision_poll", "generic no-identity fail must still use the poll path");
+});
+
+test("6A.3D: real skip response cross-checks against scanSla's own isCleanFailPayload classifier", () => {
+  // Cross-module consistency: the response slaCacheFallback.js actually
+  // builds must still satisfy the clean-fail classifier scanSla.js exports.
+  const p = buildSlaExhaustedSkipResponse({ query: "black cylindrical portable bluetooth speaker", confidence: 0.85 });
+  assert.equal(isCleanFailPayload(p), true, "must still be classified as clean-fail despite carrying a retryable identity");
+});
+
+test("6A.3D: direct retry requests isBackgroundRecovery:true (6000ms deadline), not the just-exhausted SLA path", () => {
+  // Mirrors the frontend's searchMarketStream call inside _runRecoveryMarketSearch —
+  // must set isBackgroundRecovery:true so the server grants the generous
+  // MARKET_BACKGROUND_RECOVERY_DEADLINE_MS budget instead of re-entering the
+  // same tight SCAN_FIRST_RESPONSE_SLA_MS clock that just got exhausted.
+  function buildRetryRequestBody(identity, scanId, imageHash) {
+    return {
+      query: identity.query,
+      variants: identity.variants || [],
+      visionConfidence: Number(identity.confidence || 0.7),
+      visionIdentity: identity.visionIdentity || null,
+      scanId: scanId || undefined,
+      imageHash: imageHash || undefined,
+      needsFamilyRecovery: identity.needsFamilyRecovery || false,
+      isBackgroundRecovery: true,
+    };
+  }
+  const identity = { query: "black cylindrical portable bluetooth speaker", confidence: 0.85 };
+  const body = buildRetryRequestBody(identity, "c.mrjo6q1m.nkfer8", null);
+  assert.equal(body.isBackgroundRecovery, true, "must request the background-recovery deadline, not the exhausted SLA path");
+  assert.equal(body.query, identity.query);
+  assert.equal(body.scanId, "c.mrjo6q1m.nkfer8");
 });

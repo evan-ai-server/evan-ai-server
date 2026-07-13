@@ -4,6 +4,7 @@ import {
   isSlaExhausted,
   classifyBudgetCacheKey,
   selectSlaFallbackSource,
+  buildSlaExhaustedSkipResponse,
   SLA_EXHAUSTED_THRESHOLD_MS,
 } from "./slaCacheFallback.js";
 
@@ -95,4 +96,55 @@ test("end-to-end — live SLA-exhausted Hawaiian scan resolves to internal_snaps
     minCleanTarget: 8,
   });
   assert.equal(decision.source, "internal_snapshot");
+});
+
+// ── Phase 6A.3D: buildSlaExhaustedSkipResponse ─────────────────────────────
+// This is the REAL function index.js imports and calls at the terminal
+// "all zero-cost sources missed" branch — not a local mirror. A regression
+// that drops retryDirectly/recoverableIdentity from the route, or reverts it
+// to an inline literal that diverges from this shape, breaks these tests.
+
+test("6A.3D: terminal skip response carries retryDirectly + the resolved identity", () => {
+  const identity = {
+    query: "black cylindrical portable bluetooth speaker",
+    variants: ["portable bluetooth speaker black"],
+    confidence: 0.85,
+    visionIdentity: { category: "electronics", brand: null },
+  };
+  const p = buildSlaExhaustedSkipResponse(identity);
+  assert.deepEqual(p.items, []);
+  assert.equal(p.reason, "scan_sla_exhausted_before_market");
+  assert.equal(p.displayMode, "rescan_needed");
+  assert.equal(p.trust, "none");
+  assert.equal(p.retryDirectly, true);
+  assert.equal(p.recoverableIdentity.query, identity.query);
+  assert.deepEqual(p.recoverableIdentity.variants, identity.variants);
+  assert.equal(p.recoverableIdentity.confidence, 0.85);
+});
+
+test("6A.3D: server-injected `plan` is stripped from the echoed visionIdentity", () => {
+  // visionIdentity gets `plan` mixed in elsewhere in the route (getResolvedPlan)
+  // purely for that route's own gating — it has no bearing on re-running the
+  // search and must not be re-emitted to the client.
+  const p = buildSlaExhaustedSkipResponse({
+    query: "q", visionIdentity: { category: "electronics", plan: "pro" },
+  });
+  assert.equal(p.recoverableIdentity.visionIdentity.plan, undefined, "plan must not be echoed back");
+  assert.equal(p.recoverableIdentity.visionIdentity.category, "electronics", "other identity fields must survive");
+});
+
+test("6A.3D: missing visionIdentity does not throw — recoverableIdentity.visionIdentity is null", () => {
+  const p = buildSlaExhaustedSkipResponse({ query: "q", variants: [], confidence: 0.5 });
+  assert.equal(p.recoverableIdentity.visionIdentity, null);
+});
+
+test("6A.3D: end-to-end — SLA-exhausted + resolved identity yields a retryable, still-clean-fail response", () => {
+  const remainingMs = 653; // the live scanId c.mrjo6q1m.nkfer8 value
+  assert.equal(isSlaExhausted(remainingMs), true);
+  const decision = selectSlaFallbackSource({ inMemoryHit: false, snapshotCleanCount: 0, minCleanTarget: 8 });
+  assert.equal(decision.source, "miss");
+  const p = buildSlaExhaustedSkipResponse({
+    query: "black cylindrical portable bluetooth speaker", variants: [], confidence: 0.85, visionIdentity: { category: "electronics" },
+  });
+  assert.equal(p.retryDirectly, true, "a genuine miss with a resolved identity must still offer direct retry");
 });

@@ -62,3 +62,26 @@ export function selectSlaFallbackSource({
   }
   return { source: "miss", log: "MARKET_SLA_EXHAUSTED_CACHE_FALLBACK_MISS" };
 }
+
+/**
+ * Phase 6A.3D — the terminal response when every zero-cost fallback above
+ * missed. The skip is a time-budget decision, not an identity failure: by
+ * the time this fires, query/variants/confidence/visionIdentity are already
+ * resolved. Surfacing them lets the client retry market search directly
+ * (isBackgroundRecovery:true) instead of polling for a master vision pass
+ * that may have been intentionally cancelled (query_fast already sufficed)
+ * and would never arrive. `plan` is stripped from the echoed visionIdentity —
+ * it's a server-injected field the client already knows about itself and
+ * has no bearing on re-running the search.
+ */
+export function buildSlaExhaustedSkipResponse({ query, variants, confidence, visionIdentity } = {}) {
+  const { plan: _plan, ...identityWithoutPlan } = visionIdentity || {};
+  return {
+    items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
+    retryDirectly: true,
+    recoverableIdentity: {
+      query, variants, confidence,
+      visionIdentity: visionIdentity ? identityWithoutPlan : null,
+    },
+  };
+}

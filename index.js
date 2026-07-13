@@ -1342,7 +1342,7 @@ import { evaluateNearDupServeGate, detectNearDupContradiction } from "./src/near
 import { evaluateProvisionalSeed }         from "./src/provisionalSeed.js";
 import { mirrorQueryFastSeedIdentity, slaFallbackPayload } from "./src/graceSeed.js";
 import { summarizeVisionPassFailures, shouldReturnVisionUnavailable, buildVisionUnavailablePayload } from "./src/visionFailSafe.js";
-import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource } from "./src/slaCacheFallback.js";
+import { isSlaExhausted, classifyBudgetCacheKey, selectSlaFallbackSource, buildSlaExhaustedSkipResponse } from "./src/slaCacheFallback.js";
 // Phase C0.1 — shared usability test for the cross-route market payload cache
 // (fixes empty-payload cache poisoning: a 0-item full payload must never
 // replay as a terminal cache hit for a later fallback request).
@@ -33853,9 +33853,11 @@ app.post("/market/search/stream", async (req, res) => {
       console.warn("MARKET_SKIPPED_SLA_EXHAUSTED", {
         rid: req.rid, scanId, remainingMs: _slaMsRemaining, elapsedMs: _clampedElapsedMs,
       });
-      send("complete", {
-        items: [], reason: "scan_sla_exhausted_before_market", displayMode: "rescan_needed", trust: "none",
-      });
+      // Phase 6A.3D: the skip is a time-budget decision, not an identity
+      // failure — surface the already-resolved identity so the client can
+      // retry directly instead of polling for a master pass that may never
+      // arrive. See buildSlaExhaustedSkipResponse for details.
+      send("complete", buildSlaExhaustedSkipResponse({ query, variants, confidence: visionConfidence, visionIdentity }));
       endStream();
       return;
     }
